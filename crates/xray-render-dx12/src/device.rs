@@ -212,6 +212,16 @@ impl Dx12DeviceContext {
 
         swapchain_base.cast()
     }
+
+    /// Query the physical hardware adapter description
+    pub fn adapter_name(&self) -> String {
+        if let Ok(desc) = unsafe { self.adapter.GetDesc1() } {
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            String::from_utf16_lossy(&desc.Description[..len])
+        } else {
+            "Unknown Adapter".to_string()
+        }
+    }
 }
 
 #[cfg(test)]

@@ -6,26 +6,39 @@
 // Forward declaration of Rust opaque renderer handle
 struct XrDx12Renderer;
 
-// C ABI function prototypes exported by xray-render-dx12
-extern "C" {
-    int xr_dx12_renderer_create(unsigned int worker_count, XrDx12Renderer** out_ptr);
-    int xr_dx12_renderer_destroy(XrDx12Renderer* renderer);
-    int xr_dx12_renderer_attach_window(XrDx12Renderer* renderer, void* hwnd, unsigned int width, unsigned int height);
-    int xr_dx12_renderer_resize(XrDx12Renderer* renderer, unsigned int width, unsigned int height);
-    int xr_dx12_renderer_begin_frame(XrDx12Renderer* renderer);
-    int xr_dx12_renderer_clear(XrDx12Renderer* renderer, float r, float g, float b, float a);
-    int xr_dx12_renderer_end_frame(XrDx12Renderer* renderer, unsigned int vsync);
-    int xr_dx12_renderer_wait_for_gpu(XrDx12Renderer* renderer);
-    int xr_dx12_renderer_get_device_state(XrDx12Renderer* renderer, int* out_state);
-}
+// Function pointer signatures for dynamic loading
+typedef int (*PFN_xr_dx12_renderer_create)(unsigned int worker_count, XrDx12Renderer** out_ptr);
+typedef int (*PFN_xr_dx12_renderer_destroy)(XrDx12Renderer* renderer);
+typedef int (*PFN_xr_dx12_renderer_attach_window)(XrDx12Renderer* renderer, void* hwnd, unsigned int width, unsigned int height);
+typedef int (*PFN_xr_dx12_renderer_resize)(XrDx12Renderer* renderer, unsigned int width, unsigned int height);
+typedef int (*PFN_xr_dx12_renderer_begin_frame)(XrDx12Renderer* renderer);
+typedef int (*PFN_xr_dx12_renderer_clear)(XrDx12Renderer* renderer, float r, float g, float b, float a);
+typedef int (*PFN_xr_dx12_renderer_end_frame)(XrDx12Renderer* renderer, unsigned int vsync);
+typedef int (*PFN_xr_dx12_renderer_wait_for_gpu)(XrDx12Renderer* renderer);
+typedef int (*PFN_xr_dx12_renderer_get_device_state)(XrDx12Renderer* renderer, int* out_state);
 
 class ENGINE_API dx12RenderDeviceRender : public IRenderDeviceRender
 {
 private:
     XrDx12Renderer* m_pRustRenderer;
+    HMODULE m_hRustModule;
     float m_fGamma;
     float m_fBrightness;
     float m_fContrast;
+
+    // Dynamically resolved function pointers
+    PFN_xr_dx12_renderer_create pfn_create;
+    PFN_xr_dx12_renderer_destroy pfn_destroy;
+    PFN_xr_dx12_renderer_attach_window pfn_attach_window;
+    PFN_xr_dx12_renderer_resize pfn_resize;
+    PFN_xr_dx12_renderer_begin_frame pfn_begin_frame;
+    PFN_xr_dx12_renderer_clear pfn_clear;
+    PFN_xr_dx12_renderer_end_frame pfn_end_frame;
+    PFN_xr_dx12_renderer_wait_for_gpu pfn_wait_for_gpu;
+    PFN_xr_dx12_renderer_get_device_state pfn_get_device_state;
+
+    bool LoadRustBackend();
+    void UnloadRustBackend();
 
 public:
     dx12RenderDeviceRender();

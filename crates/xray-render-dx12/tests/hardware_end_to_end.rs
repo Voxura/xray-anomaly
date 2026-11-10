@@ -47,18 +47,22 @@ fn test_hardware_end_to_end_swapchain_and_c_abi() {
         let mut renderer = Dx12Renderer::new(2)
             .expect("Failed to initialize hardware Dx12Renderer on host adapter");
 
+        println!("[Hardware Verification] Active DX12 Adapter: {}", renderer.adapter_name());
+        println!("[Hardware Verification] Device State: {:?}", renderer.device_state());
         assert_eq!(renderer.device_state(), DeviceState::Ok);
 
         // Attach native window and initialize Flip-Discard swapchain
         renderer
             .attach_window(hwnd, 800, 600)
             .expect("Failed to attach window and create swapchain");
+        println!("[Hardware Verification] Swapchain Created: 800x600 (3 backbuffers)");
 
         // Record & present Frame 0
         {
             let _cmd = renderer.begin_frame().expect("Frame 0 begin failed");
             renderer.clear_backbuffer([0.2, 0.4, 0.8, 1.0]);
             renderer.end_frame(false).expect("Frame 0 end/present failed");
+            println!("[Hardware Verification] Frame 0 Presented");
         }
 
         // Record & present Frame 1
@@ -66,12 +70,14 @@ fn test_hardware_end_to_end_swapchain_and_c_abi() {
             let _cmd = renderer.begin_frame().expect("Frame 1 begin failed");
             renderer.clear_backbuffer([0.1, 0.1, 0.1, 1.0]);
             renderer.end_frame(false).expect("Frame 1 end/present failed");
+            println!("[Hardware Verification] Frame 1 Presented");
         }
 
         // Resize window to 1024x768 while resources are active
         renderer
             .resize(1024, 768)
             .expect("Resize to 1024x768 failed");
+        println!("[Hardware Verification] Live Synchronized Resize: 1024x768");
 
         assert_eq!(renderer.width, 1024);
         assert_eq!(renderer.height, 768);
@@ -81,11 +87,14 @@ fn test_hardware_end_to_end_swapchain_and_c_abi() {
             let _cmd = renderer.begin_frame().expect("Frame 2 post-resize begin failed");
             renderer.clear_backbuffer([0.5, 0.5, 0.0, 1.0]);
             renderer.end_frame(false).expect("Frame 2 post-resize end/present failed");
+            println!("[Hardware Verification] Frame 2 Presented");
         }
 
         renderer.wait_for_gpu().expect("GPU flush failed");
 
         let stats = renderer.stats();
+        println!("[Hardware Verification] Pipeline Summary: Frames Presented: {}, Width: {}, Height: {}, Completed GPU Fence: {}",
+            stats.frame_index, stats.width, stats.height, stats.completed_gpu_fence);
         assert_eq!(stats.frame_index, 3);
         assert_eq!(stats.width, 1024);
         assert_eq!(stats.height, 768);
@@ -94,41 +103,52 @@ fn test_hardware_end_to_end_swapchain_and_c_abi() {
 
     // 2. C ABI Lifecycle & Smoke Test
     unsafe {
+        println!("[C ABI Smoke Test] Executing xr_dx12_renderer_create...");
         let mut c_renderer: *mut Dx12Renderer = ptr::null_mut();
         assert_eq!(xr_dx12_renderer_create(2, &mut c_renderer), XR_DX12_OK);
         assert!(!c_renderer.is_null());
 
+        println!("[C ABI Smoke Test] Executing xr_dx12_renderer_attach_window (800x600)...");
         assert_eq!(
             xr_dx12_renderer_attach_window(c_renderer, hwnd.0, 800, 600),
             XR_DX12_OK
         );
 
         // Frame via C ABI
+        println!("[C ABI Smoke Test] Frame 0: begin, clear, end...");
         assert_eq!(xr_dx12_renderer_begin_frame(c_renderer), XR_DX12_OK);
         assert_eq!(xr_dx12_renderer_clear(c_renderer, 0.0, 0.5, 0.5, 1.0), XR_DX12_OK);
         assert_eq!(xr_dx12_renderer_end_frame(c_renderer, 0), XR_DX12_OK);
 
         // Resize via C ABI
+        println!("[C ABI Smoke Test] Executing xr_dx12_renderer_resize (640x480)...");
         assert_eq!(xr_dx12_renderer_resize(c_renderer, 640, 480), XR_DX12_OK);
 
         // Frame post-resize via C ABI
+        println!("[C ABI Smoke Test] Frame 1 (post-resize): begin, clear, end...");
         assert_eq!(xr_dx12_renderer_begin_frame(c_renderer), XR_DX12_OK);
         assert_eq!(xr_dx12_renderer_clear(c_renderer, 0.3, 0.3, 0.3, 1.0), XR_DX12_OK);
         assert_eq!(xr_dx12_renderer_end_frame(c_renderer, 0), XR_DX12_OK);
 
+        println!("[C ABI Smoke Test] Executing xr_dx12_renderer_wait_for_gpu...");
         assert_eq!(xr_dx12_renderer_wait_for_gpu(c_renderer), XR_DX12_OK);
 
         let mut state: i32 = -1;
         assert_eq!(xr_dx12_renderer_get_device_state(c_renderer, &mut state), XR_DX12_OK);
+        println!("[C ABI Smoke Test] Device State: {} (0=Ok)", state);
         assert_eq!(state, 0);
 
         let mut stats = RenderStats::default();
         assert_eq!(xr_dx12_renderer_get_stats(c_renderer, &mut stats), XR_DX12_OK);
+        println!("[C ABI Smoke Test] Stats: Frames: {}, Res: {}x{}, Fence: {}",
+            stats.frame_index, stats.width, stats.height, stats.completed_gpu_fence);
         assert_eq!(stats.frame_index, 2);
         assert_eq!(stats.width, 640);
         assert_eq!(stats.height, 480);
 
+        println!("[C ABI Smoke Test] Executing xr_dx12_renderer_destroy...");
         assert_eq!(xr_dx12_renderer_destroy(c_renderer), XR_DX12_OK);
         let _ = DestroyWindow(hwnd);
+        println!("[C ABI Smoke Test] 100% XR_DX12_OK (0) Verified");
     }
 }

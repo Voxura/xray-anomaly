@@ -1150,9 +1150,11 @@
     <ProjectReference Include="..\3rd party\OpenAL-new\OpenAL-new.vcxproj">
       <Project>{10d13331-3282-43f9-bea0-150d80388b52}</Project>
     </ProjectReference>
+    <!--
     <ProjectReference Include="..\3rd party\optick\optick.vcxproj">
       <Project>{4ddc8f7a-3b57-4250-9404-d2ee1991be78}</Project>
     </ProjectReference>
+    -->
   </ItemGroup>
   <ItemGroup Condition="'$(Configuration)|$(Platform)'=='Verified|x64'">
     <ProjectReference Include="$(SolutionDir)Layers\xrRenderPC_R4\xrRender_R4.vcxproj">
@@ -1174,11 +1176,13 @@
       <Project>{AC9B12ED-A2D7-4337-A981-5BD8430E96D8}</Project>
     </ProjectReference>
   </ItemGroup>
+  <!--
   <ItemGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseR4|x64'">
     <ProjectReference Include="$(SolutionDir)Layers\xrRenderPC_R4\xrRender_R4.vcxproj">
       <Project>{AC9B12ED-A2D7-4337-A981-5BD8430E96D8}</Project>
     </ProjectReference>
   </ItemGroup>
+  -->
   <ItemGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseR4-AVX|x64'">
     <ProjectReference Include="$(SolutionDir)Layers\xrRenderPC_R4\xrRender_R4.vcxproj">
       <Project>{AC9B12ED-A2D7-4337-A981-5BD8430E96D8}</Project>

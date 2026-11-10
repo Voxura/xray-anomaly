@@ -241,6 +241,11 @@ impl Dx12Renderer {
         Ok(())
     }
 
+    /// Get physical GPU adapter name
+    pub fn adapter_name(&self) -> String {
+        self.device_ctx.adapter_name()
+    }
+
     /// Query current device cooperative state
     pub fn device_state(&self) -> DeviceState {
         if let Some(sc) = &self.swapchain {

@@ -198,11 +198,11 @@ int open_string(lua_State *L)
 /******************** MATH ********************/
 std::random_device ndrng;
 std::mt19937 intgen;
-std::uniform_real<float> float_random_01;
+std::uniform_real_distribution<float> float_random_01(0.0f, 1.0f);
 
 int gen_random_in_range(int a1, int a2)
 {	//unsigned?
-    std::uniform_int<> dist(a1, a2);
+    std::uniform_int_distribution<int> dist(a1, a2);
     return dist(intgen);
 }
 
