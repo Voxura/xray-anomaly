@@ -171,7 +171,10 @@ mod tests {
 
     #[test]
     fn test_crc32_computation() {
-        assert_eq!(compute_crc32(b"123456789"), 0xCBF43926);
+        // Standard IEEE 802.3 test vectors
+        assert_eq!(compute_crc32(b""), 0x0000_0000);
+        assert_eq!(compute_crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(compute_crc32(b"The quick brown fox jumps over the lazy dog"), 0x414F_A339);
     }
 
     #[test]

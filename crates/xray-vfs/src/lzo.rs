@@ -179,17 +179,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_corrupt_input_rejection() {
+    fn test_unexpected_eof() {
         let mut out = [0u8; 128];
-
-        // Empty input
         assert_eq!(decompress_lzo1x(&[], &mut out), Err(LzoError::UnexpectedEof));
-
-        // Truncated input
         assert_eq!(decompress_lzo1x(&[0x10], &mut out), Err(LzoError::UnexpectedEof));
+    }
 
-        // Invalid lookbehind distance on non-empty match
-        let bad_match = [64, 255]; // match referring to offset > out_pos
+    #[test]
+    fn test_output_overrun() {
+        // Feed 10 bytes of literals into a 3-byte buffer
+        let mut out = [0u8; 3];
+        // Instruction byte for 10 literals: 10 - 3 = 7 -> instruction = 7 (literal run of 7+3 = 10)
+        let in_data = [7u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        assert_eq!(decompress_lzo1x(&in_data, &mut out), Err(LzoError::OutputOverrun));
+    }
+
+    #[test]
+    fn test_lookbehind_out_of_bounds() {
+        let mut out = [0u8; 128];
+        // Match instruction referencing offset before buffer start
+        let bad_match = [64u8, 255u8];
         assert_eq!(decompress_lzo1x(&bad_match, &mut out), Err(LzoError::LookbehindOutOfBounds));
     }
 }
