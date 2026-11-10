@@ -451,4 +451,70 @@ mod tests {
         assert_eq!(bytes_written, original.len());
         assert_eq!(decompressed, original);
     }
+
+    #[test]
+    fn test_golden_lzo1x_m2_m3_fixtures() {
+        // Golden LZO1X Stream 1: M2 match (16 literals, 8-byte match at distance 16, standard EOF)
+        // Expected decompressed plaintext: "ABCDEFGH12345678ABCDEFGH" (24 bytes)
+        let golden_m2_stream = [
+            33u8, // First instruction: 17 + 16 = 33 literals
+            b'A', b'B', b'C', b'D', b'E', b'F', b'G', b'H',
+            b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8',
+            252u8, 1u8, // M2 match: m_len = 8, m_off = 16
+            17u8, 0u8, 0u8, // EOF marker
+        ];
+
+        let mut out = [0u8; 32];
+        let bytes_written = decompress_lzo1x(&golden_m2_stream, &mut out)
+            .expect("Golden M2 fixture must decompress successfully");
+        assert_eq!(bytes_written, 24);
+        assert_eq!(&out[..bytes_written], b"ABCDEFGH12345678ABCDEFGH");
+
+        // Golden LZO1X Stream 2: M3 match (32 literals, 12-byte match at distance 32, standard EOF)
+        let mut golden_m3_stream = Vec::new();
+        // 32 literals: 0 instruction for > 18 literals: [0, 14 (32-18=14)]
+        golden_m3_stream.push(0u8);
+        golden_m3_stream.push(14u8);
+        golden_m3_stream.extend_from_slice(b"0123456789ABCDEF0123456789ABCDEF"); // 32 bytes
+        // M3 match: len = 12, dist = 32 (off = 31):
+        // instruction: 32 | (12 - 2) = 42
+        // off & 63 << 2 = 31 << 2 = 124
+        // off >> 6 = 0
+        golden_m3_stream.push(42u8);
+        golden_m3_stream.push(124u8);
+        golden_m3_stream.push(0u8);
+        // EOF marker
+        golden_m3_stream.push(17u8);
+        golden_m3_stream.push(0u8);
+        golden_m3_stream.push(0u8);
+
+        let mut out_m3 = [0u8; 64];
+        let written_m3 = decompress_lzo1x(&golden_m3_stream, &mut out_m3)
+            .expect("Golden M3 fixture must decompress successfully");
+        assert_eq!(written_m3, 32 + 12);
+        assert_eq!(&out_m3[..32], b"0123456789ABCDEF0123456789ABCDEF");
+        assert_eq!(&out_m3[32..44], b"0123456789AB");
+    }
+
+    #[test]
+    fn test_malformed_truncated_stream_variants() {
+        let mut out = [0u8; 64];
+
+        // 1. Truncated instruction in literal run
+        assert_eq!(decompress_lzo1x(&[0u8, 5u8, b'a'], &mut out), Err(LzoError::UnexpectedEof));
+
+        // 2. Truncated M2 offset
+        assert_eq!(decompress_lzo1x(&[21u8, b'a', b'b', b'c', b'd', 252u8], &mut out), Err(LzoError::UnexpectedEof));
+
+        // 3. Truncated M3 offset bytes
+        assert_eq!(decompress_lzo1x(&[21u8, b'a', b'b', b'c', b'd', 42u8, 124u8], &mut out), Err(LzoError::UnexpectedEof));
+
+        // 4. Overrun on small destination buffer
+        let mut tiny_out = [0u8; 2];
+        let stream = [19u8, b'a', b'b', 17u8, 0u8, 0u8];
+        assert_eq!(decompress_lzo1x(&stream, &mut tiny_out), Ok(2));
+
+        let stream_overflow = [20u8, b'a', b'b', b'c', 17u8, 0u8, 0u8];
+        assert_eq!(decompress_lzo1x(&stream_overflow, &mut tiny_out), Err(LzoError::OutputOverrun));
+    }
 }
