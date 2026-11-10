@@ -1,0 +1,7 @@
+[package]
+name = "xray-render-dx12"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xray-core = { path = "../xray-core" }

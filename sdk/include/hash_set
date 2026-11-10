@@ -1,0 +1,11 @@
+#pragma once
+#include <unordered_set>
+#include "hash_map"
+
+namespace stdext {
+    template <typename K, typename Traits = hash_compare<K>, typename Alloc = std::allocator<K>>
+    using hash_set = std::unordered_set<K>;
+
+    template <typename K, typename Traits = hash_compare<K>, typename Alloc = std::allocator<K>>
+    using hash_multiset = std::unordered_multiset<K>;
+}

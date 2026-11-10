@@ -1,0 +1,8 @@
+#pragma once
+#include <filesystem>
+
+namespace std {
+    namespace experimental {
+        namespace filesystem = std::filesystem;
+    }
+}

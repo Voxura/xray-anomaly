@@ -1,0 +1,281 @@
+{
+  "total_fixtures": 46,
+  "fixtures": [
+    {
+      "rel_path": "gamedata/configs/environment/env_mods/_template.ltx",
+      "size_bytes": 709,
+      "sha256": "6bb61f8f392a5b64066a80fabab54a8d2a63569945957d7c49005fdf12b32b9c",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/misc/task/mod_task_manager_warfare_ecolog_escort_fix.ltx",
+      "size_bytes": 89,
+      "sha256": "7d8821ce0f09c783e4c84aa191fcf3105c7f16c0a26b1559a3d2794eb898ac5a",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/mod_script_dxml.ltx",
+      "size_bytes": 115,
+      "sha256": "4c47677e3dbb3de203da4b1ea6694e05f16c9a3b0c54e00bd4b0877df1104afd",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/mod_spawn_overlays_meadow.ltx",
+      "size_bytes": 141,
+      "sha256": "dae551adf34b980daf452ede9025d9de08ea734f606b1371d87af0a1604a4837",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/mod_system_anomaly_fixes.ltx",
+      "size_bytes": 112,
+      "sha256": "9a0570e5c96e833f68bff43a94979c6b6ba231f6c3d06a4a49bb0caab135b7a5",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/mod_system_base_hud.ltx",
+      "size_bytes": 141,
+      "sha256": "06cc98465c5fb35b058ca415b535d71b4823608b6ea5c0efdabe5af13bbfad80",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/mod_system_flashlight_definition.ltx",
+      "size_bytes": 41,
+      "sha256": "53b0b11d94527eb17595090aa853502616b707f94cffd12910c7fef484930293",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/mod_system_knife.ltx",
+      "size_bytes": 47,
+      "sha256": "ef6c32e602a6672a050626f3373f4b8b5b09df43cbc4999a86e3b8228af3f403",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/mod_system_shader_crosshair.ltx",
+      "size_bytes": 88,
+      "sha256": "98402fe499452820d0f5b0b5505cc81ce611e313810515bdb2ef607d580f2988",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/mod_system_spawn_antifreeze_ignore.ltx",
+      "size_bytes": 2792,
+      "sha256": "920707c02593f8e90aafd189381193e35557f8f609df5831f6d40bf7d5f1be42",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/patrol_paths.ltx",
+      "size_bytes": 2,
+      "sha256": "7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/scripts/escape/mod_esc_smart_terrain_5_7_smart_logic_warfare_fix.ltx",
+      "size_bytes": 261,
+      "sha256": "d04191a7fdcd677257f5f3e748361a152a5c30d85570cb4b1d8d8dd60d6674ad",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/scripts/labx8/mod_lx8_door_lock_fix.ltx",
+      "size_bytes": 72,
+      "sha256": "8213750beb28f1a3d29ef2ad21fb21eafb02657208c606eb93f4b2c1ef259dc3",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/scripts/pripyat/mod_monolith_kbo_logic_warfare_fix.ltx",
+      "size_bytes": 215,
+      "sha256": "885fc8ad3c7cba5e6ff19742d74df5ed0d91faf75596eb8dbc2ce46a97baaa0b",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/scripts/pripyat/mod_pri_b36_monolith_marines_1_b36_pier_fix.ltx",
+      "size_bytes": 168,
+      "sha256": "05f8010e3d27b7ac58ea5eecebb11b1022cc850a8a3a99442e1b1f0e129602df",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/scripts/pripyat/mod_pri_b36_monolith_marines_2_b36_pier_fix.ltx",
+      "size_bytes": 170,
+      "sha256": "68ef70661be3c76959da0f2dbb0a1c8fe6f933203fa56fb70ef8deb36c70b0ea",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/scripts/pripyat/mod_pri_b36_monolith_marines_3_b36_pier_fix.ltx",
+      "size_bytes": 170,
+      "sha256": "68ef70661be3c76959da0f2dbb0a1c8fe6f933203fa56fb70ef8deb36c70b0ea",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/scripts/pripyat/mod_pri_b36_monolith_marines_4_b36_pier_fix.ltx",
+      "size_bytes": 170,
+      "sha256": "68ef70661be3c76959da0f2dbb0a1c8fe6f933203fa56fb70ef8deb36c70b0ea",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/scripts/pripyat/mod_pri_b36_monolith_marines_5_b36_pier_fix.ltx",
+      "size_bytes": 197,
+      "sha256": "bd1058011fc71089060ba328afbf31cdbe888a2c9a6f5bd7745d8b92c2689406",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/scripts/pripyat/mod_pri_b36_monolith_marines_sniper_b36_pier_fix.ltx",
+      "size_bytes": 197,
+      "sha256": "adea71fcec77e1ad4783a397bdd22f47c3013bb5c32861095b4346691ddd6fb6",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/scripts/pripyat/mod_pri_b36_monolith_sniper_b36_pier_fix.ltx",
+      "size_bytes": 58,
+      "sha256": "cd732d5c45b52b13dca47cda301f94c1ca0e097215794a1c81b5df875d52720b",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/spawn_overlays.ltx",
+      "size_bytes": 17509,
+      "sha256": "f5dac201b8d3985bae529c86a0498fb347838ce6f36f213a04bcc700781a09a8",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/text/eng/ui_lua_fatal_window.xml",
+      "size_bytes": 856,
+      "sha256": "5228a60f5f0945e3197f2b9fc2ea43031f7dfbcab7398f9b531e85934db4ef14",
+      "format": "xml"
+    },
+    {
+      "rel_path": "gamedata/configs/text/eng/ui_mm_modded_exes.xml",
+      "size_bytes": 70769,
+      "sha256": "ff65bb422bbe78f87460679df1e89210b2628068431987bde44c4ca7d75b8d46",
+      "format": "xml"
+    },
+    {
+      "rel_path": "gamedata/configs/text/rus/ui_lua_fatal_window.xml",
+      "size_bytes": 851,
+      "sha256": "c520cade548e2c85f2b9f335a35287c00222b61a5f8bc231f9084d288c109a4b",
+      "format": "xml"
+    },
+    {
+      "rel_path": "gamedata/configs/text/rus/ui_mm_modded_exes.xml",
+      "size_bytes": 73553,
+      "sha256": "50e039efb3ab018776eb8de09025b1c12fe1ebb42ea1d5348c59c01d241d8b61",
+      "format": "xml"
+    },
+    {
+      "rel_path": "gamedata/configs/ui/textures_descr/ui_actor_main_menu_options.xml",
+      "size_bytes": 2392,
+      "sha256": "99db76808a26fef189a160d74a06298f835d3cb5baf1567cf3a71258cf45c59f",
+      "format": "xml"
+    },
+    {
+      "rel_path": "gamedata/configs/ui/textures_descr/ui_actor_multiplayer_menu_screen.xml",
+      "size_bytes": 10272,
+      "sha256": "464978921a28817d432649e4fd9c919edc74ba37a5d6e5f299f71ddeab9d831d",
+      "format": "xml"
+    },
+    {
+      "rel_path": "gamedata/configs/ui/textures_descr/ui_common.xml",
+      "size_bytes": 56828,
+      "sha256": "ec1d10af53ee44652368c5bb014b820479f7d09c25d7dbae27bc5ca5564faf7c",
+      "format": "xml"
+    },
+    {
+      "rel_path": "gamedata/configs/ui/ui_ctrl_hdr.xml",
+      "size_bytes": 32,
+      "sha256": "b760bbfa1e612532e3e3f888527dbc0c52a0483b1f3480a292e876be83a85aaf",
+      "format": "xml"
+    },
+    {
+      "rel_path": "gamedata/configs/ui/ui_ctrl_hdr_16.xml",
+      "size_bytes": 1055,
+      "sha256": "c7634855c7cbefb752e1d0508bafa78980921424401ddede2920086bd7acfd1f",
+      "format": "xml"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_axr_trade_manager.ltx",
+      "size_bytes": 80,
+      "sha256": "44f60f1cf196298f9e8b86621e1cd82e035a3241d4a96cdb8eea08c2a1e022cf",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_bind_item.ltx",
+      "size_bytes": 1444,
+      "sha256": "7f4c962343ffefbc71b3ebdc93436504b9788386f308616c7a24bdbcd95ba730",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_global.ltx",
+      "size_bytes": 17,
+      "sha256": "710c17551d7510ea1e9fbbba6a64a380eccd4ffbe7528a57d17333ef9ebdc07a",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_info_portions.ltx",
+      "size_bytes": 1469,
+      "sha256": "df8a0f9bd4f87e40b6ee66e03af26b10fcebac475c1eb2815103fd616ef7875f",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_item_device_script_fixes.ltx",
+      "size_bytes": 33,
+      "sha256": "3deb0d8fe896ed7214897377146ea2ba3ff6a138479b19f121cfd6d580d2ccff",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_item_weapon.ltx",
+      "size_bytes": 64,
+      "sha256": "78b04455aa15c4f73364ae2e15bccd8fe73c5ac02ba335fd4114214a4aaa8d49",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_pda.ltx",
+      "size_bytes": 1490,
+      "sha256": "0bcf11b4b0bba6f4a7fd0b78371e54730a017d139abe29078731bdd55124bcdf",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_sim_squad_scripted.ltx",
+      "size_bytes": 38,
+      "sha256": "d1b352e2043c986d3d99d0eebd881f60d6d1e55d1d741965630c862e8ba3188a",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_state_mgr_animation.ltx",
+      "size_bytes": 39,
+      "sha256": "b475e39155c350ff2556e480e5bb39318a1d2de126746e6e473a7043289e523d",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_ui_debug_launcher.ltx",
+      "size_bytes": 29,
+      "sha256": "c638f5df12aa5f507f2d9c24e02d65ed6804013db627f8e926f67fd588d334eb",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_ui_debug_main.ltx",
+      "size_bytes": 44,
+      "sha256": "5435c418ce6e0e581808a343082c7918b00bb4b3b9d5d118f633ce3da071a818",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_utils_item.ltx",
+      "size_bytes": 40,
+      "sha256": "d9a8644b24ad76ba4e747d2c74dcbf48f2c68c884fdb386fb7f1375b3efc9639",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_modded_exes_xrs_facer_script_fixes.ltx",
+      "size_bytes": 36,
+      "sha256": "72b78ff60bc381156f47136b139a34e236aa0c71d68f1930242be5ab66701f31",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_test.ltx",
+      "size_bytes": 1445,
+      "sha256": "67dd1820702868104e29d0d7f8e33dd420a0600baa99a053ce12a5f28f2708f0",
+      "format": "ltx"
+    },
+    {
+      "rel_path": "gamedata/configs/unlocalizers/unlocalizer_ui_options.ltx",
+      "size_bytes": 22,
+      "sha256": "e6e016153a627b36ed9112c19418f749cae55acaacad2ffc9f5be384fc8702eb",
+      "format": "ltx"
+    }
+  ]
+}

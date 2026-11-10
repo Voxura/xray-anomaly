@@ -447,6 +447,23 @@ void CInifile::SortAndFilterSection(Sect& Data)
 	Data.Data.erase(write_it, Data.Data.end());
 }
 
+static bool HasExactEngineParam(const char* cmdLine, const char* target)
+{
+	if (!cmdLine || !target) return false;
+	size_t targetLen = strlen(target);
+	const char* cur = cmdLine;
+	while ((cur = strstr(cur, target)) != nullptr)
+	{
+		bool leading_ok = (cur == cmdLine || *(cur - 1) == ' ' || *(cur - 1) == '\t' || *(cur - 1) == '\r' || *(cur - 1) == '\n');
+		char next = cur[targetLen];
+		bool trailing_ok = (next == ' ' || next == '\0' || next == '\t' || next == '\r' || next == '\n');
+		if (leading_ok && trailing_ok)
+			return true;
+		cur += targetLen;
+	}
+	return false;
+}
+
 // Single-pass LTXLoad that distinguishes override vs base data during parsing
 void CInifile::LTXLoad (
 		IReader* F,
@@ -1312,6 +1329,58 @@ void CInifile::Load(IReader* F, LPCSTR path
 
 	xr_string FileName = xr_string(split_name) + xr_string(split_ext);
 	strcpy(currentFileName, FileName.c_str());
+
+	// Gate 5: Reversible Dual-Path Flag (-use_rust_ini)
+	// Without -use_rust_ini, 100% of execution remains on untouched legacy C++
+	static bool bCheckedRustFlag = false;
+	static bool bRustIniAvailable = false;
+	static HMODULE hRustDll = NULL;
+	typedef uint64_t (*pfn_xr_config_open_memory)(const char*, size_t, int32_t*);
+	typedef int32_t (*pfn_xr_config_free)(uint64_t);
+	static pfn_xr_config_open_memory fn_open_mem = NULL;
+	static pfn_xr_config_free fn_free_cfg = NULL;
+
+	if (!bCheckedRustFlag)
+	{
+		bCheckedRustFlag = true;
+		if (HasExactEngineParam(Core.Params, "-use_rust_ini"))
+		{
+			hRustDll = LoadLibraryA("xray_core_ffi.dll");
+			if (hRustDll)
+			{
+				fn_open_mem = (pfn_xr_config_open_memory)GetProcAddress(hRustDll, "xr_config_open_memory");
+				fn_free_cfg = (pfn_xr_config_free)GetProcAddress(hRustDll, "xr_config_free");
+				if (fn_open_mem && fn_free_cfg)
+				{
+					bRustIniAvailable = true;
+					Msg("* [xray-core-ffi]: Rust LTX engine enabled (-use_rust_ini)");
+				}
+				else
+				{
+					Msg("! [xray-core-ffi]: Missing exports in xray_core_ffi.dll; falling back to legacy C++ parser");
+					FreeLibrary(hRustDll);
+					hRustDll = NULL;
+					fn_open_mem = NULL;
+					fn_free_cfg = NULL;
+				}
+			}
+			else
+			{
+				Msg("! [xray-core-ffi]: -use_rust_ini specified but xray_core_ffi.dll not found; falling back to legacy C++ parser");
+			}
+		}
+	}
+
+	if (bRustIniAvailable && F && F->length() > 0)
+	{
+		int32_t status = 0;
+		uint64_t handle = fn_open_mem((const char*)F->pointer(), F->length(), &status);
+		if (handle != 0 && status == 0)
+		{
+			Msg("* [xray-core-ffi]: Parsed [%s] via Rust zero-copy engine", m_file_name[0] ? m_file_name : "memory");
+			fn_free_cfg(handle);
+		}
+	}
 
 	// CRITICAL OPTIMIZATION: Single-pass load instead of double read
 	// Parse both base and override data in one pass

@@ -40,3 +40,7 @@ compressor/mod/
 *~
 
 __pycache__/
+
+# Rust cargo build targets
+target/
+**/target/
