@@ -50,7 +50,14 @@ void CRenderDevice::Destroy(void)
 	seqDeviceReset.R.clear();
 	seqParallel.clear();
 
-	RenderFactory->DestroyRenderDeviceRender(m_pRender);
+	if (strstr(Core.Params, "-use_rust_dx12") || strstr(Core.Params, "-r5"))
+	{
+		xr_delete(m_pRender);
+	}
+	else
+	{
+		RenderFactory->DestroyRenderDeviceRender(m_pRender);
+	}
 	m_pRender = 0;
 	xr_delete(Statistic);
 }

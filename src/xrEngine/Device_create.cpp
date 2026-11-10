@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "dx12_render_device.h"
 
 //#include "resourcemanager.h"
 #include "../Include/xrRender/DrawUtils.h"
@@ -158,7 +159,17 @@ PreCache (0);
 void CRenderDevice::ConnectToRender()
 {
 	if (!m_pRender)
-		m_pRender = RenderFactory->CreateRenderDeviceRender();
+	{
+		if (strstr(Core.Params, "-use_rust_dx12") || strstr(Core.Params, "-r5"))
+		{
+			Log("Initializing Modern DirectX 12 Pure Rust Render Backend (-use_rust_dx12)...");
+			m_pRender = xr_new<dx12RenderDeviceRender>();
+		}
+		else
+		{
+			m_pRender = RenderFactory->CreateRenderDeviceRender();
+		}
+	}
 }
 
 extern u32 g_screenmode;

@@ -862,6 +862,7 @@
     <ClInclude Include="dedicated_server_only.h" />
     <ClInclude Include="defines.h" />
     <ClInclude Include="device.h" />
+    <ClInclude Include="dx12_render_device.h" />
     <ClInclude Include="GIFResource.h" />
     <ClInclude Include="MonitorList.h" />
     <ClInclude Include="edit_actions.h" />
@@ -973,6 +974,7 @@
     <ClCompile Include="GIFResource.cpp" />
     <ClCompile Include="MonitorList.cpp" />
     <ClCompile Include="Device_create.cpp" />
+    <ClCompile Include="dx12_render_device.cpp" />
     <ClCompile Include="Device_destroy.cpp" />
     <ClCompile Include="Device_Initialize.cpp" />
     <ClCompile Include="Device_Misc.cpp" />
