@@ -216,4 +216,50 @@ mod tests {
 
         assert_eq!(data, payload);
     }
+
+    #[test]
+    fn test_lzo1x_compressed_archive_entry_parsing_and_read() {
+        use crate::lzo::compress_lzo1x;
+
+        // Realistic game configuration payload with repeated sections
+        let mut original_payload = Vec::new();
+        for i in 0..50 {
+            original_payload.extend_from_slice(
+                format!("[stalker_profile_{}]\nrank = master\ncommunity = monolith\nhealth = 100.0\n", i).as_bytes()
+            );
+        }
+
+        let compressed_payload = compress_lzo1x(&original_payload);
+        assert!(compressed_payload.len() < original_payload.len());
+        let crc = compute_crc32(&original_payload);
+
+        let file_name = b"configs\\creatures\\stalkers.ltx";
+        let record_size = (16 + file_name.len()) as u16;
+
+        let mut chunk1 = Vec::new();
+        chunk1.extend_from_slice(&record_size.to_le_bytes());
+        chunk1.extend_from_slice(&(original_payload.len() as u32).to_le_bytes()); // real size
+        chunk1.extend_from_slice(&(compressed_payload.len() as u32).to_le_bytes()); // compressed size
+        chunk1.extend_from_slice(&crc.to_le_bytes());
+        chunk1.extend_from_slice(file_name);
+
+        let chunk1_header_len = 8;
+        let data_offset = chunk1_header_len + chunk1.len() + 4;
+        chunk1.extend_from_slice(&(data_offset as u32).to_le_bytes());
+
+        let mut archive_bytes = Vec::new();
+        archive_bytes.extend_from_slice(&1u32.to_le_bytes()); // chunk ID = 1
+        archive_bytes.extend_from_slice(&(chunk1.len() as u32).to_le_bytes());
+        archive_bytes.extend_from_slice(&chunk1);
+        archive_bytes.extend_from_slice(&compressed_payload);
+
+        let archive = XRayArchive::parse(&archive_bytes).expect("Failed to parse compressed archive");
+        assert_eq!(archive.entries.len(), 1);
+
+        let data = archive
+            .read_file("configs/creatures/stalkers.ltx", &archive_bytes)
+            .expect("Decompression and CRC32 verification must pass");
+
+        assert_eq!(data, original_payload);
+    }
 }
