@@ -10,6 +10,7 @@ pub mod device;
 pub mod graph;
 pub mod heaps;
 pub mod pipeline;
+pub mod shaders;
 
 
 
