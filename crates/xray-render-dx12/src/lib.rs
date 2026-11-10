@@ -8,6 +8,7 @@ pub mod allocators;
 pub mod bindless;
 pub mod device;
 pub mod graph;
+pub mod heaps;
 pub mod pipeline;
 
 
