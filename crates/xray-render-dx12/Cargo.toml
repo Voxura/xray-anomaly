@@ -3,6 +3,9 @@ name = "xray-render-dx12"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 xray-core = { path = "../xray-core" }
 windows = { version = "0.61", features = [
@@ -14,4 +17,3 @@ windows = { version = "0.61", features = [
     "Win32_Security",
     "Win32_System_Threading",
 ] }
-

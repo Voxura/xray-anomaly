@@ -6,11 +6,12 @@
 
 pub mod allocators;
 pub mod bindless;
+pub mod deferred;
 pub mod device;
+pub mod ffi;
 pub mod graph;
 pub mod heaps;
 pub mod pipeline;
+pub mod renderer;
 pub mod shaders;
-
-
-
+pub mod swapchain;
