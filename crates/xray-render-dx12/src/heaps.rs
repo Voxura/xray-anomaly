@@ -315,74 +315,91 @@ mod tests {
         };
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
 
-        if let Ok(ctx) = Dx12DeviceContext::new(false) {
-            if ctx.caps.resource_heap_tier.0 >= windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_HEAP_TIER_2.0 {
-                let heap_mgr = TransientHeapManager::new(&ctx.device, 1024 * 1024)
-                    .expect("Creating transient heap must succeed");
-
-                let buf_desc = D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Alignment: DEFAULT_ALIGNMENT,
-                    Width: 64 * 1024,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    Format: DXGI_FORMAT_UNKNOWN,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    Flags: D3D12_RESOURCE_FLAG_NONE,
-                };
-
-                let res_a = heap_mgr.create_placed_resource(
-                    0,
-                    &buf_desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                ).expect("Creating placed resource A must succeed");
-
-                let res_b = heap_mgr.create_placed_resource(
-                    0,
-                    &buf_desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                ).expect("Creating placed resource B must succeed");
-
-                unsafe {
-                    let cmd_alloc: windows::Win32::Graphics::Direct3D12::ID3D12CommandAllocator =
-                        ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                            .expect("Creating command allocator must succeed");
-
-                    let cmd_list: windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList =
-                        ctx.device.CreateCommandList(
-                            0,
-                            D3D12_COMMAND_LIST_TYPE_DIRECT,
-                            &cmd_alloc,
-                            None,
-                        ).expect("Creating command list must succeed");
-
-                    let mut barrier = D3D12_RESOURCE_BARRIER::default();
-                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
-                    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-                    barrier.Anonymous.Aliasing = std::mem::ManuallyDrop::new(
-                        D3D12_RESOURCE_ALIASING_BARRIER {
-                            pResourceBefore: std::mem::transmute_copy(&res_a),
-                            pResourceAfter: std::mem::transmute_copy(&res_b),
-                        }
-                    );
-
-                    cmd_list.ResourceBarrier(&[barrier]);
-                    cmd_list.Close().expect("Closing command list must succeed");
-
-                    let command_lists = [Some(ID3D12CommandList::from(cmd_list))];
-                    ctx.direct_queue.ExecuteCommandLists(&command_lists);
-
-                    let fence: windows::Win32::Graphics::Direct3D12::ID3D12Fence =
-                        ctx.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)
-                            .expect("Creating fence must succeed");
-                    ctx.direct_queue.Signal(&fence, 1).expect("Signaling fence must succeed");
-                    while fence.GetCompletedValue() < 1 {
-                        std::thread::yield_now();
-                    }
-                }
+        let ctx = match Dx12DeviceContext::new(false) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("D3D12 hardware device unavailable: {:?}", e);
+                return;
             }
+        };
+
+        let adapter_desc = unsafe { ctx.adapter.GetDesc1() }.expect("GetDesc1 must succeed");
+        let adapter_name = String::from_utf16_lossy(&adapter_desc.Description)
+            .trim_matches('\0')
+            .to_string();
+
+        println!(
+            "[DX12 Hardware Test] Adapter: '{}', FeatureLevel: 0x{:X}, ResourceHeapTier: {:?}",
+            adapter_name, ctx.caps.max_feature_level.0, ctx.caps.resource_heap_tier
+        );
+
+        let heap_mgr = TransientHeapManager::new(&ctx.device, 1024 * 1024)
+            .expect("Creating transient heap must succeed");
+
+        let buf_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Alignment: DEFAULT_ALIGNMENT,
+            Width: 64 * 1024,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+
+        let res_a = heap_mgr.create_placed_resource(
+            0,
+            &buf_desc,
+            D3D12_RESOURCE_STATE_COMMON,
+        ).expect("Creating placed resource A must succeed");
+
+        let res_b = heap_mgr.create_placed_resource(
+            0,
+            &buf_desc,
+            D3D12_RESOURCE_STATE_COMMON,
+        ).expect("Creating placed resource B must succeed");
+
+        unsafe {
+            let cmd_alloc: windows::Win32::Graphics::Direct3D12::ID3D12CommandAllocator =
+                ctx.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .expect("Creating command allocator must succeed");
+
+            let cmd_list: windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList =
+                ctx.device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &cmd_alloc,
+                    None,
+                ).expect("Creating command list must succeed");
+
+            let mut barrier = D3D12_RESOURCE_BARRIER::default();
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+            barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+            barrier.Anonymous.Aliasing = std::mem::ManuallyDrop::new(
+                D3D12_RESOURCE_ALIASING_BARRIER {
+                    pResourceBefore: std::mem::transmute_copy(&res_a),
+                    pResourceAfter: std::mem::transmute_copy(&res_b),
+                }
+            );
+
+            cmd_list.ResourceBarrier(&[barrier]);
+            cmd_list.Close().expect("Closing command list must succeed");
+
+            let command_lists = [Some(ID3D12CommandList::from(cmd_list))];
+            ctx.direct_queue.ExecuteCommandLists(&command_lists);
+
+            let fence: windows::Win32::Graphics::Direct3D12::ID3D12Fence =
+                ctx.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                    .expect("Creating fence must succeed");
+            ctx.direct_queue.Signal(&fence, 1).expect("Signaling fence must succeed");
+            while fence.GetCompletedValue() < 1 {
+                std::thread::yield_now();
+            }
+
+            println!("[DX12 Hardware Test] GPU Execution & Fence Sync Succeeded (fence value: 1)");
+            assert_eq!(fence.GetCompletedValue(), 1);
         }
     }
 }

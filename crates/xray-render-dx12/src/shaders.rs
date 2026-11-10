@@ -310,10 +310,12 @@ mod tests {
             let bc1 = cache.get_or_compile(&req, &compiler).expect("SM 6.6 compilation must succeed");
             assert!(!bc1.is_empty());
             assert_eq!(cache.cached_count(), 1);
+            println!("[DXC Test] Compiled SM 6.6 DXIL Bytecode via {:?}, Bytecode Length: {} bytes", compiler.dxc_path, bc1.len());
 
             // Second query: retrieved from memory cache
             let bc2 = cache.get_or_compile(&req, &compiler).expect("Cache hit must succeed");
             assert_eq!(bc1, bc2);
+            println!("[DXC Test] Memory cache hit verified (cache count: {})", cache.cached_count());
         } else {
             eprintln!("Skipping DXC test: dxc.exe not found");
         }

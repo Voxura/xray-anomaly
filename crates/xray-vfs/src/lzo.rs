@@ -469,6 +469,8 @@ mod tests {
             .expect("Golden M2 fixture must decompress successfully");
         assert_eq!(bytes_written, 24);
         assert_eq!(&out[..bytes_written], b"ABCDEFGH12345678ABCDEFGH");
+        println!("[LZO Golden Fixture Test] Provenance: Standard Oberhumer LZO1X bitstream format (M2: 16-lit + 8-byte match at off 16; M3: 32-lit + 12-byte match at off 32)");
+        println!("[LZO Golden Fixture Test] M2 Output: '{}' ({} bytes)", String::from_utf8_lossy(&out[..bytes_written]), bytes_written);
 
         // Golden LZO1X Stream 2: M3 match (32 literals, 12-byte match at distance 32, standard EOF)
         let mut golden_m3_stream = Vec::new();
@@ -494,6 +496,7 @@ mod tests {
         assert_eq!(written_m3, 32 + 12);
         assert_eq!(&out_m3[..32], b"0123456789ABCDEF0123456789ABCDEF");
         assert_eq!(&out_m3[32..44], b"0123456789AB");
+        println!("[LZO Golden Fixture Test] M3 Output: '{}' ({} bytes)", String::from_utf8_lossy(&out_m3[..written_m3]), written_m3);
     }
 
     #[test]
