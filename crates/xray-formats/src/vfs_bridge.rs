@@ -1,11 +1,17 @@
 //! Bridges between `xray-vfs` (`VirtualFileSystem`), `xray-core` (`.ltx` / DLTX),
-//! and `xray-formats` (`OgfModel` / `ChunkReader`).
+//! and `xray-formats` (`OgfModel`, `OmfMotions`, `TextureParams`, `GameMaterialLibrary`).
 
 use xray_core::ltx_loader::{collect_ltx_sources, glob_matches_ascii, LtxFileProvider, OwnedLtxDocument};
 use xray_vfs::{normalize_virtual_path, normalize_virtual_prefix, VfsError, VirtualFileSystem};
 
 use crate::chunk::FormatError;
-use crate::ogf::OgfModel;
+use crate::gamemtl::GameMaterialLibrary;
+use crate::ogf::{OgfModel, OgfTextureLink};
+use crate::omf::OmfMotions;
+use crate::thm::{
+    strip_texture_extension, texture_stem_to_dds_vpath, texture_stem_to_thm_vpath,
+    ResolvedTextureLinks, TextureParams,
+};
 
 /// Adapter implementing `xray_core::ltx_loader::LtxFileProvider` over a mounted `VirtualFileSystem`.
 pub struct VfsLtxProvider<'a>(pub &'a VirtualFileSystem);
@@ -91,13 +97,150 @@ pub fn load_ogf_from_vfs(
     Ok(OgfModel::parse(&bytes)?)
 }
 
+/// Stream a standalone `.omf` clip library from `VirtualFileSystem`.
+///
+/// Accepts either a full VFS path (`$game_meshes$/actors/stalker_animation.omf`) or an
+/// `OGF_S_MOTION_REFS` reference (`actors\stalker_animation`).
+pub fn load_omf_from_vfs(
+    vfs: &VirtualFileSystem,
+    reference_or_path: &str,
+) -> Result<OmfMotions, AssetLoadError> {
+    let trimmed = reference_or_path.trim();
+    let has_omf_ext = trimmed.len() >= 4 && trimmed[trimmed.len() - 4..].eq_ignore_ascii_case(".omf");
+    let with_ext = if has_omf_ext {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.omf")
+    };
+
+    let candidate_path = if with_ext.starts_with('$') {
+        with_ext
+    } else {
+        let norm = normalize_virtual_path(&with_ext)?;
+        if norm.starts_with("meshes\\") {
+            norm
+        } else {
+            format!("meshes\\{norm}")
+        }
+    };
+
+    let bytes = vfs.read_bytes(&candidate_path)?;
+    Ok(OmfMotions::parse(&bytes)?)
+}
+
+/// Stream optional `.thm` (or `.ltx` `[texture]` fallback) metadata from `VirtualFileSystem`.
+///
+/// Returns `Ok(None)` when neither `<tex>.thm` nor `<tex>.ltx` exists in VFS.
+pub fn load_thm_from_vfs(
+    vfs: &VirtualFileSystem,
+    texture_name: &str,
+) -> Result<Option<TextureParams>, AssetLoadError> {
+    let thm_path = texture_stem_to_thm_vpath(texture_name);
+    if vfs.exists(&thm_path) {
+        let bytes = vfs.read_bytes(&thm_path)?;
+        return Ok(Some(TextureParams::parse(&bytes)?));
+    }
+
+    let ltx_path = format!(
+        "{}.ltx",
+        strip_texture_extension(&thm_path)
+    );
+    if vfs.exists(&ltx_path) {
+        let text = vfs.read_to_string_lossy(&ltx_path)?;
+        match TextureParams::from_ltx_fallback(texture_name, &text) {
+            Ok(params) => return Ok(Some(params)),
+            Err(FormatError::MissingChunk(_)) => return Ok(None),
+            Err(e) => return Err(AssetLoadError::Format(e)),
+        }
+    }
+
+    Ok(None)
+}
+
+/// Resolve an `OgfTextureLink`'s diffuse `.dds` and optional `.thm` bump (`_bump` / `_bump#`),
+/// detail, and external normal map paths from `VirtualFileSystem`.
+pub fn resolve_ogf_texture_links(
+    vfs: &VirtualFileSystem,
+    link: &OgfTextureLink,
+) -> Result<ResolvedTextureLinks, AssetLoadError> {
+    if let Some(params) = load_thm_from_vfs(vfs, &link.texture)? {
+        return Ok(params.resolve_texture_links(&link.texture));
+    }
+
+    let clean_name = strip_texture_extension(&link.texture).replace('/', "\\");
+    Ok(ResolvedTextureLinks {
+        diffuse_dds: texture_stem_to_dds_vpath(&clean_name),
+        diffuse_name: clean_name,
+        bump: None,
+        detail_dds: None,
+        detail_scale: 1.0,
+        use_diffuse_detail: false,
+        use_bump_detail: false,
+        ext_normal_map_dds: None,
+        material_id: 1.0,
+    })
+}
+
+/// Stream `$game_data$/gamemtl.xr` from `VirtualFileSystem` and apply optional Anomaly loose LTX overlays
+/// (`materials\materials.ltx` and `materials\material_pairs.ltx`) when present.
+pub fn load_gamemtl_from_vfs(
+    vfs: &VirtualFileSystem,
+) -> Result<GameMaterialLibrary, AssetLoadError> {
+    let bytes = vfs.read_bytes("$game_data$/gamemtl.xr")?;
+    let mut lib = GameMaterialLibrary::parse(&bytes)?;
+
+    if vfs.exists("$game_data$/materials/materials.ltx") {
+        let mtls_ltx = load_ltx_tree_from_vfs(vfs, "$game_data$/materials/materials.ltx", &[])?;
+        lib.apply_materials_ltx(&mtls_ltx);
+    }
+
+    if vfs.exists("$game_data$/materials/material_pairs.ltx") {
+        let pairs_ltx =
+            load_ltx_tree_from_vfs(vfs, "$game_data$/materials/material_pairs.ltx", &[])?;
+        lib.apply_material_pairs_ltx(&pairs_ltx);
+    }
+
+    Ok(lib)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chunk::ChunkWriter;
+    use crate::gamemtl::{gamemtl_chunks, gamemtl_flags, gamemtl_root_chunks};
     use crate::ogf::ogf_chunks::*;
     use crate::ogf::{fvf_flags, OgfVisualType};
+    use crate::omf::{motion_def_flags, motion_key_flags};
+    use crate::thm::{thm_chunks, TextureBumpMode, TextureFormat};
+    use std::path::PathBuf;
     use xray_vfs::{compress_lzo1x, compute_crc32};
+
+    fn pack_synthetic_db(entries: Vec<(&str, Vec<u8>, Vec<u8>)>) -> Vec<u8> {
+        let mut table_len = 0usize;
+        for (n, _, _) in &entries {
+            table_len += 2 + 16 + n.len();
+        }
+        let mut offset = 8 + table_len;
+        let mut chunk1 = Vec::new();
+        for (n, raw, comp) in &entries {
+            let rec_len = (16 + n.len()) as u16;
+            chunk1.extend_from_slice(&rec_len.to_le_bytes());
+            chunk1.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            chunk1.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+            chunk1.extend_from_slice(&compute_crc32(raw).to_le_bytes());
+            chunk1.extend_from_slice(n.as_bytes());
+            chunk1.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += comp.len();
+        }
+        let mut db = Vec::new();
+        db.extend_from_slice(&1u32.to_le_bytes());
+        db.extend_from_slice(&(chunk1.len() as u32).to_le_bytes());
+        db.extend_from_slice(&chunk1);
+        for (_, _, comp) in &entries {
+            db.extend_from_slice(comp);
+        }
+        db
+    }
 
     #[test]
     fn test_stream_ogf_and_ltx_from_vfs_archive() {
@@ -126,39 +269,16 @@ mod tests {
         let sub_ltx = b"#include \"weapons.ltx\"\n[wpn_ak]:wpn_base\ncaliber = 5.45\n";
         let mod_ltx = b"![wpn_ak]\ndamage = 35\n";
 
-        let entries: Vec<(&str, &[u8], Vec<u8>)> = vec![
-            ("meshes\\weapons\\ak.ogf", &ogf_raw, ogf_comp),
-            ("configs\\weapons.ltx", root_ltx, root_ltx.to_vec()),
-            ("configs\\weapons_ak.ltx", sub_ltx, sub_ltx.to_vec()),
-            ("configs\\mod_weapons_balance.ltx", mod_ltx, mod_ltx.to_vec()),
+        let entries = vec![
+            ("meshes\\weapons\\ak.ogf", ogf_raw.clone(), ogf_comp),
+            ("configs\\weapons.ltx", root_ltx.to_vec(), root_ltx.to_vec()),
+            ("configs\\weapons_ak.ltx", sub_ltx.to_vec(), sub_ltx.to_vec()),
+            ("configs\\mod_weapons_balance.ltx", mod_ltx.to_vec(), mod_ltx.to_vec()),
         ];
 
-        let mut table_len = 0usize;
-        for (n, _, _) in &entries {
-            table_len += 2 + 16 + n.len();
-        }
-        let mut offset = 8 + table_len;
-        let mut chunk1 = Vec::new();
-        for (n, raw, comp) in &entries {
-            let rec_len = (16 + n.len()) as u16;
-            chunk1.extend_from_slice(&rec_len.to_le_bytes());
-            chunk1.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-            chunk1.extend_from_slice(&(comp.len() as u32).to_le_bytes());
-            chunk1.extend_from_slice(&compute_crc32(raw).to_le_bytes());
-            chunk1.extend_from_slice(n.as_bytes());
-            chunk1.extend_from_slice(&(offset as u32).to_le_bytes());
-            offset += comp.len();
-        }
-        let mut db = Vec::new();
-        db.extend_from_slice(&1u32.to_le_bytes());
-        db.extend_from_slice(&(chunk1.len() as u32).to_le_bytes());
-        db.extend_from_slice(&chunk1);
-        for (_, _, comp) in &entries {
-            db.extend_from_slice(comp);
-        }
-
         let mut vfs = VirtualFileSystem::new();
-        vfs.mount_archive_bytes("test.db0", db).unwrap();
+        vfs.mount_archive_bytes("test.db0", pack_synthetic_db(entries))
+            .unwrap();
 
         let model = load_ogf_from_vfs(&vfs, "$game_meshes$/weapons/ak.ogf").unwrap();
         assert_eq!(model.triangle_count(), 1);
@@ -172,5 +292,228 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.read_i32("wpn_ak", "damage", 0), 35);
         assert_eq!(cfg.read_str("wpn_ak", "caliber"), Some("5.45"));
+    }
+
+    #[test]
+    fn test_real_gamedata_cursor_cross_dds_and_configs_vfs_streaming() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let gamedata_dir = repo_root.join("gamedata");
+        assert!(
+            gamedata_dir.is_dir(),
+            "repo gamedata directory must exist at {}",
+            gamedata_dir.display()
+        );
+
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_loose_dir(&gamedata_dir);
+
+        // Stream real `gamedata/textures/ui/cursor_cross.dds` (plus cursor_dot/cursor_plus)
+        for tex in [
+            "$game_textures$/ui/cursor_cross.dds",
+            "textures\\ui\\cursor_dot.dds",
+            "textures/ui/cursor_plus.dds",
+        ] {
+            let dds = vfs
+                .read_bytes(tex)
+                .unwrap_or_else(|e| panic!("failed streaming {tex}: {e:?}"));
+            // Validate exact uncompressed BGRA8 256x256 DDS header (128 + 256*256*4 = 262272B)
+            assert_eq!(&dds[0..4], b"DDS ", "{tex} missing DDS magic");
+            let hdr_size = u32::from_le_bytes(dds[4..8].try_into().unwrap());
+            let height = u32::from_le_bytes(dds[12..16].try_into().unwrap());
+            let width = u32::from_le_bytes(dds[16..20].try_into().unwrap());
+            let pf_flags = u32::from_le_bytes(dds[80..84].try_into().unwrap());
+            let bpp = u32::from_le_bytes(dds[88..92].try_into().unwrap());
+            let r_mask = u32::from_le_bytes(dds[92..96].try_into().unwrap());
+            let g_mask = u32::from_le_bytes(dds[96..100].try_into().unwrap());
+            let b_mask = u32::from_le_bytes(dds[100..104].try_into().unwrap());
+            let a_mask = u32::from_le_bytes(dds[104..108].try_into().unwrap());
+
+            assert_eq!(hdr_size, 124);
+            assert_eq!((width, height), (256, 256));
+            assert_eq!(pf_flags, 0x41); // DDPF_ALPHAPIXELS | DDPF_RGB
+            assert_eq!(bpp, 32);
+            assert_eq!(
+                (r_mask, g_mask, b_mask, a_mask),
+                (0x00FF_0000, 0x0000_FF00, 0x0000_00FF, 0xFF00_0000)
+            );
+            assert_eq!(dds.len(), 128 + 256 * 256 * 4);
+            // Must contain drawn crosshair texels (non-zero alpha channel byte in payload)
+            assert!(
+                dds[128..].as_chunks::<4>().0.iter().any(|bgra| bgra[3] > 0),
+                "{tex} expected non-empty alpha crosshair texels"
+            );
+        }
+
+        // Verify real config streaming from mounted gamedata/ via VFS
+        let knife_cfg = load_ltx_tree_from_vfs(
+            &vfs,
+            "$game_configs$/mod_system_knife.ltx",
+            &[],
+        )
+        .unwrap();
+        assert!(!knife_cfg.read_bool("wpn_knife", "firepos", true));
+    }
+
+    #[test]
+    fn test_stream_omf_thm_gamemtl_and_real_dds_from_mmap_archive() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let cursor_cross_bytes =
+            std::fs::read(repo_root.join("gamedata/textures/ui/cursor_cross.dds")).unwrap();
+
+        // 1. Minimal THM pointing cursor_cross -> ui\cursor_cross_bump
+        let mut thm_w = ChunkWriter::new();
+        let mut tp = Vec::new();
+        tp.extend_from_slice(&(TextureFormat::Rgba as u32).to_le_bytes());
+        for v in [1u32, 0, 0, 0, 0, 256, 256] {
+            tp.extend_from_slice(&v.to_le_bytes());
+        }
+        thm_w.write_chunk(thm_chunks::THM_CHUNK_TEXTUREPARAM, &tp);
+        let mut bump = Vec::new();
+        bump.extend_from_slice(&0.05f32.to_le_bytes());
+        bump.extend_from_slice(&(TextureBumpMode::Use as u32).to_le_bytes());
+        bump.extend_from_slice(b"ui\\cursor_cross_bump\0");
+        thm_w.write_chunk(thm_chunks::THM_CHUNK_BUMP, &bump);
+        let thm_raw = thm_w.into_bytes();
+
+        // 2. OGF referencing ui\cursor_cross + external actors\stalker_anim.omf
+        let mut ogf_w = ChunkWriter::new();
+        let mut hdr = vec![4u8, OgfVisualType::SkeletonAnim as u8, 0, 0];
+        hdr.extend_from_slice(&[0u8; 40]);
+        ogf_w.write_chunk(OGF_HEADER, &hdr);
+        ogf_w.write_chunk(OGF_TEXTURE, b"ui\\cursor_cross\0hud\\default\0");
+        let mut bn = Vec::new();
+        bn.extend_from_slice(&1u32.to_le_bytes());
+        bn.extend_from_slice(b"bip01\0\0");
+        bn.extend_from_slice(&[0u8; 60]);
+        ogf_w.write_chunk(OGF_S_BONE_NAMES, &bn);
+        ogf_w.write_chunk(OGF_S_MOTION_REFS, b"actors\\stalker_anim\0");
+        let ogf_raw = ogf_w.into_bytes();
+
+        // 3. Matching OMF for actors\stalker_anim
+        let mut mp = Vec::new();
+        mp.extend_from_slice(&4u16.to_le_bytes());
+        mp.extend_from_slice(&1u16.to_le_bytes());
+        mp.extend_from_slice(b"default\0");
+        mp.extend_from_slice(&1u16.to_le_bytes());
+        mp.extend_from_slice(b"bip01\0");
+        mp.extend_from_slice(&0u32.to_le_bytes());
+        mp.extend_from_slice(&1u16.to_le_bytes());
+        mp.extend_from_slice(b"stand\0");
+        mp.extend_from_slice(&(motion_def_flags::ESM_IDLE as u32).to_le_bytes());
+        for v in [0u16, 0] {
+            mp.extend_from_slice(&v.to_le_bytes());
+        }
+        for f in [1.0f32, 1.0, 1.0, 0.5] {
+            mp.extend_from_slice(&f.to_le_bytes());
+        }
+        mp.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut clip = Vec::new();
+        clip.extend_from_slice(b"stand\0");
+        clip.extend_from_slice(&1u32.to_le_bytes());
+        clip.push(motion_key_flags::FL_RKEY_ABSENT);
+        for v in [0i16, 0, 0, 32767] {
+            clip.extend_from_slice(&v.to_le_bytes());
+        }
+        for f in [0.0f32, 2.0, 0.0] {
+            clip.extend_from_slice(&f.to_le_bytes());
+        }
+        let mut ms = ChunkWriter::new();
+        ms.write_chunk(0, &1u32.to_le_bytes());
+        ms.write_chunk(1, &clip);
+        let mut omf_w = ChunkWriter::new();
+        omf_w.write_chunk(OGF_S_SMPARAMS, &mp);
+        omf_w.write_chunk(OGF_S_MOTIONS, &ms.into_bytes());
+        let omf_raw = omf_w.into_bytes();
+
+        // 4. Minimal gamemtl.xr + loose materials.ltx overlay
+        let mut mtl0 = ChunkWriter::new();
+        let mut m_main = 0u32.to_le_bytes().to_vec();
+        m_main.extend_from_slice(b"default_object\0");
+        mtl0.write_chunk(gamemtl_chunks::GAMEMTL_CHUNK_MAIN, &m_main);
+        mtl0.write_chunk(
+            gamemtl_chunks::GAMEMTL_CHUNK_FLAGS,
+            &gamemtl_flags::FL_SHOOTABLE.to_le_bytes(),
+        );
+        mtl0.write_chunk(gamemtl_chunks::GAMEMTL_CHUNK_PHYSICS, &[0u8; 20]);
+        mtl0.write_chunk(gamemtl_chunks::GAMEMTL_CHUNK_FACTORS, &[0u8; 16]);
+        let mut mtls = ChunkWriter::new();
+        mtls.write_chunk(0, &mtl0.into_bytes());
+        let mut gm = ChunkWriter::new();
+        gm.write_chunk(gamemtl_root_chunks::GAMEMTLS_CHUNK_VERSION, &1u16.to_le_bytes());
+        gm.write_chunk(gamemtl_root_chunks::GAMEMTLS_CHUNK_AUTOINC, &[0u8; 8]);
+        gm.write_chunk(gamemtl_root_chunks::GAMEMTLS_CHUNK_MTLS, &mtls.into_bytes());
+        let gm_raw = gm.into_bytes();
+
+        let entries = vec![
+            (
+                "textures\\ui\\cursor_cross.dds",
+                cursor_cross_bytes.clone(),
+                compress_lzo1x(&cursor_cross_bytes),
+            ),
+            (
+                "textures\\ui\\cursor_cross.thm",
+                thm_raw.clone(),
+                compress_lzo1x(&thm_raw),
+            ),
+            (
+                "meshes\\actors\\hero.ogf",
+                ogf_raw.clone(),
+                compress_lzo1x(&ogf_raw),
+            ),
+            (
+                "meshes\\actors\\stalker_anim.omf",
+                omf_raw.clone(),
+                compress_lzo1x(&omf_raw),
+            ),
+            ("gamemtl.xr", gm_raw.clone(), compress_lzo1x(&gm_raw)),
+            (
+                "materials\\materials.ltx",
+                b"[default_object]\nfriction = 0.42\n".to_vec(),
+                b"[default_object]\nfriction = 0.42\n".to_vec(),
+            ),
+        ];
+
+        let temp_dir = std::env::temp_dir().join(format!("xray_formats_vfs_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let archive_path = temp_dir.join("assets.db0");
+        std::fs::write(&archive_path, pack_synthetic_db(entries)).unwrap();
+
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_mmap(&archive_path).unwrap();
+
+        let ogf = load_ogf_from_vfs(&vfs, "$game_meshes$/actors/hero.ogf").unwrap();
+        let tex_links = resolve_ogf_texture_links(&vfs, ogf.texture.as_ref().unwrap()).unwrap();
+        assert_eq!(tex_links.diffuse_dds, "textures\\ui\\cursor_cross.dds");
+        assert_eq!(
+            tex_links.bump.as_ref().unwrap().bump_dds,
+            "textures\\ui\\cursor_cross_bump.dds"
+        );
+        assert_eq!(
+            tex_links.bump.as_ref().unwrap().bump_hash_dds,
+            "textures\\ui\\cursor_cross_bump#.dds"
+        );
+        assert_eq!(vfs.read_bytes(&tex_links.diffuse_dds).unwrap().len(), 262_272);
+
+        let skel = ogf.skeleton.as_ref().unwrap();
+        let omf = load_omf_from_vfs(&vfs, &skel.motion_refs[0]).unwrap();
+        let pose = omf.evaluate_skeleton_pose(skel, 0, 0.0).unwrap();
+        assert_eq!(pose[0][3], [0.0, 2.0, 0.0, 1.0]);
+
+        let gmlib = load_gamemtl_from_vfs(&vfs).unwrap();
+        let mat = gmlib.material_by_name("default_object").unwrap();
+        assert!((mat.ph_friction - 0.42).abs() < 1e-6);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

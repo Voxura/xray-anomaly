@@ -236,8 +236,18 @@ impl<'a> ByteCursor<'a> {
     }
 
     #[inline]
+    pub fn read_i8(&mut self) -> Result<i8, FormatError> {
+        Ok(self.read_bytes(1)?[0] as i8)
+    }
+
+    #[inline]
     pub fn read_u16(&mut self) -> Result<u16, FormatError> {
         Ok(u16::from_le_bytes(self.read_bytes(2)?.try_into().unwrap()))
+    }
+
+    #[inline]
+    pub fn read_i16(&mut self) -> Result<i16, FormatError> {
+        Ok(i16::from_le_bytes(self.read_bytes(2)?.try_into().unwrap()))
     }
 
     #[inline]
@@ -299,6 +309,33 @@ impl<'a> ByteCursor<'a> {
             self.pos = end;
         }
         Ok(s)
+    }
+
+    /// Read a `\r`/`\n`-terminated line matching `IReader::r_string` (`motion_marks`).
+    pub fn read_line_string(&mut self) -> Result<String, FormatError> {
+        if self.is_eof() {
+            return Err(FormatError::UnexpectedEof);
+        }
+        let start = self.pos;
+        while self.pos < self.data.len() {
+            let b = self.data[self.pos];
+            if b == b'\r' || b == b'\n' {
+                break;
+            }
+            self.pos += 1;
+        }
+        let line = String::from_utf8_lossy(&self.data[start..self.pos]).into_owned();
+        if self.pos < self.data.len() {
+            if self.data[self.pos] == b'\r' {
+                self.pos += 1;
+                if self.pos < self.data.len() && self.data[self.pos] == b'\n' {
+                    self.pos += 1;
+                }
+            } else if self.data[self.pos] == b'\n' {
+                self.pos += 1;
+            }
+        }
+        Ok(line)
     }
 }
 
@@ -379,5 +416,25 @@ mod tests {
             reader.find_chunk(1),
             Err(FormatError::InvalidChunkBounds { .. })
         ));
+    }
+
+    #[test]
+    fn test_byte_cursor_signed_and_line_strings() {
+        let mut raw = Vec::new();
+        raw.push((-42i8) as u8);
+        raw.extend_from_slice(&(-1234i16).to_le_bytes());
+        raw.extend_from_slice(b"mark_alpha\r\n");
+        raw.extend_from_slice(b"\r\n"); // empty line
+        raw.extend_from_slice(b"mark_lf\n");
+        raw.extend_from_slice(b"tail_eof");
+
+        let mut cur = ByteCursor::new(&raw);
+        assert_eq!(cur.read_i8().unwrap(), -42);
+        assert_eq!(cur.read_i16().unwrap(), -1234);
+        assert_eq!(cur.read_line_string().unwrap(), "mark_alpha");
+        assert_eq!(cur.read_line_string().unwrap(), "");
+        assert_eq!(cur.read_line_string().unwrap(), "mark_lf");
+        assert_eq!(cur.read_line_string().unwrap(), "tail_eof");
+        assert!(matches!(cur.read_line_string(), Err(FormatError::UnexpectedEof)));
     }
 }
