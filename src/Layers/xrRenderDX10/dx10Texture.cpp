@@ -309,6 +309,12 @@ IC u32 it_height_rev_base(u32 d, u32 s)	{	return	color_rgba	(
 */
 ID3DBaseTexture* CRender::texture_load(LPCSTR fRName, u32& ret_msize, bool bStaging)
 {
+	if (!HW.pDevice)
+	{
+		ret_msize = 0;
+		return nullptr;
+	}
+
 	//	Moved here just to avoid warning
 #ifdef USE_DX11
 	D3DX11_IMAGE_INFO IMG;

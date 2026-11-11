@@ -13,6 +13,8 @@ void dxFlareRender::Copy(IFlareRender& _in)
 
 void dxFlareRender::CreateShader(LPCSTR sh_name, LPCSTR tex_name)
 {
+	if (!HW.pDevice)
+		return;
 	if (tex_name && tex_name[0])
 		hShader.create(sh_name, tex_name);
 }
@@ -29,6 +31,9 @@ void dxLensFlareRender::Copy(ILensFlareRender& _in)
 
 void dxLensFlareRender::Render(CLensFlare& owner, BOOL bSun, BOOL bFlares, BOOL bGradient)
 {
+	if (!HW.pDevice)
+		return;
+
 	Fcolor dwLight;
 	Fcolor color;
 	Fvector vec, vecSx, vecSy;
@@ -145,6 +150,8 @@ void dxLensFlareRender::Render(CLensFlare& owner, BOOL bSun, BOOL bFlares, BOOL 
 
 void dxLensFlareRender::OnDeviceCreate()
 {
+	if (!HW.pDevice)
+		return;
 	hGeom.create(FVF::F_LIT, RCache.Vertex.Buffer(), RCache.QuadIB);
 }
 

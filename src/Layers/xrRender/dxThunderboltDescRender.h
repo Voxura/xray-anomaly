@@ -9,6 +9,7 @@ class IRender_DetailModel;
 class dxThunderboltDescRender : public IThunderboltDescRender
 {
 public:
+	dxThunderboltDescRender() : l_model(nullptr) {}
 	virtual void Copy(IThunderboltDescRender& _in);
 
 	virtual void CreateModel(LPCSTR m_name);

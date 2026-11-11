@@ -26,7 +26,8 @@ SVS::SVS() :
 
 SVS::~SVS()
 {
-	DEV->_DeleteVS(this);
+	if (DEV)
+		DEV->_DeleteVS(this);
 #if defined(USE_DX10) || defined(USE_DX11)
 	//_RELEASE(signature);
 	//	Now it is release automatically
@@ -40,7 +41,8 @@ SVS::~SVS()
 SPS::~SPS()
 {
 	_RELEASE(ps);
-	DEV->_DeletePS(this);
+	if (DEV)
+		DEV->_DeletePS(this);
 }
 
 #if defined(USE_DX10) || defined(USE_DX11)
@@ -49,26 +51,30 @@ SPS::~SPS()
 SGS::~SGS()
 {
 	_RELEASE(gs);
-	DEV->_DeleteGS(this);
+	if (DEV)
+		DEV->_DeleteGS(this);
 }
 
 #	ifdef USE_DX11
 SHS::~SHS()
 {
 	_RELEASE(sh);
-	DEV->_DeleteHS(this);
+	if (DEV)
+		DEV->_DeleteHS(this);
 }
 
 SDS::~SDS()
 {
 	_RELEASE(sh);
-	DEV->_DeleteDS(this);
+	if (DEV)
+		DEV->_DeleteDS(this);
 }
 
 SCS::~SCS()
 {
 	_RELEASE(sh);
-	DEV->_DeleteCS(this);
+	if (DEV)
+		DEV->_DeleteCS(this);
 }
 #	endif
 
@@ -84,7 +90,8 @@ SInputSignature::SInputSignature(ID3DBlob* pBlob)
 SInputSignature::~SInputSignature()
 {
 	_RELEASE(signature);
-	DEV->_DeleteInputSignature(this);
+	if (DEV)
+		DEV->_DeleteInputSignature(this);
 }
 #endif	//	USE_DX10
 
@@ -93,14 +100,16 @@ SInputSignature::~SInputSignature()
 SState::~SState()
 {
 	_RELEASE(state);
-	DEV->_DeleteState(this);
+	if (DEV)
+		DEV->_DeleteState(this);
 }
 
 ///////////////////////////////////////////////////////////////////////
 //	SDeclaration
 SDeclaration::~SDeclaration()
 {
-	DEV->_DeleteDecl(this);
+	if (DEV)
+		DEV->_DeleteDecl(this);
 #if defined(USE_DX10) || defined(USE_DX11)
 	xr_map<ID3DBlob*, ID3DInputLayout*>::iterator iLayout;
 	iLayout = vs_to_layout.begin();

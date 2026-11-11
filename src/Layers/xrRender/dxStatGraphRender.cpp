@@ -8,6 +8,8 @@ void dxStatGraphRender::Copy(IStatGraphRender& _in)
 
 void dxStatGraphRender::OnDeviceCreate()
 {
+	if (!HW.pDevice)
+		return;
 	hGeomLine.create(FVF::F_TL0uv, RCache.Vertex.Buffer(), RCache.Index.Buffer());
 	hGeomTri.create(FVF::F_TL0uv, RCache.Vertex.Buffer(), RCache.QuadIB);
 }
@@ -20,6 +22,8 @@ void dxStatGraphRender::OnDeviceDestroy()
 
 void dxStatGraphRender::OnRender(CStatGraph& owner)
 {
+	if (!HW.pDevice)
+		return;
 	RCache.OnFrameEnd();
 
 	RenderBack(owner);

@@ -28,6 +28,8 @@ void dxUIShader::Copy(IUIShader& _in)
 
 void dxUIShader::create(LPCSTR sh, LPCSTR tex, bool no_cache)
 {
+    if (!HW.pDevice)
+        return;
     if (no_cache)
     {
         hShader.create(sh, tex);

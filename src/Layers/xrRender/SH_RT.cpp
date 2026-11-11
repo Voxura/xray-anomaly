@@ -19,12 +19,13 @@ CRT::~CRT()
 	destroy();
 
 	// release external reference
-	DEV->_DeleteRT(this);
+	if (DEV)
+		DEV->_DeleteRT(this);
 }
 
 void CRT::create(LPCSTR Name, u32 w, u32 h, D3DFORMAT f, u32 SampleCount)
 {
-	if (pSurface) return;
+	if (!HW.pDevice || pSurface) return;
 
 	R_ASSERT(HW.pDevice && Name && Name[0] && w && h);
 	_order = CPU::GetCLK(); //RDEVICE.GetTimerGlobal()->GetElapsed_clk();
@@ -113,6 +114,11 @@ void CRT::reset_end()
 
 void resptrcode_crt::create(LPCSTR Name, u32 w, u32 h, D3DFORMAT f, u32 SampleCount)
 {
+	if (!HW.pDevice || !DEV)
+	{
+		_set(nullptr);
+		return;
+	}
 	_set(DEV->_CreateRT(Name, w, h, f));
 }
 

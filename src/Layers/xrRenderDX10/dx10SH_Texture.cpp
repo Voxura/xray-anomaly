@@ -21,6 +21,11 @@
 
 void resptrcode_texture::create(LPCSTR _name)
 {
+	if (!HW.pDevice || !DEV)
+	{
+		_set(nullptr);
+		return;
+	}
 	_set(DEV->_CreateTexture(_name));
 }
 
@@ -52,11 +57,20 @@ CTexture::~CTexture()
 	Unload();
 
 	// release external reference
-	DEV->_DeleteTexture(this);
+	if (DEV)
+		DEV->_DeleteTexture(this);
 }
 
 void CTexture::surface_set(ID3DBaseTexture* surf)
 {
+	if (!HW.pDevice)
+	{
+		_RELEASE(pSurface);
+		_RELEASE(m_pSRView);
+		pSurface = nullptr;
+		return;
+	}
+
 	if (surf) surf->AddRef();
 	_RELEASE(pSurface);
 	_RELEASE(m_pSRView);
@@ -387,6 +401,8 @@ void CTexture::apply_normal(u32 dwStage)
 
 void CTexture::Preload()
 {
+	if (!DEV)
+		return;
 	if (!strstr(Core.Params, "-r4_dev"))
 	{
 	m_bumpmap = DEV->m_textures_description.GetBumpName(cName);
@@ -399,6 +415,7 @@ void CTexture::Load()
 	flags.bLoaded = true;
 	desc_cache = 0;
 	if (pSurface) return;
+	if (!HW.pDevice) return;
 
 	flags.bUser = false;
 	flags.MemoryUsage = 0;

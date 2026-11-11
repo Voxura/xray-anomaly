@@ -16,6 +16,8 @@ dxWallMarkArray::~dxWallMarkArray()
 
 void dxWallMarkArray::AppendMark(LPCSTR s_textures)
 {
+	if (!HW.pDevice)
+		return;
 	ref_shader s;
 
 #if defined(USE_DX11)

@@ -3,7 +3,8 @@
 #pragma once
 
 #ifndef _EDITOR
-#define DEV dxRenderDeviceRender::Instance().Resources
+#include "HW.h"
+#define DEV dxRenderDeviceRender::GetResources()
 #else
 	#define DEV EDevice.Resources
 #endif
@@ -19,6 +20,7 @@ class dxRenderDeviceRender : public IRenderDeviceRender
 {
 public:
 	static dxRenderDeviceRender& Instance() { return *((dxRenderDeviceRender*)(&*Device.m_pRender)); }
+	static CResourceManager* GetResources() { return (HW.pDevice && Device.m_pRender) ? Instance().Resources : nullptr; }
 
 	dxRenderDeviceRender();
 

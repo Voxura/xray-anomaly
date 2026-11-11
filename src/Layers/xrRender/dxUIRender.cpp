@@ -8,6 +8,8 @@ dxUIRender UIRenderImpl;
 
 void dxUIRender::CreateUIGeom()
 {
+	if (!HW.pDevice)
+		return;
 	hGeom_TL.create(FVF::F_TL, RCache.Vertex.Buffer(), 0);
 	hGeom_LIT.create(FVF::F_LIT, RCache.Vertex.Buffer(), 0);
 }
@@ -25,6 +27,8 @@ void dxUIRender::DestroyUIGeom()
 
 void dxUIRender::SetShader(IUIShader& shader)
 {
+	if (!HW.pDevice)
+		return;
 	dxUIShader* pShader = (dxUIShader*)&shader;
 	VERIFY(&pShader);
 	VERIFY(pShader->hShader);
@@ -33,6 +37,8 @@ void dxUIRender::SetShader(IUIShader& shader)
 
 void dxUIRender::SetAlphaRef(int aref)
 {
+	if (!HW.pDevice)
+		return;
 	//CHK_DX(HW.pDevice->SetRenderState(D3DRS_ALPHAREF,aref));
 	RCache.set_AlphaRef(aref);
 }
@@ -146,6 +152,8 @@ void dxUIRender::FlushLineList()
 */
 void dxUIRender::SetScissor(Irect* rect)
 {
+	if (!HW.pDevice)
+		return;
 #if (RENDER == R_R3) || (RENDER == R_R4)
 	RCache.set_Scissor(rect);
 	StateManager.OverrideScissoring(rect ? true : false, TRUE);
@@ -156,6 +164,11 @@ void dxUIRender::SetScissor(Irect* rect)
 
 void dxUIRender::GetActiveTextureResolution(Fvector2& res)
 {
+	if (!HW.pDevice)
+	{
+		res.set(0.f, 0.f);
+		return;
+	}
 	CTexture* T = RCache.get_ActiveTexture(0);
 	res.set(float(T->get_Width()), float(T->get_Height()));
 }
@@ -163,6 +176,9 @@ void dxUIRender::GetActiveTextureResolution(Fvector2& res)
 bool dxUIRender::GetTextureResolution(LPCSTR name, Fvector2& res)
 {
 	res.set(0.f, 0.f);
+
+	if (!HW.pDevice || !DEV)
+		return false;
 
 	CTexture* T = DEV->_FindTexture(name);
 	if (!T || !T->flags.bLoaded) return false;
@@ -177,6 +193,8 @@ bool dxUIRender::GetTextureResolution(LPCSTR name, Fvector2& res)
 
 LPCSTR dxUIRender::UpdateShaderName(LPCSTR tex_name, LPCSTR sh_name)
 {
+	if (!HW.pDevice)
+		return sh_name;
 	string_path buff;
 	u32 v_dev = CAP_VERSION(HW.Caps.raster_major, HW.Caps.raster_minor);
 	u32 v_need = CAP_VERSION(2, 0);
@@ -206,6 +224,8 @@ void dxUIRender::PushPoint(int x, int y, u32 c, float u, float v)
 
 void dxUIRender::PushPoint(float x, float y, float z, u32 C, float u, float v)
 {
+	if (!HW.pDevice || PrimitiveType == ptNone)
+		return;
 	//.	VERIFY(m_PointType==pttLIT);
 	switch (m_PointType)
 	{
@@ -222,6 +242,12 @@ void dxUIRender::PushPoint(float x, float y, float z, u32 C, float u, float v)
 
 void dxUIRender::StartPrimitive(u32 iMaxVerts, ePrimitiveType primType, ePointType pointType)
 {
+	if (!HW.pDevice)
+	{
+		PrimitiveType = ptNone;
+		m_PointType = pttNone;
+		return;
+	}
 	VERIFY(PrimitiveType==ptNone);
 	VERIFY(m_PointType==pttNone);
 	//.	R_ASSERT(pointType==pttLIT);
@@ -245,6 +271,12 @@ void dxUIRender::StartPrimitive(u32 iMaxVerts, ePrimitiveType primType, ePointTy
 
 void dxUIRender::FlushPrimitive()
 {
+	if (!HW.pDevice || PrimitiveType == ptNone)
+	{
+		PrimitiveType = ptNone;
+		m_PointType = pttNone;
+		return;
+	}
 	u32 primCount = 0;
 	_D3DPRIMITIVETYPE d3dPrimType = D3DPT_FORCE_DWORD;
 	std::ptrdiff_t p_cnt = 0;
@@ -301,10 +333,14 @@ void dxUIRender::FlushPrimitive()
 
 void dxUIRender::CacheSetXformWorld(const Fmatrix& M)
 {
+	if (!HW.pDevice)
+		return;
 	RCache.set_xform_world(M);
 }
 
 void dxUIRender::CacheSetCullMode(CullMode m)
 {
+	if (!HW.pDevice)
+		return;
 	RCache.set_CullMode(CULL_NONE + m);
 }

@@ -26,6 +26,9 @@ int current_items;
 dxRainRender::dxRainRender()
 {
 	current_items = 0;
+	DM_Drop = NULL;
+	if (!HW.pDevice)
+		return;
 
 	IReader* F = FS.r_open("$game_meshes$", "dm\\rain.dm");
 	VERIFY3(F, "Can't open file.", "dm\\rain.dm");
@@ -47,7 +50,8 @@ dxRainRender::dxRainRender()
 
 dxRainRender::~dxRainRender()
 {
-	::RImplementation.model_Delete(DM_Drop);
+	if (DM_Drop)
+		::RImplementation.model_Delete(DM_Drop);
 }
 
 void dxRainRender::Copy(IRainRender& _in)
@@ -59,6 +63,9 @@ void dxRainRender::Copy(IRainRender& _in)
 
 void dxRainRender::Render(CEffect_Rain& owner)
 {
+	if (!HW.pDevice || !DM_Drop)
+		return;
+
 	float factor = g_pGamePersistent->Environment().CurrentEnv->rain_density;
 	if (factor < EPS_L) return;
 
@@ -336,5 +343,8 @@ void dxRainRender::Render(CEffect_Rain& owner)
 
 const Fsphere& dxRainRender::GetDropBounds() const
 {
+	static const Fsphere s_empty = {};
+	if (!DM_Drop)
+		return s_empty;
 	return DM_Drop->bv_sphere;
 }

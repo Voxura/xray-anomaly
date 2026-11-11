@@ -15,6 +15,8 @@ dxFontRender::~dxFontRender()
 
 void dxFontRender::Initialize(LPCSTR cShader, LPCSTR cTexture)
 {
+	if (!HW.pDevice)
+		return;
 	pShader.create(cShader, cTexture);
 	pGeom.create(FVF::F_TL, RCache.Vertex.Buffer(), RCache.QuadIB);
 }
@@ -24,6 +26,8 @@ extern ENGINE_API Fvector2 g_current_font_scale;
 
 void dxFontRender::OnRender(CGameFont& owner)
 {
+	if (!HW.pDevice)
+		return;
 	VERIFY(g_bRendering);
 	if (pShader) RCache.set_Shader(pShader);
 

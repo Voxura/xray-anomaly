@@ -143,6 +143,7 @@ void CResourceManager::_ParseList(sh_list& dest, LPCSTR names)
 
 ShaderElement* CResourceManager::_CreateElement(ShaderElement& S)
 {
+	if (!HW.pDevice) return 0;
 	if (S.passes.empty()) return 0;
 
 	xrCriticalSectionGuard guard(creationGuard);
@@ -169,6 +170,7 @@ void CResourceManager::_DeleteElement(const ShaderElement* S)
 Shader* CResourceManager::_cpp_Create(IBlender* B, LPCSTR s_shader, LPCSTR s_textures, LPCSTR s_constants,
                                       LPCSTR s_matrices)
 {
+	if (!HW.pDevice) return NULL;
 	xrCriticalSectionGuard guard(creationGuard);
 
 	CBlender_Compile C;
@@ -279,6 +281,7 @@ Shader* CResourceManager::_cpp_Create(IBlender* B, LPCSTR s_shader, LPCSTR s_tex
 
 Shader* CResourceManager::_cpp_Create(LPCSTR s_shader, LPCSTR s_textures, LPCSTR s_constants, LPCSTR s_matrices)
 {
+	if (!HW.pDevice) return NULL;
 	//#ifndef DEDICATED_SERVER
 #ifndef _EDITOR
 	if (!g_dedicated_server)
@@ -305,6 +308,7 @@ Shader* CResourceManager::_cpp_Create(LPCSTR s_shader, LPCSTR s_textures, LPCSTR
 
 Shader* CResourceManager::Create(IBlender* B, LPCSTR s_shader, LPCSTR s_textures, LPCSTR s_constants, LPCSTR s_matrices)
 {
+	if (!HW.pDevice) return NULL;
 	//#ifndef DEDICATED_SERVER
 #ifndef _EDITOR
 	if (!g_dedicated_server)
@@ -324,6 +328,7 @@ Shader* CResourceManager::Create(IBlender* B, LPCSTR s_shader, LPCSTR s_textures
 
 Shader* CResourceManager::Create(LPCSTR s_shader, LPCSTR s_textures, LPCSTR s_constants, LPCSTR s_matrices)
 {
+	if (!HW.pDevice) return NULL;
 	//#ifndef DEDICATED_SERVER
 #ifndef _EDITOR
 	if (!g_dedicated_server)

@@ -3,6 +3,8 @@
 
 dxConsoleRender::dxConsoleRender()
 {
+	if (!HW.pDevice)
+		return;
 #if defined(USE_DX10) || defined(USE_DX11)
 	m_Shader.create("hud\\crosshair");
 	m_Geom.create(FVF::F_TL, RCache.Vertex.Buffer(), RCache.QuadIB);
@@ -16,6 +18,8 @@ void dxConsoleRender::Copy(IConsoleRender& _in)
 
 void dxConsoleRender::OnRender(bool bGame)
 {
+	if (!HW.pDevice)
+		return;
 	VERIFY(HW.pDevice);
 
 

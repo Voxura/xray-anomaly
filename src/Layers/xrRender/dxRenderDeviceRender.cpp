@@ -337,22 +337,26 @@ void dxRenderDeviceRender::overdrawEnd()
 
 void dxRenderDeviceRender::DeferredLoad(BOOL E)
 {
-	Resources->DeferredLoad(E);
+	if (Resources)
+		Resources->DeferredLoad(E);
 }
 
 void dxRenderDeviceRender::ResourcesDeferredUpload()
 {
-	Resources->DeferredUpload();
+	if (Resources)
+		Resources->DeferredUpload();
 }
 
 void dxRenderDeviceRender::ResourcesDeferredUnload()
 {
-	Resources->DeferredUnload();
+	if (Resources)
+		Resources->DeferredUnload();
 }
 
 void dxRenderDeviceRender::ResourcesPrefetchCreateTexture(LPCSTR name)
 {
-	Resources->_CreateTexture(name);
+	if (Resources)
+		Resources->_CreateTexture(name);
 }
 
 void dxRenderDeviceRender::ResourcesGetMemoryUsage(u32& m_base, u32& c_base, u32& m_lmaps, u32& c_lmaps)
@@ -363,12 +367,14 @@ void dxRenderDeviceRender::ResourcesGetMemoryUsage(u32& m_base, u32& c_base, u32
 
 void dxRenderDeviceRender::ResourcesStoreNecessaryTextures()
 {
-	dxRenderDeviceRender::Instance().Resources->StoreNecessaryTextures();
+	if (Resources)
+		Resources->StoreNecessaryTextures();
 }
 
 void dxRenderDeviceRender::ResourcesDumpMemoryUsage()
 {
-	dxRenderDeviceRender::Instance().Resources->_DumpMemoryUsage();
+	if (Resources)
+		Resources->_DumpMemoryUsage();
 }
 
 dxRenderDeviceRender::DeviceState dxRenderDeviceRender::GetDeviceState()

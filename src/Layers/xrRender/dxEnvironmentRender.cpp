@@ -160,6 +160,9 @@ void dxEnvDescriptorMixerRender::lerp(IEnvDescriptorRender* inA, IEnvDescriptorR
 
 void dxEnvDescriptorRender::OnDeviceCreate(CEnvDescriptor& owner)
 {
+	if (!HW.pDevice)
+		return;
+
 	dxEnvDescriptorMixerRender& mixRen = *(dxEnvDescriptorMixerRender*)&*g_pGamePersistent
 	                                                                     ->Environment().CurrentEnv->m_pDescriptorMixer;
 
@@ -206,12 +209,18 @@ void dxEnvDescriptorRender::OnDeviceDestroy()
 
 dxEnvironmentRender::dxEnvironmentRender()
 {
+	if (!HW.pDevice)
+		return;
+
 	tsky0 = DEV->_CreateTexture("$user$sky0");
 	tsky1 = DEV->_CreateTexture("$user$sky1");
 }
 
 void dxEnvironmentRender::OnFrame(CEnvironment& env)
 {
+	if (!HW.pDevice)
+		return;
+
 	dxEnvDescriptorMixerRender& mixRen = *(dxEnvDescriptorMixerRender*)&*env.CurrentEnv->m_pDescriptorMixer;
 
 	if (::Render->get_generation() == IRender_interface::GENERATION_R2)
@@ -262,6 +271,9 @@ void dxEnvironmentRender::OnFrame(CEnvironment& env)
 
 void dxEnvironmentRender::OnLoad()
 {
+	if (!HW.pDevice)
+		return;
+
 	tonemap = DEV->_CreateTexture("$user$tonemap"); //. hack
 }
 
@@ -272,6 +284,8 @@ void dxEnvironmentRender::OnUnload()
 
 void dxEnvironmentRender::RenderSky(CEnvironment& env, bool OnlyMV)
 {
+	if (!HW.pDevice)
+		return;
 	// clouds_sh.create		("clouds","null");
 	//. this is the bug-fix for the case when the sky is broken
 	//. for some unknown reason the geoms happen to be invalid sometimes
@@ -357,6 +371,9 @@ void dxEnvironmentRender::RenderSky(CEnvironment& env, bool OnlyMV)
 
 void dxEnvironmentRender::RenderClouds(CEnvironment& env)
 {
+	if (!HW.pDevice)
+		return;
+
 	::Render->rmFar();
 
 	Fmatrix mXFORM, mScale;
@@ -399,6 +416,9 @@ void dxEnvironmentRender::RenderClouds(CEnvironment& env)
 
 void dxEnvironmentRender::OnDeviceCreate()
 {
+	if (!HW.pDevice)
+		return;
+
 	sh_2sky.create(&m_b_skybox, "skybox_2t");
 	sh_2geom.create(v_skybox_fvf, RCache.Vertex.Buffer(), RCache.Index.Buffer());
 	clouds_sh.create("clouds", "null");
@@ -407,8 +427,10 @@ void dxEnvironmentRender::OnDeviceCreate()
 
 void dxEnvironmentRender::OnDeviceDestroy()
 {
-	tsky0->surface_set(NULL);
-	tsky1->surface_set(NULL);
+	if (tsky0)
+		tsky0->surface_set(NULL);
+	if (tsky1)
+		tsky1->surface_set(NULL);
 
 	sh_2sky.destroy();
 	sh_2geom.destroy();

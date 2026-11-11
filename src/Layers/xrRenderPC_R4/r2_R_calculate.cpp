@@ -13,6 +13,8 @@ extern float r_ssaGLOD_start, r_ssaGLOD_end;
 
 void CRender::Calculate()
 {
+	if (!HW.pDevice || !Target)
+		return;
 	// Transfer to global space to avoid deep pointer access
 	IRender_Target* T = getTarget();
 	float fov_factor = _sqr(90.f / Device.fFOV);

@@ -177,6 +177,8 @@ void CRender::render_main(Fmatrix& m_ViewProjection, bool _fportals)
 
 void CRender::render_menu()
 {
+	if (!HW.pDevice || !Target)
+		return;
 	PIX_EVENT(render_menu);
 	//	Globals
 	RCache.set_CullMode(CULL_CCW);
@@ -229,6 +231,8 @@ extern u32 g_r;
 
 void CRender::Render()
 {
+	if (!HW.pDevice || !Target)
+		return;
 	PIX_EVENT(CRender_Render);
 
 	VERIFY(0 == mapDistort.size() + mapHUDDistort.size());
@@ -664,6 +668,9 @@ void CRender::Render()
 
 void CRender::RenderUI3DDirect()
 {
+	if (!HW.pDevice || !Target)
+		return;
+
 	HW.pContext->ClearDepthStencilView(HW.pBaseZB, D3D_CLEAR_DEPTH | D3D_CLEAR_STENCIL, 1.0f, 0);
 
 	RCache.set_Z(FALSE);

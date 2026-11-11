@@ -13,5 +13,7 @@ void dxUISequenceVideoItem::Copy(IUISequenceVideoItem& _in)
 
 void dxUISequenceVideoItem::CaptureTexture()
 {
+	if (!HW.pDevice)
+		return;
 	m_texture = RCache.get_ActiveTexture(0);
 }

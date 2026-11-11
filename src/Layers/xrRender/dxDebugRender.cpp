@@ -7,6 +7,8 @@ dxDebugRender DebugRenderImpl;
 
 void dxDebugRender::Render()
 {
+	if (!HW.pDevice)
+		return;
 	RCache.set_xform_world(Fidentity);
 
 	if (!m_line_vertices_hud.empty())
@@ -114,26 +116,36 @@ void dxDebugRender::NextSceneMode()
 
 void dxDebugRender::ZEnable(bool bEnable)
 {
+	if (!HW.pDevice)
+		return;
 	RCache.set_Z(bEnable);
 }
 
 void dxDebugRender::OnFrameEnd()
 {
+	if (!HW.pDevice)
+		return;
 	RCache.OnFrameEnd();
 }
 
 void dxDebugRender::SetShader(const debug_shader &shader)
 {
+	if (!HW.pDevice)
+		return;
 	RCache.set_Shader(((dxUIShader*)&*shader)->hShader);
 }
 
 void dxDebugRender::CacheSetXformWorld(const Fmatrix& M)
 {
+	if (!HW.pDevice)
+		return;
 	RCache.set_xform_world(M);
 }
 
 void dxDebugRender::CacheSetCullMode(CullMode m)
 {
+	if (!HW.pDevice)
+		return;
 	RCache.set_CullMode	(CULL_NONE+m);
 }
 
@@ -149,6 +161,8 @@ void dxDebugRender::SetAmbient(u32 colour)
 
 void dxDebugRender::SetDebugShader(dbgShaderHandle shdHandle)
 {
+	if (!HW.pDevice)
+		return;
 	R_ASSERT(shdHandle<dbgShaderCount);
 
 	static const LPCSTR dbgShaderParams[][2] = 
@@ -171,6 +185,8 @@ void dxDebugRender::DestroyDebugShader(dbgShaderHandle shdHandle)
 
 void dxDebugRender::dbg_DrawTRI(Fmatrix& T, Fvector& p1, Fvector& p2, Fvector& p3, u32 C)
 {
+	if (!HW.pDevice)
+		return;
 	RCache.dbg_DrawTRI(T, p1, p2, p3, C);
 }
 

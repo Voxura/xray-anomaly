@@ -25,7 +25,8 @@ CRT::~CRT()
 	destroy();
 
 	// release external reference
-	DEV->_DeleteRT(this);
+	if (DEV)
+		DEV->_DeleteRT(this);
 }
 
 #ifdef USE_DX11
@@ -34,7 +35,7 @@ void CRT::create(LPCSTR Name, u32 w, u32 h, D3DFORMAT f, u32 SampleCount, bool u
 void CRT::create(LPCSTR Name, u32 w, u32 h, D3DFORMAT f, u32 SampleCount)
 #endif
 {
-	if (pSurface) return;
+	if (!HW.pDevice || pSurface) return;
 
 	R_ASSERT(HW.pDevice && Name && Name[0] && w && h);
 	_order = CPU::GetCLK(); //Device.GetTimerGlobal()->GetElapsed_clk();
@@ -220,11 +221,21 @@ void CRT::reset_end()
 #ifdef USE_DX11
 void resptrcode_crt::create(LPCSTR Name, u32 w, u32 h, D3DFORMAT f, u32 SampleCount, bool useUAV)
 {
+	if (!HW.pDevice || !DEV)
+	{
+		_set(nullptr);
+		return;
+	}
 	_set(DEV->_CreateRT(Name, w, h, f, SampleCount, useUAV));
 }
 #else
 void resptrcode_crt::create(LPCSTR Name, u32 w, u32 h, D3DFORMAT f, u32 SampleCount)
 {
+	if (!HW.pDevice || !DEV)
+	{
+		_set(nullptr);
+		return;
+	}
 	_set(DEV->_CreateRT(Name, w, h, f, SampleCount));
 }
 #endif

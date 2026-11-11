@@ -12,11 +12,14 @@ void dxApplicationRender::Copy(IApplicationRender& _in)
 
 void dxApplicationRender::LoadBegin()
 {
-	ll_hGeom.create(FVF::F_TL, RCache.Vertex.Buffer(), RCache.QuadIB);
-	sh_progress.create("hud\\default", "ui\\ui_actor_loadgame_screen");
-	hLevelLogo_Add.create("hud\\default", "ui\\ui_actor_widescreen_sidepanels.dds");
+	if (HW.pDevice)
+	{
+		ll_hGeom.create(FVF::F_TL, RCache.Vertex.Buffer(), RCache.QuadIB);
+		sh_progress.create("hud\\default", "ui\\ui_actor_loadgame_screen");
+		hLevelLogo_Add.create("hud\\default", "ui\\ui_actor_widescreen_sidepanels.dds");
 
-	ll_hGeom2.create(FVF::F_TL, RCache.Vertex.Buffer(),NULL);
+		ll_hGeom2.create(FVF::F_TL, RCache.Vertex.Buffer(),NULL);
+	}
 
 	//Discord
 	discord_gameinfo.loadscreen = true;
@@ -46,6 +49,8 @@ void dxApplicationRender::destroy_loading_shaders()
 
 void dxApplicationRender::setLevelLogo(LPCSTR pszLogoName)
 {
+	if (!HW.pDevice)
+		return;
 	if (pszLogoName && pszLogoName[0])
 		hLevelLogo.create("hud\\default", pszLogoName);
 	else
@@ -63,6 +68,8 @@ extern void render_reshade_effects();
 
 void dxApplicationRender::load_draw_internal(CApplication& owner)
 {
+	if (!HW.pDevice)
+		return;
 #if defined(USE_DX10) || defined(USE_DX11)
 	//	TODO: DX10: remove this???
 	RImplementation.rmNormal();
@@ -277,6 +284,8 @@ void dxApplicationRender::load_draw_internal(CApplication& owner)
 
 void dxApplicationRender::draw_face(ref_shader& sh, Frect& coords, Frect& tex_coords, const Fvector2& tsz)
 {
+	if (!HW.pDevice)
+		return;
 	u32 Offset;
 	u32 C = 0xffffffff;
 	FVF::TL* pv = NULL;

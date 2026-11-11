@@ -14,37 +14,44 @@
 //
 STextureList::~STextureList()
 {
-	DEV->_DeleteTextureList(this);
+	if (DEV)
+		DEV->_DeleteTextureList(this);
 }
 
 SMatrixList::~SMatrixList()
 {
-	DEV->_DeleteMatrixList(this);
+	if (DEV)
+		DEV->_DeleteMatrixList(this);
 }
 
 SConstantList::~SConstantList()
 {
-	DEV->_DeleteConstantList(this);
+	if (DEV)
+		DEV->_DeleteConstantList(this);
 }
 
 SPass::~SPass()
 {
-	DEV->_DeletePass(this);
+	if (DEV)
+		DEV->_DeletePass(this);
 }
 
 ShaderElement::~ShaderElement()
 {
-	DEV->_DeleteElement(this);
+	if (DEV)
+		DEV->_DeleteElement(this);
 }
 
 SGeometry::~SGeometry()
 {
-	DEV->DeleteGeom(this);
+	if (DEV)
+		DEV->DeleteGeom(this);
 }
 
 Shader::~Shader()
 {
-	DEV->Delete(this);
+	if (DEV)
+		DEV->Delete(this);
 }
 
 // demonized: Possible race condition with spawn antifreeze, add guard
@@ -54,6 +61,11 @@ xrCriticalSection shaderCreate_cs;
 //////////////////////////////////////////////////////////////////////////					 
 void resptrcode_shader::create(LPCSTR s_shader, LPCSTR s_textures, LPCSTR s_constants, LPCSTR s_matrices)
 {
+	if (!HW.pDevice || !DEV)
+	{
+		_set(nullptr);
+		return;
+	}
 #ifdef SPAWN_ANTIFREEZE
 	xrCriticalSectionGuard g(shaderCreate_cs);
 #endif
@@ -62,6 +74,11 @@ void resptrcode_shader::create(LPCSTR s_shader, LPCSTR s_textures, LPCSTR s_cons
 
 void resptrcode_shader::create(IBlender* B, LPCSTR s_shader, LPCSTR s_textures, LPCSTR s_constants, LPCSTR s_matrices)
 {
+	if (!HW.pDevice || !DEV)
+	{
+		_set(nullptr);
+		return;
+	}
 #ifdef SPAWN_ANTIFREEZE
 	xrCriticalSectionGuard g(shaderCreate_cs);
 #endif
@@ -71,11 +88,21 @@ void resptrcode_shader::create(IBlender* B, LPCSTR s_shader, LPCSTR s_textures, 
 //////////////////////////////////////////////////////////////////////////
 void resptrcode_geom::create(u32 FVF, ID3DVertexBuffer* vb, ID3DIndexBuffer* ib)
 {
+	if (!HW.pDevice || !DEV)
+	{
+		_set(nullptr);
+		return;
+	}
 	_set(DEV->CreateGeom(FVF, vb, ib));
 }
 
 void resptrcode_geom::create(D3DVERTEXELEMENT9* decl, ID3DVertexBuffer* vb, ID3DIndexBuffer* ib)
 {
+	if (!HW.pDevice || !DEV)
+	{
+		_set(nullptr);
+		return;
+	}
 	_set(DEV->CreateGeom(decl, vb, ib));
 }
 

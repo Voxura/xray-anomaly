@@ -80,7 +80,8 @@ void CRenderDevice::Reset(bool precache)
 
 	use_reshade = false;
 
-	m_imgui.OnDeviceResetBegin();
+	if (!(strstr(Core.Params, "-use_rust_dx12") || strstr(Core.Params, "-r5")))
+		m_imgui.OnDeviceResetBegin();
 
 	u32 dwWidth_before = dwWidth;
 	u32 dwHeight_before = dwHeight;
@@ -129,7 +130,8 @@ void CRenderDevice::Reset(bool precache)
 	ClipCursor(&winRect);
 #endif
 
-	m_imgui.OnDeviceResetEnd();
+	if (!(strstr(Core.Params, "-use_rust_dx12") || strstr(Core.Params, "-r5")))
+		m_imgui.OnDeviceResetEnd();
 	use_reshade = init_reshade();
 }
 
@@ -163,7 +165,8 @@ bool CRenderDevice::ChangeOutputMonitor(HMONITOR hTargetMon)
 		unregister_reshade();
 	use_reshade = false;
 
-	m_imgui.OnDeviceResetBegin();
+	if (!(strstr(Core.Params, "-use_rust_dx12") || strstr(Core.Params, "-r5")))
+		m_imgui.OnDeviceResetBegin();
 	ShowCursor(TRUE);
 
 	u32 dwWidth_before  = dwWidth;
@@ -175,7 +178,8 @@ bool CRenderDevice::ChangeOutputMonitor(HMONITOR hTargetMon)
 
 	if (!switched)
 	{
-		m_imgui.OnDeviceResetEnd();
+		if (!(strstr(Core.Params, "-use_rust_dx12") || strstr(Core.Params, "-r5")))
+			m_imgui.OnDeviceResetEnd();
 		ShowCursor(FALSE);
 		use_reshade = init_reshade();
 		return false;
@@ -204,7 +208,8 @@ bool CRenderDevice::ChangeOutputMonitor(HMONITOR hTargetMon)
 	ClipCursor(&winRect);
 #endif
 
-	m_imgui.OnDeviceResetEnd();
+	if (!(strstr(Core.Params, "-use_rust_dx12") || strstr(Core.Params, "-r5")))
+		m_imgui.OnDeviceResetEnd();
 	use_reshade = init_reshade();
 
 	Msg("* vid_monitor: live switch succeeded");

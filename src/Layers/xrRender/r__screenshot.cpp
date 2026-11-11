@@ -48,6 +48,9 @@ extern int ps_r4_hdr10_on;
 #if defined(USE_DX10) || defined(USE_DX11)
 void CRender::ScreenshotImpl(ScreenshotMode mode, LPCSTR name, CMemoryWriter* memory_writer)
 {
+	if (!HW.pDevice)
+		return;
+
 	// demonized: Disable screenshots if HDR is enabled
 	if (ps_r4_hdr10_on) {
 		return;
@@ -243,7 +246,7 @@ void CRender::ScreenshotImpl(ScreenshotMode mode, LPCSTR name, CMemoryWriter* me
 
 void CRender::ScreenshotImpl(ScreenshotMode mode, LPCSTR name, CMemoryWriter* memory_writer)
 {
-	if (!Device.b_is_Ready) return;
+	if (!Device.b_is_Ready || !HW.pDevice) return;
 
 	// Create temp-surface
 	IDirect3DSurface9* pFB;
@@ -436,6 +439,9 @@ void CRender::ScreenshotAsyncBegin()
 
 void CRender::ScreenshotAsyncEnd(CMemoryWriter& memory_writer)
 {
+	if (!HW.pDevice || !Target)
+		return;
+
 	VERIFY(!m_bMakeAsyncSS);
 
 	//	Don't own. No need to release.
@@ -480,7 +486,7 @@ void CRender::ScreenshotAsyncEnd(CMemoryWriter& memory_writer)
 
 void CRender::ScreenshotAsyncEnd(CMemoryWriter& memory_writer)
 {
-	if (!Device.b_is_Ready) return;
+	if (!Device.b_is_Ready || !HW.pDevice || !Target) return;
 
 	VERIFY(!m_bMakeAsyncSS);
 
@@ -562,6 +568,8 @@ void CRender::ScreenshotAsyncEnd(CMemoryWriter& memory_writer)
 
 void DoAsyncScreenshot()
 {
+	if (!HW.pDevice || !RImplementation.Target)
+		return;
 	RImplementation.Target->DoAsyncScreenshot();
 }
 
@@ -569,6 +577,8 @@ void DoAsyncScreenshot()
 #if defined(USE_DX10) || defined(USE_DX11)
 void CRender::TakeScreenshot(LPCSTR path, Fvector2 dimensions, DxEncoding encoding)
 {
+	if (!HW.pDevice)
+		return;
 	// demonized: Disable screenshots if HDR is enabled
 	if (ps_r4_hdr10_on) {
 		return;
@@ -675,7 +685,7 @@ void CRender::TakeScreenshot(LPCSTR path, Fvector2 dimensions, DxEncoding encodi
 // Antglobes: Export Screenshot Func + variable resolution & encoding
 void CRender::TakeScreenshot(LPCSTR path, Fvector2 dimensions, DxEncoding encoding)
 {
-	if (!Device.b_is_Ready) return;
+	if (!Device.b_is_Ready || !HW.pDevice) return;
 	
 	string_path fname;
 	if (0 == strext(path)) strconcat(sizeof(fname), fname, path, ".dds");

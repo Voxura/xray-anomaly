@@ -7,6 +7,8 @@
 
 dxThunderboltRender::dxThunderboltRender()
 {
+	if (!HW.pDevice)
+		return;
 	// geom
 	hGeom_model.create(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1, RCache.Vertex.Buffer(), RCache.Index.Buffer());
 	hGeom_gradient.create(FVF::F_LIT, RCache.Vertex.Buffer(), RCache.QuadIB);
@@ -25,6 +27,8 @@ void dxThunderboltRender::Copy(IThunderboltRender& _in)
 
 void dxThunderboltRender::Render(CEffect_Thunderbolt& owner)
 {
+	if (!HW.pDevice)
+		return;
 	VERIFY(owner.current);
 
 	// lightning model

@@ -8,6 +8,9 @@ void dxThunderboltDescRender::Copy(IThunderboltDescRender& _in)
 
 void dxThunderboltDescRender::CreateModel(LPCSTR m_name)
 {
+	l_model = nullptr;
+	if (!HW.pDevice)
+		return;
 	IReader* F = 0;
 	F = FS.r_open("$game_meshes$", m_name);
 	R_ASSERT2(F, "Empty 'lightning_model'.");
@@ -17,5 +20,6 @@ void dxThunderboltDescRender::CreateModel(LPCSTR m_name)
 
 void dxThunderboltDescRender::DestroyModel()
 {
-	::RImplementation.model_Delete(l_model);
+	if (l_model)
+		::RImplementation.model_Delete(l_model);
 }

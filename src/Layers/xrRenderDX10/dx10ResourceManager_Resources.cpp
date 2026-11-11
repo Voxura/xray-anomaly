@@ -72,6 +72,7 @@ BOOL reclaim(xr_vector<T*>& vec, const T* ptr)
 //--------------------------------------------------------------------------------------------------------------
 SState* CResourceManager::_CreateState(SimulatorStates& state_code)
 {
+	if (!HW.pDevice) return nullptr;
 	xrCriticalSectionGuard guard(creationGuard);
 	// Search equal state-code 
 	for (u32 it = 0; it < v_states.size(); it++)
@@ -142,6 +143,7 @@ void CResourceManager::_DeletePass(const SPass* P)
 //--------------------------------------------------------------------------------------------------------------
 SVS* CResourceManager::_CreateVS(LPCSTR _name)
 {
+	if (!HW.pDevice) return nullptr;
 	xrCriticalSectionGuard guard(creationGuard);
 	int skinning = -1;
 	string_path name;
@@ -258,6 +260,7 @@ void CResourceManager::_DeleteVS(const SVS* vs)
 //--------------------------------------------------------------------------------------------------------------
 SPS* CResourceManager::_CreatePS(LPCSTR _name)
 {
+	if (!HW.pDevice) return nullptr;
 	xrCriticalSectionGuard guard(creationGuard);
 	string_path name;
 	xr_strcpy(name, _name);
@@ -376,6 +379,7 @@ void CResourceManager::_DeletePS(const SPS* ps)
 //--------------------------------------------------------------------------------------------------------------
 SGS* CResourceManager::_CreateGS(LPCSTR name)
 {
+	if (!HW.pDevice) return nullptr;
 	xrCriticalSectionGuard guard(creationGuard);
 	LPSTR N = LPSTR(name);
 	map_GS::iterator I = m_gs.find(N);
@@ -515,6 +519,7 @@ CRT* CResourceManager::_CreateRT(LPCSTR Name, u32 w, u32 h, D3DFORMAT f, u32 Sam
 CRT* CResourceManager::_CreateRT(LPCSTR Name, u32 w, u32 h, D3DFORMAT f, u32 SampleCount)
 #endif
 {
+	if (!HW.pDevice) return nullptr;
 	R_ASSERT(Name && Name[0] && w && h);
 
 	// ***** first pass - search already created RT
@@ -601,6 +606,7 @@ void CResourceManager::DBG_VerifyGeoms()
 
 SGeometry* CResourceManager::CreateGeom(D3DVERTEXELEMENT9* decl, ID3DVertexBuffer* vb, ID3DIndexBuffer* ib)
 {
+	if (!HW.pDevice) return nullptr;
 	xrCriticalSectionGuard guard(creationGuard);
 	R_ASSERT(decl && vb);
 
@@ -626,6 +632,7 @@ SGeometry* CResourceManager::CreateGeom(D3DVERTEXELEMENT9* decl, ID3DVertexBuffe
 
 SGeometry* CResourceManager::CreateGeom(u32 FVF, ID3DVertexBuffer* vb, ID3DIndexBuffer* ib)
 {
+	if (!HW.pDevice) return nullptr;
 	xrCriticalSectionGuard guard(creationGuard);
 	D3DVERTEXELEMENT9 dcl [MAX_FVF_DECL_SIZE];
 	CHK_DX(D3DXDeclaratorFromFVF(FVF,dcl));
@@ -644,6 +651,7 @@ void CResourceManager::DeleteGeom(const SGeometry* Geom)
 //--------------------------------------------------------------------------------------------------------------
 CTexture* CResourceManager::_CreateTexture(LPCSTR _Name)
 {
+	if (!HW.pDevice) return nullptr;
 	// DBG_VerifyTextures	();
 	if (0 == xr_strcmp(_Name, "null")) return 0;
 	//Msg("texture %s", _Name);
@@ -662,7 +670,7 @@ CTexture* CResourceManager::_CreateTexture(LPCSTR _Name)
 		T->dwFlags |= xr_resource_flagged::RF_REGISTERED;
 		m_textures.insert(mk_pair(T->set_name(Name), T));
 		T->Preload();
-		if (Device.b_is_Ready && !bDeferredLoad) T->Load();
+		if (HW.pDevice && Device.b_is_Ready && !bDeferredLoad) T->Load();
 		return T;
 	}
 }

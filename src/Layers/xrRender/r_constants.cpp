@@ -22,7 +22,8 @@
 R_constant_table::~R_constant_table()
 {
 	//dxRenderDeviceRender::Instance().Resources->_DeleteConstantTable(this);	
-	DEV->_DeleteConstantTable(this);
+	if (DEV)
+		DEV->_DeleteConstantTable(this);
 }
 
 

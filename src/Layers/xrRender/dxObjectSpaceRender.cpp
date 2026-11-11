@@ -6,7 +6,8 @@
 
 dxObjectSpaceRender::dxObjectSpaceRender()
 {
-	m_shDebug.create("debug\\wireframe","$null");
+	if (HW.pDevice)
+		m_shDebug.create("debug\\wireframe","$null");
 }
 
 dxObjectSpaceRender::~dxObjectSpaceRender()
@@ -26,6 +27,8 @@ void dxObjectSpaceRender::dbgAddSphere(const Fsphere &sphere, u32 colour)
 
 void dxObjectSpaceRender::dbgRender()
 {
+	if (!HW.pDevice)
+		return;
 	R_ASSERT(bDebug);
 
 	RCache.set_Shader(m_shDebug);
@@ -55,6 +58,8 @@ void dxObjectSpaceRender::dbgRender()
 
 void dxObjectSpaceRender::SetShader()
 {
+	if (!HW.pDevice)
+		return;
 	RCache.set_Shader(m_shDebug);
 }
 

@@ -561,6 +561,8 @@ void CRender::create()
 
 void CRender::destroy()
 {
+	if (!HW.pDevice)
+		return;
 	m_bMakeAsyncSS = false;
 	FluidManager.Destroy();
 	::PortalTraverser.destroy();
@@ -660,6 +662,8 @@ fastdelegate::FastDelegate0<>(&HOM,&CHOM::MT_RENDER));
 }*/
 void CRender::OnFrame()
 {
+	if (!HW.pDevice || !Models)
+		return;
 	PROF_EVENT("CRender::OnFrame()");
 	Models->DeleteQueue();
 	if (ps_r2_ls_flags.test(R2FLAG_EXP_MT_CALC))
@@ -907,6 +911,9 @@ void CRender::set_Object(IRenderable* O)
 
 void CRender::rmNear()
 {
+	if (!HW.pDevice || !Target)
+		return;
+
 	IRender_Target* T = getTarget();
 	D3D_VIEWPORT VP = {0, 0, (float)T->get_width(), (float)T->get_height(), 0, 0.02f};
 
@@ -916,6 +923,9 @@ void CRender::rmNear()
 
 void CRender::rmFar()
 {
+	if (!HW.pDevice || !Target)
+		return;
+
 	IRender_Target* T = getTarget();
 	D3D_VIEWPORT VP = {0, 0, (float)T->get_width(), (float)T->get_height(), 0.99999f, 1.f};
 
@@ -925,6 +935,9 @@ void CRender::rmFar()
 
 void CRender::rmNormal()
 {
+	if (!HW.pDevice || !Target)
+		return;
+
 	IRender_Target* T = getTarget();
 	D3D_VIEWPORT VP = {0, 0, (float)T->get_width(), (float)T->get_height(), 0, 1.f};
 
