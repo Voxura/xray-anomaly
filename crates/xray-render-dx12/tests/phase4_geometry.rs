@@ -52,12 +52,20 @@ unsafe fn transition(
     };
     unsafe {
         cmd.ResourceBarrier(std::slice::from_ref(&barrier));
-        ManuallyDrop::drop(&mut barrier.Anonymous.Transition.pResource);
+        ManuallyDrop::drop(&mut (*barrier.Anonymous.Transition).pResource);
     }
 }
 
 #[test]
 fn phase4_indexed_draw_readback_and_lifetimes() {
+    unsafe {
+        let mut debug: Option<windows::Win32::Graphics::Direct3D12::ID3D12Debug> = None;
+        if windows::Win32::Graphics::Direct3D12::D3D12GetDebugInterface(&mut debug).is_ok() {
+            if let Some(d) = debug {
+                d.EnableDebugLayer();
+            }
+        }
+    }
     let window = Window(unsafe {
         CreateWindowExW(
             Default::default(),

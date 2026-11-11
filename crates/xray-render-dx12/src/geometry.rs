@@ -145,21 +145,35 @@ impl GeometryPipeline {
             )?
         };
         let source = include_str!("../shaders/geometry.hlsl");
-        let compiler = ShaderCompiler::new().map_err(|_| failure())?;
-        let vs = compiler
-            .compile(&ShaderCompileRequest::new(
-                source,
-                "vs_main",
-                ShaderTarget::Vertex6_6,
-            ))
-            .map_err(|_| failure())?;
-        let ps = compiler
-            .compile(&ShaderCompileRequest::new(
-                source,
-                "ps_main",
-                ShaderTarget::Pixel6_6,
-            ))
-            .map_err(|_| failure())?;
+        let compiler = match ShaderCompiler::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[GeometryPipeline] ShaderCompiler::new failed: {:?}", e);
+                return Err(failure());
+            }
+        };
+        let vs = match compiler.compile(&ShaderCompileRequest::new(
+            source,
+            "vs_main",
+            ShaderTarget::Vertex6_0,
+        )) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[GeometryPipeline] vs compile failed: {:?}", e);
+                return Err(failure());
+            }
+        };
+        let ps = match compiler.compile(&ShaderCompileRequest::new(
+            source,
+            "ps_main",
+            ShaderTarget::Pixel6_0,
+        )) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[GeometryPipeline] ps compile failed: {:?}", e);
+                return Err(failure());
+            }
+        };
         let layout = [
             (s!("POSITION"), DXGI_FORMAT_R32G32B32_FLOAT, 0),
             (s!("NORMAL"), DXGI_FORMAT_R32G32B32_FLOAT, 12),
@@ -225,7 +239,32 @@ impl GeometryPipeline {
         unsafe {
             ManuallyDrop::drop(&mut desc.pRootSignature);
         }
-        let pso = pso?;
+        let pso = match pso {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[GeometryPipeline] CreateGraphicsPipelineState failed: {:?}", e);
+                unsafe {
+                    use windows::core::Interface;
+                    if let Ok(info_queue) = device.cast::<windows::Win32::Graphics::Direct3D12::ID3D12InfoQueue>() {
+                        let num_messages = info_queue.GetNumStoredMessagesAllowedByRetrievalFilter();
+                        for i in 0..num_messages {
+                            let mut message_size = 0;
+                            let _ = info_queue.GetMessage(i, None, &mut message_size);
+                            if message_size > 0 {
+                                let mut buffer = vec![0u8; message_size];
+                                let msg_ptr = buffer.as_mut_ptr() as *mut windows::Win32::Graphics::Direct3D12::D3D12_MESSAGE;
+                                if info_queue.GetMessage(i, Some(msg_ptr), &mut message_size).is_ok() {
+                                    let msg = &*msg_ptr;
+                                    let desc = std::ffi::CStr::from_ptr(msg.pDescription.cast()).to_string_lossy();
+                                    eprintln!("[D3D12 Debug InfoQueue] {}", desc);
+                                }
+                            }
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         let srv_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {

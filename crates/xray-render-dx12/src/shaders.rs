@@ -30,9 +30,11 @@ impl std::fmt::Display for ShaderError {
 
 impl std::error::Error for ShaderError {}
 
-/// Shader Model 6.6 compilation target profile
+/// Shader Model compilation target profile
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShaderTarget {
+    Vertex6_0,
+    Pixel6_0,
     Vertex6_6,
     Pixel6_6,
     Compute6_6,
@@ -43,6 +45,8 @@ pub enum ShaderTarget {
 impl ShaderTarget {
     pub fn profile_str(&self) -> &'static str {
         match self {
+            ShaderTarget::Vertex6_0 => "vs_6_0",
+            ShaderTarget::Pixel6_0 => "ps_6_0",
             ShaderTarget::Vertex6_6 => "vs_6_6",
             ShaderTarget::Pixel6_6 => "ps_6_6",
             ShaderTarget::Compute6_6 => "cs_6_6",

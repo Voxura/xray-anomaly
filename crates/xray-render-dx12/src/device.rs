@@ -68,8 +68,9 @@ impl Dx12DeviceContext {
         };
         let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(factory_flags)? };
 
-        // 3. Enumerate high-performance hardware adapter
+        // 3. Enumerate high-performance hardware adapter (prefer discrete GPU with largest dedicated VRAM)
         let mut adapter: Option<IDXGIAdapter1> = None;
+        let mut max_dedicated_vram: usize = 0;
         let mut adapter_idx = 0;
         loop {
             let candidate: IDXGIAdapter1 = match unsafe { factory.EnumAdapters1(adapter_idx) } {
@@ -81,8 +82,10 @@ impl Dx12DeviceContext {
                 // Skip software (WARP) renderer if hardware adapter exists
                 let is_software = (desc.Flags & 2) != 0; // DXGI_ADAPTER_FLAG_SOFTWARE
                 if !is_software {
-                    adapter = Some(candidate);
-                    break;
+                    if desc.DedicatedVideoMemory >= max_dedicated_vram || adapter.is_none() {
+                        max_dedicated_vram = desc.DedicatedVideoMemory;
+                        adapter = Some(candidate);
+                    }
                 }
             }
             adapter_idx += 1;
