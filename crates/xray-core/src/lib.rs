@@ -3,6 +3,7 @@
 //! Provides zero-copy, highly optimized LTX configuration parsing, multi-parent section inheritance,
 //! DLTX (Differential LTX) mod override resolution, and type-safe query interfaces.
 
+pub mod ltx_loader;
 pub mod string_table;
 
 use std::cmp::Ordering;
@@ -61,109 +62,119 @@ impl<'a> LtxDocument<'a> {
 
     /// Parse raw LTX text with an explicit DLTX depth level.
     pub fn parse_with_depth(input: &'a str, depth: i32) -> Self {
+        Self::parse_sources(&[(depth, input)])
+    }
+
+    /// Parse multiple `(depth, text)` slices into a single unified LTX document,
+    /// applying DLTX section/key overrides and tombstones globally across all sources.
+    pub fn parse_sources(sources: &[(i32, &'a str)]) -> Self {
         let mut doc = LtxDocument::default();
-        let mut current_sec_name: Option<&'a str> = None;
         let mut raw_items: HashMap<&'a str, Vec<DltxItem<'a>>> = HashMap::new();
         let mut insertion_counter: u32 = 0;
 
-        for line in input.lines() {
-            let trimmed = line.trim();
-            // Skip empty lines and comment lines
-            if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with("//") {
-                continue;
-            }
+        for &(depth, raw_input) in sources {
+            let input = raw_input.strip_prefix('\u{feff}').unwrap_or(raw_input);
+            let mut current_sec_name: Option<&'a str> = None;
 
-            // Strip inline comments, taking care of comments inside quotes
-            let clean = Self::strip_comment(trimmed);
-            if clean.is_empty() {
-                continue;
-            }
-
-            // Section delete syntax: !![section]
-            if clean.starts_with("!![") {
-                if let Some(close_bracket) = clean.find(']') {
-                    let sec_name = clean[3..close_bracket].trim();
-                    doc.deleted_sections.insert(sec_name);
-                    doc.sections.remove(sec_name);
-                    current_sec_name = None;
+            for line in input.lines() {
+                let trimmed = line.trim();
+                // Skip empty lines, ';'/'//' comments, and '#' comments/directives (`#include`, `# ...`)
+                if trimmed.is_empty()
+                    || trimmed.starts_with(';')
+                    || trimmed.starts_with("//")
+                    || trimmed.starts_with('#')
+                {
                     continue;
                 }
-            }
 
-            // Section headers: [section], ![section] (override), @[section] (safe override), or [child]:p1,p2
-            if clean.starts_with('[') || clean.starts_with("![") || clean.starts_with("@[") {
-                let header_start = if clean.starts_with('[') {
-                    1
-                } else {
-                    2
-                };
+                // Strip inline comments, taking care of comments inside quotes
+                let clean = Self::strip_comment(trimmed);
+                if clean.is_empty() {
+                    continue;
+                }
 
-                if let Some(close_bracket) = clean[header_start..].find(']') {
-                    let sec_name = clean[header_start..header_start + close_bracket].trim();
-                    let close_abs = header_start + close_bracket;
-
-                    let mut parents = Vec::new();
-                    if let Some(colon_pos) = clean[close_abs..].find(':') {
-                        let parent_str = clean[close_abs + colon_pos + 1..].trim();
-                        for p in parent_str.split(',') {
-                            let p_trimmed = p.trim();
-                            if !p_trimmed.is_empty() {
-                                parents.push(p_trimmed);
-                            }
-                        }
-                    }
-
-                    if doc.deleted_sections.contains(sec_name) {
+                // Section delete syntax: !![section]
+                if clean.starts_with("!![") {
+                    if let Some(close_bracket) = clean.find(']') {
+                        let sec_name = clean[3..close_bracket].trim();
+                        doc.deleted_sections.insert(sec_name);
+                        doc.sections.remove(sec_name);
                         current_sec_name = None;
                         continue;
                     }
-
-                    current_sec_name = Some(sec_name);
-                    let sec = doc.sections.entry(sec_name).or_insert_with(|| LtxSection {
-                        name: sec_name,
-                        parents: Vec::new(),
-                        entries: HashMap::new(),
-                    });
-
-                    for p in parents {
-                        if !sec.parents.contains(&p) {
-                            sec.parents.push(p);
-                        }
-                    }
-                    continue;
                 }
-            }
 
-            // Key-Value entry: key = value or !key = value (tombstone) or !key
-            if let Some(sec_name) = current_sec_name {
-                let (is_delete, kv_slice) = if clean.starts_with('!') {
-                    (true, clean[1..].trim_start())
-                } else {
-                    (false, clean)
-                };
+                // Section headers: [section], ![section] (override), @[section] (safe override), or [child]:p1,p2
+                if clean.starts_with('[') || clean.starts_with("![") || clean.starts_with("@[") {
+                    let header_start = if clean.starts_with('[') { 1 } else { 2 };
 
-                let (key, val) = if let Some(eq_pos) = kv_slice.find('=') {
-                    let k = kv_slice[..eq_pos].trim();
-                    let v = if is_delete {
-                        DLTX_DELETE
+                    if let Some(close_bracket) = clean[header_start..].find(']') {
+                        let sec_name = clean[header_start..header_start + close_bracket].trim();
+                        let close_abs = header_start + close_bracket;
+
+                        let mut parents = Vec::new();
+                        if let Some(colon_pos) = clean[close_abs..].find(':') {
+                            let parent_str = clean[close_abs + colon_pos + 1..].trim();
+                            for p in parent_str.split(',') {
+                                let p_trimmed = p.trim();
+                                if !p_trimmed.is_empty() {
+                                    parents.push(p_trimmed);
+                                }
+                            }
+                        }
+
+                        if doc.deleted_sections.contains(sec_name) {
+                            current_sec_name = None;
+                            continue;
+                        }
+
+                        current_sec_name = Some(sec_name);
+                        let sec = doc.sections.entry(sec_name).or_insert_with(|| LtxSection {
+                            name: sec_name,
+                            parents: Vec::new(),
+                            entries: HashMap::new(),
+                        });
+
+                        for p in parents {
+                            if !sec.parents.contains(&p) {
+                                sec.parents.push(p);
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                // Key-Value entry: key = value or !key = value (tombstone) or !key
+                if let Some(sec_name) = current_sec_name {
+                    let (is_delete, kv_slice) = if clean.starts_with('!') {
+                        (true, clean[1..].trim_start())
                     } else {
-                        kv_slice[eq_pos + 1..].trim()
+                        (false, clean)
                     };
-                    (k, v)
-                } else if is_delete {
-                    (kv_slice.trim(), DLTX_DELETE)
-                } else {
-                    continue;
-                };
 
-                if !key.is_empty() {
-                    insertion_counter += 1;
-                    raw_items.entry(sec_name).or_default().push(DltxItem {
-                        key,
-                        val,
-                        depth,
-                        insertion_index: insertion_counter,
-                    });
+                    let (key, val) = if let Some(eq_pos) = kv_slice.find('=') {
+                        let k = kv_slice[..eq_pos].trim();
+                        let v = if is_delete {
+                            DLTX_DELETE
+                        } else {
+                            kv_slice[eq_pos + 1..].trim()
+                        };
+                        (k, v)
+                    } else if is_delete {
+                        (kv_slice.trim(), DLTX_DELETE)
+                    } else {
+                        continue;
+                    };
+
+                    if !key.is_empty() {
+                        insertion_counter += 1;
+                        raw_items.entry(sec_name).or_default().push(DltxItem {
+                            key,
+                            val,
+                            depth,
+                            insertion_index: insertion_counter,
+                        });
+                    }
                 }
             }
         }
@@ -259,6 +270,41 @@ impl<'a> LtxDocument<'a> {
                 _ => default,
             })
             .unwrap_or(default)
+    }
+
+    /// Read comma-separated string list (trimmed, preserving non-empty elements).
+    pub fn read_csv(&self, section: &str, key: &str) -> Option<Vec<&'a str>> {
+        self.read_str(section, key).map(|s| {
+            s.split(',')
+                .map(|part| part.trim())
+                .filter(|part| !part.is_empty())
+                .collect()
+        })
+    }
+
+    /// Read a 3D float vector (`x, y, z`).
+    pub fn read_vec3(&self, section: &str, key: &str) -> Option<[f32; 3]> {
+        let vals = self.read_csv(section, key)?;
+        if vals.len() < 3 {
+            return None;
+        }
+        Some([
+            vals[0].parse::<f32>().ok()?,
+            vals[1].parse::<f32>().ok()?,
+            vals[2].parse::<f32>().ok()?,
+        ])
+    }
+
+    /// Check whether `section` exists (and has not been deleted).
+    pub fn contains_section(&self, section: &str) -> bool {
+        self.sections.contains_key(section)
+    }
+
+    /// Return sorted section names in the materialized document.
+    pub fn section_names(&self) -> Vec<&'a str> {
+        let mut names: Vec<&'a str> = self.sections.keys().copied().collect();
+        names.sort_unstable();
+        names
     }
 
     /// Strip comments while preserving comments inside quotes.
@@ -447,5 +493,43 @@ mod tests {
         assert_eq!(doc.read_str("keep_sec", "k2"), None);
         assert_eq!(doc.read_str("keep_sec", "k3"), None);
         assert_eq!(doc.sections.get("deleted_sec"), None);
+    }
+
+    #[test]
+    fn test_parse_sources_bom_hash_comments_and_vec3() {
+        let base = "\u{feff}[wpn_ak74]\nhit_power = 0.45\nposition = 0.1, -0.25, 1.5\n# base comment = ignore_me\n";
+        let mod_override = "# Fixes to Anomaly configs\n![wpn_ak74]\nhit_power = 0.72\n";
+        let doc = LtxDocument::parse_sources(&[(0, base), (-200, mod_override)]);
+        assert!(doc.contains_section("wpn_ak74"));
+        assert_eq!(doc.read_f32("wpn_ak74", "hit_power", 0.0), 0.72);
+        assert_eq!(doc.read_vec3("wpn_ak74", "position"), Some([0.1, -0.25, 1.5]));
+        assert_eq!(doc.read_str("wpn_ak74", "# base comment"), None);
+    }
+
+    #[test]
+    fn test_real_repo_ltx_configs_if_present() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let fixes = repo_root.join("gamedata/configs/mod_system_anomaly_fixes.ltx");
+        let knife = repo_root.join("gamedata/configs/mod_system_knife.ltx");
+        let parts = repo_root.join("gamedata/meshes/anomaly_weapons/hands/bone_parts.ltx");
+        if fixes.is_file() && knife.is_file() && parts.is_file() {
+            let fixes_txt = std::fs::read_to_string(fixes).unwrap();
+            let knife_txt = std::fs::read_to_string(knife).unwrap();
+            let parts_txt = std::fs::read_to_string(parts).unwrap();
+
+            let merged = LtxDocument::parse_sources(&[
+                (-200, &fixes_txt),
+                (-200, &knife_txt),
+                (0, &parts_txt),
+            ]);
+            assert_eq!(merged.read_f32("ammo_base", "k_dist", 0.0), 1.0);
+            assert!(!merged.read_bool("wpn_knife", "firepos", true));
+            assert_eq!(merged.read_str("part_1", "partition_name"), Some("left_hand"));
+            assert_eq!(merged.read_str("part_0", "bip01"), Some(""));
+        }
     }
 }
