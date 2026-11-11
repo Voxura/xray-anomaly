@@ -350,7 +350,7 @@ impl VirtualFileSystem {
             .clamp(1, paths.len());
         let chunk_size = paths.len().div_ceil(max_workers);
 
-        let chunk_results: Vec<Vec<(&'a str, Result<Vec<u8>, VfsError>)>> =
+        let chunk_results: Vec<Vec<_>> =
             std::thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for slice in paths.chunks(chunk_size) {

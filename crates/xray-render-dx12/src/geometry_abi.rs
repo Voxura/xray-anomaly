@@ -88,9 +88,7 @@ impl<T> Default for MeshRegistry<T> {
 impl<T> MeshRegistry<T> {
     pub fn insert(&mut self, value: T) -> Option<MeshHandle> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        let handle = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .ok()?;
+        let handle = NEXT.fetch_add(1, Ordering::Relaxed);
         self.0.insert(handle, value);
         Some(handle)
     }

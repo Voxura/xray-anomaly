@@ -202,12 +202,37 @@ impl Dx12Renderer {
         Ok(self.current_cmd_list.as_ref().unwrap())
     }
 
-    /// Clear the current backbuffer with an RGBA color
+    /// Clear the current backbuffer with an RGBA color and clear depth to 1.0
     pub fn clear_backbuffer(&self, color: [f32; 4]) {
         if let (Some(cmd), Some(sc)) = (&self.current_cmd_list, &self.swapchain) {
             let rtv = sc.current_rtv_handle();
+            let dsv = sc.dsv_handle();
             unsafe {
                 cmd.ClearRenderTargetView(rtv, &color, None);
+                cmd.ClearDepthStencilView(
+                    dsv,
+                    windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAG_DEPTH,
+                    1.0,
+                    0,
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Clear the depth and stencil buffers explicitly
+    pub fn clear_depth_stencil(&self, depth: f32, stencil: u8) {
+        if let (Some(cmd), Some(sc)) = (&self.current_cmd_list, &self.swapchain) {
+            let dsv = sc.dsv_handle();
+            unsafe {
+                cmd.ClearDepthStencilView(
+                    dsv,
+                    windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAG_DEPTH
+                        | windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAG_STENCIL,
+                    depth,
+                    stencil,
+                    None,
+                );
             }
         }
     }
@@ -413,10 +438,12 @@ impl Dx12Renderer {
             None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
         };
         let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
         self.geometry.draw(
             &self.device_ctx.device,
             cmd,
             rtv,
+            Some(dsv),
             self.width,
             self.height,
             handle,
@@ -440,6 +467,7 @@ impl Dx12Renderer {
             None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
         };
         let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
         let push_constants = crate::geometry::PushDrawConstants {
             albedo_index: albedo_index.0,
             ..Default::default()
@@ -448,6 +476,7 @@ impl Dx12Renderer {
             &self.device_ctx.device,
             cmd,
             rtv,
+            Some(dsv),
             self.width,
             self.height,
             handle,
@@ -472,6 +501,7 @@ impl Dx12Renderer {
             None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
         };
         let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
         let push_constants = crate::geometry::PushDrawConstants {
             albedo_index: albedo_index.0,
             transform_index,
@@ -481,6 +511,7 @@ impl Dx12Renderer {
             &self.device_ctx.device,
             cmd,
             rtv,
+            Some(dsv),
             self.width,
             self.height,
             handle,
@@ -506,6 +537,7 @@ impl Dx12Renderer {
             None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
         };
         let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
         let push_constants = crate::geometry::PushDrawConstants {
             albedo_index: albedo_index.map(|i| i.0).unwrap_or(u32::MAX),
             normal_index: normal_index.map(|i| i.0).unwrap_or(u32::MAX),
@@ -516,6 +548,7 @@ impl Dx12Renderer {
             &self.device_ctx.device,
             cmd,
             rtv,
+            Some(dsv),
             self.width,
             self.height,
             handle,

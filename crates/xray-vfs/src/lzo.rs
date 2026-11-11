@@ -141,15 +141,13 @@ pub fn decompress_lzo1x(input: &[u8], output: &mut [u8]) -> Result<usize, LzoErr
 
         // Inner match loop
         loop {
-            let lit: usize;
-
-            if t >= 64 {
+            let lit = if t >= 64 {
                 // M2 match
                 let b = read_byte(&mut in_pos)? as usize;
                 let dist = 1 + ((t >> 2) & 7) + (b << 3);
                 let len = ((t >> 5) - 1) + 2;
                 copy_match(&mut out_pos, dist, len, output)?;
-                lit = input[in_pos - 2] as usize & 3;
+                input[in_pos - 2] as usize & 3
             } else if t >= 32 {
                 // M3 match
                 let mut len = t & 31;
@@ -165,7 +163,7 @@ pub fn decompress_lzo1x(input: &[u8], output: &mut [u8]) -> Result<usize, LzoErr
                 let b1 = read_byte(&mut in_pos)? as usize;
                 let dist = 1 + (b0 >> 2) + (b1 << 6);
                 copy_match(&mut out_pos, dist, len + 2, output)?;
-                lit = b0 & 3;
+                b0 & 3
             } else if t >= 16 {
                 // M4 match or EOF
                 let mut dist = (t & 8) << 11;
@@ -189,14 +187,14 @@ pub fn decompress_lzo1x(input: &[u8], output: &mut [u8]) -> Result<usize, LzoErr
 
                 dist += offset_lo + 0x4000;
                 copy_match(&mut out_pos, dist, len + 2, output)?;
-                lit = b0 & 3;
+                b0 & 3
             } else {
                 // M1 match
                 let b = read_byte(&mut in_pos)? as usize;
                 let dist = 1 + (t >> 2) + (b << 2);
                 copy_match(&mut out_pos, dist, 2, output)?;
-                lit = input[in_pos - 2] as usize & 3;
-            }
+                input[in_pos - 2] as usize & 3
+            };
 
             if lit == 0 {
                 break;

@@ -94,14 +94,14 @@ impl<'a> LtxDocument<'a> {
                 }
 
                 // Section delete syntax: !![section]
-                if clean.starts_with("!![") {
-                    if let Some(close_bracket) = clean.find(']') {
-                        let sec_name = clean[3..close_bracket].trim();
-                        doc.deleted_sections.insert(sec_name);
-                        doc.sections.remove(sec_name);
-                        current_sec_name = None;
-                        continue;
-                    }
+                if clean.starts_with("!![")
+                    && let Some(close_bracket) = clean.find(']')
+                {
+                    let sec_name = clean[3..close_bracket].trim();
+                    doc.deleted_sections.insert(sec_name);
+                    doc.sections.remove(sec_name);
+                    current_sec_name = None;
+                    continue;
                 }
 
                 // Section headers: [section], ![section] (override), @[section] (safe override), or [child]:p1,p2
@@ -146,8 +146,8 @@ impl<'a> LtxDocument<'a> {
 
                 // Key-Value entry: key = value or !key = value (tombstone) or !key
                 if let Some(sec_name) = current_sec_name {
-                    let (is_delete, kv_slice) = if clean.starts_with('!') {
-                        (true, clean[1..].trim_start())
+                    let (is_delete, kv_slice) = if let Some(stripped) = clean.strip_prefix('!') {
+                        (true, stripped.trim_start())
                     } else {
                         (false, clean)
                     };
@@ -350,7 +350,7 @@ mod tests {
         let doc = LtxDocument::parse(ltx);
         assert_eq!(doc.read_i32("general", "speed", 0), 150);
         assert_eq!(doc.read_f32("general", "gravity", 0.0), 9.81);
-        assert_eq!(doc.read_bool("general", "enabled", false), true);
+        assert!(doc.read_bool("general", "enabled", false));
 
         // Inheritance check
         assert_eq!(doc.read_i32("modifier", "speed", 0), 200); // overridden

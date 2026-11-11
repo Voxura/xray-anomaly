@@ -261,15 +261,14 @@ impl GeometryPipeline {
             RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
             ..Default::default()
         };
-        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-        let stencil = D3D12_DEPTH_STENCILOP_DESC {
-            StencilFailOp: D3D12_STENCIL_OP_KEEP,
-            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
-            StencilPassOp: D3D12_STENCIL_OP_KEEP,
-            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+        desc.DepthStencilState = D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+            DepthFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+            StencilEnable: false.into(),
+            ..Default::default()
         };
-        desc.DepthStencilState.FrontFace = stencil;
-        desc.DepthStencilState.BackFace = stencil;
+        desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         desc.SampleMask = u32::MAX;
         desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         desc.NumRenderTargets = 1;
@@ -441,6 +440,7 @@ impl GeometryState {
         device: &ID3D12Device,
         cmd: &ID3D12GraphicsCommandList,
         rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        dsv: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
         width: u32,
         height: u32,
         handle: MeshHandle,
@@ -510,7 +510,8 @@ impl GeometryState {
                 right: width as i32,
                 bottom: height as i32,
             }]);
-            cmd.OMSetRenderTargets(1, Some(&rtv), false, None);
+            let dsv_ptr = dsv.as_ref().map(|d| d as *const D3D12_CPU_DESCRIPTOR_HANDLE);
+            cmd.OMSetRenderTargets(1, Some(&rtv), false, dsv_ptr);
             cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             cmd.IASetVertexBuffers(0, Some(&[mesh.vertex_view]));
             cmd.IASetIndexBuffer(Some(&mesh.index_view));

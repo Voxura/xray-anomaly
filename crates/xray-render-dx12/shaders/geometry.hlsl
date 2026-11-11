@@ -8,7 +8,7 @@ cbuffer CameraConstants : register(b0)
     float4 padding[3];
 };
 
-struct PushDrawConstants
+cbuffer cb_draw : register(b1)
 {
     uint albedo_index;
     uint normal_index;
@@ -19,11 +19,20 @@ struct PushDrawConstants
     uint custom_param2;
     uint custom_param3;
 };
-ConstantBuffer<PushDrawConstants> cb_draw : register(b1);
 
 Texture2D g_textures[] : register(t0);
 SamplerState g_sampler : register(s0);
-StructuredBuffer<float4x4> g_transforms : register(t0, space1);
+ByteAddressBuffer g_transforms : register(t0, space1);
+
+float4x4 load_transform(uint index)
+{
+    uint offset = index * 64;
+    float4 r0 = asfloat(g_transforms.Load4(offset));
+    float4 r1 = asfloat(g_transforms.Load4(offset + 16));
+    float4 r2 = asfloat(g_transforms.Load4(offset + 32));
+    float4 r3 = asfloat(g_transforms.Load4(offset + 48));
+    return float4x4(r0, r1, r2, r3);
+}
 
 struct VSInput
 {
@@ -50,12 +59,12 @@ PSInput vs_main(VSInput input)
     float3 world_normal;
     float3 world_tangent;
 
-    if (cb_draw.transform_index != 0xFFFFFFFF)
+    if (transform_index != 0xFFFFFFFF)
     {
-        float4x4 world = g_transforms[cb_draw.transform_index];
-        world_pos = mul(world, local_pos);
-        world_normal = normalize(mul((float3x3)world, input.normal));
-        world_tangent = normalize(mul((float3x3)world, input.tangent));
+        float4x4 world = load_transform(transform_index);
+        world_pos = mul(local_pos, world);
+        world_normal = normalize(mul(input.normal, (float3x3)world));
+        world_tangent = normalize(mul(input.tangent, (float3x3)world));
     }
     else
     {
@@ -76,9 +85,9 @@ float4 ps_main(PSInput input) : SV_Target0
 {
     // Decode perturbed normal if normal_index is bound
     float3 world_normal = input.normal;
-    if (cb_draw.normal_index != 0xFFFFFFFF)
+    if (normal_index != 0xFFFFFFFF)
     {
-        float4 n_tex = g_textures[NonUniformResourceIndex(cb_draw.normal_index)].Sample(g_sampler, input.uv);
+        float4 n_tex = g_textures[NonUniformResourceIndex(normal_index)].Sample(g_sampler, input.uv);
         // Supports BC5/ATI2 (RG), DXT5nm (Alpha/Green), and standard 3-channel RGB normal maps
         float2 xy;
         if (n_tex.a > 0.0 && n_tex.b < 0.1)
@@ -103,10 +112,10 @@ float4 ps_main(PSInput input) : SV_Target0
         world_normal = normalize(mul(tangent_normal, TBN));
     }
 
-    if (cb_draw.albedo_index != 0xFFFFFFFF)
+    if (albedo_index != 0xFFFFFFFF)
     {
-        float4 albedo = g_textures[NonUniformResourceIndex(cb_draw.albedo_index)].Sample(g_sampler, input.uv);
-        if (cb_draw.normal_index != 0xFFFFFFFF)
+        float4 albedo = g_textures[NonUniformResourceIndex(albedo_index)].Sample(g_sampler, input.uv);
+        if (normal_index != 0xFFFFFFFF)
         {
             float3 light_dir = normalize(float3(0.577, 0.577, 0.577));
             float diff = saturate(dot(world_normal, light_dir));
