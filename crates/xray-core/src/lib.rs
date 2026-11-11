@@ -163,7 +163,7 @@ impl<'a> LtxDocument<'a> {
                     } else if is_delete {
                         (kv_slice.trim(), DLTX_DELETE)
                     } else {
-                        continue;
+                        (kv_slice.trim(), "")
                     };
 
                     if !key.is_empty() {
@@ -483,6 +483,7 @@ mod tests {
         k1 = hello
         !k2 = tombstone
         !k3
+        bare_list_entry
 
         !![deleted_sec]
         bad_val = 999
@@ -492,6 +493,7 @@ mod tests {
         assert_eq!(doc.read_str("keep_sec", "k1"), Some("hello"));
         assert_eq!(doc.read_str("keep_sec", "k2"), None);
         assert_eq!(doc.read_str("keep_sec", "k3"), None);
+        assert_eq!(doc.read_str("keep_sec", "bare_list_entry"), Some(""));
         assert_eq!(doc.sections.get("deleted_sec"), None);
     }
 

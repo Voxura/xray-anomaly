@@ -1291,8 +1291,473 @@ impl<'a> LtxView<'a> {
 
     fn read_vec3(&self, section: &str, key: &str) -> Option<[f32; 3]> {
         let s = self.read_str(section, key)?;
-        let mut it = s.split(',').filter_map(|p| p.trim().parse::<f32>().ok());
+        let vals = s.split(',').filter_map(|p| p.trim().parse::<f32>().ok());
+        let mut it = vals;
         Some([it.next()?, it.next()?, it.next()?])
+    }
+}
+
+/// Collision shape attached to space restrictors / anomaly zones (`CSE_Shape`, `xrServer_Objects.cpp:24-85`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerShapeDef {
+    Sphere { center: [f32; 3], radius: f32 },
+    /// 4x3 transform matrix (`i`, `j`, `k`, `c`) as serialized by `NET_Packet::r_matrix` / `w_matrix`.
+    Box([f32; 12]),
+}
+
+impl ServerShapeDef {
+    /// Parse a `CSE_Shape::cform_read` sequence from `cur`.
+    pub fn parse_cform_shapes(cur: &mut ByteCursor<'_>) -> Result<Vec<Self>, FormatError> {
+        let count = usize::from(cur.read_u8()?);
+        let mut shapes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let kind = cur.read_u8()?;
+            match kind {
+                0 => {
+                    let center = cur.read_f32_3()?;
+                    let radius = cur.read_f32()?;
+                    shapes.push(Self::Sphere { center, radius });
+                }
+                1 => {
+                    let mut m = [0.0f32; 12];
+                    for slot in &mut m {
+                        *slot = cur.read_f32()?;
+                    }
+                    shapes.push(Self::Box(m));
+                }
+                _ => return Err(FormatError::InvalidValue("unknown CSE_Shape type")),
+            }
+        }
+        Ok(shapes)
+    }
+
+    /// Encode a `CSE_Shape::cform_write` sequence into `out`.
+    pub fn encode_cform_shapes(shapes: &[Self], out: &mut Vec<u8>) {
+        out.push(shapes.len().min(u8::MAX as usize) as u8);
+        for shape in shapes.iter().take(u8::MAX as usize) {
+            match shape {
+                Self::Sphere { center, radius } => {
+                    out.push(0);
+                    for f in center {
+                        out.extend_from_slice(&f.to_le_bytes());
+                    }
+                    out.extend_from_slice(&radius.to_le_bytes());
+                }
+                Self::Box(m) => {
+                    out.push(1);
+                    for f in m {
+                        out.extend_from_slice(&f.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Visual reference embedded in `CSE_Visual::visual_read` (`xrServer_Objects_Abstract.cpp:50-61`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerVisualState {
+    pub visual_name: String,
+    pub flags: u8,
+}
+
+impl ServerVisualState {
+    pub fn parse_from_cursor(version: u16, cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let visual_name = cur.read_zstring()?;
+        let flags = if version > 103 { cur.read_u8()? } else { 0 };
+        Ok(Self { visual_name, flags })
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.visual_name.as_bytes());
+        out.push(0);
+        out.push(self.flags);
+    }
+}
+
+/// Decoded `CSE_ALifeDynamicObjectVisual::STATE_Read` (`xrServer_Objects_ALife.cpp:741-746`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeDynamicVisualState {
+    pub alife: AlifeObjectState,
+    pub visual: ServerVisualState,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeDynamicVisualState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut alife = AlifeObjectState::parse(version, state_bytes)?;
+        let payload = std::mem::take(&mut alife.subclass_payload);
+        let mut cur = ByteCursor::new(&payload);
+        let visual = if version > 31 {
+            ServerVisualState::parse_from_cursor(version, &mut cur)?
+        } else {
+            ServerVisualState::default()
+        };
+        let trailing = payload[cur.position()..].to_vec();
+        Ok(Self {
+            alife,
+            visual,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut sub = Vec::new();
+        self.visual.write_to(&mut sub);
+        sub.extend_from_slice(&self.trailing);
+        let mut base = self.alife.clone();
+        base.subclass_payload = sub;
+        base.to_bytes()
+    }
+}
+
+/// Decoded `CSE_ALifeSpaceRestrictor::STATE_Read` (`xrServer_Objects_ALife.cpp:862-875`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeSpaceRestrictorState {
+    pub alife: AlifeObjectState,
+    pub shapes: Vec<ServerShapeDef>,
+    pub restrictor_type: u8,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeSpaceRestrictorState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut alife = AlifeObjectState::parse(version, state_bytes)?;
+        let payload = std::mem::take(&mut alife.subclass_payload);
+        let mut cur = ByteCursor::new(&payload);
+        let shapes = ServerShapeDef::parse_cform_shapes(&mut cur)?;
+        let restrictor_type = if version > 74 { cur.read_u8()? } else { 0 };
+        let trailing = payload[cur.position()..].to_vec();
+        Ok(Self {
+            alife,
+            shapes,
+            restrictor_type,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut sub = Vec::new();
+        ServerShapeDef::encode_cform_shapes(&self.shapes, &mut sub);
+        sub.push(self.restrictor_type);
+        sub.extend_from_slice(&self.trailing);
+        let mut base = self.alife.clone();
+        base.subclass_payload = sub;
+        base.to_bytes()
+    }
+}
+
+/// Decoded `CSE_ALifeLevelChanger::STATE_Read` (`xrServer_Objects_ALife.cpp:926-951`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeLevelChangerState {
+    pub restrictor: AlifeSpaceRestrictorState,
+    pub next_graph_vertex: u16,
+    pub next_level_vertex: u32,
+    pub next_position: [f32; 3],
+    pub next_angles: [f32; 3],
+    pub level_to_change: String,
+    pub level_point_to_change: String,
+    pub silent_mode: bool,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeLevelChangerState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut restrictor = AlifeSpaceRestrictorState::parse(version, state_bytes)?;
+        let payload = std::mem::take(&mut restrictor.trailing);
+        let mut cur = ByteCursor::new(&payload);
+
+        let (next_graph_vertex, next_level_vertex, next_position, next_angles) = if version < 34 {
+            let _ = cur.read_u32()?;
+            let _ = cur.read_u32()?;
+            (INVALID_GAME_VERTEX, INVALID_AI_VERTEX, [0.0; 3], [0.0; 3])
+        } else {
+            let gvid = cur.read_u16()?;
+            let lvid = cur.read_u32()?;
+            let pos = cur.read_f32_3()?;
+            let ang = if version <= 53 {
+                [0.0, cur.read_f32()?, 0.0]
+            } else {
+                cur.read_f32_3()?
+            };
+            (gvid, lvid, pos, ang)
+        };
+
+        let level_to_change = cur.read_zstring()?;
+        let level_point_to_change = cur.read_zstring()?;
+        let silent_mode = if version > 116 {
+            cur.read_u8()? != 0
+        } else {
+            false
+        };
+        let trailing = payload[cur.position()..].to_vec();
+
+        Ok(Self {
+            restrictor,
+            next_graph_vertex,
+            next_level_vertex,
+            next_position,
+            next_angles,
+            level_to_change,
+            level_point_to_change,
+            silent_mode,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut rest = Vec::new();
+        rest.extend_from_slice(&self.next_graph_vertex.to_le_bytes());
+        rest.extend_from_slice(&self.next_level_vertex.to_le_bytes());
+        for f in self.next_position {
+            rest.extend_from_slice(&f.to_le_bytes());
+        }
+        for f in self.next_angles {
+            rest.extend_from_slice(&f.to_le_bytes());
+        }
+        rest.extend_from_slice(self.level_to_change.as_bytes());
+        rest.push(0);
+        rest.extend_from_slice(self.level_point_to_change.as_bytes());
+        rest.push(0);
+        rest.push(u8::from(self.silent_mode));
+        rest.extend_from_slice(&self.trailing);
+
+        let mut r = self.restrictor.clone();
+        r.trailing = rest;
+        r.to_bytes()
+    }
+}
+
+/// Decoded `CSE_ALifeItem::STATE_Read` (`CSE_ALifeDynamicObjectVisual` + `CSE_ALifeInventoryItem`,
+/// `xrServer_Objects_ALife_Items.cpp:94-106,359-369`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeInventoryItemState {
+    pub base: AlifeDynamicVisualState,
+    pub condition: f32,
+    pub upgrades: Vec<String>,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeInventoryItemState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut base = AlifeDynamicVisualState::parse(version, state_bytes)?;
+        let payload = std::mem::take(&mut base.trailing);
+        let mut cur = ByteCursor::new(&payload);
+
+        let condition = if version > 52 {
+            cur.read_f32()?
+        } else {
+            1.0
+        };
+        let mut upgrades = Vec::new();
+        if version > 123 {
+            let count = cur.read_u32()? as usize;
+            upgrades.reserve(count.min(4096));
+            for _ in 0..count {
+                upgrades.push(cur.read_zstring()?);
+            }
+        }
+        let trailing = payload[cur.position()..].to_vec();
+
+        Ok(Self {
+            base,
+            condition,
+            upgrades,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&self.condition.to_le_bytes());
+        tail.extend_from_slice(&(self.upgrades.len() as u32).to_le_bytes());
+        for u in &self.upgrades {
+            tail.extend_from_slice(u.as_bytes());
+            tail.push(0);
+        }
+        tail.extend_from_slice(&self.trailing);
+
+        let mut b = self.base.clone();
+        b.trailing = tail;
+        b.to_bytes()
+    }
+}
+
+/// Decoded `CSE_ALifeItemWeapon::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:566-592`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeItemWeaponState {
+    pub item: AlifeInventoryItemState,
+    pub ammo_current: u16,
+    pub ammo_elapsed: u16,
+    pub wpn_state: u8,
+    pub addon_flags: u8,
+    pub ammo_type: u8,
+    pub ammo_elapsed_grenades: u8,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeItemWeaponState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut item = AlifeInventoryItemState::parse(version, state_bytes)?;
+        let payload = std::mem::take(&mut item.trailing);
+        let mut cur = ByteCursor::new(&payload);
+
+        let ammo_current = cur.read_u16()?;
+        let ammo_elapsed = cur.read_u16()?;
+        let wpn_state = cur.read_u8()?;
+        let addon_flags = if version > 40 { cur.read_u8()? } else { 0 };
+        let ammo_type = if version > 46 { cur.read_u8()? } else { 0 };
+        let ammo_elapsed_grenades = if version > 122 { cur.read_u8()? } else { 0 };
+        let trailing = payload[cur.position()..].to_vec();
+
+        Ok(Self {
+            item,
+            ammo_current,
+            ammo_elapsed,
+            wpn_state,
+            addon_flags,
+            ammo_type,
+            ammo_elapsed_grenades,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&self.ammo_current.to_le_bytes());
+        tail.extend_from_slice(&self.ammo_elapsed.to_le_bytes());
+        tail.push(self.wpn_state);
+        tail.push(self.addon_flags);
+        tail.push(self.ammo_type);
+        tail.push(self.ammo_elapsed_grenades);
+        tail.extend_from_slice(&self.trailing);
+
+        let mut it = self.item.clone();
+        it.trailing = tail;
+        it.to_bytes()
+    }
+}
+
+/// Decoded `CSE_ALifeTraderAbstract::STATE_Read` tail (`xrServer_Objects_ALife_Monsters.cpp:218-300`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlifeTraderAbstractState {
+    pub money: u32,
+    pub specific_character: String,
+    pub trader_flags: u32,
+    pub character_profile: String,
+    pub community_index: i32,
+    pub rank: i32,
+    pub reputation: i32,
+    pub character_name: String,
+    pub deadbody_can_take: bool,
+    pub deadbody_closed: bool,
+}
+
+impl AlifeTraderAbstractState {
+    pub fn parse_from_cursor(version: u16, cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let mut money = 0u32;
+        let mut specific_character = String::new();
+        let mut trader_flags = 0u32;
+        let mut character_profile = String::new();
+        let mut community_index = -1i32;
+        let mut rank = i32::MIN;
+        let mut reputation = i32::MIN;
+        let mut character_name = String::new();
+
+        if version > 19 {
+            if version < 108 {
+                let _ = cur.read_u32()?;
+            }
+            if version < 36 {
+                let n = cur.read_u32()? as usize;
+                let _ = cur.read_bytes(n.saturating_mul(2))?;
+            }
+            if version > 62 {
+                money = cur.read_u32()?;
+            }
+            if version > 75 && version < 98 {
+                let _ = cur.read_i32()?;
+            } else if version >= 98 {
+                specific_character = cur.read_zstring()?;
+            }
+            if version > 77 {
+                trader_flags = cur.read_u32()?;
+            }
+            if version > 81 && version < 96 {
+                let _ = cur.read_i32()?;
+            } else if version > 95 {
+                character_profile = cur.read_zstring()?;
+            }
+            if version > 85 {
+                community_index = cur.read_i32()?;
+            }
+            if version > 86 {
+                rank = cur.read_i32()?;
+                reputation = cur.read_i32()?;
+            }
+            if version > 104 {
+                character_name = cur.read_zstring()?;
+            }
+        }
+
+        let (deadbody_can_take, deadbody_closed) = if version > 124 {
+            let can_take = cur.read_u8()? == 1;
+            let closed = cur.read_u8()? == 1;
+            (can_take, closed)
+        } else {
+            (true, false)
+        };
+
+        Ok(Self {
+            money,
+            specific_character,
+            trader_flags,
+            character_profile,
+            community_index,
+            rank,
+            reputation,
+            character_name,
+            deadbody_can_take,
+            deadbody_closed,
+        })
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.money.to_le_bytes());
+        out.extend_from_slice(self.specific_character.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.trader_flags.to_le_bytes());
+        out.extend_from_slice(self.character_profile.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.community_index.to_le_bytes());
+        out.extend_from_slice(&self.rank.to_le_bytes());
+        out.extend_from_slice(&self.reputation.to_le_bytes());
+        out.extend_from_slice(self.character_name.as_bytes());
+        out.push(0);
+        out.push(u8::from(self.deadbody_can_take));
+        out.push(u8::from(self.deadbody_closed));
+    }
+}
+
+impl SpawnPacket {
+    pub fn decode_dynamic_visual_state(&self) -> Result<AlifeDynamicVisualState, FormatError> {
+        AlifeDynamicVisualState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_space_restrictor_state(&self) -> Result<AlifeSpaceRestrictorState, FormatError> {
+        AlifeSpaceRestrictorState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_level_changer_state(&self) -> Result<AlifeLevelChangerState, FormatError> {
+        AlifeLevelChangerState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_inventory_item_state(&self) -> Result<AlifeInventoryItemState, FormatError> {
+        AlifeInventoryItemState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_weapon_state(&self) -> Result<AlifeItemWeaponState, FormatError> {
+        AlifeItemWeaponState::parse(self.version, &self.state_payload)
     }
 }
 
@@ -1625,5 +2090,94 @@ p1:position = 4, 2, 6
         let pp = parsed.find_patrol_path("esc_patrol_u32").unwrap();
         assert_eq!(pp.points[0].vertex_id, 100_000);
         assert_eq!(parsed.game_graph.vertices[0].level_vertex_id, 77);
+    }
+
+    #[test]
+    fn test_alife_subclass_packet_codecs() {
+        let base_alife = AlifeObjectState {
+            game_vertex_id: 12,
+            distance: 4.5,
+            direct_control: true,
+            level_vertex_id: 505,
+            flags: alife_object_flags::CAN_SAVE | alife_object_flags::SWITCH_ONLINE,
+            custom_data: "[logic]\nactive = nil\n".to_string(),
+            story_id: 9001,
+            spawn_story_id: INVALID_SPAWN_STORY_ID,
+            subclass_payload: Vec::new(),
+        };
+
+        // Level changer (inherits SpaceRestrictor w/ Sphere + 4x3 Box shape)
+        let lc = AlifeLevelChangerState {
+            restrictor: AlifeSpaceRestrictorState {
+                alife: base_alife.clone(),
+                shapes: vec![
+                    ServerShapeDef::Sphere {
+                        center: [0.5, 1.0, -0.5],
+                        radius: 2.5,
+                    },
+                    ServerShapeDef::Box([
+                        1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 4.0, 5.0, 6.0,
+                    ]),
+                ],
+                restrictor_type: 2,
+                trailing: Vec::new(),
+            },
+            next_graph_vertex: 88,
+            next_level_vertex: 7777,
+            next_position: [12.0, 1.0, -4.0],
+            next_angles: [0.0, 1.57, 0.0],
+            level_to_change: "l02_garbage".to_string(),
+            level_point_to_change: "gar_start".to_string(),
+            silent_mode: true,
+            trailing: Vec::new(),
+        };
+        let lc_decoded = AlifeLevelChangerState::parse(SPAWN_VERSION, &lc.to_bytes()).unwrap();
+        assert_eq!(lc_decoded, lc);
+
+        // Inventory weapon (inherits AlifeDynamicVisualState + InventoryItem + Weapon)
+        let wpn = AlifeItemWeaponState {
+            item: AlifeInventoryItemState {
+                base: AlifeDynamicVisualState {
+                    alife: base_alife,
+                    visual: ServerVisualState {
+                        visual_name: "dynamics\\weapons\\wpn_ak74\\wpn_ak74".to_string(),
+                        flags: 1,
+                    },
+                    trailing: Vec::new(),
+                },
+                condition: 0.85,
+                upgrades: vec!["up_sect_firsta_ak74".to_string(), "up_sect_secona_ak74".to_string()],
+                trailing: Vec::new(),
+            },
+            ammo_current: 90,
+            ammo_elapsed: 30,
+            wpn_state: 0,
+            addon_flags: 0x03,
+            ammo_type: 1,
+            ammo_elapsed_grenades: 1,
+            trailing: Vec::new(),
+        };
+        let wpn_decoded = AlifeItemWeaponState::parse(SPAWN_VERSION, &wpn.to_bytes()).unwrap();
+        assert_eq!(wpn_decoded, wpn);
+
+        // TraderAbstract section
+        let trader = AlifeTraderAbstractState {
+            money: 15000,
+            specific_character: "esc_2_12_stalker_wolf".to_string(),
+            trader_flags: 0x04,
+            character_profile: "esc_2_12_stalker_wolf".to_string(),
+            community_index: 2,
+            rank: 450,
+            reputation: 120,
+            character_name: "Wolf".to_string(),
+            deadbody_can_take: true,
+            deadbody_closed: false,
+        };
+        let mut tbytes = Vec::new();
+        trader.write_to(&mut tbytes);
+        let mut tcur = ByteCursor::new(&tbytes);
+        let trader_decoded = AlifeTraderAbstractState::parse_from_cursor(SPAWN_VERSION, &mut tcur).unwrap();
+        assert_eq!(trader_decoded, trader);
+        assert!(tcur.is_eof());
     }
 }

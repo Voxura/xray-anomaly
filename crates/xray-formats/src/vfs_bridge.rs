@@ -10,6 +10,7 @@ use crate::cform::CformModel;
 use crate::chunk::FormatError;
 use crate::details::{DetailMesh, LevelDetails};
 use crate::envelopes::{ObjectMotion, ObjectMotionLibrary, PostprocessEffect};
+use crate::fonts::{font_atlas_ini_vpath, resolve_font_section_owned, FontAtlas, FontSectionConfig};
 use crate::gamemtl::GameMaterialLibrary;
 use crate::hom::HomMesh;
 use crate::lanims::LightAnimLibrary;
@@ -27,6 +28,7 @@ use crate::shaders_xr::{
 use crate::sound_env::{
     LevelSoundEnv, LevelStaticSounds, OggSoundMetadata, SoundEnvironmentLibrary, SoundOcclusionMesh,
 };
+use crate::spawn_overlays::SpawnOverlaysConfig;
 use crate::spawns::{AlifeSpawnArchive, LevelGameData, LevelSpawnData, PatrolPath};
 use crate::thm::{
     strip_texture_extension, texture_stem_to_dds_vpath, texture_stem_to_thm_vpath,
@@ -915,6 +917,83 @@ pub fn load_ogg_sound_metadata_from_vfs(
     };
     let bytes = vfs.read_bytes(&candidate)?;
     Ok(OggSoundMetadata::parse(&bytes)?)
+}
+
+/// Resolve `[section]` font texture rung + `.ini`/`.dds` paths from `config_ltx` (`fonts.ltx` / `system.ltx`),
+/// probing VFS existence of candidate `<resolved_texture>.ini` atlases (`GetFontTextureName`).
+pub fn resolve_font_config_from_vfs(
+    vfs: &VirtualFileSystem,
+    config_ltx: &OwnedLtxDocument,
+    section: &str,
+    screen_height: u32,
+) -> Result<FontSectionConfig, AssetLoadError> {
+    Ok(resolve_font_section_owned(
+        config_ltx,
+        section,
+        screen_height,
+        |ini_vpath| vfs.exists(ini_vpath),
+    )?)
+}
+
+/// Stream a `<font_texture>.ini` glyph metric atlas (`FontAtlas`) from `$game_textures$/` (or explicit VFS path).
+pub fn load_font_atlas_from_vfs(
+    vfs: &VirtualFileSystem,
+    resolved_texture_or_ini: &str,
+) -> Result<FontAtlas, AssetLoadError> {
+    let trimmed = resolved_texture_or_ini.trim();
+    let candidate = if trimmed.starts_with('$') {
+        if trimmed.len() >= 4 && trimmed[trimmed.len() - 4..].eq_ignore_ascii_case(".ini") {
+            trimmed.to_string()
+        } else {
+            let stem = strip_texture_extension(trimmed);
+            format!("{stem}.ini")
+        }
+    } else {
+        font_atlas_ini_vpath(trimmed)
+    };
+    let text = vfs.read_to_string_lossy(&candidate)?;
+    Ok(FontAtlas::parse_ini_str(&text)?)
+}
+
+/// Resolve and stream both `[section]` font config (`FontSectionConfig`) and its parsed `FontAtlas` in one call.
+pub fn load_font_from_vfs(
+    vfs: &VirtualFileSystem,
+    config_ltx: &OwnedLtxDocument,
+    section: &str,
+    screen_height: u32,
+) -> Result<(FontSectionConfig, FontAtlas), AssetLoadError> {
+    let cfg = resolve_font_config_from_vfs(vfs, config_ltx, section, screen_height)?;
+    let atlas = load_font_atlas_from_vfs(vfs, &cfg.atlas_ini_vpath)?;
+    Ok((cfg, atlas))
+}
+
+/// Discover `$game_configs$/mod_spawn_overlays_*.ltx` DLTX overlay files sorted lexicographically.
+pub fn discover_spawn_overlay_mods_from_vfs(
+    vfs: &VirtualFileSystem,
+) -> Result<Vec<String>, AssetLoadError> {
+    let provider = VfsLtxProvider(vfs);
+    let mut mods = provider.list_ltx_matches("$game_configs$", "mod_spawn_overlays_*.ltx")?;
+    mods.sort_by_key(|s| s.to_ascii_lowercase());
+    Ok(mods)
+}
+
+/// Stream `$game_configs$/spawn_overlays.ltx` merged with DLTX `mod_spawn_overlays_*.ltx` files.
+///
+/// When `dltx_mod_paths` is `None`, auto-discovers all `$game_configs$/mod_spawn_overlays_*.ltx` files.
+pub fn load_spawn_overlays_from_vfs(
+    vfs: &VirtualFileSystem,
+    dltx_mod_paths: Option<&[&str]>,
+) -> Result<SpawnOverlaysConfig, AssetLoadError> {
+    let owned_mods;
+    let mod_refs: Vec<&str> = match dltx_mod_paths {
+        Some(explicit) => explicit.to_vec(),
+        None => {
+            owned_mods = discover_spawn_overlay_mods_from_vfs(vfs)?;
+            owned_mods.iter().map(String::as_str).collect()
+        }
+    };
+    let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/spawn_overlays.ltx", &mod_refs)?;
+    Ok(SpawnOverlaysConfig::from_owned_ltx(&doc))
 }
 
 #[cfg(test)]
@@ -2390,5 +2469,292 @@ mod tests {
         assert_eq!(ogg_meta.sample_rate, 44_100);
         assert!((ogg_meta.duration_seconds.unwrap() - 1.0).abs() < 1e-6);
         assert_eq!(ogg_meta.xray_params, Some(xray_c));
+    }
+
+    #[test]
+    fn test_stream_fonts_spawn_overlays_and_alife_subclasses_from_vfs() {
+        use crate::ai_graph::{
+            GameDeathPoint, GameEdge, GameGraphHeader, GameLevelInfo, GameVertex,
+            XRAI_CURRENT_VERSION,
+        };
+        use crate::fonts::{FontAlignment, FontDrawParams};
+        use crate::spawns::{
+            alife_object_flags, m_spawn_flags, AlifeDynamicVisualState, AlifeInventoryItemState,
+            AlifeItemWeaponState, AlifeLevelChangerState, AlifeObjectState,
+            AlifeSpaceRestrictorState, ServerShapeDef, ServerVisualState, SpawnHeader, SpawnPacket,
+            SpawnVertex, INVALID_OBJECT_ID, INVALID_SPAWN_STORY_ID, INVALID_STORY_ID, M_UPDATE,
+            SPAWN_VERSION,
+        };
+
+        let fonts_ltx = br#"[string_table]
+font_prefix = _west
+
+[ui_font_letterica18_russian]
+shader = font
+texture = ui\ui_font_letter_18_1024
+texture1600 = ui\ui_font_letter_18_1600
+size = 18
+interval = 0.9, 1.0
+"#;
+        let font_ini = br#"[symbol_coords]
+height = 18
+065 = 8, 16, 20
+066 = 24, 16, 38
+"#;
+
+        let overlays_base = br#"[settings]
+link_tolerance = 2.0
+sync_level_offsets = true
+
+[graph_links]
+"#;
+        let overlays_mod = br#"![graph_links@demo]
+l01_escape:0.0,0.0,0.0 = l02_garbage:0.0,0.0,0.0
+
+![spawn_patch@esc_ak74]
+story_id = 5500
+"#;
+
+        let gg = GameGraph {
+            header: GameGraphHeader {
+                version: 10,
+                vertex_count: 2,
+                edge_count: 0,
+                death_point_count: 1,
+                guid: [0x10, 0x20],
+                levels: vec![
+                    GameLevelInfo {
+                        name: "l01_escape".into(),
+                        offset: [0.0; 3],
+                        id: 1,
+                        section: "level01".into(),
+                        guid: [1, 1],
+                    },
+                    GameLevelInfo {
+                        name: "l02_garbage".into(),
+                        offset: [0.0, 0.0, 150.0],
+                        id: 2,
+                        section: "level02".into(),
+                        guid: [2, 2],
+                    },
+                ],
+            },
+            vertices: vec![
+                GameVertex {
+                    local_point: [0.0; 3],
+                    global_point: [0.0; 3],
+                    level_id: 1,
+                    level_vertex_id: 10,
+                    vertex_types: [0; 4],
+                    edge_offset: 84,
+                    point_offset: 84,
+                    neighbour_count: 0,
+                    death_point_count: 1,
+                },
+                GameVertex {
+                    local_point: [0.0; 3],
+                    global_point: [0.0, 0.0, 150.0],
+                    level_id: 2,
+                    level_vertex_id: 20,
+                    vertex_types: [0; 4],
+                    edge_offset: 84,
+                    point_offset: 104,
+                    neighbour_count: 0,
+                    death_point_count: 0,
+                },
+            ],
+            edges: Vec::<GameEdge>::new(),
+            death_points: vec![GameDeathPoint {
+                point: [0.0; 3],
+                level_vertex_id: 10,
+                distance: 1.0,
+            }],
+            cross_tables: Vec::new(),
+        };
+
+        let base_alife = AlifeObjectState {
+            game_vertex_id: 0,
+            distance: 0.0,
+            direct_control: true,
+            level_vertex_id: 10,
+            flags: alife_object_flags::CAN_SAVE,
+            custom_data: String::new(),
+            story_id: INVALID_STORY_ID,
+            spawn_story_id: INVALID_SPAWN_STORY_ID,
+            subclass_payload: Vec::new(),
+        };
+        let lc_state = AlifeLevelChangerState {
+            restrictor: AlifeSpaceRestrictorState {
+                alife: base_alife.clone(),
+                shapes: vec![ServerShapeDef::Sphere {
+                    center: [0.0; 3],
+                    radius: 2.0,
+                }],
+                restrictor_type: 0,
+                trailing: Vec::new(),
+            },
+            next_graph_vertex: 1,
+            next_level_vertex: 20,
+            next_position: [0.0; 3],
+            next_angles: [0.0; 3],
+            level_to_change: "l02_garbage".into(),
+            level_point_to_change: "gar_wp".into(),
+            silent_mode: false,
+            trailing: Vec::new(),
+        };
+        let wpn_state = AlifeItemWeaponState {
+            item: AlifeInventoryItemState {
+                base: AlifeDynamicVisualState {
+                    alife: base_alife,
+                    visual: ServerVisualState {
+                        visual_name: "dynamics\\weapons\\wpn_ak74\\wpn_ak74".into(),
+                        flags: 0,
+                    },
+                    trailing: Vec::new(),
+                },
+                condition: 0.9,
+                upgrades: vec!["up_sect_ak74".into()],
+                trailing: Vec::new(),
+            },
+            ammo_current: 60,
+            ammo_elapsed: 30,
+            wpn_state: 0,
+            addon_flags: 1,
+            ammo_type: 0,
+            ammo_elapsed_grenades: 0,
+            trailing: Vec::new(),
+        };
+
+        let archive = AlifeSpawnArchive {
+            header: SpawnHeader {
+                version: XRAI_CURRENT_VERSION,
+                guid: [0x55; 16],
+                graph_guid: [0x10u64, 0x20]
+                    .into_iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+                spawn_count: 2,
+                level_count: 2,
+            },
+            spawns: vec![
+                SpawnVertex {
+                    spawn_id: 0,
+                    spawn: SpawnPacket {
+                        section: "level_changer".into(),
+                        name_replace: "lc_esc_gar".into(),
+                        game_id_legacy: 0,
+                        rp: 0xFE,
+                        position: [0.0; 3],
+                        angle: [0.0; 3],
+                        respawn_time: 0,
+                        id: INVALID_OBJECT_ID,
+                        parent_id: INVALID_OBJECT_ID,
+                        phantom_id: INVALID_OBJECT_ID,
+                        flags: m_spawn_flags::VERSION,
+                        version: SPAWN_VERSION,
+                        game_type: u16::MAX,
+                        script_version: 10,
+                        client_data: Vec::new(),
+                        spawn_id: 0,
+                        state_payload: lc_state.to_bytes(),
+                        trailing_update_payload: Vec::new(),
+                    },
+                    update_packet: M_UPDATE.to_le_bytes().to_vec(),
+                },
+                SpawnVertex {
+                    spawn_id: 1,
+                    spawn: SpawnPacket {
+                        section: "wpn_ak74".into(),
+                        name_replace: "esc_ak74".into(),
+                        game_id_legacy: 0,
+                        rp: 0xFE,
+                        position: [3.0, 0.0, 1.0],
+                        angle: [0.0; 3],
+                        respawn_time: 0,
+                        id: INVALID_OBJECT_ID,
+                        parent_id: INVALID_OBJECT_ID,
+                        phantom_id: INVALID_OBJECT_ID,
+                        flags: m_spawn_flags::VERSION,
+                        version: SPAWN_VERSION,
+                        game_type: u16::MAX,
+                        script_version: 10,
+                        client_data: Vec::new(),
+                        spawn_id: 1,
+                        state_payload: wpn_state.to_bytes(),
+                        trailing_update_payload: Vec::new(),
+                    },
+                    update_packet: M_UPDATE.to_le_bytes().to_vec(),
+                },
+            ],
+            edges: Vec::new(),
+            artefact_spawn_positions: Vec::new(),
+            patrol_paths: Vec::new(),
+            game_graph: gg,
+        }
+        .to_bytes();
+
+        let entries = vec![
+            ("configs\\fonts.ltx", fonts_ltx.to_vec(), fonts_ltx.to_vec()),
+            (
+                "textures\\ui\\ui_font_letter_18_1600_west.ini",
+                font_ini.to_vec(),
+                font_ini.to_vec(),
+            ),
+            (
+                "configs\\spawn_overlays.ltx",
+                overlays_base.to_vec(),
+                overlays_base.to_vec(),
+            ),
+            (
+                "configs\\mod_spawn_overlays_demo.ltx",
+                overlays_mod.to_vec(),
+                overlays_mod.to_vec(),
+            ),
+            ("spawns\\all.spawn", archive.clone(), compress_lzo1x(&archive)),
+        ];
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_bytes("ui_spawn_pack.db0", pack_synthetic_db(entries))
+            .unwrap();
+
+        let fonts_doc = load_ltx_tree_from_vfs(&vfs, "$game_configs$/fonts.ltx", &[]).unwrap();
+        let (fcfg, atlas) =
+            load_font_from_vfs(&vfs, &fonts_doc, "ui_font_letterica18_russian", 1440).unwrap();
+        assert_eq!(fcfg.resolved_texture, "ui\\ui_font_letter_18_1600_west");
+        let quads = atlas.build_string_quads(
+            [512, 256],
+            [10.0, 20.0],
+            "AB",
+            &FontDrawParams {
+                current_height: 18.0,
+                align: FontAlignment::Left,
+                ..FontDrawParams::default()
+            },
+        );
+        assert_eq!(quads.len(), 2);
+
+        let overlays = load_spawn_overlays_from_vfs(&vfs, None).unwrap();
+        assert_eq!(overlays.graph_links.len(), 1);
+        let mut loaded_spawn = load_all_spawn_from_vfs(&vfs, "all").unwrap();
+        assert_eq!(
+            loaded_spawn.spawns[0].spawn.decode_level_changer_state().unwrap(),
+            lc_state
+        );
+        assert_eq!(
+            loaded_spawn.spawns[1].spawn.decode_weapon_state().unwrap(),
+            wpn_state
+        );
+        let report = overlays.apply_to_spawn_archive(&mut loaded_spawn, false, &[]);
+        assert_eq!(report.graph.edges_added, 2);
+        assert_eq!(report.spawns_patched, 1);
+        assert_eq!(
+            loaded_spawn.spawns[1]
+                .spawn
+                .decode_alife_state()
+                .unwrap()
+                .story_id,
+            5500
+        );
     }
 }

@@ -7,6 +7,7 @@
 //! - `chunk`: Zero-copy X-Ray Chunked File Format reader (`ID + size + payload` + `CFS_CompressMark` LZHuf)
 //! - `details`: `.dm` & `level.details` (`DETAIL_VERSION_3` / `DETAIL_VERSION_4`) flora/grass slots
 //! - `envelopes`: LightWave `CEnvelope` splines (`TCB`/`Hermite`/`Bezier`/`Linear`/`Step`/`Bezier2D`), `.anm` `ObjectMotion` & `.ppe` `PostprocessEffect`
+//! - `fonts`: `CGameFont` resolution rung selector (`texture_h<N>` + `[string_table] font_prefix`), UI `.ini` glyph atlases, word-wrap & DX12 glyph quad emitter
 //! - `gamemtl`: X-Ray `gamemtl.xr` physical/surface material & interaction pair library parser
 //! - `hom`: `level.hom` Hierarchical Occlusion Mapping parser, `ClipFrustum` & 64x64->8 `OccRasterizer`
 //! - `lanims`: `$game_data$/lanims.xr` keyframed `LightAnimItem` / `LightAnimLibrary` color anims
@@ -19,11 +20,12 @@
 //! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
 //! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, OMF pose evaluation & `1W`–`4W` CPU skinning
 //! - `sound_env`: `senvironment.xr` v4/v5, `level.som` BVH acoustic occlusion, `level.snd_env` & `level.snd_static`
-//! - `spawns`: `level.game` (`RPoint`/`PatrolPath`), `patrol_paths.ltx`, `level.spawn`, `all.spawn` (`AlifeSpawnArchive`) & `NET_Packet` entity spawn/state codecs
+//! - `spawn_overlays`: Anomaly `spawn_overlays.ltx` / `mod_spawn_overlays_*.ltx` DLTX graph links/unlinks, patches & `level_cut` applicators
+//! - `spawns`: `level.game` (`RPoint`/`PatrolPath`), `patrol_paths.ltx`, `level.spawn`, `all.spawn` (`AlifeSpawnArchive`) & ALife `NET_Packet` entity/subclass codecs
 //! - `thm`: X-Ray `.thm` / `.ltx` texture descriptor parser (`_bump` / `_bump#` / detail / material links)
 //! - `weather`: Weather cycles (`weathers\*.ltx`), weather effects, sun positions, ambients, lens flares, thunderbolts & atmospheric mixer
 //! - `xml_ui`: Pure-Rust Windows-1251/UTF-8 UI XML DOM (`#include` & `a:b:c` nav), localization tables, UI atlases & color defs
-//! - `vfs_bridge`: Direct `xray-vfs` streaming integration across all binary/LTX/XML/savegame assets
+//! - `vfs_bridge`: Direct `xray-vfs` streaming integration across all binary/LTX/XML/font/savegame assets
 
 pub mod ai_graph;
 pub mod camera;
@@ -31,6 +33,7 @@ pub mod cform;
 pub mod chunk;
 pub mod details;
 pub mod envelopes;
+pub mod fonts;
 pub mod gamemtl;
 pub mod hom;
 pub mod lanims;
@@ -43,6 +46,7 @@ pub mod savegames;
 pub mod shaders_xr;
 pub mod skinning;
 pub mod sound_env;
+pub mod spawn_overlays;
 pub mod spawns;
 pub mod thm;
 pub mod vfs_bridge;
@@ -76,6 +80,13 @@ pub use envelopes::{
     ObjectMotionLibrary, PostprocessColorCurve, PostprocessEffect, PostprocessState, EOBJ_OMOTION,
     EOBJ_OMOTION_VERSION, EOBJ_OMOTION_VERSION_V3, EOBJ_OMOTION_VERSION_V4,
     POSTPROCESS_FILE_VERSION, POSTPROCESS_FILE_VERSION_V1,
+};
+pub use fonts::{
+    font_atlas_ini_vpath, font_flags, is_alpha_character, is_bad_end_character,
+    is_bad_start_character, is_need_space_character, mbh_multi2wide, rank_font_candidates,
+    rank_font_candidates_owned, resolve_font_section, resolve_font_section_owned,
+    resolve_font_texture_name, FontAlignment, FontAtlas, FontAtlasKind, FontDrawParams,
+    FontGlyphCoord, FontGlyphQuad, FontRungCandidate, FontSectionConfig, STANDARD_FONT_SECTIONS,
 };
 pub use gamemtl::{
     gamemtl_chunks, gamemtl_flags, gamemtl_pair_chunks, gamemtl_pair_flags,
@@ -149,10 +160,17 @@ pub use sound_env::{
     SoundEnvironment, SoundEnvironmentLibrary, SoundOcclusionMesh, StaticSound,
     OGG_COMMENT_VERSION, SDEF_ENV_VERSION, SNDENV_VER_EXTENDED, SOM_POLY_SIZE,
 };
+pub use spawn_overlays::{
+    parse_endpoint, unescape_custom_data, OverlayArchiveReport, OverlayEndpoint,
+    OverlayGraphLink, OverlayGraphReport, OverlayGraphUnlink, OverlayObjectSelector,
+    OverlaySpawnPatch, SpawnOverlaysConfig, DEFAULT_LINK_TOLERANCE, MATCH_TOLERANCE,
+};
 pub use spawns::{
-    alife_object_flags, cse_spawn_flags, m_spawn_flags, wayobject_chunks, AlifeObjectState,
-    AlifeSpawnArchive, GraphPointState, LevelGameData, LevelSpawnData, PatrolEdge, PatrolPath,
-    PatrolPoint, RPoint, RPointType, SpawnEdge, SpawnHeader, SpawnPacket, SpawnVertex,
+    alife_object_flags, cse_spawn_flags, m_spawn_flags, wayobject_chunks, AlifeDynamicVisualState,
+    AlifeInventoryItemState, AlifeItemWeaponState, AlifeLevelChangerState, AlifeObjectState,
+    AlifeSpaceRestrictorState, AlifeSpawnArchive, AlifeTraderAbstractState, GraphPointState,
+    LevelGameData, LevelSpawnData, PatrolEdge, PatrolPath, PatrolPoint, RPoint, RPointType,
+    ServerShapeDef, ServerVisualState, SpawnEdge, SpawnHeader, SpawnPacket, SpawnVertex,
     INVALID_OBJECT_ID, INVALID_SPAWN_STORY_ID, INVALID_STORY_ID, M_SPAWN, M_UPDATE, POINT_BASE,
     RPOINT_CHUNK, SPAWN_VERSION, WAYOBJECT_VERSION, WAY_BASE, WAY_PATROLPATH_CHUNK,
 };
@@ -162,20 +180,22 @@ pub use thm::{
     TextureMaterial, TextureParams, TextureType,
 };
 pub use vfs_bridge::{
-    load_all_spawn_from_vfs, load_anm_from_vfs, load_anms_from_vfs, load_blood_wallmarks_from_vfs,
-    load_bone_parts_ltx_from_vfs, load_cform_from_vfs, load_color_defs_from_vfs,
-    load_details_from_vfs, load_dm_from_vfs, load_env_mods_from_vfs, load_fog_volumes_from_vfs,
-    load_game_graph_from_vfs, load_gamemtl_from_vfs, load_hom_from_vfs, load_lanims_from_vfs,
-    load_level_ai_from_vfs, load_level_from_vfs, load_level_game_from_vfs,
+    discover_spawn_overlay_mods_from_vfs, load_all_spawn_from_vfs, load_anm_from_vfs,
+    load_anms_from_vfs, load_blood_wallmarks_from_vfs, load_bone_parts_ltx_from_vfs,
+    load_cform_from_vfs, load_color_defs_from_vfs, load_details_from_vfs, load_dm_from_vfs,
+    load_env_mods_from_vfs, load_fog_volumes_from_vfs, load_font_atlas_from_vfs,
+    load_font_from_vfs, load_game_graph_from_vfs, load_gamemtl_from_vfs, load_hom_from_vfs,
+    load_lanims_from_vfs, load_level_ai_from_vfs, load_level_from_vfs, load_level_game_from_vfs,
     load_level_gct_from_vfs, load_level_geometry_from_vfs, load_level_sound_env_from_vfs,
     load_level_spawn_from_vfs, load_localization_table_from_vfs, load_ltx_tree_from_vfs,
     load_ogg_sound_metadata_from_vfs, load_ogf_from_vfs, load_omf_from_vfs,
     load_particles_from_vfs, load_patrol_paths_ltx_from_vfs, load_ppe_from_vfs,
     load_ps_static_from_vfs, load_scop_from_vfs, load_shaders_xr_from_vfs,
     load_shaders_xrlc_from_vfs, load_som_from_vfs, load_sound_environments_from_vfs,
-    load_static_sounds_from_vfs, load_thm_from_vfs, load_ui_texture_atlases_from_vfs,
-    load_weather_library_from_vfs, load_xml_from_vfs, resolve_ogf_texture_links, AssetLoadError,
-    VfsLtxProvider, VfsXmlProvider,
+    load_spawn_overlays_from_vfs, load_static_sounds_from_vfs, load_thm_from_vfs,
+    load_ui_texture_atlases_from_vfs, load_weather_library_from_vfs, load_xml_from_vfs,
+    resolve_font_config_from_vfs, resolve_ogf_texture_links, AssetLoadError, VfsLtxProvider,
+    VfsXmlProvider,
 };
 pub use weather::{
     calculate_dynamic_sun_dir, dir_from_hp, lerp_descriptors, normalize_time, parse_hhmmss_seconds,
