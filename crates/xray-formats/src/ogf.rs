@@ -196,7 +196,11 @@ impl StaticVertexLayout {
             stride += 4;
         }
 
-        for i in 0..(texcoord_count as usize) {
+        for (i, dim) in texcoord_dims
+            .iter_mut()
+            .enumerate()
+            .take(texcoord_count as usize)
+        {
             let size_code = (fvf >> (16 + i * 2)) & 0b11;
             let floats = match size_code {
                 0 => 2, // D3DFVF_TEXCOORDSIZE2
@@ -205,7 +209,7 @@ impl StaticVertexLayout {
                 3 => 1, // D3DFVF_TEXCOORDSIZE1
                 _ => unreachable!(),
             };
-            texcoord_dims[i] = floats;
+            *dim = floats;
             stride += (floats as usize) * 4;
         }
 
@@ -503,6 +507,14 @@ pub struct OgfSlideWindows {
     pub windows: Vec<SlideWindow>,
 }
 
+/// Individual VB or IB slice reference (`OGF_VCONTAINER` / `OGF_ICONTAINER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OgfBufferRef {
+    pub id: u32,
+    pub base: u32,
+    pub count: u32,
+}
+
 /// Shared level geometry container reference (`OGF_GCONTAINER`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OgfGContainerRef {
@@ -773,7 +785,12 @@ pub struct OgfModel {
     pub vertices: Option<OgfVertices>,
     pub indices: Vec<u16>,
     pub swi: Option<OgfSlideWindows>,
+    pub swi_container: Option<u32>,
     pub gcontainer: Option<OgfGContainerRef>,
+    pub vcontainer: Option<OgfBufferRef>,
+    pub icontainer: Option<OgfBufferRef>,
+    pub fastpath_gcontainer: Option<OgfGContainerRef>,
+    pub fastpath_swi: Option<OgfSlideWindows>,
     pub skeleton: Option<OgfSkeleton>,
     pub desc: Option<OgfDesc>,
     pub child_links: Vec<u32>,
@@ -800,18 +817,42 @@ impl OgfModel {
         };
 
         let gcontainer = match reader.open_chunk(OGF_GCONTAINER)? {
+            Some(bytes) => Some(parse_gcontainer(&bytes)?),
+            None => None,
+        };
+
+        let vcontainer = match reader.open_chunk(OGF_VCONTAINER)? {
+            Some(bytes) => Some(parse_buffer_ref(&bytes)?),
+            None => None,
+        };
+
+        let icontainer = match reader.open_chunk(OGF_ICONTAINER)? {
+            Some(bytes) => Some(parse_buffer_ref(&bytes)?),
+            None => None,
+        };
+
+        let swi_container = match reader.open_chunk(OGF_SWICONTAINER)? {
             Some(bytes) => {
                 let mut cur = ByteCursor::new(&bytes);
-                Some(OgfGContainerRef {
-                    vb_id: cur.read_u32()?,
-                    vb_base: cur.read_u32()?,
-                    vb_count: cur.read_u32()?,
-                    ib_id: cur.read_u32()?,
-                    ib_base: cur.read_u32()?,
-                    ib_count: cur.read_u32()?,
-                })
+                Some(cur.read_u32()?)
             }
             None => None,
+        };
+
+        let (fastpath_gcontainer, fastpath_swi) = match reader.open_chunk(OGF_FASTPATH)? {
+            Some(bytes) => {
+                let fp_reader = ChunkReader::new(&bytes);
+                let fp_g = match fp_reader.open_chunk(OGF_GCONTAINER)? {
+                    Some(gb) => Some(parse_gcontainer(&gb)?),
+                    None => None,
+                };
+                let fp_s = match fp_reader.open_chunk(OGF_SWIDATA)? {
+                    Some(sb) => Some(parse_swidata(&sb)?),
+                    None => None,
+                };
+                (fp_g, fp_s)
+            }
+            None => (None, None),
         };
 
         let vertices = match reader.open_chunk(OGF_VERTICES)? {
@@ -878,7 +919,12 @@ impl OgfModel {
             vertices,
             indices,
             swi,
+            swi_container,
             gcontainer,
+            vcontainer,
+            icontainer,
+            fastpath_gcontainer,
+            fastpath_swi,
             skeleton,
             desc,
             child_links,
@@ -889,6 +935,27 @@ impl OgfModel {
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
     }
+}
+
+fn parse_buffer_ref(data: &[u8]) -> Result<OgfBufferRef, FormatError> {
+    let mut cur = ByteCursor::new(data);
+    Ok(OgfBufferRef {
+        id: cur.read_u32()?,
+        base: cur.read_u32()?,
+        count: cur.read_u32()?,
+    })
+}
+
+fn parse_gcontainer(data: &[u8]) -> Result<OgfGContainerRef, FormatError> {
+    let mut cur = ByteCursor::new(data);
+    Ok(OgfGContainerRef {
+        vb_id: cur.read_u32()?,
+        vb_base: cur.read_u32()?,
+        vb_count: cur.read_u32()?,
+        ib_id: cur.read_u32()?,
+        ib_base: cur.read_u32()?,
+        ib_count: cur.read_u32()?,
+    })
 }
 
 fn parse_header(data: &[u8]) -> Result<OgfHeader, FormatError> {
@@ -928,7 +995,7 @@ fn parse_vertices(data: &[u8]) -> Result<OgfVertices, FormatError> {
                 .ok_or(FormatError::UnexpectedEof)?;
             let raw = cur.read_bytes(need)?;
             let mut out = Vec::with_capacity(count);
-            for chunk in raw.chunks_exact(60) {
+            for chunk in raw.as_chunks::<60>().0 {
                 let mut vc = ByteCursor::new(chunk);
                 out.push(VertBoned1W {
                     position: vc.read_f32_3()?,
@@ -948,7 +1015,7 @@ fn parse_vertices(data: &[u8]) -> Result<OgfVertices, FormatError> {
                 .ok_or(FormatError::UnexpectedEof)?;
             let raw = cur.read_bytes(need)?;
             let mut out = Vec::with_capacity(count);
-            for chunk in raw.chunks_exact(64) {
+            for chunk in raw.as_chunks::<64>().0 {
                 let mut vc = ByteCursor::new(chunk);
                 out.push(VertBoned2W {
                     matrix0: vc.read_u16()?,
@@ -970,7 +1037,7 @@ fn parse_vertices(data: &[u8]) -> Result<OgfVertices, FormatError> {
                 .ok_or(FormatError::UnexpectedEof)?;
             let raw = cur.read_bytes(need)?;
             let mut out = Vec::with_capacity(count);
-            for chunk in raw.chunks_exact(70) {
+            for chunk in raw.as_chunks::<70>().0 {
                 let mut vc = ByteCursor::new(chunk);
                 out.push(VertBoned3W {
                     matrices: [vc.read_u16()?, vc.read_u16()?, vc.read_u16()?],
@@ -991,7 +1058,7 @@ fn parse_vertices(data: &[u8]) -> Result<OgfVertices, FormatError> {
                 .ok_or(FormatError::UnexpectedEof)?;
             let raw = cur.read_bytes(need)?;
             let mut out = Vec::with_capacity(count);
-            for chunk in raw.chunks_exact(76) {
+            for chunk in raw.as_chunks::<76>().0 {
                 let mut vc = ByteCursor::new(chunk);
                 out.push(VertBoned4W {
                     matrices: [
@@ -1038,8 +1105,8 @@ fn parse_indices(data: &[u8]) -> Result<Vec<u16>, FormatError> {
         .ok_or(FormatError::UnexpectedEof)?;
     let raw = cur.read_bytes(need)?;
     let mut indices = Vec::with_capacity(count);
-    for pair in raw.chunks_exact(2) {
-        indices.push(u16::from_le_bytes([pair[0], pair[1]]));
+    for pair in raw.as_chunks::<2>().0 {
+        indices.push(u16::from_le_bytes(*pair));
     }
     Ok(indices)
 }
@@ -1058,7 +1125,7 @@ fn parse_swidata(data: &[u8]) -> Result<OgfSlideWindows, FormatError> {
         .ok_or(FormatError::UnexpectedEof)?;
     let raw = cur.read_bytes(need)?;
     let mut windows = Vec::with_capacity(count);
-    for rec in raw.chunks_exact(8) {
+    for rec in raw.as_chunks::<8>().0 {
         let mut rc = ByteCursor::new(rec);
         windows.push(SlideWindow {
             offset: rc.read_u32()?,

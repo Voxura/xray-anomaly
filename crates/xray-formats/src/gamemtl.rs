@@ -346,6 +346,12 @@ impl GameMaterialLibrary {
         })
     }
 
+    /// Look up material by 0-based dense library index (`CGameMtlLibrary::GetMaterialByIdx`,
+    /// used by `level.cform` `CDB::TRI::material`).
+    pub fn material_by_idx(&self, idx: usize) -> Option<&GameMaterial> {
+        self.materials.get(idx)
+    }
+
     pub fn material_by_id(&self, id: u32) -> Option<&GameMaterial> {
         self.materials.iter().find(|m| m.id == id)
     }

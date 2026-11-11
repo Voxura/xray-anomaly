@@ -197,6 +197,20 @@ pub struct BoneKeyframe {
 }
 
 impl BoneKeyframe {
+    /// Blend two keyframes by `t` in `[0.0, 1.0]` using shortest-arc quaternion SLERP
+    /// and linear translation interpolation (`AnimationBlend` / `MixChannels`).
+    pub fn blend(a: Self, b: Self, t: f32) -> Self {
+        let weight = t.clamp(0.0, 1.0);
+        Self {
+            rotation_xyzw: slerp_quat_xyzw(a.rotation_xyzw, b.rotation_xyzw, weight),
+            translation: [
+                a.translation[0] + (b.translation[0] - a.translation[0]) * weight,
+                a.translation[1] + (b.translation[1] - a.translation[1]) * weight,
+                a.translation[2] + (b.translation[2] - a.translation[2]) * weight,
+            ],
+        }
+    }
+
     /// Convert dequantized keyframe into local bone transform matrix (`Fmatrix::mk_xform`).
     pub fn to_matrix(self) -> XRayMatrix {
         let [x, y, z, w] = normalize_quat_xyzw(self.rotation_xyzw);
@@ -451,45 +465,89 @@ impl OmfMotions {
             local_by_skel_id[skel_id] = key.to_matrix();
         }
 
-        let Some(root_id) = skeleton.root_bone else {
-            return Ok(local_by_skel_id);
-        };
+        accumulate_world_pose(skeleton, &local_by_skel_id)
+    }
 
-        let mut world = vec![crate::ogf::XRAY_IDENTITY_MATRIX; skeleton.bones.len()];
-        fn recurse(
-            skeleton: &OgfSkeleton,
-            bone_id: u16,
-            parent_world: &XRayMatrix,
-            local_mats: &[XRayMatrix],
-            world_out: &mut [XRayMatrix],
-            depth: usize,
-        ) -> Result<(), FormatError> {
-            if depth > skeleton.bones.len() {
-                return Err(FormatError::InvalidValue("cycle in OGF skeleton hierarchy"));
-            }
-            let bone = skeleton
-                .bones
-                .get(bone_id as usize)
-                .ok_or(FormatError::InvalidValue("invalid OGF bone id"))?;
-            let local = &local_mats[bone_id as usize];
-            let cur_world = matrix_mul_43(parent_world, local);
-            world_out[bone_id as usize] = cur_world;
-            for &child in &bone.children {
-                recurse(skeleton, child, &cur_world, local_mats, world_out, depth + 1)?;
-            }
-            Ok(())
+    /// Evaluate blended model-space pose matrices across two clips using per-bone quaternion SLERP
+    /// + translation LERP before hierarchical FK composition (`CKinematicsAnimated::LL_BoneMatrixBuild`).
+    pub fn evaluate_blended_pose(
+        &self,
+        skeleton: &OgfSkeleton,
+        clip_a: usize,
+        time_a: f32,
+        clip_b: usize,
+        time_b: f32,
+        weight_b: f32,
+    ) -> Result<Vec<XRayMatrix>, FormatError> {
+        let a = self
+            .clips
+            .get(clip_a)
+            .ok_or(FormatError::InvalidValue("OMF clip_a index out of range"))?;
+        let b = self
+            .clips
+            .get(clip_b)
+            .ok_or(FormatError::InvalidValue("OMF clip_b index out of range"))?;
+        let rm_bones = self.map_bones_to_skeleton(skeleton)?;
+        if a.tracks.len() != rm_bones.len() || b.tracks.len() != rm_bones.len() {
+            return Err(FormatError::InvalidValue(
+                "OMF clip track count does not match skeleton bone count",
+            ));
         }
 
-        recurse(
-            skeleton,
-            root_id,
-            &crate::ogf::XRAY_IDENTITY_MATRIX,
-            &local_by_skel_id,
-            &mut world,
-            0,
-        )?;
-        Ok(world)
+        let mut local_by_skel_id = vec![crate::ogf::XRAY_IDENTITY_MATRIX; skeleton.bones.len()];
+        for (track_idx, (track_a, track_b)) in a.tracks.iter().zip(&b.tracks).enumerate() {
+            let skel_id = rm_bones[track_idx] as usize;
+            let ka = track_a.sample_at_time(time_a);
+            let kb = track_b.sample_at_time(time_b);
+            local_by_skel_id[skel_id] = BoneKeyframe::blend(ka, kb, weight_b).to_matrix();
+        }
+
+        accumulate_world_pose(skeleton, &local_by_skel_id)
     }
+}
+
+fn accumulate_world_pose(
+    skeleton: &OgfSkeleton,
+    local_by_skel_id: &[XRayMatrix],
+) -> Result<Vec<XRayMatrix>, FormatError> {
+    let Some(root_id) = skeleton.root_bone else {
+        return Ok(local_by_skel_id.to_vec());
+    };
+
+    let mut world = vec![crate::ogf::XRAY_IDENTITY_MATRIX; skeleton.bones.len()];
+    fn recurse(
+        skeleton: &OgfSkeleton,
+        bone_id: u16,
+        parent_world: &XRayMatrix,
+        local_mats: &[XRayMatrix],
+        world_out: &mut [XRayMatrix],
+        depth: usize,
+    ) -> Result<(), FormatError> {
+        if depth > skeleton.bones.len() {
+            return Err(FormatError::InvalidValue("cycle in OGF skeleton hierarchy"));
+        }
+        let bone = skeleton
+            .bones
+            .get(bone_id as usize)
+            .ok_or(FormatError::InvalidValue("invalid OGF bone id"))?;
+        let local = &local_mats[bone_id as usize];
+        let cur_world = matrix_mul_43(parent_world, local);
+        world_out[bone_id as usize] = cur_world;
+        for &child in &bone.children {
+            recurse(skeleton, child, &cur_world, local_mats, world_out, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    recurse(
+        skeleton,
+        root_id,
+        &crate::ogf::XRAY_IDENTITY_MATRIX,
+        local_by_skel_id,
+        &mut world,
+        0,
+    )?;
+    Ok(world)
 }
 
 fn parse_sm_params(data: &[u8]) -> Result<(u16, Vec<MotionPartition>, Vec<MotionDef>), FormatError> {
@@ -694,7 +752,8 @@ fn normalize_quat_xyzw(q: [f32; 4]) -> [f32; 4] {
     [q[0] * inv, q[1] * inv, q[2] * inv, q[3] * inv]
 }
 
-fn slerp_quat_xyzw(q0: [f32; 4], q1: [f32; 4], tm: f32) -> [f32; 4] {
+/// Shortest-arc quaternion SLERP (`[x, y, z, w]`).
+pub fn slerp_quat_xyzw(q0: [f32; 4], q1: [f32; 4], tm: f32) -> [f32; 4] {
     let mut cosom = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3];
     let sign = if cosom < 0.0 {
         cosom = -cosom;

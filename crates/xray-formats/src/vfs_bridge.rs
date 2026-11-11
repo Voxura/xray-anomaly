@@ -1,11 +1,15 @@
 //! Bridges between `xray-vfs` (`VirtualFileSystem`), `xray-core` (`.ltx` / DLTX),
-//! and `xray-formats` (`OgfModel`, `OmfMotions`, `TextureParams`, `GameMaterialLibrary`).
+//! and `xray-formats` (`OgfModel`, `OmfMotions`, `TextureParams`, `GameMaterialLibrary`,
+//! `CformModel`, `LevelDetails`, `LevelData`, `LevelGeometry`).
 
 use xray_core::ltx_loader::{collect_ltx_sources, glob_matches_ascii, LtxFileProvider, OwnedLtxDocument};
 use xray_vfs::{normalize_virtual_path, normalize_virtual_prefix, VfsError, VirtualFileSystem};
 
+use crate::cform::CformModel;
 use crate::chunk::FormatError;
+use crate::details::{DetailMesh, LevelDetails};
 use crate::gamemtl::GameMaterialLibrary;
+use crate::level::{LevelData, LevelGeometry};
 use crate::ogf::{OgfModel, OgfTextureLink};
 use crate::omf::OmfMotions;
 use crate::thm::{
@@ -201,6 +205,67 @@ pub fn load_gamemtl_from_vfs(
     }
 
     Ok(lib)
+}
+
+fn resolve_level_file_path(dir_or_file: &str, filename: &str) -> String {
+    let trimmed = dir_or_file.trim().trim_end_matches(['/', '\\']);
+    let leaf = trimmed.rsplit(['/', '\\']).next().unwrap_or("");
+    if leaf.eq_ignore_ascii_case(filename) {
+        trimmed.to_string()
+    } else if trimmed.is_empty() {
+        filename.to_string()
+    } else {
+        format!("{trimmed}/{filename}")
+    }
+}
+
+/// Stream `level.cform` (accepting either full path or level directory like `"levels/l01_escape"`).
+pub fn load_cform_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<CformModel, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.cform");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(CformModel::parse(&bytes)?)
+}
+
+/// Stream `level.details` (accepting either full path or level directory).
+pub fn load_details_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<LevelDetails, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.details");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelDetails::parse(&bytes)?)
+}
+
+/// Stream a standalone `.dm` flora/detail mesh from `VirtualFileSystem`.
+pub fn load_dm_from_vfs(
+    vfs: &VirtualFileSystem,
+    virtual_path: &str,
+) -> Result<DetailMesh, AssetLoadError> {
+    let bytes = vfs.read_bytes(virtual_path)?;
+    Ok(DetailMesh::parse_dm(&bytes)?)
+}
+
+/// Stream `level.geom` or `level.geomx` from `VirtualFileSystem`.
+pub fn load_level_geometry_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<LevelGeometry, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.geom");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelGeometry::parse(&bytes)?)
+}
+
+/// Stream `level` scene data (accepting either `"levels/l01_escape/level"` or `"levels/l01_escape"`).
+pub fn load_level_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<LevelData, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelData::parse(&bytes)?)
 }
 
 #[cfg(test)]
@@ -515,5 +580,215 @@ mod tests {
         assert!((mat.ph_friction - 0.42).abs() < 1e-6);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_stream_level_bundle_cform_details_and_skinning_from_vfs() {
+        use crate::cform::{CformTriangle, CFORM_CURRENT_VERSION};
+        use crate::details::{DetailPalette, DetailSlot, DETAIL_ID_EMPTY, DETAIL_VERSION_4};
+        use crate::level::{d3d_decl_type, d3d_decl_usage, level_chunks, sector_chunks, VertexElement9};
+        use crate::skinning::{skin_vertices, BonePalette};
+
+        // 1. Minimal gamemtl.xr with 1 material at index 0
+        let mut mtl0 = ChunkWriter::new();
+        let mut m_main = 0u32.to_le_bytes().to_vec();
+        m_main.extend_from_slice(b"default_floor\0");
+        mtl0.write_chunk(gamemtl_chunks::GAMEMTL_CHUNK_MAIN, &m_main);
+        mtl0.write_chunk(
+            gamemtl_chunks::GAMEMTL_CHUNK_FLAGS,
+            &gamemtl_flags::FL_SHOOTABLE.to_le_bytes(),
+        );
+        mtl0.write_chunk(gamemtl_chunks::GAMEMTL_CHUNK_PHYSICS, &[0u8; 20]);
+        mtl0.write_chunk(gamemtl_chunks::GAMEMTL_CHUNK_FACTORS, &[0u8; 16]);
+        let mut mtls = ChunkWriter::new();
+        mtls.write_chunk(0, &mtl0.into_bytes());
+        let mut gm = ChunkWriter::new();
+        gm.write_chunk(gamemtl_root_chunks::GAMEMTLS_CHUNK_VERSION, &1u16.to_le_bytes());
+        gm.write_chunk(gamemtl_root_chunks::GAMEMTLS_CHUNK_AUTOINC, &[0u8; 8]);
+        gm.write_chunk(gamemtl_root_chunks::GAMEMTLS_CHUNK_MTLS, &mtls.into_bytes());
+        let gm_raw = gm.into_bytes();
+
+        // 2. Minimal level.cform: horizontal floor quad tri on y = 0.0
+        let mut cform_raw = Vec::new();
+        cform_raw.extend_from_slice(&CFORM_CURRENT_VERSION.to_le_bytes());
+        cform_raw.extend_from_slice(&3u32.to_le_bytes()); // vertcount
+        cform_raw.extend_from_slice(&1u32.to_le_bytes()); // facecount
+        for f in [-5.0f32, 0.0, -5.0, 5.0, 0.0, 5.0] {
+            cform_raw.extend_from_slice(&f.to_le_bytes());
+        }
+        for v in [[0.0f32, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 0.0, 10.0]] {
+            for f in v {
+                cform_raw.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        let tri = CformTriangle {
+            verts: [0, 1, 2],
+            material: 0,
+            suppress_shadows: false,
+            suppress_wm: false,
+            sector: 0,
+        };
+        for idx in tri.verts {
+            cform_raw.extend_from_slice(&idx.to_le_bytes());
+        }
+        cform_raw.extend_from_slice(&tri.to_raw_dummy().to_le_bytes());
+
+        // 3. Minimal level.details (v4, 1x1)
+        let mut dm_raw = Vec::new();
+        dm_raw.extend_from_slice(b"details\\blend\0detail\\gr\0");
+        dm_raw.extend_from_slice(&0u32.to_le_bytes());
+        dm_raw.extend_from_slice(&0.8f32.to_le_bytes());
+        dm_raw.extend_from_slice(&1.2f32.to_le_bytes());
+        dm_raw.extend_from_slice(&3u32.to_le_bytes());
+        dm_raw.extend_from_slice(&3u32.to_le_bytes());
+        dm_raw.extend_from_slice(&[0u8; 3 * 20]);
+        for i in [0u16, 1, 2] {
+            dm_raw.extend_from_slice(&i.to_le_bytes());
+        }
+        let mut det_objs = ChunkWriter::new();
+        det_objs.write_chunk(0, &dm_raw);
+        let mut det_hdr = Vec::new();
+        for v in [DETAIL_VERSION_4, 1, 0, 0, 1, 1] {
+            det_hdr.extend_from_slice(&v.to_le_bytes());
+        }
+        let slot = DetailSlot {
+            ids: [0, DETAIL_ID_EMPTY, DETAIL_ID_EMPTY, DETAIL_ID_EMPTY],
+            c_dir: 15,
+            c_hemi: 15,
+            y_base: 1000,
+            y_height: 10,
+            c_r: 15,
+            c_g: 15,
+            c_b: 15,
+            palette: [DetailPalette { a0: 15, a1: 15, a2: 15, a3: 15 }; 4],
+        };
+        let mut det_w = ChunkWriter::new();
+        det_w.write_chunk(0, &det_hdr);
+        det_w.write_chunk(1, &det_objs.into_bytes());
+        det_w.write_chunk(2, &slot.to_v4_bytes());
+        let details_raw = det_w.into_bytes();
+
+        // 4. Minimal level + level.geom (1 visual referencing VB 0 / IB 0)
+        let write_elem = |out: &mut Vec<u8>, e: VertexElement9| {
+            out.extend_from_slice(&e.stream.to_le_bytes());
+            out.extend_from_slice(&e.offset.to_le_bytes());
+            out.push(e.decl_type);
+            out.push(e.method);
+            out.push(e.usage);
+            out.push(e.usage_index);
+        };
+        let mut vb_raw = Vec::new();
+        vb_raw.extend_from_slice(&1u32.to_le_bytes());
+        write_elem(
+            &mut vb_raw,
+            VertexElement9 {
+                stream: 0,
+                offset: 0,
+                decl_type: d3d_decl_type::FLOAT3,
+                method: 0,
+                usage: d3d_decl_usage::POSITION,
+                usage_index: 0,
+            },
+        );
+        write_elem(&mut vb_raw, VertexElement9::END);
+        vb_raw.extend_from_slice(&3u32.to_le_bytes());
+        for p in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]] {
+            for f in p {
+                vb_raw.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        let mut ib_raw = Vec::new();
+        ib_raw.extend_from_slice(&1u32.to_le_bytes());
+        ib_raw.extend_from_slice(&3u32.to_le_bytes());
+        for i in [0u16, 1, 2] {
+            ib_raw.extend_from_slice(&i.to_le_bytes());
+        }
+        let mut geom_w = ChunkWriter::new();
+        geom_w.write_chunk(level_chunks::FSL_VB, &vb_raw);
+        geom_w.write_chunk(level_chunks::FSL_IB, &ib_raw);
+        let geom_raw = geom_w.into_bytes();
+
+        let mut vis0 = ChunkWriter::new();
+        let mut vhdr = vec![4u8, OgfVisualType::Normal as u8, 1, 0];
+        vhdr.extend_from_slice(&[0u8; 40]);
+        vis0.write_chunk(OGF_HEADER, &vhdr);
+        let mut gcont = Vec::new();
+        for v in [0u32, 0, 3, 0, 0, 3] {
+            gcont.extend_from_slice(&v.to_le_bytes());
+        }
+        vis0.write_chunk(OGF_GCONTAINER, &gcont);
+        let mut vis_wrap = ChunkWriter::new();
+        vis_wrap.write_chunk(0, &vis0.into_bytes());
+
+        let mut shd_raw = Vec::new();
+        shd_raw.extend_from_slice(&2u32.to_le_bytes());
+        shd_raw.extend_from_slice(b"\0levels\\ground/terrain\\ter\0");
+        let mut sec0 = ChunkWriter::new();
+        sec0.write_chunk(sector_chunks::FSP_ROOT, &0u32.to_le_bytes());
+        let mut secs_wrap = ChunkWriter::new();
+        secs_wrap.write_chunk(0, &sec0.into_bytes());
+
+        let mut lvl_w = ChunkWriter::new();
+        lvl_w.write_chunk(level_chunks::FSL_HEADER, &[14, 0, 1, 0]);
+        lvl_w.write_chunk(level_chunks::FSL_SHADERS, &shd_raw);
+        lvl_w.write_chunk(level_chunks::FSL_VISUALS, &vis_wrap.into_bytes());
+        lvl_w.write_chunk(level_chunks::FSL_SECTORS, &secs_wrap.into_bytes());
+        let lvl_raw = lvl_w.into_bytes();
+
+        // 5. Minimal skeletal OGF with inline vertices + OMF for BonePalette verification
+        let mut skel_ogf_w = ChunkWriter::new();
+        let mut shdr = vec![4u8, OgfVisualType::SkeletonAnim as u8, 0, 0];
+        shdr.extend_from_slice(&[0u8; 40]);
+        skel_ogf_w.write_chunk(OGF_HEADER, &shdr);
+        let mut skel_vb = Vec::new();
+        skel_vb.extend_from_slice(&crate::ogf::skel_vert_type::FVF_1L.to_le_bytes());
+        skel_vb.extend_from_slice(&1u32.to_le_bytes());
+        for f in [0.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0] {
+            skel_vb.extend_from_slice(&f.to_le_bytes());
+        }
+        skel_vb.extend_from_slice(&0u32.to_le_bytes());
+        skel_ogf_w.write_chunk(OGF_VERTICES, &skel_vb);
+        let mut bn = Vec::new();
+        bn.extend_from_slice(&1u32.to_le_bytes());
+        bn.extend_from_slice(b"bip01\0\0");
+        bn.extend_from_slice(&[0u8; 60]);
+        skel_ogf_w.write_chunk(OGF_S_BONE_NAMES, &bn);
+        let skel_ogf_raw = skel_ogf_w.into_bytes();
+
+        let entries = vec![
+            ("gamemtl.xr", gm_raw.clone(), compress_lzo1x(&gm_raw)),
+            ("levels\\test_map\\level.cform", cform_raw.clone(), compress_lzo1x(&cform_raw)),
+            ("levels\\test_map\\level.details", details_raw.clone(), compress_lzo1x(&details_raw)),
+            ("levels\\test_map\\level.geom", geom_raw.clone(), compress_lzo1x(&geom_raw)),
+            ("levels\\test_map\\level", lvl_raw.clone(), compress_lzo1x(&lvl_raw)),
+            ("meshes\\actors\\box_skel.ogf", skel_ogf_raw.clone(), compress_lzo1x(&skel_ogf_raw)),
+        ];
+
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_bytes("level_pack.db0", pack_synthetic_db(entries))
+            .unwrap();
+
+        let gmlib = load_gamemtl_from_vfs(&vfs).unwrap();
+        let cform = load_cform_from_vfs(&vfs, "levels/test_map").unwrap();
+        let bvh = cform.build_bvh();
+        let hit = bvh
+            .raycast_nearest([1.0, 5.0, 1.0], [0.0, -1.0, 0.0], 20.0, false)
+            .unwrap();
+        assert!((hit.range - 5.0).abs() < 1e-5);
+        assert_eq!(bvh.hit_material(&hit, &gmlib).unwrap().name, "default_floor");
+
+        let details = load_details_from_vfs(&vfs, "levels\\test_map").unwrap();
+        assert_eq!(details.query_slot(0, 0).unwrap().ids[0], 0);
+
+        let level = load_level_from_vfs(&vfs, "levels/test_map").unwrap();
+        let geom = load_level_geometry_from_vfs(&vfs, "levels/test_map").unwrap();
+        let mesh = level.resolve_visual_mesh(0, &geom).unwrap();
+        assert_eq!(mesh.vertices.len(), 3);
+        assert_eq!(mesh.shader.unwrap().textures, vec!["terrain\\ter"]);
+
+        let skel_model = load_ogf_from_vfs(&vfs, "meshes\\actors\\box_skel.ogf").unwrap();
+        let bind_pal = BonePalette::bind_pose(skel_model.skeleton.as_ref().unwrap()).unwrap();
+        let skinned = skin_vertices(skel_model.vertices.as_ref().unwrap(), &bind_pal).unwrap();
+        assert_eq!(skinned.len(), 1);
     }
 }
