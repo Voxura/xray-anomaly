@@ -12,6 +12,8 @@ use crate::chunk::{ByteCursor, ChunkReader, FormatError};
 pub const SDEF_ENV_VERSION: u32 = 4;
 pub const SNDENV_VER_EXTENDED: u32 = 5;
 pub const SOM_POLY_SIZE: usize = 44;
+/// X-Ray `.ogg` Vorbis comment payload version (`Sound.h:23`).
+pub const OGG_COMMENT_VERSION: u32 = 0x0003;
 
 #[inline]
 fn mb_to_gain(mb: f32) -> f32 {
@@ -473,6 +475,271 @@ impl LevelStaticSounds {
     }
 }
 
+/// X-Ray spatial & gameplay sound metadata stored inside `.ogg` Vorbis comment 0
+/// (`CSoundRender_Source::LoadWave`, `src/xrSound/SoundRender_Source_loader.cpp:108-153`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OggXRayParams {
+    pub version: u32,
+    pub min_dist: f32,
+    pub max_dist: f32,
+    pub base_volume: f32,
+    pub game_type: u32,
+    pub max_ai_dist: f32,
+}
+
+impl Default for OggXRayParams {
+    fn default() -> Self {
+        Self {
+            version: OGG_COMMENT_VERSION,
+            min_dist: 1.0,
+            max_dist: 30.0,
+            base_volume: 1.0,
+            game_type: 0,
+            max_ai_dist: 30.0,
+        }
+    }
+}
+
+impl OggXRayParams {
+    /// Parse binary comment 0 payload (`0x0001`, `0x0002`, or `0x0003` = `OGG_COMMENT_VERSION`).
+    pub fn parse(bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(bytes);
+        let version = cur.read_u32()?;
+        match version {
+            0x0001 => {
+                let min_dist = cur.read_f32()?;
+                let max_dist = cur.read_f32()?;
+                let game_type = cur.read_u32()?;
+                Ok(Self {
+                    version,
+                    min_dist,
+                    max_dist,
+                    base_volume: 1.0,
+                    game_type,
+                    max_ai_dist: max_dist,
+                })
+            }
+            0x0002 => {
+                let min_dist = cur.read_f32()?;
+                let max_dist = cur.read_f32()?;
+                let base_volume = cur.read_f32()?;
+                let game_type = cur.read_u32()?;
+                Ok(Self {
+                    version,
+                    min_dist,
+                    max_dist,
+                    base_volume,
+                    game_type,
+                    max_ai_dist: max_dist,
+                })
+            }
+            OGG_COMMENT_VERSION => {
+                let min_dist = cur.read_f32()?;
+                let max_dist = cur.read_f32()?;
+                let base_volume = cur.read_f32()?;
+                let game_type = cur.read_u32()?;
+                let max_ai_dist = cur.read_f32()?;
+                Ok(Self {
+                    version,
+                    min_dist,
+                    max_dist,
+                    base_volume,
+                    game_type,
+                    max_ai_dist,
+                })
+            }
+            _ => Err(FormatError::InvalidValue(
+                "unsupported X-Ray .ogg comment version (expected 1, 2, or 3)",
+            )),
+        }
+    }
+
+    /// Serialize in `OGG_COMMENT_VERSION` (`0x0003`) 24-byte layout.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(24);
+        out.extend_from_slice(&OGG_COMMENT_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.min_dist.to_le_bytes());
+        out.extend_from_slice(&self.max_dist.to_le_bytes());
+        out.extend_from_slice(&self.base_volume.to_le_bytes());
+        out.extend_from_slice(&self.game_type.to_le_bytes());
+        out.extend_from_slice(&self.max_ai_dist.to_le_bytes());
+        out
+    }
+}
+
+/// Pure-Rust Ogg Vorbis container + X-Ray sound source metadata (`CSoundRender_Source`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OggSoundMetadata {
+    pub channels: u8,
+    pub sample_rate: u32,
+    pub bitrate_maximum: i32,
+    pub bitrate_nominal: i32,
+    pub bitrate_minimum: i32,
+    pub total_samples: Option<u64>,
+    pub duration_seconds: Option<f32>,
+    pub pcm_16bit_bytes_total: Option<u64>,
+    pub vendor: String,
+    pub xray_params: Option<OggXRayParams>,
+    pub raw_comments: Vec<Vec<u8>>,
+    pub tags: Vec<(String, String)>,
+}
+
+impl OggSoundMetadata {
+    /// Parse an Ogg Vorbis stream, decoding Vorbis identification (`0x01vorbis`),
+    /// Vorbis comment (`0x03vorbis`) with X-Ray `OGG_COMMENT_VERSION` metadata,
+    /// and page-level `granule_position` duration.
+    pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
+        let mut pos = 0usize;
+        let mut serial_filter: Option<u32> = None;
+        let mut last_granule: Option<u64> = None;
+        let mut packet_buf = Vec::new();
+        let mut packets: Vec<Vec<u8>> = Vec::new();
+        let mut pages_seen = 0usize;
+
+        while pos < data.len() {
+            if pos + 27 > data.len() {
+                return Err(FormatError::UnexpectedEof);
+            }
+            if &data[pos..pos + 4] != b"OggS" {
+                return Err(FormatError::InvalidValue("expected OggS page magic"));
+            }
+            let stream_version = data[pos + 4];
+            if stream_version != 0 {
+                return Err(FormatError::InvalidValue("unsupported Ogg stream version"));
+            }
+            let header_type = data[pos + 5];
+            let granule = u64::from_le_bytes(data[pos + 6..pos + 14].try_into().unwrap());
+            let serial = u32::from_le_bytes(data[pos + 14..pos + 18].try_into().unwrap());
+            let page_segments = data[pos + 26] as usize;
+            let seg_table_start = pos + 27;
+            let seg_table_end = seg_table_start + page_segments;
+            if seg_table_end > data.len() {
+                return Err(FormatError::UnexpectedEof);
+            }
+            let seg_table = &data[seg_table_start..seg_table_end];
+            let payload_len: usize = seg_table.iter().map(|&b| usize::from(b)).sum();
+            let payload_start = seg_table_end;
+            let payload_end = payload_start + payload_len;
+            if payload_end > data.len() {
+                return Err(FormatError::UnexpectedEof);
+            }
+
+            if serial_filter.is_none() {
+                serial_filter = Some(serial);
+            }
+            pages_seen += 1;
+
+            if Some(serial) == serial_filter {
+                if (granule as i64) >= 0 {
+                    last_granule = Some(granule);
+                }
+
+                // Reassemble packets only until both Vorbis ID & Comment headers are extracted.
+                if packets.len() < 2 {
+                    if (header_type & 0x01) == 0 && !packet_buf.is_empty() {
+                        packet_buf.clear();
+                    }
+                    let mut pcur = payload_start;
+                    for &seg_len_u8 in seg_table {
+                        let seg_len = usize::from(seg_len_u8);
+                        packet_buf.extend_from_slice(&data[pcur..pcur + seg_len]);
+                        pcur += seg_len;
+                        if seg_len < 255 {
+                            packets.push(core::mem::take(&mut packet_buf));
+                        }
+                    }
+                }
+            }
+
+            pos = payload_end;
+        }
+
+        if pages_seen == 0 || packets.is_empty() {
+            return Err(FormatError::InvalidValue("empty or truncated Ogg stream"));
+        }
+
+        let id_pkt = &packets[0];
+        if id_pkt.len() < 30 || id_pkt[0] != 0x01 || &id_pkt[1..7] != b"vorbis" {
+            return Err(FormatError::InvalidValue("expected Vorbis identification header"));
+        }
+        let mut id_cur = ByteCursor::new(&id_pkt[7..]);
+        let vorbis_version = id_cur.read_u32()?;
+        if vorbis_version != 0 {
+            return Err(FormatError::InvalidValue("unsupported Vorbis codec version"));
+        }
+        let channels = id_cur.read_u8()?;
+        let sample_rate = id_cur.read_u32()?;
+        if channels == 0 || sample_rate == 0 {
+            return Err(FormatError::InvalidValue("invalid Vorbis channel/sample rate"));
+        }
+        let bitrate_maximum = id_cur.read_i32()?;
+        let bitrate_nominal = id_cur.read_i32()?;
+        let bitrate_minimum = id_cur.read_i32()?;
+        let _blocksize = id_cur.read_u8()?;
+        let framing = id_cur.read_u8()?;
+        if (framing & 1) == 0 {
+            return Err(FormatError::InvalidValue("Vorbis identification framing bit is zero"));
+        }
+
+        let mut vendor = String::new();
+        let mut raw_comments = Vec::new();
+        let mut tags = Vec::new();
+        let mut xray_params = None;
+
+        if let Some(cmt_pkt) = packets.get(1)
+            && cmt_pkt.len() >= 15
+            && cmt_pkt[0] == 0x03
+            && &cmt_pkt[1..7] == b"vorbis"
+        {
+            let mut ccur = ByteCursor::new(&cmt_pkt[7..]);
+            let vlen = ccur.read_u32()? as usize;
+            let vbytes = ccur.read_bytes(vlen)?;
+            vendor = String::from_utf8_lossy(vbytes).into_owned();
+            let count = ccur.read_u32()? as usize;
+            raw_comments.reserve(count.min(256));
+            for idx in 0..count {
+                let clen = ccur.read_u32()? as usize;
+                let cbytes = ccur.read_bytes(clen)?.to_vec();
+                if idx == 0 && cbytes.len() >= 16 {
+                    let vers = u32::from_le_bytes([cbytes[0], cbytes[1], cbytes[2], cbytes[3]]);
+                    if matches!(vers, 0x0001 | 0x0002 | OGG_COMMENT_VERSION)
+                        && let Ok(parsed) = OggXRayParams::parse(&cbytes)
+                    {
+                        xray_params = Some(parsed);
+                    }
+                }
+                if let Ok(text) = core::str::from_utf8(&cbytes)
+                    && let Some((k, v)) = text.split_once('=')
+                    && !k.is_empty()
+                    && !k.contains('\0')
+                {
+                    tags.push((k.to_string(), v.to_string()));
+                }
+                raw_comments.push(cbytes);
+            }
+        }
+
+        let duration_seconds = last_granule.map(|samples| (samples as f32) / (sample_rate as f32));
+        let pcm_16bit_bytes_total =
+            last_granule.map(|samples| samples.saturating_mul(u64::from(channels) * 2));
+
+        Ok(Self {
+            channels,
+            sample_rate,
+            bitrate_maximum,
+            bitrate_nominal,
+            bitrate_minimum,
+            total_samples: last_granule,
+            duration_seconds,
+            pcm_16bit_bytes_total,
+            vendor,
+            xray_params,
+            raw_comments,
+            tags,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +871,104 @@ mod tests {
         assert_eq!(static_sounds.sounds[0].wav_name, "ambient\\wind_1");
         assert!(static_sounds.sounds[0].is_active_at(12000));
         assert!(!static_sounds.sounds[0].is_active_at(20000));
+    }
+
+    fn build_ogg_page(serial: u32, seq: u32, header_type: u8, granule: u64, segs: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"OggS");
+        out.push(0); // stream structure version
+        out.push(header_type);
+        out.extend_from_slice(&granule.to_le_bytes());
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(&seq.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // CRC (not verified by parser)
+        out.push(segs.len() as u8);
+        for s in segs {
+            out.push(s.len() as u8);
+        }
+        for s in segs {
+            out.extend_from_slice(s);
+        }
+        out
+    }
+
+    #[test]
+    fn parse_ogg_vorbis_and_xray_comment_versions() {
+        // Test OggXRayParams v1 and v2 backward-compat defaults
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&2.0f32.to_le_bytes());
+        v1.extend_from_slice(&45.0f32.to_le_bytes());
+        v1.extend_from_slice(&7u32.to_le_bytes());
+        let p1 = OggXRayParams::parse(&v1).unwrap();
+        assert_eq!(p1.base_volume, 1.0);
+        assert_eq!(p1.max_ai_dist, 45.0);
+
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(&2u32.to_le_bytes());
+        v2.extend_from_slice(&1.5f32.to_le_bytes());
+        v2.extend_from_slice(&60.0f32.to_le_bytes());
+        v2.extend_from_slice(&0.8f32.to_le_bytes());
+        v2.extend_from_slice(&12u32.to_le_bytes());
+        let p2 = OggXRayParams::parse(&v2).unwrap();
+        assert_eq!(p2.base_volume, 0.8);
+        assert_eq!(p2.max_ai_dist, 60.0);
+
+        // Build full Ogg stream with Vorbis ID + multi-page Comment + Audio EOS page
+        let mut id_pkt = Vec::new();
+        id_pkt.push(0x01);
+        id_pkt.extend_from_slice(b"vorbis");
+        id_pkt.extend_from_slice(&0u32.to_le_bytes()); // version
+        id_pkt.push(2); // stereo
+        id_pkt.extend_from_slice(&44_100u32.to_le_bytes());
+        id_pkt.extend_from_slice(&0i32.to_le_bytes());
+        id_pkt.extend_from_slice(&128_000i32.to_le_bytes());
+        id_pkt.extend_from_slice(&0i32.to_le_bytes());
+        id_pkt.push(0xB8); // blocksize 0/1
+        id_pkt.push(0x01); // framing bit
+
+        let xray_c = OggXRayParams {
+            version: OGG_COMMENT_VERSION,
+            min_dist: 3.0,
+            max_dist: 55.0,
+            base_volume: 0.9,
+            game_type: 0x0100_0001,
+            max_ai_dist: 35.0,
+        };
+        let mut cmt_pkt = Vec::new();
+        cmt_pkt.push(0x03);
+        cmt_pkt.extend_from_slice(b"vorbis");
+        let vendor = b"X-Ray Sound Encoder";
+        cmt_pkt.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        cmt_pkt.extend_from_slice(vendor);
+        cmt_pkt.extend_from_slice(&2u32.to_le_bytes());
+        let c0 = xray_c.to_bytes();
+        cmt_pkt.extend_from_slice(&(c0.len() as u32).to_le_bytes());
+        cmt_pkt.extend_from_slice(&c0);
+        let c1 = b"TITLE=Campfire Guitar";
+        cmt_pkt.extend_from_slice(&(c1.len() as u32).to_le_bytes());
+        cmt_pkt.extend_from_slice(c1);
+        cmt_pkt.push(0x01); // framing bit
+
+        // Split comment packet across two Ogg pages if desired (test 255-byte continuation)
+        let mut pad_cmt = cmt_pkt;
+        pad_cmt.resize(260, 0);
+        let serial = 0x1234_5678;
+        let mut ogg = Vec::new();
+        ogg.extend_from_slice(&build_ogg_page(serial, 0, 0x02, 0, &[&id_pkt]));
+        ogg.extend_from_slice(&build_ogg_page(serial, 1, 0x00, 0, &[&pad_cmt[..255]]));
+        ogg.extend_from_slice(&build_ogg_page(serial, 2, 0x01, 0, &[&pad_cmt[255..]]));
+        ogg.extend_from_slice(&build_ogg_page(serial, 3, 0x04, 88_200, &[b"\x05dummy"]));
+
+        let meta = OggSoundMetadata::parse(&ogg).unwrap();
+        assert_eq!(meta.channels, 2);
+        assert_eq!(meta.sample_rate, 44_100);
+        assert_eq!(meta.bitrate_nominal, 128_000);
+        assert_eq!(meta.total_samples, Some(88_200));
+        assert!((meta.duration_seconds.unwrap() - 2.0).abs() < 1e-6);
+        assert_eq!(meta.pcm_16bit_bytes_total, Some(88_200 * 4));
+        assert_eq!(meta.vendor, "X-Ray Sound Encoder");
+        assert_eq!(meta.xray_params, Some(xray_c));
+        assert_eq!(meta.tags, vec![("TITLE".to_string(), "Campfire Guitar".to_string())]);
     }
 }

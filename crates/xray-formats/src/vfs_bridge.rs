@@ -9,13 +9,13 @@ use crate::ai_graph::{GameGraph, LevelCrossTable, LevelGraph};
 use crate::cform::CformModel;
 use crate::chunk::FormatError;
 use crate::details::{DetailMesh, LevelDetails};
-use crate::envelopes::{ObjectMotion, PostprocessEffect};
+use crate::envelopes::{ObjectMotion, ObjectMotionLibrary, PostprocessEffect};
 use crate::gamemtl::GameMaterialLibrary;
 use crate::hom::HomMesh;
 use crate::lanims::LightAnimLibrary;
 use crate::level::{LevelData, LevelGeometry};
 use crate::ogf::{OgfModel, OgfTextureLink};
-use crate::omf::OmfMotions;
+use crate::omf::{BonePartitionSet, OmfMotions};
 use crate::particles::{
     BloodWallmarksConfig, ParticleEffectDef, ParticleGroupDef, ParticlesLibrary,
 };
@@ -25,7 +25,7 @@ use crate::shaders_xr::{
     ShaderXrlcLibrary,
 };
 use crate::sound_env::{
-    LevelSoundEnv, LevelStaticSounds, SoundEnvironmentLibrary, SoundOcclusionMesh,
+    LevelSoundEnv, LevelStaticSounds, OggSoundMetadata, SoundEnvironmentLibrary, SoundOcclusionMesh,
 };
 use crate::spawns::{AlifeSpawnArchive, LevelGameData, LevelSpawnData, PatrolPath};
 use crate::thm::{
@@ -842,6 +842,79 @@ pub fn load_color_defs_from_vfs(vfs: &VirtualFileSystem) -> Result<UiColorDefs, 
 pub fn load_lanims_from_vfs(vfs: &VirtualFileSystem) -> Result<LightAnimLibrary, AssetLoadError> {
     let bytes = vfs.read_bytes("$game_data$/lanims.xr")?;
     Ok(LightAnimLibrary::parse(&bytes)?)
+}
+
+/// Stream a multi-clip `.anms` motion library from `$game_anims$/` (or explicit VFS path).
+pub fn load_anms_from_vfs(
+    vfs: &VirtualFileSystem,
+    reference_or_path: &str,
+) -> Result<ObjectMotionLibrary, AssetLoadError> {
+    let trimmed = reference_or_path.trim();
+    let with_ext = ensure_extension_ci(trimmed, b".anms");
+    let candidate = if with_ext.starts_with('$') {
+        with_ext
+    } else {
+        let norm = normalize_virtual_path(&with_ext)?;
+        if norm.starts_with("anims\\") {
+            norm
+        } else {
+            format!("anims\\{norm}")
+        }
+    };
+    let bytes = vfs.read_bytes(&candidate)?;
+    Ok(ObjectMotionLibrary::parse(&bytes)?)
+}
+
+/// Stream skeletal bone partition LTX overrides (`CPartition::load`, `SkeletonMotions.cpp:27-80`).
+///
+/// When `force_hands` is `true`, loads `$game_meshes$/anomaly_weapons/hands/bone_parts.ltx`;
+/// otherwise replaces the model extension with `.ltx` under `$game_meshes$/`.
+pub fn load_bone_parts_ltx_from_vfs(
+    vfs: &VirtualFileSystem,
+    model_or_ltx_path: &str,
+    force_hands: bool,
+) -> Result<BonePartitionSet, AssetLoadError> {
+    let candidate = if force_hands {
+        "$game_meshes$/anomaly_weapons/hands/bone_parts.ltx".to_string()
+    } else {
+        let trimmed = model_or_ltx_path.trim();
+        let stem = strip_texture_extension(trimmed);
+        let with_ext = format!("{stem}.ltx");
+        if with_ext.starts_with('$') {
+            with_ext
+        } else {
+            let norm = normalize_virtual_path(&with_ext)?;
+            if norm.starts_with("meshes\\") {
+                norm
+            } else {
+                format!("meshes\\{norm}")
+            }
+        }
+    };
+    let text = vfs.read_to_string_lossy(&candidate)?;
+    let doc = xray_core::LtxDocument::parse(&text);
+    Ok(BonePartitionSet::from_ltx(&doc))
+}
+
+/// Stream `.ogg` sound metadata (`CSoundRender_Source::LoadWave`) from `$game_sounds$/`.
+pub fn load_ogg_sound_metadata_from_vfs(
+    vfs: &VirtualFileSystem,
+    sound_name_or_path: &str,
+) -> Result<OggSoundMetadata, AssetLoadError> {
+    let trimmed = sound_name_or_path.trim();
+    let with_ext = ensure_extension_ci(trimmed, b".ogg");
+    let candidate = if with_ext.starts_with('$') {
+        with_ext
+    } else {
+        let norm = normalize_virtual_path(&with_ext)?;
+        if norm.starts_with("sounds\\") {
+            norm
+        } else {
+            format!("sounds\\{norm}")
+        }
+    };
+    let bytes = vfs.read_bytes(&candidate)?;
+    Ok(OggSoundMetadata::parse(&bytes)?)
 }
 
 #[cfg(test)]
@@ -2185,5 +2258,137 @@ mod tests {
         let (verts, idx) = batches[0].instances[0].expand_quad(0);
         assert_eq!(verts.len(), 4);
         assert_eq!(idx, [0, 1, 2, 3, 2, 1]);
+    }
+
+    #[test]
+    fn test_stream_anms_bone_parts_and_ogg_metadata_from_vfs() {
+        use crate::envelopes::{
+            Envelope, EnvelopeBehavior, EnvelopeKey, EnvelopeShape, ObjectMotion,
+            ObjectMotionLibrary,
+        };
+        use crate::sound_env::{OggXRayParams, OGG_COMMENT_VERSION};
+
+        let make_env = |val: f32| Envelope {
+            behavior: [EnvelopeBehavior::Constant, EnvelopeBehavior::Constant],
+            keys: vec![EnvelopeKey {
+                value: val,
+                time: 0.0,
+                shape: EnvelopeShape::Linear,
+                ..EnvelopeKey::default()
+            }],
+        };
+        let anms_raw = ObjectMotionLibrary {
+            motions: vec![
+                ObjectMotion {
+                    name: "cam_hit".to_string(),
+                    frame_start: 0,
+                    frame_end: 30,
+                    fps: 30.0,
+                    version: 5,
+                    envelopes: [
+                        make_env(1.0),
+                        make_env(0.0),
+                        make_env(0.0),
+                        make_env(0.0),
+                        make_env(0.0),
+                        make_env(0.0),
+                    ],
+                },
+                ObjectMotion {
+                    name: "cam_walk".to_string(),
+                    frame_start: 0,
+                    frame_end: 60,
+                    fps: 30.0,
+                    version: 5,
+                    envelopes: [
+                        make_env(0.0),
+                        make_env(0.5),
+                        make_env(0.0),
+                        make_env(0.0),
+                        make_env(0.0),
+                        make_env(0.0),
+                    ],
+                },
+            ],
+        }
+        .to_bytes();
+
+        let bone_parts_ltx = b"[part_0]\nbip01 =\npartition_name = default\n[part_1]\nl_hand =\npartition_name = left_hand\n";
+
+        // Minimal 2-page Ogg Vorbis stream with X-Ray OGG_COMMENT_VERSION 0x0003 metadata
+        let make_ogg_page = |seq: u32, hdr_type: u8, granule: u64, pkt: &[u8]| -> Vec<u8> {
+            let mut p = Vec::new();
+            p.extend_from_slice(b"OggS");
+            p.push(0);
+            p.push(hdr_type);
+            p.extend_from_slice(&granule.to_le_bytes());
+            p.extend_from_slice(&42u32.to_le_bytes());
+            p.extend_from_slice(&seq.to_le_bytes());
+            p.extend_from_slice(&0u32.to_le_bytes());
+            p.push(1);
+            p.push(pkt.len() as u8);
+            p.extend_from_slice(pkt);
+            p
+        };
+        let mut id_pkt = vec![0x01];
+        id_pkt.extend_from_slice(b"vorbis");
+        id_pkt.extend_from_slice(&0u32.to_le_bytes());
+        id_pkt.push(1);
+        id_pkt.extend_from_slice(&44_100u32.to_le_bytes());
+        id_pkt.extend_from_slice(&0i32.to_le_bytes());
+        id_pkt.extend_from_slice(&64_000i32.to_le_bytes());
+        id_pkt.extend_from_slice(&0i32.to_le_bytes());
+        id_pkt.push(0xB8);
+        id_pkt.push(1);
+
+        let xray_c = OggXRayParams {
+            version: OGG_COMMENT_VERSION,
+            min_dist: 2.0,
+            max_dist: 40.0,
+            base_volume: 0.75,
+            game_type: 9,
+            max_ai_dist: 25.0,
+        };
+        let mut cmt_pkt = vec![0x03];
+        cmt_pkt.extend_from_slice(b"vorbis");
+        cmt_pkt.extend_from_slice(&4u32.to_le_bytes());
+        cmt_pkt.extend_from_slice(b"XRay");
+        cmt_pkt.extend_from_slice(&1u32.to_le_bytes());
+        let c0 = xray_c.to_bytes();
+        cmt_pkt.extend_from_slice(&(c0.len() as u32).to_le_bytes());
+        cmt_pkt.extend_from_slice(&c0);
+        cmt_pkt.push(1);
+
+        let mut ogg = Vec::new();
+        ogg.extend_from_slice(&make_ogg_page(0, 0x02, 0, &id_pkt));
+        ogg.extend_from_slice(&make_ogg_page(1, 0x00, 0, &cmt_pkt));
+        ogg.extend_from_slice(&make_ogg_page(2, 0x04, 44_100, b"\x02ok"));
+
+        let entries = vec![
+            ("anims\\camera_pack.anms", anms_raw.clone(), compress_lzo1x(&anms_raw)),
+            (
+                "meshes\\anomaly_weapons\\hands\\bone_parts.ltx",
+                bone_parts_ltx.to_vec(),
+                bone_parts_ltx.to_vec(),
+            ),
+            ("sounds\\weapons\\ak_shot.ogg", ogg.clone(), ogg),
+        ];
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_bytes("audio_cam.db0", pack_synthetic_db(entries))
+            .unwrap();
+
+        let anms = load_anms_from_vfs(&vfs, "camera_pack").unwrap();
+        assert_eq!(anms.motions.len(), 2);
+        assert!((anms.find("cam_hit").unwrap().evaluate(0.0).0[0] - 1.0).abs() < 1e-6);
+
+        let parts = load_bone_parts_ltx_from_vfs(&vfs, "", true).unwrap();
+        assert_eq!(parts.part_id("default"), Some(0));
+        assert_eq!(parts.part_id("left_hand"), Some(1));
+
+        let ogg_meta = load_ogg_sound_metadata_from_vfs(&vfs, "weapons\\ak_shot").unwrap();
+        assert_eq!(ogg_meta.channels, 1);
+        assert_eq!(ogg_meta.sample_rate, 44_100);
+        assert!((ogg_meta.duration_seconds.unwrap() - 1.0).abs() < 1e-6);
+        assert_eq!(ogg_meta.xray_params, Some(xray_c));
     }
 }

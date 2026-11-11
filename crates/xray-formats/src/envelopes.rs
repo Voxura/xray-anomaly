@@ -648,6 +648,11 @@ impl ObjectMotion {
     /// Parse unchunked `COMotion` payload (supporting versions `0x0003`, `0x0004`, `0x0005`).
     pub fn parse_raw(payload: &[u8]) -> Result<Self, FormatError> {
         let mut cur = ByteCursor::new(payload);
+        Self::parse_from_cursor(&mut cur)
+    }
+
+    /// Parse unchunked `COMotion` sequential stream (`COMotion::Load`) from a shared cursor.
+    pub fn parse_from_cursor(cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
         let name = cur.read_zstring()?;
         let frame_start = cur.read_i32()?;
         let frame_end = cur.read_i32()?;
@@ -656,30 +661,30 @@ impl ObjectMotion {
 
         let envelopes = match version {
             EOBJ_OMOTION_VERSION_V3 => [
-                Envelope::parse_load1(&mut cur)?,
-                Envelope::parse_load1(&mut cur)?,
-                Envelope::parse_load1(&mut cur)?,
-                Envelope::parse_load1(&mut cur)?,
-                Envelope::parse_load1(&mut cur)?,
-                Envelope::parse_load1(&mut cur)?,
+                Envelope::parse_load1(cur)?,
+                Envelope::parse_load1(cur)?,
+                Envelope::parse_load1(cur)?,
+                Envelope::parse_load1(cur)?,
+                Envelope::parse_load1(cur)?,
+                Envelope::parse_load1(cur)?,
             ],
             EOBJ_OMOTION_VERSION_V4 => {
                 // Version 4 stored rotation channels in swapped [P, H, B] order (`motion.cpp:136-147`)
-                let px = Envelope::parse_load2(&mut cur)?;
-                let py = Envelope::parse_load2(&mut cur)?;
-                let pz = Envelope::parse_load2(&mut cur)?;
-                let rp = Envelope::parse_load2(&mut cur)?;
-                let rh = Envelope::parse_load2(&mut cur)?;
-                let rb = Envelope::parse_load2(&mut cur)?;
+                let px = Envelope::parse_load2(cur)?;
+                let py = Envelope::parse_load2(cur)?;
+                let pz = Envelope::parse_load2(cur)?;
+                let rp = Envelope::parse_load2(cur)?;
+                let rh = Envelope::parse_load2(cur)?;
+                let rb = Envelope::parse_load2(cur)?;
                 [px, py, pz, rh, rp, rb]
             }
             EOBJ_OMOTION_VERSION => [
-                Envelope::parse_load2(&mut cur)?,
-                Envelope::parse_load2(&mut cur)?,
-                Envelope::parse_load2(&mut cur)?,
-                Envelope::parse_load2(&mut cur)?,
-                Envelope::parse_load2(&mut cur)?,
-                Envelope::parse_load2(&mut cur)?,
+                Envelope::parse_load2(cur)?,
+                Envelope::parse_load2(cur)?,
+                Envelope::parse_load2(cur)?,
+                Envelope::parse_load2(cur)?,
+                Envelope::parse_load2(cur)?,
+                Envelope::parse_load2(cur)?,
             ],
             _ => return Err(FormatError::InvalidValue("unsupported .anm COMotion version")),
         };
@@ -694,18 +699,23 @@ impl ObjectMotion {
         })
     }
 
+    /// Append raw unchunked `COMotion` bytes (without `EOBJ_OMOTION` chunk header).
+    pub fn write_raw(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.name.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.frame_start.to_le_bytes());
+        out.extend_from_slice(&self.frame_end.to_le_bytes());
+        out.extend_from_slice(&self.fps.to_le_bytes());
+        out.extend_from_slice(&EOBJ_OMOTION_VERSION.to_le_bytes());
+        for env in &self.envelopes {
+            env.write_load2(out);
+        }
+    }
+
     /// Serialize into standard chunked `.anm` v5 (`EOBJ_OMOTION`).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut raw = Vec::new();
-        raw.extend_from_slice(self.name.as_bytes());
-        raw.push(0);
-        raw.extend_from_slice(&self.frame_start.to_le_bytes());
-        raw.extend_from_slice(&self.frame_end.to_le_bytes());
-        raw.extend_from_slice(&self.fps.to_le_bytes());
-        raw.extend_from_slice(&EOBJ_OMOTION_VERSION.to_le_bytes());
-        for env in &self.envelopes {
-            env.write_load2(&mut raw);
-        }
+        self.write_raw(&mut raw);
         let mut w = ChunkWriter::new();
         w.write_chunk(EOBJ_OMOTION, &raw);
         w.into_bytes()
@@ -741,6 +751,43 @@ impl ObjectMotion {
             self.envelopes[5].evaluate(t),
         ];
         (pos, rot)
+    }
+}
+
+/// Multi-clip `.anms` library (`CObjectAnimator::LoadMotions`, `ObjectAnimator.cpp:60-76`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObjectMotionLibrary {
+    pub motions: Vec<ObjectMotion>,
+}
+
+impl ObjectMotionLibrary {
+    /// Parse a binary `.anms` buffer (`u32 count` + sequential unchunked `COMotion` records).
+    pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(data);
+        let count = cur.read_u32()? as usize;
+        let mut motions = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            motions.push(ObjectMotion::parse_from_cursor(&mut cur)?);
+        }
+        motions.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Self { motions })
+    }
+
+    /// Serialize to binary `.anms`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.motions.len() as u32).to_le_bytes());
+        for m in &self.motions {
+            m.write_raw(&mut out);
+        }
+        out
+    }
+
+    /// Find clip by name (`CObjectAnimator::Play` lookup).
+    pub fn find(&self, name: &str) -> Option<&ObjectMotion> {
+        self.motions
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(name))
     }
 }
 
@@ -903,6 +950,51 @@ impl PostprocessState {
         self.cm_tex2 = blended.cm_tex2;
         self.cm_influence += blended.cm_influence;
         self.cm_interpolate += blended.cm_interpolate;
+    }
+
+    /// Accumulate another postprocess snapshot matching `SPPInfo::add` (`CameraManager.cpp:25-55`).
+    pub fn add_pp(&mut self, ppi: &Self) {
+        self.blur += ppi.blur;
+        self.gray += ppi.gray;
+        self.duality_h += ppi.duality_h;
+        self.duality_v += ppi.duality_v;
+        self.noise_intensity = self.noise_intensity.max(ppi.noise_intensity);
+        self.noise_granularity = self.noise_granularity.max(ppi.noise_granularity);
+        self.noise_fps = self.noise_fps.max(ppi.noise_fps);
+        for axis in 0..3 {
+            self.color_base[axis] += ppi.color_base[axis];
+            self.color_gray[axis] += ppi.color_gray[axis];
+            self.color_add[axis] += ppi.color_add[axis];
+        }
+        if !ppi.cm_tex1.is_empty() {
+            if !self.cm_tex1.is_empty() {
+                self.cm_tex2 = ppi.cm_tex1.clone();
+                let denom = self.cm_influence + ppi.cm_influence;
+                self.cm_interpolate = if denom.abs() > 1e-8 {
+                    1.0 - self.cm_influence / denom
+                } else {
+                    0.0
+                };
+            } else {
+                self.cm_tex1 = ppi.cm_tex1.clone();
+                self.cm_influence = ppi.cm_influence;
+                self.cm_interpolate = 0.0;
+            }
+            self.cm_influence = self.cm_influence.max(ppi.cm_influence);
+        }
+    }
+
+    /// Subtract additive postprocess channels matching `SPPInfo::sub` (`CameraManager.cpp:57-67`).
+    pub fn sub_pp(&mut self, ppi: &Self) {
+        self.blur -= ppi.blur;
+        self.gray -= ppi.gray;
+        self.duality_h -= ppi.duality_h;
+        self.duality_v -= ppi.duality_v;
+        for axis in 0..3 {
+            self.color_base[axis] -= ppi.color_base[axis];
+            self.color_gray[axis] -= ppi.color_gray[axis];
+            self.color_add[axis] -= ppi.color_add[axis];
+        }
     }
 }
 

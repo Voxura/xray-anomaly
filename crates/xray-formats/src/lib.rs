@@ -2,6 +2,7 @@
 //!
 //! Pure Rust X-Ray Monolith binary asset & model format parsers:
 //! - `ai_graph`: `level.ai` (v10/v13 + A* pathfinder + `pv_compress_normal`/`pv_decompress_normal`), `level.gct` cross-tables & global `game.graph`
+//! - `camera`: X-Ray view/projection matrices, `CamEffectorInfo`, `.anm`/`.anms` & `.ppe` players + `CameraManagerState`
 //! - `cform`: `level.cform` collision database, pure-Rust AABB BVH raycast (`OPT_CULL`/`OPT_ONLYFIRST`/`OPT_ONLYNEAREST`) & SAT box queries
 //! - `chunk`: Zero-copy X-Ray Chunked File Format reader (`ID + size + payload` + `CFS_CompressMark` LZHuf)
 //! - `details`: `.dm` & `level.details` (`DETAIL_VERSION_3` / `DETAIL_VERSION_4`) flora/grass slots
@@ -25,6 +26,7 @@
 //! - `vfs_bridge`: Direct `xray-vfs` streaming integration across all binary/LTX/XML/savegame assets
 
 pub mod ai_graph;
+pub mod camera;
 pub mod cform;
 pub mod chunk;
 pub mod details;
@@ -53,6 +55,12 @@ pub use ai_graph::{
     GameVertex, LevelCrossTable, LevelGraph, INVALID_AI_LINK_V10, INVALID_AI_LINK_V13,
     INVALID_AI_VERTEX, INVALID_GAME_VERTEX, XRAI_CURRENT_VERSION, XRAI_LARGE_VERSION,
 };
+pub use camera::{
+    matrix_build_camera, matrix_build_camera_dir, matrix_build_projection,
+    matrix_build_projection_hat, matrix_build_projection_ortho, mix_postprocess_effectors,
+    CamEffectorInfo, CameraManagerState, CameraMotionEffector, CameraMotionPlayer,
+    PostprocessPlayer,
+};
 pub use cform::{
     ray_options, BoxQueryHit, CformBvh, CformHeader, CformModel, CformTriangle, RaycastHit,
     RaycastOptions, CFORM_CURRENT_VERSION,
@@ -65,9 +73,9 @@ pub use details::{
 };
 pub use envelopes::{
     decode_q16, encode_q16, Envelope, EnvelopeBehavior, EnvelopeKey, EnvelopeShape, ObjectMotion,
-    PostprocessColorCurve, PostprocessEffect, PostprocessState, EOBJ_OMOTION, EOBJ_OMOTION_VERSION,
-    EOBJ_OMOTION_VERSION_V3, EOBJ_OMOTION_VERSION_V4, POSTPROCESS_FILE_VERSION,
-    POSTPROCESS_FILE_VERSION_V1,
+    ObjectMotionLibrary, PostprocessColorCurve, PostprocessEffect, PostprocessState, EOBJ_OMOTION,
+    EOBJ_OMOTION_VERSION, EOBJ_OMOTION_VERSION_V3, EOBJ_OMOTION_VERSION_V4,
+    POSTPROCESS_FILE_VERSION, POSTPROCESS_FILE_VERSION_V1,
 };
 pub use gamemtl::{
     gamemtl_chunks, gamemtl_flags, gamemtl_pair_chunks, gamemtl_pair_flags,
@@ -101,9 +109,9 @@ pub use ogf::{
 };
 pub use omf::{
     motion_def_flags, motion_key_flags, slerp_quat_xyzw, BoneKeyframe, BoneMotionTrack,
-    BoneTranslationKeys, MotionClip, MotionDef, MotionMark, MotionPartition,
-    MotionPartitionBone, OmfMotions, QuantizedRotKey, KEY_QUANT, KEY_QUANT_INV,
-    MOTION_QUANTIZER_RANGE_EXT, SAMPLE_FPS, SAMPLE_SPF, XR_OGF_SM_PARAMS_VERSION,
+    BonePartitionDef, BonePartitionSet, BoneTranslationKeys, MotionClip, MotionDef, MotionMark,
+    MotionPartition, MotionPartitionBone, OmfMotions, QuantizedRotKey, KEY_QUANT, KEY_QUANT_INV,
+    MAX_PARTS, MOTION_QUANTIZER_RANGE_EXT, SAMPLE_FPS, SAMPLE_SPF, XR_OGF_SM_PARAMS_VERSION,
 };
 pub use particle_sim::{
     ParticleBillboardDrawBatch, ParticleBillboardInstance, ParticleEffectInstance,
@@ -126,19 +134,20 @@ pub use savegames::{
     OBJECT_CHUNK_DATA, REGISTRY_CHUNK_DATA, SAVE_EXTENSION, SAVE_MAGIC, SPAWN_CHUNK_DATA,
 };
 pub use shaders_xr::{
-    clsid_to_string, env_mod_flags, shader_xrlc_flags, BlenderDesc, BlenderProperty,
-    BlenderPropertyValue, BlenderShader, EngineShaderLibrary, EnvModAccum, EnvModifier, FogVolume,
-    LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles, ShaderConstant, ShaderMatrix,
-    ShaderXrlcEntry, ShaderXrlcLibrary, StaticParticle, WaveForm, WaveFunction, CBLENDER_DESC_SIZE,
-    SHADER_XRLC_ENTRY_SIZE,
+    clsid_to_string, env_mod_flags, matrix_mode, shader_xrlc_flags, tcm_flags, transform_uv,
+    BlenderDesc, BlenderProperty, BlenderPropertyValue, BlenderShader, EngineShaderLibrary,
+    EnvModAccum, EnvModifier, FogVolume, LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles,
+    ShaderConstant, ShaderMatrix, ShaderXrlcEntry, ShaderXrlcLibrary, StaticParticle, WaveForm,
+    WaveFunction, CBLENDER_DESC_SIZE, SHADER_XRLC_ENTRY_SIZE,
 };
 pub use skinning::{
     compute_skinned_aabb, matrix_transform_dir, normalize_vec3, skin_ogf_hierarchy,
     skin_vertices, BoneMatrix4x3, BonePalette, SkinnedMeshPart, SkinnedVertex,
 };
 pub use sound_env::{
-    LevelSoundEnv, LevelStaticSounds, SomPolygon, SoundEnvironment, SoundEnvironmentLibrary,
-    SoundOcclusionMesh, StaticSound, SDEF_ENV_VERSION, SNDENV_VER_EXTENDED, SOM_POLY_SIZE,
+    LevelSoundEnv, LevelStaticSounds, OggSoundMetadata, OggXRayParams, SomPolygon,
+    SoundEnvironment, SoundEnvironmentLibrary, SoundOcclusionMesh, StaticSound,
+    OGG_COMMENT_VERSION, SDEF_ENV_VERSION, SNDENV_VER_EXTENDED, SOM_POLY_SIZE,
 };
 pub use spawns::{
     alife_object_flags, cse_spawn_flags, m_spawn_flags, wayobject_chunks, AlifeObjectState,
@@ -153,14 +162,16 @@ pub use thm::{
     TextureMaterial, TextureParams, TextureType,
 };
 pub use vfs_bridge::{
-    load_all_spawn_from_vfs, load_anm_from_vfs, load_blood_wallmarks_from_vfs, load_cform_from_vfs,
-    load_color_defs_from_vfs, load_details_from_vfs, load_dm_from_vfs, load_env_mods_from_vfs,
-    load_fog_volumes_from_vfs, load_game_graph_from_vfs, load_gamemtl_from_vfs, load_hom_from_vfs,
-    load_lanims_from_vfs, load_level_ai_from_vfs, load_level_from_vfs, load_level_game_from_vfs,
+    load_all_spawn_from_vfs, load_anm_from_vfs, load_anms_from_vfs, load_blood_wallmarks_from_vfs,
+    load_bone_parts_ltx_from_vfs, load_cform_from_vfs, load_color_defs_from_vfs,
+    load_details_from_vfs, load_dm_from_vfs, load_env_mods_from_vfs, load_fog_volumes_from_vfs,
+    load_game_graph_from_vfs, load_gamemtl_from_vfs, load_hom_from_vfs, load_lanims_from_vfs,
+    load_level_ai_from_vfs, load_level_from_vfs, load_level_game_from_vfs,
     load_level_gct_from_vfs, load_level_geometry_from_vfs, load_level_sound_env_from_vfs,
     load_level_spawn_from_vfs, load_localization_table_from_vfs, load_ltx_tree_from_vfs,
-    load_ogf_from_vfs, load_omf_from_vfs, load_particles_from_vfs, load_patrol_paths_ltx_from_vfs,
-    load_ppe_from_vfs, load_ps_static_from_vfs, load_scop_from_vfs, load_shaders_xr_from_vfs,
+    load_ogg_sound_metadata_from_vfs, load_ogf_from_vfs, load_omf_from_vfs,
+    load_particles_from_vfs, load_patrol_paths_ltx_from_vfs, load_ppe_from_vfs,
+    load_ps_static_from_vfs, load_scop_from_vfs, load_shaders_xr_from_vfs,
     load_shaders_xrlc_from_vfs, load_som_from_vfs, load_sound_environments_from_vfs,
     load_static_sounds_from_vfs, load_thm_from_vfs, load_ui_texture_atlases_from_vfs,
     load_weather_library_from_vfs, load_xml_from_vfs, resolve_ogf_texture_links, AssetLoadError,

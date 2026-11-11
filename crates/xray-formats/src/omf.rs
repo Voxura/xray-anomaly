@@ -7,12 +7,17 @@
 //! Works identically for standalone `.omf` files referenced by `OGF_S_MOTION_REFS`
 //! and embedded `OGF_S_SMPARAMS` / `OGF_S_MOTIONS` chunks inside `.ogf` v4 models.
 
+use xray_core::ltx_loader::OwnedLtxDocument;
+use xray_core::LtxDocument;
+
 use crate::chunk::{ByteCursor, ChunkReader, FormatError};
 use crate::ogf::ogf_chunks::{OGF_S_MOTIONS, OGF_S_SMPARAMS};
 use crate::ogf::{matrix_mul_43, OgfSkeleton, XRayMatrix};
 
 /// Maximum `OGF_S_SMPARAMS` format version supported by X-Ray Anomaly (`Fmesh.h:86`).
 pub const XR_OGF_SM_PARAMS_VERSION: u16 = 4;
+/// Maximum number of skeletal motion partitions (`MAX_PARTS` in `SkeletonMotionDefs.h:6`).
+pub const MAX_PARTS: usize = 5;
 /// X-Ray skeletal sample rate (`SkeletonMotionDefs.h:8-12`).
 pub const SAMPLE_FPS: f32 = 30.0;
 pub const SAMPLE_SPF: f32 = 1.0 / SAMPLE_FPS;
@@ -54,6 +59,126 @@ pub struct MotionPartitionBone {
 pub struct MotionPartition {
     pub name: String,
     pub bones: Vec<MotionPartitionBone>,
+}
+
+/// Loose LTX bone partition override (`CPartDef` loaded from `<model>.ltx` / `anomaly_weapons/hands/bone_parts.ltx`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BonePartitionDef {
+    pub index: u16,
+    pub name: String,
+    pub bone_names: Vec<String>,
+}
+
+/// Collection of up to `MAX_PARTS` skeletal bone partition overrides (`CPartition::load` in `SkeletonMotions.cpp:27-80`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BonePartitionSet {
+    pub parts: Vec<BonePartitionDef>,
+}
+
+impl BonePartitionSet {
+    /// Parse `[part_0]..[part_4]` sections from a borrowed `LtxDocument`.
+    pub fn from_ltx(doc: &LtxDocument<'_>) -> Self {
+        let mut parts = Vec::new();
+        for i in 0..MAX_PARTS {
+            let sec_name = format!("part_{i}");
+            let Some(sect) = doc.sections.get(sec_name.as_str()) else {
+                continue;
+            };
+            if sect.entries.is_empty() {
+                continue;
+            }
+            let mut name = String::new();
+            let mut bone_names = Vec::new();
+            for (&k, &v) in &sect.entries {
+                if k.eq_ignore_ascii_case("partition_name") {
+                    name = v.trim().to_string();
+                } else {
+                    bone_names.push(k.trim().to_string());
+                }
+            }
+            bone_names.sort_unstable();
+            parts.push(BonePartitionDef {
+                index: i as u16,
+                name,
+                bone_names,
+            });
+        }
+        Self { parts }
+    }
+
+    /// Parse `[part_0]..[part_4]` sections from a merged `OwnedLtxDocument`.
+    pub fn from_owned_ltx(doc: &OwnedLtxDocument) -> Self {
+        let mut parts = Vec::new();
+        for i in 0..MAX_PARTS {
+            let sec_name = format!("part_{i}");
+            let Some(sect) = doc.sections.get(&sec_name) else {
+                continue;
+            };
+            if sect.entries.is_empty() {
+                continue;
+            }
+            let mut name = String::new();
+            let mut bone_names = Vec::new();
+            for (k, v) in &sect.entries {
+                if k.eq_ignore_ascii_case("partition_name") {
+                    name = v.trim().to_string();
+                } else {
+                    bone_names.push(k.trim().to_string());
+                }
+            }
+            bone_names.sort_unstable();
+            parts.push(BonePartitionDef {
+                index: i as u16,
+                name,
+                bone_names,
+            });
+        }
+        Self { parts }
+    }
+
+    /// Look up partition index by `partition_name` (`CPartition::part_id`).
+    pub fn part_id(&self, name: &str) -> Option<u16> {
+        self.parts
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .map(|p| p.index)
+    }
+
+    /// Look up partition definition by `[part_N]` slot index.
+    pub fn part(&self, index: u16) -> Option<&BonePartitionDef> {
+        self.parts.iter().find(|p| p.index == index)
+    }
+
+    /// Resolve bone IDs for a partition slot against `skeleton` (missing bones map to `u16::MAX` == `BI_NONE`).
+    pub fn resolve_part_bones(&self, part_index: u16, skeleton: &OgfSkeleton) -> Vec<u16> {
+        let Some(part) = self.part(part_index) else {
+            return Vec::new();
+        };
+        part.bone_names
+            .iter()
+            .map(|name| skeleton.bone_id(name).unwrap_or(u16::MAX))
+            .collect()
+    }
+
+    /// Convert resolved partitions into `MotionPartition` descriptors matching `skeleton`.
+    pub fn to_motion_partitions(&self, skeleton: &OgfSkeleton) -> Vec<MotionPartition> {
+        self.parts
+            .iter()
+            .map(|part| MotionPartition {
+                name: part.name.clone(),
+                bones: part
+                    .bone_names
+                    .iter()
+                    .filter_map(|b| {
+                        skeleton.bone_id(b).map(|id| MotionPartitionBone {
+                            name: b.clone(),
+                            motion_bone_index: u32::from(id),
+                        })
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
 }
 
 /// Time interval mark attached to a v4 skeletal animation clip (`motion_marks`).
@@ -1006,6 +1131,47 @@ mod tests {
                     expected[r][c]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_bone_partition_set_from_ltx_and_real_hands_config() {
+        let ltx_text = concat!(
+            "[part_0]\n",
+            "bip01 = \n",
+            "partition_name = default\n",
+            "[part_1]\n",
+            "l_hand = \n",
+            "partition_name = left_hand\n",
+            "[part_3]\n",
+            "partition_name = \n",
+        );
+        let doc = LtxDocument::parse(ltx_text);
+        let set = BonePartitionSet::from_ltx(&doc);
+        assert_eq!(set.parts.len(), 3);
+        assert_eq!(set.part_id("default"), Some(0));
+        assert_eq!(set.part_id("left_hand"), Some(1));
+        assert_eq!(set.part(3).unwrap().name, "");
+        assert!(set.part(3).unwrap().bone_names.is_empty());
+
+        let hands_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("gamedata/meshes/anomaly_weapons/hands/bone_parts.ltx");
+        if hands_path.is_file() {
+            let real_text = std::fs::read_to_string(&hands_path).unwrap();
+            let real_doc = LtxDocument::parse(&real_text);
+            let real_parts = BonePartitionSet::from_ltx(&real_doc);
+            assert_eq!(real_parts.parts.len(), 5);
+            assert_eq!(real_parts.part_id("default"), Some(0));
+            assert_eq!(real_parts.part_id("left_hand"), Some(1));
+            assert_eq!(real_parts.part_id("right_hand"), Some(2));
+            let p1 = real_parts.part(1).unwrap();
+            assert!(p1.bone_names.iter().any(|b| b == "l_clavicle"));
+            let p2 = real_parts.part(2).unwrap();
+            assert!(p2.bone_names.iter().any(|b| b == "lead_gun"));
         }
     }
 }

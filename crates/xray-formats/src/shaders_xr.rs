@@ -13,7 +13,23 @@ use xray_core::ltx_loader::OwnedLtxDocument;
 use xray_core::LtxDocument;
 
 use crate::chunk::{ByteCursor, ChunkReader, FormatError};
-use crate::ogf::XRayMatrix;
+use crate::ogf::{matrix_invert_43, matrix_mul_43, XRayMatrix, XRAY_IDENTITY_MATRIX};
+
+/// `CMatrix` evaluation mode (`src/Layers/xrRender/SH_Matrix.h:13`).
+pub mod matrix_mode {
+    pub const PROGRAMMABLE: u32 = 0;
+    pub const TCM: u32 = 1;
+    pub const S_REFL: u32 = 2;
+    pub const C_REFL: u32 = 3;
+    pub const DETAIL: u32 = 4;
+}
+
+/// `CMatrix` texture-coordinate modifier mask bits (`src/Layers/xrRender/SH_Matrix.h:15-21`).
+pub mod tcm_flags {
+    pub const SCALE: u32 = 1 << 0;
+    pub const ROTATE: u32 = 1 << 1;
+    pub const SCROLL: u32 = 1 << 2;
+}
 
 pub const SHADER_XRLC_ENTRY_SIZE: usize = 144;
 pub const CBLENDER_DESC_SIZE: usize = 176;
@@ -175,6 +191,104 @@ pub struct ShaderMatrix {
     pub tcm: u32,
     /// `[scale_u, scale_v, rotate, scroll_u, scroll_v]` waveforms.
     pub transforms: [WaveForm; 5],
+}
+
+#[inline]
+fn matrix_tc_trans(u: f32, v: f32) -> XRayMatrix {
+    let mut m = XRAY_IDENTITY_MATRIX;
+    m[2][0] = u;
+    m[2][1] = v;
+    m
+}
+
+#[inline]
+fn matrix_rotate_z(angle: f32) -> XRayMatrix {
+    let (sina, cosa) = angle.sin_cos();
+    [
+        [cosa, sina, 0.0, 0.0],
+        [-sina, cosa, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+/// Transform 2D texture coordinates `(u, v)` using X-Ray's homogeneous 3-coord `(u, v, 1)` layout (`CMatrix::tc_trans` puts translation in row 2).
+#[inline]
+pub fn transform_uv(m: &XRayMatrix, uv: [f32; 2]) -> [f32; 2] {
+    [
+        uv[0] * m[0][0] + uv[1] * m[1][0] + m[2][0],
+        uv[0] * m[0][1] + uv[1] * m[1][1] + m[2][1],
+    ]
+}
+
+impl ShaderMatrix {
+    /// Evaluate `CMatrix::Calculate()` (`src/Layers/xrRender/SH_Matrix.cpp:4-80`), keeping `prev` untouched for `PROGRAMMABLE`/`DETAIL` modes.
+    pub fn evaluate_with_prev(
+        &self,
+        prev: XRayMatrix,
+        t_global: f32,
+        view_matrix: &XRayMatrix,
+    ) -> XRayMatrix {
+        match self.mode {
+            matrix_mode::PROGRAMMABLE | matrix_mode::DETAIL => prev,
+            matrix_mode::TCM => {
+                // Exact call sequence from SH_Matrix.cpp:15-44 (`tc_trans(.5,.5)` -> `mulA_43` -> `mulB_43(-0.5,-0.5)`)
+                let mut s_u = 1.0f32;
+                let mut s_v = 1.0f32;
+                let mut xform = matrix_tc_trans(0.5, 0.5);
+                if (self.tcm & tcm_flags::ROTATE) != 0 {
+                    let rot = matrix_rotate_z(self.transforms[2].evaluate(t_global) * t_global);
+                    xform = matrix_mul_43(&rot, &xform);
+                }
+                if (self.tcm & tcm_flags::SCALE) != 0 {
+                    s_u = self.transforms[0].evaluate(t_global);
+                    s_v = self.transforms[1].evaluate(t_global);
+                    let scale = [
+                        [s_u, 0.0, 0.0, 0.0],
+                        [0.0, s_v, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ];
+                    xform = matrix_mul_43(&scale, &xform);
+                }
+                if (self.tcm & tcm_flags::SCROLL) != 0 {
+                    let u = self.transforms[3].evaluate(t_global) * t_global * s_u;
+                    let v = self.transforms[4].evaluate(t_global) * t_global * s_v;
+                    let scroll = matrix_tc_trans(u, v);
+                    xform = matrix_mul_43(&scroll, &xform);
+                }
+                let post = matrix_tc_trans(-0.5, -0.5);
+                matrix_mul_43(&xform, &post)
+            }
+            matrix_mode::S_REFL => {
+                let ux = 0.5 * view_matrix[0][0];
+                let uy = 0.5 * view_matrix[1][0];
+                let uz = 0.5 * view_matrix[2][0];
+                let vx = -0.5 * view_matrix[0][1];
+                let vy = -0.5 * view_matrix[1][1];
+                let vz = -0.5 * view_matrix[2][1];
+                [
+                    [ux, vx, 0.0, 0.0],
+                    [uy, vy, 0.0, 0.0],
+                    [uz, vz, 0.0, 0.0],
+                    [0.5, 0.5, 0.0, 0.0],
+                ]
+            }
+            matrix_mode::C_REFL => {
+                let mut m = *view_matrix;
+                m[3][0] = 0.0;
+                m[3][1] = 0.0;
+                m[3][2] = 0.0;
+                matrix_invert_43(&m).unwrap_or(XRAY_IDENTITY_MATRIX)
+            }
+            _ => prev,
+        }
+    }
+
+    /// Stateless evaluation of `CMatrix::Calculate()` starting from identity.
+    pub fn evaluate(&self, t_global: f32, view_matrix: &XRayMatrix) -> XRayMatrix {
+        self.evaluate_with_prev(XRAY_IDENTITY_MATRIX, t_global, view_matrix)
+    }
 }
 
 /// Decode X-Ray `MK_CLSID(a..h)` 64-bit value into its readable 8-char ASCII code.
@@ -996,5 +1110,92 @@ mod tests {
         assert_eq!(fogs.version, 3);
         assert_eq!(fogs.volumes[0].profile.as_deref(), Some("swamp_fog"));
         assert_eq!(fogs.volumes[0].obstacles.len(), 1);
+    }
+
+    #[test]
+    fn evaluate_shader_matrix_modes() {
+        let wf = |val: f32| WaveForm {
+            func: WaveFunction::Constant,
+            arg: [val, 0.0, 0.0, 1.0],
+        };
+
+        // 1. TCM Scale + Scroll
+        let mat_scale_scroll = ShaderMatrix {
+            name: "water_flow".to_string(),
+            mode: matrix_mode::TCM,
+            tcm: tcm_flags::SCALE | tcm_flags::SCROLL,
+            transforms: [wf(2.0), wf(3.0), wf(0.0), wf(0.25), wf(-0.5)],
+        };
+        let m = mat_scale_scroll.evaluate(2.0, &XRAY_IDENTITY_MATRIX);
+        // u_scroll = 0.25 * 2 * 2 = 1.0, v_scroll = -0.5 * 2 * 3 = -3.0
+        let uv = transform_uv(&m, [0.5, 0.25]);
+        assert!((uv[0] - (0.5 * 2.0 + 1.0)).abs() < 1e-5);
+        assert!((uv[1] - (0.25 * 3.0 - 3.0)).abs() < 1e-5);
+
+        // 2. TCM Rotate (90 deg at t = 1.0)
+        let mat_rot = ShaderMatrix {
+            name: "rot90".to_string(),
+            mode: matrix_mode::TCM,
+            tcm: tcm_flags::ROTATE,
+            transforms: [wf(1.0), wf(1.0), wf(std::f32::consts::FRAC_PI_2), wf(0.0), wf(0.0)],
+        };
+        let mr = mat_rot.evaluate(1.0, &XRAY_IDENTITY_MATRIX);
+        let uvr = transform_uv(&mr, [1.0, 0.0]);
+        assert!((uvr[0] - 0.0).abs() < 1e-5);
+        assert!((uvr[1] - 1.0).abs() < 1e-5);
+
+        // 3. S_REFL spherical projection from view matrix
+        let mut view = crate::ogf::matrix_set_hpb(0.0, 0.0, 0.0);
+        view[3][0] = 12.0;
+        view[3][1] = -4.0;
+        view[3][2] = 7.0;
+        let s_refl = ShaderMatrix {
+            name: "$s_refl".to_string(),
+            mode: matrix_mode::S_REFL,
+            tcm: 0,
+            transforms: [wf(0.0); 5],
+        };
+        let ms = s_refl.evaluate(0.0, &view);
+        assert!((ms[0][0] - 0.5).abs() < 1e-6);
+        assert!((ms[1][1] - (-0.5)).abs() < 1e-6);
+        assert!((ms[3][0] - 0.5).abs() < 1e-6);
+        assert!((ms[3][1] - 0.5).abs() < 1e-6);
+        assert_eq!(ms[3][3], 0.0);
+
+        // 4. C_REFL view-rotation inverse without translation
+        let view_rot = crate::ogf::matrix_set_hpb(0.4, -0.2, 0.1);
+        let mut view_with_trans = view_rot;
+        view_with_trans[3][0] = 99.0;
+        view_with_trans[3][1] = -42.0;
+        view_with_trans[3][2] = 17.0;
+        let c_refl = ShaderMatrix {
+            name: "$c_refl".to_string(),
+            mode: matrix_mode::C_REFL,
+            tcm: 0,
+            transforms: [wf(0.0); 5],
+        };
+        let mc = c_refl.evaluate(0.0, &view_with_trans);
+        assert_eq!([mc[3][0], mc[3][1], mc[3][2]], [0.0, 0.0, 0.0]);
+        let prod = matrix_mul_43(&view_rot, &mc);
+        for r in 0..4 {
+            for c in 0..4 {
+                assert!((prod[r][c] - XRAY_IDENTITY_MATRIX[r][c]).abs() < 1e-5);
+            }
+        }
+
+        // 5. PROGRAMMABLE preserves previous matrix
+        let custom = [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let prog = ShaderMatrix {
+            name: "$prog".to_string(),
+            mode: matrix_mode::PROGRAMMABLE,
+            tcm: 0,
+            transforms: [wf(0.0); 5],
+        };
+        assert_eq!(prog.evaluate_with_prev(custom, 3.0, &view_with_trans), custom);
     }
 }
