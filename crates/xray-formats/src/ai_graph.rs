@@ -599,6 +599,23 @@ impl LevelCrossTable {
     pub fn game_vertex_for_level_vertex(&self, level_vertex_id: u32) -> Option<&CrossTableCell> {
         self.cells.get(level_vertex_id as usize)
     }
+
+    /// Encode header + cell array in raw unchunked layout (`game.graph` embedded format).
+    pub fn to_raw_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(44 + self.cells.len() * 6);
+        out.extend_from_slice(&self.header.version.to_le_bytes());
+        out.extend_from_slice(&(self.cells.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32::from(self.header.game_vertex_count).to_le_bytes());
+        out.extend_from_slice(&self.header.level_guid[0].to_le_bytes());
+        out.extend_from_slice(&self.header.level_guid[1].to_le_bytes());
+        out.extend_from_slice(&self.header.game_guid[0].to_le_bytes());
+        out.extend_from_slice(&self.header.game_guid[1].to_le_bytes());
+        for cell in &self.cells {
+            out.extend_from_slice(&cell.game_vertex_id.to_le_bytes());
+            out.extend_from_slice(&cell.distance.to_le_bytes());
+        }
+        out
+    }
 }
 
 /// Level descriptor in `game.graph` header (`GameGraph::SLevel`).
@@ -907,6 +924,71 @@ impl GameGraph {
         }
 
         None
+    }
+
+    /// Encode this `GameGraph` into binary `game.graph` / `all.spawn` Chunk 4 wire format.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(self.header.version);
+        out.extend_from_slice(&(self.vertices.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(self.edges.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.death_points.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.header.guid[0].to_le_bytes());
+        out.extend_from_slice(&self.header.guid[1].to_le_bytes());
+        out.push(self.header.levels.len() as u8);
+
+        for lvl in &self.header.levels {
+            out.extend_from_slice(lvl.name.as_bytes());
+            out.push(0);
+            for f in lvl.offset {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+            out.push(lvl.id);
+            out.extend_from_slice(lvl.section.as_bytes());
+            out.push(0);
+            out.extend_from_slice(&lvl.guid[0].to_le_bytes());
+            out.extend_from_slice(&lvl.guid[1].to_le_bytes());
+        }
+
+        for v in &self.vertices {
+            for f in v.local_point {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+            for f in v.global_point {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+            let packed = u32::from(v.level_id) | (v.level_vertex_id << 8);
+            out.extend_from_slice(&packed.to_le_bytes());
+            out.extend_from_slice(&v.vertex_types);
+            out.extend_from_slice(&v.edge_offset.to_le_bytes());
+            out.extend_from_slice(&v.point_offset.to_le_bytes());
+            out.push(v.neighbour_count);
+            out.push(v.death_point_count);
+        }
+
+        for e in &self.edges {
+            out.extend_from_slice(&e.target_vertex_id.to_le_bytes());
+            out.extend_from_slice(&e.distance.to_le_bytes());
+        }
+
+        for dp in &self.death_points {
+            for f in dp.point {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+            out.extend_from_slice(&dp.level_vertex_id.to_le_bytes());
+            out.extend_from_slice(&dp.distance.to_le_bytes());
+        }
+
+        let mut sorted_ct: Vec<&(u8, LevelCrossTable)> = self.cross_tables.iter().collect();
+        sorted_ct.sort_by_key(|(id, _)| *id);
+        for (_, ct) in sorted_ct {
+            let raw = ct.to_raw_bytes();
+            let block_len = (4 + raw.len()) as u32;
+            out.extend_from_slice(&block_len.to_le_bytes());
+            out.extend_from_slice(&raw);
+        }
+
+        out
     }
 }
 

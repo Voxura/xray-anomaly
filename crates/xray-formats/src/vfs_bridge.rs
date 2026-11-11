@@ -9,11 +9,15 @@ use crate::ai_graph::{GameGraph, LevelCrossTable, LevelGraph};
 use crate::cform::CformModel;
 use crate::chunk::FormatError;
 use crate::details::{DetailMesh, LevelDetails};
+use crate::envelopes::{ObjectMotion, PostprocessEffect};
 use crate::gamemtl::GameMaterialLibrary;
 use crate::hom::HomMesh;
 use crate::level::{LevelData, LevelGeometry};
 use crate::ogf::{OgfModel, OgfTextureLink};
 use crate::omf::OmfMotions;
+use crate::particles::{
+    BloodWallmarksConfig, ParticleEffectDef, ParticleGroupDef, ParticlesLibrary,
+};
 use crate::shaders_xr::{
     EngineShaderLibrary, LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles,
     ShaderXrlcLibrary,
@@ -21,6 +25,7 @@ use crate::shaders_xr::{
 use crate::sound_env::{
     LevelSoundEnv, LevelStaticSounds, SoundEnvironmentLibrary, SoundOcclusionMesh,
 };
+use crate::spawns::{AlifeSpawnArchive, LevelGameData, LevelSpawnData, PatrolPath};
 use crate::thm::{
     strip_texture_extension, texture_stem_to_dds_vpath, texture_stem_to_thm_vpath,
     ResolvedTextureLinks, TextureParams,
@@ -414,6 +419,174 @@ pub fn load_fog_volumes_from_vfs(
     Ok(LevelFogVolumes::parse(&bytes)?)
 }
 
+fn ensure_extension_ci(trimmed: &str, ext: &[u8]) -> String {
+    if trimmed.len() >= ext.len()
+        && trimmed.as_bytes()[trimmed.len() - ext.len()..].eq_ignore_ascii_case(ext)
+    {
+        trimmed.to_string()
+    } else {
+        let ext_str = std::str::from_utf8(ext).unwrap_or("");
+        format!("{trimmed}{ext_str}")
+    }
+}
+
+/// Stream `$game_data$/particles.xr` and merge loose `particles\*.pe` / `*.pg` LTX definitions
+/// with Anomaly precedence (loose `.pe`/`.pg` files override compiled definitions).
+pub fn load_particles_from_vfs(vfs: &VirtualFileSystem) -> Result<ParticlesLibrary, AssetLoadError> {
+    let has_xr = vfs.exists("$game_data$/particles.xr");
+    let mut lib = if has_xr {
+        let bytes = vfs.read_bytes("$game_data$/particles.xr")?;
+        ParticlesLibrary::parse(&bytes)?
+    } else {
+        ParticlesLibrary::default()
+    };
+
+    let particle_files = vfs.list_files("particles")?;
+    let mut loose_effects = Vec::new();
+    let mut loose_groups = Vec::new();
+
+    for vpath in particle_files {
+        let rel = vpath.strip_prefix("particles\\").unwrap_or(&vpath);
+        if rel.len() > 3 && rel.as_bytes()[rel.len() - 3..].eq_ignore_ascii_case(b".pe") {
+            let name = &rel[..rel.len() - 3];
+            let text = vfs.read_to_string_lossy(&vpath)?;
+            loose_effects.push(ParticleEffectDef::from_pe_ltx(name, &text)?);
+        } else if rel.len() > 3 && rel.as_bytes()[rel.len() - 3..].eq_ignore_ascii_case(b".pg") {
+            let name = &rel[..rel.len() - 3];
+            let text = vfs.read_to_string_lossy(&vpath)?;
+            loose_groups.push(ParticleGroupDef::from_pg_ltx(name, &text)?);
+        }
+    }
+
+    if !has_xr && loose_effects.is_empty() && loose_groups.is_empty() {
+        return Err(AssetLoadError::Vfs(VfsError::FileNotFound));
+    }
+
+    lib.merge_loose(loose_effects, loose_groups);
+    Ok(lib)
+}
+
+/// Load a blood wallmarks LTX section (e.g. `[m_blood_marks]`) via `load_ltx_tree_from_vfs`.
+pub fn load_blood_wallmarks_from_vfs(
+    vfs: &VirtualFileSystem,
+    ltx_virtual_path: &str,
+    section: &str,
+) -> Result<BloodWallmarksConfig, AssetLoadError> {
+    let doc = load_ltx_tree_from_vfs(vfs, ltx_virtual_path, &[])?;
+    Ok(BloodWallmarksConfig::from_ltx_doc(&doc, section)?)
+}
+
+/// Stream a camera / object `.anm` motion file from `$game_anims$/` (or explicit VFS path).
+pub fn load_anm_from_vfs(
+    vfs: &VirtualFileSystem,
+    reference_or_path: &str,
+) -> Result<ObjectMotion, AssetLoadError> {
+    let trimmed = reference_or_path.trim();
+    let with_ext = ensure_extension_ci(trimmed, b".anm");
+    let candidate = if with_ext.starts_with('$') {
+        with_ext
+    } else {
+        let norm = normalize_virtual_path(&with_ext)?;
+        if norm.starts_with("anims\\") {
+            norm
+        } else {
+            format!("anims\\{norm}")
+        }
+    };
+    let bytes = vfs.read_bytes(&candidate)?;
+    Ok(ObjectMotion::parse(&bytes)?)
+}
+
+/// Stream a `.ppe` postprocess effect (`CPostprocessAnimator::Load`: checks `level_dir` first, then `$game_anims$/`).
+pub fn load_ppe_from_vfs(
+    vfs: &VirtualFileSystem,
+    reference_or_path: &str,
+    level_dir: Option<&str>,
+) -> Result<PostprocessEffect, AssetLoadError> {
+    let trimmed = reference_or_path.trim();
+    let with_ext = ensure_extension_ci(trimmed, b".ppe");
+
+    if with_ext.starts_with('$') {
+        let bytes = vfs.read_bytes(&with_ext)?;
+        return Ok(PostprocessEffect::parse(&bytes)?);
+    }
+
+    if let Some(dir) = level_dir {
+        let dir_clean = dir.trim().trim_end_matches(['/', '\\']);
+        if !dir_clean.is_empty() {
+            let rel_clean = with_ext.trim_start_matches(['/', '\\']);
+            let level_candidate = format!("{dir_clean}/{rel_clean}");
+            if vfs.exists(&level_candidate) {
+                let bytes = vfs.read_bytes(&level_candidate)?;
+                return Ok(PostprocessEffect::parse(&bytes)?);
+            }
+        }
+    }
+
+    let norm = normalize_virtual_path(&with_ext)?;
+    let anim_candidate = if norm.starts_with("anims\\") {
+        norm
+    } else {
+        format!("anims\\{norm}")
+    };
+    let bytes = vfs.read_bytes(&anim_candidate)?;
+    Ok(PostprocessEffect::parse(&bytes)?)
+}
+
+/// Stream `level.game` (RPoints & PatrolPaths; accepts full path or level directory).
+pub fn load_level_game_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<LevelGameData, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.game");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelGameData::parse(&bytes)?)
+}
+
+/// Stream Anomaly `$game_configs$/patrol_paths.ltx` (+ optional DLTX overrides) into `Vec<PatrolPath>`.
+pub fn load_patrol_paths_ltx_from_vfs(
+    vfs: &VirtualFileSystem,
+    dltx_mod_paths: &[&str],
+) -> Result<Vec<PatrolPath>, AssetLoadError> {
+    let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/patrol_paths.ltx", dltx_mod_paths)?;
+    Ok(PatrolPath::parse_all_ltx_doc(&doc)?)
+}
+
+/// Stream `level.spawn` (`M_SPAWN` entity list; accepts full path or level directory).
+pub fn load_level_spawn_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<LevelSpawnData, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.spawn");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelSpawnData::parse(&bytes)?)
+}
+
+/// Stream compiled `all.spawn` (or `<name>.spawn` under `$game_spawns$/`).
+pub fn load_all_spawn_from_vfs(
+    vfs: &VirtualFileSystem,
+    spawn_name_or_path: &str,
+) -> Result<AlifeSpawnArchive, AssetLoadError> {
+    let trimmed = spawn_name_or_path.trim();
+    let with_ext = if trimmed.is_empty() {
+        "all.spawn".to_string()
+    } else {
+        ensure_extension_ci(trimmed, b".spawn")
+    };
+    let candidate = if with_ext.starts_with('$') {
+        with_ext
+    } else {
+        let norm = normalize_virtual_path(&with_ext)?;
+        if norm.starts_with("spawns\\") {
+            norm
+        } else {
+            format!("spawns\\{norm}")
+        }
+    };
+    let bytes = vfs.read_bytes(&candidate)?;
+    Ok(AlifeSpawnArchive::parse(&bytes)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,6 +741,9 @@ mod tests {
         )
         .unwrap();
         assert!(!knife_cfg.read_bool("wpn_knife", "firepos", true));
+
+        let real_patrols = load_patrol_paths_ltx_from_vfs(&vfs, &[]).unwrap();
+        assert!(real_patrols.is_empty());
     }
 
     #[test]
@@ -1176,5 +1352,288 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn test_stream_particles_envelopes_and_spawns_from_vfs() {
+        use crate::ai_graph::{
+            GameDeathPoint, GameGraph, GameGraphHeader, GameLevelInfo, GameVertex,
+            XRAI_CURRENT_VERSION,
+        };
+        use crate::envelopes::{
+            Envelope, EnvelopeBehavior, EnvelopeKey, EnvelopeShape, ObjectMotion,
+            PostprocessColorCurve, PostprocessEffect, EOBJ_OMOTION_VERSION,
+            POSTPROCESS_FILE_VERSION,
+        };
+        use crate::particles::{ped_flags, ParticleEffectDef, ParticlesLibrary};
+        use crate::spawns::{
+            alife_object_flags, cse_spawn_flags, m_spawn_flags, AlifeObjectState,
+            AlifeSpawnArchive, LevelGameData, PatrolEdge, PatrolPoint, RPoint, RPointType,
+            SpawnHeader, SpawnPacket, SpawnVertex, INVALID_SPAWN_STORY_ID, INVALID_STORY_ID,
+            M_UPDATE, SPAWN_VERSION,
+        };
+
+        // 1. particles.xr + loose .pe override + .pg group + wallmarks.ltx
+        let base_eff = ParticleEffectDef {
+            name: "pfx\\sparks".to_string(),
+            flags: ped_flags::DF_SPRITE,
+            max_particles: 16,
+            update_step_ms: 33,
+            shader: Some("effects\\add".to_string()),
+            texture: Some("fx\\fx_spark".to_string()),
+            frame: None,
+            time_limit: None,
+            collision: None,
+            velocity_scale: None,
+            align_to_path_rotation: None,
+            actions: vec![],
+        };
+        let pxr_raw = ParticlesLibrary {
+            effects: vec![base_eff],
+            groups: vec![],
+        }
+        .to_bytes();
+
+        let pe_override = b"[_effect]\nversion = 1\nmax_particles = 96\nupdate_step = 25\nflags = 0\naction_count = 0\n";
+        let pg_ltx = b"[_group]\nflags = 0\neffects_count = 1\ntimelimit = 3.0\n\n[effect_0000]\neffect_name = pfx\\sparks\non_play_child =\non_birth_child =\non_death_child =\ntime0 = 0.0\ntime1 = 3.0\nflags = 4\n";
+        let wm_ltx = b"[m_blood_marks]\nwallmarks = wm\\wm_blood_1\nmin_size = 0.4\nmax_size = 1.1\ndist = 2.0\nnominal_hit = 0.5\nblood_drops = wm\\wm_blood_drop_1\nstart_blood_size = 0.3\nstop_blood_size = 0.02\nblood_drop_size = 0.1\n";
+
+        // 2. .anm and .ppe (level override + global $game_anims$)
+        let lin = |time: f32, value: f32| EnvelopeKey {
+            value,
+            time,
+            shape: EnvelopeShape::Linear,
+            ..EnvelopeKey::default()
+        };
+        let env_const = |v: f32| Envelope {
+            behavior: [EnvelopeBehavior::Constant, EnvelopeBehavior::Constant],
+            keys: vec![lin(0.0, v)],
+        };
+        let anm_raw = ObjectMotion {
+            name: "cam_cutscene".to_string(),
+            frame_start: 0,
+            frame_end: 30,
+            fps: 30.0,
+            version: EOBJ_OMOTION_VERSION,
+            envelopes: [
+                env_const(4.0),
+                env_const(5.0),
+                env_const(6.0),
+                env_const(0.5),
+                env_const(0.25),
+                env_const(0.0),
+            ],
+        }
+        .to_bytes();
+
+        let ppe_global = PostprocessEffect {
+            version: POSTPROCESS_FILE_VERSION,
+            base_color: PostprocessColorCurve::default(),
+            add_color: PostprocessColorCurve::default(),
+            gray_color: PostprocessColorCurve::default(),
+            gray: env_const(0.2),
+            blur: Envelope::default(),
+            duality_h: Envelope::default(),
+            duality_v: Envelope::default(),
+            noise_intensity: Envelope::default(),
+            noise_granularity: Envelope::default(),
+            noise_fps: Envelope::default(),
+            cm_influence: Envelope::default(),
+            cm_tex1: String::new(),
+        }
+        .to_bytes();
+
+        let mut ppe_level_eff = PostprocessEffect::parse(&ppe_global).unwrap();
+        ppe_level_eff.gray = env_const(0.9);
+        let ppe_level = ppe_level_eff.to_bytes();
+
+        // 3. level.game + patrol_paths.ltx (+ DLTX override) + level.spawn + all.spawn
+        let patrol = PatrolPath {
+            name: "esc_guard_walk".to_string(),
+            level_override: None,
+            way_type: 0,
+            points: vec![
+                PatrolPoint {
+                    vertex_id: 0,
+                    name: "wp00".to_string(),
+                    pos: [0.0, 0.0, 0.0],
+                    flags: 1,
+                    level_vertex_id: 10,
+                    game_vertex_id: 0,
+                },
+                PatrolPoint {
+                    vertex_id: 1,
+                    name: "wp01".to_string(),
+                    pos: [10.0, 0.0, 0.0],
+                    flags: 2,
+                    level_vertex_id: 11,
+                    game_vertex_id: 0,
+                },
+            ],
+            edges: vec![PatrolEdge {
+                from: 0,
+                to: 1,
+                probability: 1.0,
+            }],
+        };
+        let level_game_raw = LevelGameData {
+            rpoints: vec![RPoint {
+                pos: [1.0, 2.0, 3.0],
+                rot: [0.0, 0.5, 0.0],
+                team: 1,
+                point_type: RPointType::ItemSpawn,
+                game_type: u16::MAX,
+                rp_profile: Some("medkit".to_string()),
+            }],
+            patrol_paths: vec![patrol.clone()],
+        }
+        .to_bytes();
+
+        let patrol_ltx = b"[esc_guard_walk]\npoints = p0\np0:name = wp00\np0:position = 1,2,3\np0:level_vertex_id = 5\np0:game_vertex_id = 0\n";
+        let patrol_dltx = b"![esc_guard_walk]\np0:flags = 7\n";
+
+        let state_raw = AlifeObjectState {
+            game_vertex_id: 0,
+            distance: 0.0,
+            direct_control: true,
+            level_vertex_id: 10,
+            flags: cse_spawn_flags::ENABLED | alife_object_flags::USED_AI_LOCATIONS,
+            custom_data: "[logic]\nactive = walker\n".to_string(),
+            story_id: INVALID_STORY_ID,
+            spawn_story_id: INVALID_SPAWN_STORY_ID,
+            subclass_payload: vec![],
+        }
+        .to_bytes();
+        let spawn_pkt = SpawnPacket {
+            section: "stalker".to_string(),
+            name_replace: "esc_wolf".to_string(),
+            game_id_legacy: 0,
+            rp: 0xFE,
+            position: [1.0, 0.0, 2.0],
+            angle: [0.0; 3],
+            respawn_time: 0,
+            id: 0xFFFF,
+            parent_id: 0xFFFF,
+            phantom_id: 0xFFFF,
+            flags: m_spawn_flags::OBJECT_LOCAL | m_spawn_flags::VERSION,
+            version: SPAWN_VERSION,
+            game_type: u16::MAX,
+            script_version: 10,
+            client_data: vec![],
+            spawn_id: 0,
+            state_payload: state_raw,
+            trailing_update_payload: vec![],
+        };
+        let level_spawn_raw = crate::spawns::LevelSpawnData {
+            spawns: vec![spawn_pkt.clone()],
+        }
+        .to_bytes();
+
+        let gg = GameGraph {
+            header: GameGraphHeader {
+                version: XRAI_CURRENT_VERSION as u8,
+                vertex_count: 1,
+                edge_count: 0,
+                death_point_count: 0,
+                guid: [0x11, 0x22],
+                levels: vec![GameLevelInfo {
+                    name: "l01_escape".to_string(),
+                    offset: [0.0; 3],
+                    id: 1,
+                    section: "level01".to_string(),
+                    guid: [0x33, 0x44],
+                }],
+            },
+            vertices: vec![GameVertex {
+                local_point: [0.0; 3],
+                global_point: [0.0; 3],
+                level_id: 1,
+                level_vertex_id: 10,
+                vertex_types: [0; 4],
+                edge_offset: 0,
+                point_offset: 0,
+                neighbour_count: 0,
+                death_point_count: 0,
+            }],
+            edges: vec![],
+            death_points: vec![],
+            cross_tables: vec![],
+        };
+        let mut graph_guid = [0u8; 16];
+        graph_guid[0..8].copy_from_slice(&0x11u64.to_le_bytes());
+        graph_guid[8..16].copy_from_slice(&0x22u64.to_le_bytes());
+        let all_spawn_raw = AlifeSpawnArchive {
+            header: SpawnHeader {
+                version: XRAI_CURRENT_VERSION,
+                guid: [0xAA; 16],
+                graph_guid,
+                spawn_count: 1,
+                level_count: 1,
+            },
+            spawns: vec![SpawnVertex {
+                spawn_id: 0,
+                spawn: spawn_pkt,
+                update_packet: M_UPDATE.to_le_bytes().to_vec(),
+            }],
+            edges: vec![],
+            artefact_spawn_positions: vec![GameDeathPoint {
+                point: [3.0, 0.0, 4.0],
+                level_vertex_id: 10,
+                distance: 1.5,
+            }],
+            patrol_paths: vec![patrol],
+            game_graph: gg,
+        }
+        .to_bytes();
+
+        let entries = vec![
+            ("particles.xr", pxr_raw.clone(), compress_lzo1x(&pxr_raw)),
+            ("particles\\pfx\\sparks.pe", pe_override.to_vec(), pe_override.to_vec()),
+            ("particles\\anom\\fire.pg", pg_ltx.to_vec(), pg_ltx.to_vec()),
+            ("configs\\creatures\\blood.ltx", wm_ltx.to_vec(), wm_ltx.to_vec()),
+            ("anims\\cam_cutscene.anm", anm_raw.clone(), compress_lzo1x(&anm_raw)),
+            ("anims\\fade.ppe", ppe_global.clone(), compress_lzo1x(&ppe_global)),
+            ("levels\\test_lvl\\fade.ppe", ppe_level.clone(), compress_lzo1x(&ppe_level)),
+            ("levels\\test_lvl\\level.game", level_game_raw.clone(), compress_lzo1x(&level_game_raw)),
+            ("configs\\patrol_paths.ltx", patrol_ltx.to_vec(), patrol_ltx.to_vec()),
+            ("configs\\mod_patrol_paths.ltx", patrol_dltx.to_vec(), patrol_dltx.to_vec()),
+            ("levels\\test_lvl\\level.spawn", level_spawn_raw.clone(), compress_lzo1x(&level_spawn_raw)),
+            ("spawns\\all.spawn", all_spawn_raw.clone(), compress_lzo1x(&all_spawn_raw)),
+        ];
+
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_bytes("assets_p2.db0", pack_synthetic_db(entries))
+            .unwrap();
+
+        let plib = load_particles_from_vfs(&vfs).unwrap();
+        assert_eq!(plib.find_effect("pfx\\sparks").unwrap().max_particles, 96);
+        assert_eq!(plib.find_group("anom\\fire").unwrap().effects[0].effect_name, "pfx\\sparks");
+
+        let wm = load_blood_wallmarks_from_vfs(&vfs, "$game_configs$/creatures/blood.ltx", "m_blood_marks").unwrap();
+        assert_eq!(wm.wallmarks.textures, vec!["wm\\wm_blood_1"]);
+
+        let mot = load_anm_from_vfs(&vfs, "cam_cutscene").unwrap();
+        assert_eq!(mot.evaluate(0.0), ([4.0, 5.0, 6.0], [0.25, 0.5, 0.0]));
+
+        // Level-local fade.ppe overrides $game_anims$/fade.ppe; without level_dir uses $game_anims$
+        let ppe_l = load_ppe_from_vfs(&vfs, "fade.ppe", Some("levels/test_lvl")).unwrap();
+        assert!((ppe_l.evaluate(0.0).gray - 0.9).abs() < 1e-5);
+        let ppe_g = load_ppe_from_vfs(&vfs, "fade.ppe", None).unwrap();
+        assert!((ppe_g.evaluate(0.0).gray - 0.2).abs() < 1e-5);
+
+        let lgame = load_level_game_from_vfs(&vfs, "levels/test_lvl").unwrap();
+        assert_eq!(lgame.rpoints[0].rp_profile.as_deref(), Some("medkit"));
+        assert_eq!(lgame.find_patrol_path("esc_guard_walk").unwrap().points.len(), 2);
+
+        let ppaths = load_patrol_paths_ltx_from_vfs(&vfs, &["$game_configs$/mod_patrol_paths.ltx"]).unwrap();
+        assert_eq!(ppaths[0].points[0].flags, 7);
+
+        let lspawn = load_level_spawn_from_vfs(&vfs, "levels/test_lvl").unwrap();
+        assert_eq!(lspawn.spawns[0].decode_alife_state().unwrap().level_vertex_id, 10);
+
+        let aspawn = load_all_spawn_from_vfs(&vfs, "all").unwrap();
+        assert_eq!(aspawn.spawns[0].spawn.name_replace, "esc_wolf");
+        assert_eq!(aspawn.artefact_spawn_positions.len(), 1);
+        assert_eq!(aspawn.game_graph.header.levels[0].name, "l01_escape");
     }
 }
