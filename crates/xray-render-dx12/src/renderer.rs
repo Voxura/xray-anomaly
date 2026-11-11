@@ -288,7 +288,13 @@ impl Dx12Renderer {
     }
 
     /// Upload a DDS texture into GPU VRAM (default heap) and register into the bindless descriptor heap.
+    /// Automatically deduplicates repeated texture requests across sub-meshes and materials.
     pub fn load_texture_from_dds(&mut self, name: &str, bytes: &[u8]) -> WinResult<DescriptorIndex> {
+        let normalized_name = name.to_ascii_lowercase().replace('\\', "/");
+        if let Some(existing) = self.textures.get_by_name(&normalized_name) {
+            return Ok(existing.descriptor_index);
+        }
+
         let dds = crate::texture::parse_dds(bytes).map_err(|_| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
 
         let descriptor_index = self
@@ -338,13 +344,14 @@ impl Dx12Renderer {
             format: dds.format,
         };
 
-        self.textures.insert(name.to_string(), gpu_tex);
+        self.textures.insert(normalized_name, gpu_tex);
         Ok(descriptor_index)
     }
 
-    /// Retrieve loaded texture metadata and GPU resource by name
+    /// Retrieve loaded texture metadata and GPU resource by name (case- and slash-normalized)
     pub fn get_texture(&self, name: &str) -> Option<&GpuTexture> {
-        self.textures.get_by_name(name)
+        let normalized = name.to_ascii_lowercase().replace('\\', "/");
+        self.textures.get_by_name(&normalized)
     }
 
     /// Retrieve loaded texture metadata and GPU resource by bindless descriptor index
@@ -448,6 +455,13 @@ mod tests {
             let tex_by_idx = renderer.get_texture_by_index(idx).expect("Texture not found by descriptor index");
             assert_eq!(tex_by_idx.width, 4);
             assert_eq!(tex_by_idx.height, 4);
+
+            // Verify deduplication: re-requesting with case or slash variations returns existing descriptor
+            let idx_duplicate = renderer
+                .load_texture_from_dds("ACT_STALKER_ALBEDO", &dds)
+                .expect("Failed to query deduplicated texture");
+            assert_eq!(idx_duplicate, idx);
+            assert_eq!(renderer.bindless_allocator.allocated_count(), 1);
         }
     }
 }
