@@ -12,12 +12,15 @@
 //! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, and skeletal mesh + bone/IK parser
 //! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
 //! - `particles`: `particles.xr` / loose `.pe` & `.pg` PAPI bytecode systems + LTX blood wallmark configs (no binary `level.wallmarks` in Anomaly/CoP)
+//! - `savegames`: Anomaly `.scop` LZO1X ALife savegame reader/writer (`GameDateTime`, spawn header, dynamic objects & 7 binary registries)
 //! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
 //! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, OMF pose evaluation & `1W`–`4W` CPU skinning
 //! - `sound_env`: `senvironment.xr` v4/v5, `level.som` BVH acoustic occlusion, `level.snd_env` & `level.snd_static`
 //! - `spawns`: `level.game` (`RPoint`/`PatrolPath`), `patrol_paths.ltx`, `level.spawn`, `all.spawn` (`AlifeSpawnArchive`) & `NET_Packet` entity spawn/state codecs
 //! - `thm`: X-Ray `.thm` / `.ltx` texture descriptor parser (`_bump` / `_bump#` / detail / material links)
-//! - `vfs_bridge`: Direct `xray-vfs` streaming integration for `.ogf`, `.omf`, `.thm`, `gamemtl.xr`, `particles`, `.anm`/`.ppe`, `level*`/`all.spawn`, `.dm` & DLTX `.ltx` trees
+//! - `weather`: Weather cycles (`weathers\*.ltx`), weather effects, sun positions, ambients, lens flares, thunderbolts & atmospheric mixer
+//! - `xml_ui`: Pure-Rust Windows-1251/UTF-8 UI XML DOM (`#include` & `a:b:c` nav), localization tables, UI atlases & color defs
+//! - `vfs_bridge`: Direct `xray-vfs` streaming integration across all binary/LTX/XML/savegame assets
 
 pub mod ai_graph;
 pub mod cform;
@@ -30,12 +33,15 @@ pub mod level;
 pub mod ogf;
 pub mod omf;
 pub mod particles;
+pub mod savegames;
 pub mod shaders_xr;
 pub mod skinning;
 pub mod sound_env;
 pub mod spawns;
 pub mod thm;
 pub mod vfs_bridge;
+pub mod weather;
+pub mod xml_ui;
 
 pub use ai_graph::{
     pv_compress_normal, pv_decompress_normal, AiGraphHeader, AiVertex, CrossTableCell,
@@ -97,6 +103,13 @@ pub use particles::{
     StaticWallmarkRecord, WallmarkSlotConfig, WallmarkVertex, PARTICLE_DOMAIN_BINARY_SIZE,
     PED_VERSION, PGD_VERSION, PS_VERSION,
 };
+pub use savegames::{
+    compress_scop, decompress_scop, validate_scop_header, ActorStatDetail, ActorStatSection,
+    GameDateTime, GameNewsEntry, GameTaskRegistryData, RelationData, SaveGameTime,
+    SaveObjectRecord, SaveRegistries, SaveSpawnHeader, SavedGameTask, SavedMapLocation,
+    SavedTaskScriptHelper, SavegameFile, ALIFE_CHUNK_DATA, ALIFE_VERSION, GAME_TIME_CHUNK_DATA,
+    OBJECT_CHUNK_DATA, REGISTRY_CHUNK_DATA, SAVE_EXTENSION, SAVE_MAGIC, SPAWN_CHUNK_DATA,
+};
 pub use shaders_xr::{
     clsid_to_string, env_mod_flags, shader_xrlc_flags, BlenderDesc, BlenderProperty,
     BlenderPropertyValue, BlenderShader, EngineShaderLibrary, EnvModAccum, EnvModifier, FogVolume,
@@ -126,13 +139,28 @@ pub use thm::{
 };
 pub use vfs_bridge::{
     load_all_spawn_from_vfs, load_anm_from_vfs, load_blood_wallmarks_from_vfs, load_cform_from_vfs,
-    load_details_from_vfs, load_dm_from_vfs, load_env_mods_from_vfs, load_fog_volumes_from_vfs,
-    load_game_graph_from_vfs, load_gamemtl_from_vfs, load_hom_from_vfs, load_level_ai_from_vfs,
-    load_level_from_vfs, load_level_game_from_vfs, load_level_gct_from_vfs,
-    load_level_geometry_from_vfs, load_level_sound_env_from_vfs, load_level_spawn_from_vfs,
-    load_ltx_tree_from_vfs, load_ogf_from_vfs, load_omf_from_vfs, load_particles_from_vfs,
-    load_patrol_paths_ltx_from_vfs, load_ppe_from_vfs, load_ps_static_from_vfs,
-    load_shaders_xr_from_vfs, load_shaders_xrlc_from_vfs, load_som_from_vfs,
-    load_sound_environments_from_vfs, load_static_sounds_from_vfs, load_thm_from_vfs,
-    resolve_ogf_texture_links, AssetLoadError, VfsLtxProvider,
+    load_color_defs_from_vfs, load_details_from_vfs, load_dm_from_vfs, load_env_mods_from_vfs,
+    load_fog_volumes_from_vfs, load_game_graph_from_vfs, load_gamemtl_from_vfs, load_hom_from_vfs,
+    load_level_ai_from_vfs, load_level_from_vfs, load_level_game_from_vfs,
+    load_level_gct_from_vfs, load_level_geometry_from_vfs, load_level_sound_env_from_vfs,
+    load_level_spawn_from_vfs, load_localization_table_from_vfs, load_ltx_tree_from_vfs,
+    load_ogf_from_vfs, load_omf_from_vfs, load_particles_from_vfs, load_patrol_paths_ltx_from_vfs,
+    load_ppe_from_vfs, load_ps_static_from_vfs, load_scop_from_vfs, load_shaders_xr_from_vfs,
+    load_shaders_xrlc_from_vfs, load_som_from_vfs, load_sound_environments_from_vfs,
+    load_static_sounds_from_vfs, load_thm_from_vfs, load_ui_texture_atlases_from_vfs,
+    load_weather_library_from_vfs, load_xml_from_vfs, resolve_ogf_texture_links, AssetLoadError,
+    VfsLtxProvider, VfsXmlProvider,
+};
+pub use weather::{
+    calculate_dynamic_sun_dir, dir_from_hp, lerp_descriptors, normalize_time, parse_hhmmss_seconds,
+    parse_ltx_str, time_diff, time_weight, EnvAmbientDef, EnvAmbientEffectDef, EnvBoost,
+    EnvDescriptor, EnvGlobalParams, EnvSoundChannelDef, LensFlareDef, LensFlareElement,
+    MixedEnvironment, SunPositionsConfig, ThunderboltCollectionDef, ThunderboltDescDef,
+    ThunderboltFlareDef, WeatherCycle, WeatherLibrary, DAY_LENGTH, WFX_TRANS_TIME,
+};
+pub use xml_ui::{
+    argb_to_rgba_f32, color_argb, decode_cp1251, decode_xray_text, expand_action_placeholders,
+    expand_xml_includes, unescape_xray_newlines, LocalizationTable, UiColorDefs,
+    UiTextureAtlasMap, UiTextureRef, UiTextureRegion, UiTextDef, UiWindowDef, XmlDocument,
+    XmlFileProvider, XmlNode,
 };

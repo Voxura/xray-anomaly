@@ -18,6 +18,7 @@ use crate::omf::OmfMotions;
 use crate::particles::{
     BloodWallmarksConfig, ParticleEffectDef, ParticleGroupDef, ParticlesLibrary,
 };
+use crate::savegames::SavegameFile;
 use crate::shaders_xr::{
     EngineShaderLibrary, LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles,
     ShaderXrlcLibrary,
@@ -29,6 +30,10 @@ use crate::spawns::{AlifeSpawnArchive, LevelGameData, LevelSpawnData, PatrolPath
 use crate::thm::{
     strip_texture_extension, texture_stem_to_dds_vpath, texture_stem_to_thm_vpath,
     ResolvedTextureLinks, TextureParams,
+};
+use crate::weather::{EnvGlobalParams, SunPositionsConfig, WeatherCycle, WeatherLibrary};
+use crate::xml_ui::{
+    LocalizationTable, UiColorDefs, UiTextureAtlasMap, XmlDocument, XmlFileProvider,
 };
 
 /// Adapter implementing `xray_core::ltx_loader::LtxFileProvider` over a mounted `VirtualFileSystem`.
@@ -587,6 +592,251 @@ pub fn load_all_spawn_from_vfs(
     Ok(AlifeSpawnArchive::parse(&bytes)?)
 }
 
+/// Adapter implementing `crate::xml_ui::XmlFileProvider` over a mounted `VirtualFileSystem`.
+pub struct VfsXmlProvider<'a>(pub &'a VirtualFileSystem);
+
+impl<'a> XmlFileProvider for VfsXmlProvider<'a> {
+    type Error = VfsError;
+
+    fn read_xml_bytes(&self, virtual_path: &str) -> Result<Vec<u8>, Self::Error> {
+        self.0.read_bytes(virtual_path)
+    }
+
+    fn list_xml_matches(
+        &self,
+        dir_prefix: &str,
+        filename_pattern: &str,
+    ) -> Result<Vec<String>, Self::Error> {
+        let prefix = normalize_virtual_prefix(dir_prefix)?;
+        let all = self.0.list_files(&prefix)?;
+
+        let mut matches = Vec::new();
+        for path in all {
+            if let Some(rest) = path.strip_prefix(&prefix)
+                && !rest.contains('\\')
+                && glob_matches_ascii(filename_pattern, rest)
+            {
+                matches.push(path);
+            }
+        }
+        Ok(matches)
+    }
+}
+
+/// Stream an Anomaly `.scop` ALife savegame archive from `VirtualFileSystem`.
+pub fn load_scop_from_vfs(
+    vfs: &VirtualFileSystem,
+    virtual_path: &str,
+) -> Result<SavegameFile, AssetLoadError> {
+    let bytes = vfs.read_bytes(virtual_path)?;
+    Ok(SavegameFile::parse(&bytes)?)
+}
+
+fn load_weather_cycles_dir(
+    vfs: &VirtualFileSystem,
+    dir_prefix: &str,
+) -> Result<Vec<(String, WeatherCycle)>, AssetLoadError> {
+    let norm_prefix = normalize_virtual_prefix(dir_prefix)?;
+    let mut files = vfs.list_files(&norm_prefix)?;
+    files.sort_by_key(|p| p.to_ascii_lowercase());
+
+    let mut out = Vec::new();
+    for vpath in files {
+        let rest = vpath.strip_prefix(&norm_prefix).unwrap_or(&vpath);
+        if rest.contains('\\') || rest.len() <= 4 || !rest.as_bytes()[rest.len() - 4..].eq_ignore_ascii_case(b".ltx") {
+            continue;
+        }
+        let stem = &rest[..rest.len() - 4];
+        let doc = load_ltx_tree_from_vfs(vfs, &vpath, &[])?;
+        out.push((stem.to_owned(), WeatherCycle::from_ltx(stem, &doc)?));
+    }
+    Ok(out)
+}
+
+/// Stream `$game_configs$/environment/` weather cycles, effects, sun paths, ambients, lens flares,
+/// and thunderbolt configs (plus optional level-specific `ambients\<level>.ltx`).
+pub fn load_weather_library_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_name: Option<&str>,
+) -> Result<WeatherLibrary, AssetLoadError> {
+    let mut lib = WeatherLibrary::default();
+    let mut any_loaded = false;
+
+    if vfs.exists("$game_configs$/environment/environment.ltx") {
+        let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/environment/environment.ltx", &[])?;
+        lib.global_params = EnvGlobalParams::from_ltx(&doc);
+        any_loaded = true;
+    }
+
+    if vfs.exists("$game_configs$/environment/sun_positions.ltx") {
+        let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/environment/sun_positions.ltx", &[])?;
+        lib.sun_positions = Some(SunPositionsConfig::from_ltx(&doc)?);
+        any_loaded = true;
+    }
+
+    if vfs.exists("$game_configs$/environment/sound_channels.ltx") {
+        let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/environment/sound_channels.ltx", &[])?;
+        lib.parse_sound_channels(&doc)?;
+        any_loaded = true;
+    }
+
+    if vfs.exists("$game_configs$/environment/effects.ltx") {
+        let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/environment/effects.ltx", &[])?;
+        lib.parse_ambient_effects(&doc)?;
+        any_loaded = true;
+    }
+
+    if vfs.exists("$game_configs$/environment/ambients.ltx") {
+        let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/environment/ambients.ltx", &[])?;
+        lib.parse_ambients(&doc)?;
+        any_loaded = true;
+    }
+
+    if let Some(level) = level_name {
+        let lvl_amb = format!("$game_configs$/environment/ambients/{level}.ltx");
+        if vfs.exists(&lvl_amb) {
+            let doc = load_ltx_tree_from_vfs(vfs, &lvl_amb, &[])?;
+            lib.parse_ambients(&doc)?;
+            any_loaded = true;
+        }
+    }
+
+    if vfs.exists("$game_configs$/environment/suns.ltx") {
+        let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/environment/suns.ltx", &[])?;
+        lib.parse_suns(&doc);
+        any_loaded = true;
+    }
+
+    if vfs.exists("$game_configs$/environment/thunderbolts.ltx") {
+        let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/environment/thunderbolts.ltx", &[])?;
+        lib.parse_thunderbolts(&doc);
+        any_loaded = true;
+    }
+
+    if vfs.exists("$game_configs$/environment/thunderbolt_collections.ltx") {
+        let doc = load_ltx_tree_from_vfs(
+            vfs,
+            "$game_configs$/environment/thunderbolt_collections.ltx",
+            &[],
+        )?;
+        lib.parse_thunderbolt_collections(&doc);
+        any_loaded = true;
+    }
+
+    for (name, cycle) in load_weather_cycles_dir(vfs, "$game_configs$/environment/weathers")? {
+        lib.cycles.insert(name, cycle);
+        any_loaded = true;
+    }
+
+    for (name, effect_cycle) in
+        load_weather_cycles_dir(vfs, "$game_configs$/environment/weather_effects")?
+    {
+        lib.effects_cycles.insert(name, effect_cycle);
+        any_loaded = true;
+    }
+
+    if !any_loaded {
+        return Err(AssetLoadError::Vfs(VfsError::FileNotFound));
+    }
+
+    Ok(lib)
+}
+
+/// Stream and parse an X-Ray XML document (decoding Windows-1251/UTF-8 and expanding `#include "..."` directives).
+pub fn load_xml_from_vfs(
+    vfs: &VirtualFileSystem,
+    virtual_path: &str,
+) -> Result<XmlDocument, AssetLoadError> {
+    let norm = normalize_virtual_path(virtual_path)?;
+    let base_dir = if norm.starts_with("configs\\") {
+        "configs"
+    } else if let Some(idx) = norm.rfind('\\') {
+        &norm[..idx]
+    } else {
+        ""
+    };
+    let provider = VfsXmlProvider(vfs);
+    Ok(XmlDocument::load_with_provider(&provider, base_dir, &norm)?)
+}
+
+fn collect_top_level_xml_in_dir(
+    vfs: &VirtualFileSystem,
+    dir_vpath: &str,
+) -> Result<Vec<String>, VfsError> {
+    let prefix = normalize_virtual_prefix(dir_vpath)?;
+    let mut files = vfs.list_files(&prefix)?;
+    files.sort_by_key(|p| p.to_ascii_lowercase());
+    Ok(files
+        .into_iter()
+        .filter(|path| {
+            let rest = path.strip_prefix(&prefix).unwrap_or(path);
+            !rest.contains('\\')
+                && rest.len() > 4
+                && rest.as_bytes()[rest.len() - 4..].eq_ignore_ascii_case(b".xml")
+        })
+        .collect())
+}
+
+/// Stream `$game_configs$/text/<language>/*.xml` into a `LocalizationTable`, pre-loading
+/// English (`text\eng\*.xml`) first for missing translation fallback (`CStringTable::Init`).
+pub fn load_localization_table_from_vfs(
+    vfs: &VirtualFileSystem,
+    language: &str,
+) -> Result<LocalizationTable, AssetLoadError> {
+    let clean_lang = language.trim();
+    if clean_lang.is_empty() {
+        return Err(AssetLoadError::Vfs(VfsError::InvalidPath(
+            "empty language".to_string(),
+        )));
+    }
+
+    let mut table = LocalizationTable::new(clean_lang);
+    let mut file_count = 0usize;
+
+    if !clean_lang.eq_ignore_ascii_case("eng") {
+        for xml_vpath in collect_top_level_xml_in_dir(vfs, "$game_configs$/text/eng")? {
+            let doc = load_xml_from_vfs(vfs, &xml_vpath)?;
+            table.merge_doc(&doc);
+            file_count += 1;
+        }
+    }
+
+    let lang_dir = format!("$game_configs$/text/{clean_lang}");
+    for xml_vpath in collect_top_level_xml_in_dir(vfs, &lang_dir)? {
+        let doc = load_xml_from_vfs(vfs, &xml_vpath)?;
+        table.merge_doc(&doc);
+        file_count += 1;
+    }
+
+    if file_count == 0 {
+        return Err(AssetLoadError::Vfs(VfsError::FileNotFound));
+    }
+
+    Ok(table)
+}
+
+/// Stream all `$game_configs$/ui/textures_descr/*.xml` UI sprite atlas sheets into `UiTextureAtlasMap`.
+pub fn load_ui_texture_atlases_from_vfs(
+    vfs: &VirtualFileSystem,
+) -> Result<UiTextureAtlasMap, AssetLoadError> {
+    let files = collect_top_level_xml_in_dir(vfs, "$game_configs$/ui/textures_descr")?;
+    if files.is_empty() {
+        return Err(AssetLoadError::Vfs(VfsError::FileNotFound));
+    }
+    let mut map = UiTextureAtlasMap::default();
+    for xml_vpath in files {
+        let doc = load_xml_from_vfs(vfs, &xml_vpath)?;
+        map.merge_doc(&doc);
+    }
+    Ok(map)
+}
+
+/// Stream `$game_configs$/ui/color_defs.xml` named color palette (`UiColorDefs`).
+pub fn load_color_defs_from_vfs(vfs: &VirtualFileSystem) -> Result<UiColorDefs, AssetLoadError> {
+    let doc = load_xml_from_vfs(vfs, "$game_configs$/ui/color_defs.xml")?;
+    Ok(UiColorDefs::from_doc(&doc))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,6 +994,41 @@ mod tests {
 
         let real_patrols = load_patrol_paths_ltx_from_vfs(&vfs, &[]).unwrap();
         assert!(real_patrols.is_empty());
+
+        // Verify real Anomaly localization tables (English + Windows-1251 Russian Cyrillic)
+        let loc_eng = load_localization_table_from_vfs(&vfs, "eng").unwrap();
+        assert_eq!(loc_eng.translate("st_continue"), "Continue");
+        assert_eq!(loc_eng.translate("ui_mm_menu_modded_exes"), "Modded Exes");
+
+        let loc_rus = load_localization_table_from_vfs(&vfs, "rus").unwrap();
+        assert_eq!(loc_rus.translate("st_continue"), "Продолжить");
+        assert_eq!(loc_rus.translate("st_disconnect"), "Вернуться в меню");
+        assert!(
+            loc_rus
+                .translate("st_lua_fatal_error")
+                .contains("«Busy Hands»"),
+            "CP1251 guillemets and Cyrillic should decode cleanly"
+        );
+
+        // Verify real UI XML `#include "ui\ui_ctrl_hdr_16.xml"` expansion
+        let hdr_xml = load_xml_from_vfs(&vfs, "$game_configs$/ui/ui_ctrl_hdr.xml").unwrap();
+        assert_eq!(hdr_xml.read_attrib_f32("ctrl_hdr", 0, "x", 0.0), 115.0);
+        assert_eq!(
+            hdr_xml.read_str("ctrl_hdr:cap_main:text", 0, ""),
+            "ui_mm_video_basic_lighting"
+        );
+
+        // Verify real UI texture atlases (`textures_descr/*.xml`)
+        let atlases = load_ui_texture_atlases_from_vfs(&vfs).unwrap();
+        let white_rect = atlases.get("ui_inGame2_white_rect").unwrap();
+        assert_eq!(white_rect.pixel_rect(), [1021.0, 1021.0, 1023.0, 1023.0]);
+        assert_eq!(white_rect.dds_vpath(), "textures\\ui\\ui_common.dds");
+        let opt_bg = atlases.get("ui_inGame2_opt_background").unwrap();
+        assert_eq!(opt_bg.pixel_rect(), [0.0, 0.0, 1024.0, 768.0]);
+        assert_eq!(
+            opt_bg.dds_vpath(),
+            "textures\\ui\\ui_actor_options_background.dds"
+        );
     }
 
     #[test]
@@ -1635,5 +1920,146 @@ mod tests {
         assert_eq!(aspawn.spawns[0].spawn.name_replace, "esc_wolf");
         assert_eq!(aspawn.artefact_spawn_positions.len(), 1);
         assert_eq!(aspawn.game_graph.header.levels[0].name, "l01_escape");
+    }
+
+    #[test]
+    fn test_stream_scop_weather_and_xml_ui_from_vfs_archive() {
+        use crate::savegames::{
+            GameDateTime, GameTaskRegistryData, SaveGameTime, SaveObjectRecord, SaveRegistries,
+            SaveSpawnHeader, SavegameFile, ALIFE_VERSION,
+        };
+        use crate::spawns::{cse_spawn_flags, m_spawn_flags, AlifeObjectState, SpawnPacket, M_UPDATE, SPAWN_VERSION};
+        use crate::weather::EnvBoost;
+        use crate::xml_ui::{color_argb, UiWindowDef};
+
+        // 1. Build a compressed `.scop` ALife savegame with an actor at 0.85 health
+        let actor_state = AlifeObjectState {
+            game_vertex_id: 1,
+            distance: 0.0,
+            direct_control: true,
+            level_vertex_id: 42,
+            flags: cse_spawn_flags::ENABLED,
+            custom_data: String::new(),
+            story_id: u32::MAX,
+            spawn_story_id: u32::MAX,
+            subclass_payload: vec![],
+        }
+        .to_bytes();
+        let actor_spawn = SpawnPacket {
+            section: "actor".to_string(),
+            name_replace: "single_player".to_string(),
+            game_id_legacy: 0,
+            rp: 0xFE,
+            position: [12.0, 1.0, -5.0],
+            angle: [0.0; 3],
+            respawn_time: 0,
+            id: 0,
+            parent_id: u16::MAX,
+            phantom_id: u16::MAX,
+            flags: m_spawn_flags::OBJECT_LOCAL | m_spawn_flags::VERSION,
+            version: SPAWN_VERSION,
+            game_type: u16::MAX,
+            script_version: 10,
+            client_data: vec![],
+            spawn_id: 0,
+            state_payload: actor_state,
+            trailing_update_payload: vec![],
+        };
+        let save = SavegameFile {
+            alife_version: ALIFE_VERSION,
+            time: SaveGameTime {
+                game_time_ms: GameDateTime {
+                    year: 2012,
+                    month: 6,
+                    day: 15,
+                    hour: 9,
+                    minute: 30,
+                    second: 0,
+                    millisecond: 0,
+                }
+                .to_game_time_ms(),
+                time_factor: 10.0,
+                normal_time_factor: 10.0,
+            },
+            spawn_info: SaveSpawnHeader {
+                spawn_name: "all".to_string(),
+                spawn_guid: [0x5A; 16],
+                level_id: Some(1),
+                level_name: Some("l01_escape".to_string()),
+                spawn_updates: vec![],
+            },
+            objects: vec![SaveObjectRecord {
+                spawn: actor_spawn,
+                update_msg_id: M_UPDATE,
+                update_payload: 0.85f32.to_le_bytes().to_vec(),
+            }],
+            registries: SaveRegistries {
+                game_tasks: GameTaskRegistryData::default(),
+                ..Default::default()
+            },
+            extra_chunks: vec![],
+        };
+        let scop_bytes = save.to_bytes().unwrap();
+
+        // 2. Weather LTX suite under configs\environment\
+        let env_ltx = b"[environment]\naltitude = 20\ndelta_longitude = 30\nmin_dist_factor = 0.8\ntilt = 15\nsecond_propability = 0.25\nsky_color = 0.2\nsun_color = 0.6\nfog_color = 0.3\n";
+        let clear_cycle_ltx = b"[00:00:00]\nambient_color = 0.2, 0.2, 0.2\nsky_color = 0.2, 0.2, 0.3\nhemi_color = 0.3, 0.3, 0.35, 1.0\nfog_distance = 300\nfog_density = 0.4\nfar_plane = 400\n[12:00:00]\nambient_color = 0.8, 0.8, 0.8\nsky_color = 0.8, 0.9, 1.0\nhemi_color = 0.9, 0.9, 1.0, 1.0\nfog_distance = 500\nfog_density = 0.1\nfar_plane = 800\n";
+        let wfx_surge_ltx = b"[00:00:00]\nfog_density = 0.9\nwind_velocity = 20.0\n";
+
+        // 3. UI XML + color_defs + textures_descr + eng/rus CP1251 localization
+        let colors_xml = b"<colors><color name=\"hud_green\" r=\"30\" g=\"220\" b=\"60\" a=\"240\"/></colors>";
+        let layout_root_xml = b"<w>\n#include \"ui\\sub_panel.xml\"\n</w>";
+        let layout_sub_xml = b"<hud_panel x=\"50\" y=\"60\" width=\"300\" height=\"80\" stretch=\"1\"><caption x=\"0\" y=\"0\" width=\"300\" height=\"20\"><text color=\"hud_green\" font=\"letterica16\" align=\"c\">st_hud_ready</text></caption></hud_panel>";
+        let tex_descr_xml = b"<w><file name=\"ui\\ui_hud\"><texture id=\"ui_hud_bar\" x=\"4\" y=\"8\" width=\"120\" height=\"16\"/></file></w>";
+        let eng_xml = b"<?xml version=\"1.0\" encoding=\"windows-1251\"?>\n<string_table>\n\t<string id=\"st_hud_ready\"><text>Ready</text></string>\n\t<string id=\"st_only_english\"><text>Fallback $$ACTION_USE$$</text></string>\n</string_table>";
+        // CP1251 Russian string for st_hud_ready ("Готово")
+        let mut rus_xml = b"<?xml version=\"1.0\" encoding=\"windows-1251\"?>\n<string_table>\n\t<string id=\"st_hud_ready\"><text>".to_vec();
+        rus_xml.extend_from_slice(b"\xC3\xEE\xF2\xEE\xE2\xEE");
+        rus_xml.extend_from_slice(b"</text></string>\n</string_table>");
+
+        let entries = vec![
+            ("savedgames\\quicksave.scop", scop_bytes.clone(), scop_bytes),
+            ("configs\\environment\\environment.ltx", env_ltx.to_vec(), env_ltx.to_vec()),
+            ("configs\\environment\\weathers\\default_clear.ltx", clear_cycle_ltx.to_vec(), clear_cycle_ltx.to_vec()),
+            ("configs\\environment\\weather_effects\\fx_surge.ltx", wfx_surge_ltx.to_vec(), wfx_surge_ltx.to_vec()),
+            ("configs\\ui\\color_defs.xml", colors_xml.to_vec(), colors_xml.to_vec()),
+            ("configs\\ui\\main_hud.xml", layout_root_xml.to_vec(), layout_root_xml.to_vec()),
+            ("configs\\ui\\sub_panel.xml", layout_sub_xml.to_vec(), layout_sub_xml.to_vec()),
+            ("configs\\ui\\textures_descr\\hud.xml", tex_descr_xml.to_vec(), tex_descr_xml.to_vec()),
+            ("configs\\text\\eng\\st_hud.xml", eng_xml.to_vec(), eng_xml.to_vec()),
+            ("configs\\text\\rus\\st_hud.xml", rus_xml.clone(), rus_xml),
+        ];
+
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_bytes("assets_p3.db0", pack_synthetic_db(entries))
+            .unwrap();
+
+        let loaded_save = load_scop_from_vfs(&vfs, "savedgames/quicksave.scop").unwrap();
+        assert_eq!(loaded_save.spawn_info.level_name.as_deref(), Some("l01_escape"));
+        assert!((loaded_save.actor_health().unwrap() - 0.85).abs() < 1e-6);
+        assert_eq!(loaded_save.time.date_time().hour, 9);
+
+        let wlib = load_weather_library_from_vfs(&vfs, None).unwrap();
+        assert!((wlib.global_params.second_probability - 0.25).abs() < 1e-6);
+        assert!(wlib.effects_cycles.contains_key("fx_surge"));
+        let noon = wlib
+            .sample_at("default_clear", 21_600.0, None, [0.0; 3], 1.0, &EnvBoost::default())
+            .unwrap();
+        assert!((noon.ambient_color[0] - 0.5).abs() < 1e-4);
+
+        let colors = load_color_defs_from_vfs(&vfs).unwrap();
+        let ui_doc = load_xml_from_vfs(&vfs, "$game_configs$/ui/main_hud.xml").unwrap();
+        let panel = UiWindowDef::from_xml_node(ui_doc.navigate("hud_panel", 0).unwrap(), &colors);
+        let caption = panel.find_child("caption").unwrap();
+        assert_eq!(caption.text.as_ref().unwrap().color_argb, color_argb(240, 30, 220, 60));
+
+        let atlases = load_ui_texture_atlases_from_vfs(&vfs).unwrap();
+        assert_eq!(atlases.get("ui_hud_bar").unwrap().dds_vpath(), "textures\\ui\\ui_hud.dds");
+
+        let loc_rus = load_localization_table_from_vfs(&vfs, "rus").unwrap();
+        assert_eq!(loc_rus.translate("st_hud_ready"), "Готово");
+        let mut keys = std::collections::BTreeMap::new();
+        keys.insert("USE".into(), "E".into());
+        assert_eq!(loc_rus.translate_formatted("st_only_english", &keys), "Fallback E");
     }
 }
