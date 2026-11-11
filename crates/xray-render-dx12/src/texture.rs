@@ -25,8 +25,11 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM,
-    DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC2_UNORM,
+    DXGI_FORMAT_BC2_UNORM_SRGB, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC3_UNORM_SRGB,
+    DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_BC7_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 
 use crate::bindless::DescriptorIndex;
@@ -143,10 +146,17 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
             data_offset = 148;
             match dxgi_fmt_raw {
                 71 => (DXGI_FORMAT_BC1_UNORM, true, 8),
+                72 => (DXGI_FORMAT_BC1_UNORM_SRGB, true, 8),
                 74 => (DXGI_FORMAT_BC2_UNORM, true, 16),
+                75 => (DXGI_FORMAT_BC2_UNORM_SRGB, true, 16),
                 77 => (DXGI_FORMAT_BC3_UNORM, true, 16),
+                78 => (DXGI_FORMAT_BC3_UNORM_SRGB, true, 16),
+                87 => (DXGI_FORMAT_B8G8R8A8_UNORM, false, 4),
+                91 => (DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, false, 4),
                 98 => (DXGI_FORMAT_BC7_UNORM, true, 16),
+                99 => (DXGI_FORMAT_BC7_UNORM_SRGB, true, 16),
                 28 => (DXGI_FORMAT_R8G8B8A8_UNORM, false, 4),
+                29 => (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, false, 4),
                 _ => (DXGI_FORMAT(dxgi_fmt_raw as i32), false, 4),
             }
         } else if pf_fourcc == FOURCC_DXT1 {
@@ -159,12 +169,20 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
             return Err(TextureError::UnsupportedFormat);
         }
     } else if pf_flags & DDPF_RGB != 0 {
-        if pf_rgb_bits == 32
-            && pf_r_mask == 0x000000FF
-            && pf_g_mask == 0x0000FF00
-            && pf_b_mask == 0x00FF0000
-        {
-            (DXGI_FORMAT_R8G8B8A8_UNORM, false, 4)
+        if pf_rgb_bits == 32 {
+            if pf_r_mask == 0x000000FF && pf_g_mask == 0x0000FF00 && pf_b_mask == 0x00FF0000 {
+                // RGBA
+                (DXGI_FORMAT_R8G8B8A8_UNORM, false, 4)
+            } else if pf_r_mask == 0x00FF0000 && pf_g_mask == 0x0000FF00 && pf_b_mask == 0x000000FF {
+                // BGRA (D3DFMT_A8R8G8B8 / D3DFMT_X8R8G8B8 common in S.T.A.L.K.E.R. UI textures)
+                if pf_flags & DDPF_ALPHAPIXELS != 0 && _pf_a_mask != 0 {
+                    (DXGI_FORMAT_B8G8R8A8_UNORM, false, 4)
+                } else {
+                    (DXGI_FORMAT_B8G8R8X8_UNORM, false, 4)
+                }
+            } else {
+                return Err(TextureError::UnsupportedFormat);
+            }
         } else {
             return Err(TextureError::UnsupportedFormat);
         }
@@ -521,6 +539,32 @@ mod tests {
     fn test_truncated_data() {
         let buf = create_test_dds(8, 8, FOURCC_DXT5, 32); // Needs 64, provided only 32
         assert_eq!(parse_dds(&buf), Err(TextureError::BufferTooShort));
+    }
+
+    #[test]
+    fn test_bgra8_ui_texture_parsing() {
+        // 4x4 BGRA8 (D3DFMT_A8R8G8B8) = 16 pixels * 4 bytes = 64 bytes
+        let mut buf = vec![0u8; 128 + 64];
+        buf[0..4].copy_from_slice(&DDS_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&124u32.to_le_bytes());
+        buf[8..12].copy_from_slice(&(DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT).to_le_bytes());
+        buf[12..16].copy_from_slice(&4u32.to_le_bytes());
+        buf[16..20].copy_from_slice(&4u32.to_le_bytes());
+        // PixelFormat
+        buf[76..80].copy_from_slice(&32u32.to_le_bytes());
+        buf[80..84].copy_from_slice(&(DDPF_RGB | DDPF_ALPHAPIXELS).to_le_bytes());
+        buf[88..92].copy_from_slice(&32u32.to_le_bytes()); // 32 bits
+        buf[92..96].copy_from_slice(&0x00FF0000u32.to_le_bytes()); // R mask
+        buf[96..100].copy_from_slice(&0x0000FF00u32.to_le_bytes()); // G mask
+        buf[100..104].copy_from_slice(&0x000000FFu32.to_le_bytes()); // B mask
+        buf[104..108].copy_from_slice(&0xFF000000u32.to_le_bytes()); // A mask
+
+        let img = parse_dds(&buf).expect("Failed to parse valid BGRA8 DDS");
+        assert_eq!(img.width, 4);
+        assert_eq!(img.height, 4);
+        assert_eq!(img.format, DXGI_FORMAT_B8G8R8A8_UNORM);
+        assert!(!img.is_block_compressed);
+        assert_eq!(img.mips[0].slice_pitch, 64);
     }
 
     #[test]
