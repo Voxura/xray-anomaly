@@ -298,6 +298,21 @@ void dx12RenderDeviceRender::Create(HWND hWnd, u32& dwWidth, u32& dwHeight, floa
     Log("Creating DirectX 12 Pure Rust Backend Device Context...");
     R_ASSERT2(LoadRustBackend(), "Failed to load pure Rust DirectX 12 backend dynamic library");
 
+    if (dwWidth == 0 || dwHeight == 0)
+    {
+        RECT rc;
+        if (GetClientRect(hWnd, &rc) && (rc.right > rc.left) && (rc.bottom > rc.top))
+        {
+            dwWidth = (u32)(rc.right - rc.left);
+            dwHeight = (u32)(rc.bottom - rc.top);
+        }
+        else
+        {
+            dwWidth = psCurrentVidMode[0] ? psCurrentVidMode[0] : 1280;
+            dwHeight = psCurrentVidMode[1] ? psCurrentVidMode[1] : 720;
+        }
+    }
+
     int status = pfn_create(4, &m_pRustRenderer);
     R_ASSERT2(status == 0, "Failed to create pure Rust DirectX 12 renderer context");
 

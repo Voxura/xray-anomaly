@@ -56,22 +56,28 @@ void dxImGuiRender::SetState(ImDrawData* data)
 void dxImGuiRender::Frame()
 {
 #if defined(USE_DX11)
-    ImGui_ImplDX11_NewFrame();
+    if (HW.pDevice && HW.pContext)
+        ImGui_ImplDX11_NewFrame();
 #elif defined(USE_DX10)
-    ImGui_ImplDX10_NewFrame();
+    if (HW.pDevice)
+        ImGui_ImplDX10_NewFrame();
 #else
-    ImGui_ImplDX9_NewFrame();
+    if (HW.pDevice)
+        ImGui_ImplDX9_NewFrame();
 #endif
 }
 
 void dxImGuiRender::Render(ImDrawData* data)
 {
 #if defined(USE_DX11)
-    ImGui_ImplDX11_RenderDrawData(data);
+    if (HW.pDevice && HW.pContext)
+        ImGui_ImplDX11_RenderDrawData(data);
 #elif defined(USE_DX10)
-    ImGui_ImplDX10_RenderDrawData(data);
+    if (HW.pDevice)
+        ImGui_ImplDX10_RenderDrawData(data);
 #else
-    ImGui_ImplDX9_RenderDrawData(data);
+    if (HW.pDevice)
+        ImGui_ImplDX9_RenderDrawData(data);
 #endif
 }
 
@@ -90,42 +96,54 @@ void dxImGuiRender::OnDeviceCreate(ImGuiContext* context)
     ImGui::SetCurrentContext(context);
 
 #if defined(USE_DX11)
-    ImGui_ImplDX11_Init(HW.pDevice, HW.pContext);
+    if (HW.pDevice && HW.pContext)
+        ImGui_ImplDX11_Init(HW.pDevice, HW.pContext);
 #elif defined(USE_DX10)
-    ImGui_ImplDX10_Init(HW.pDevice);
+    if (HW.pDevice)
+        ImGui_ImplDX10_Init(HW.pDevice);
 #else
-    ImGui_ImplDX9_Init(HW.pDevice);
+    if (HW.pDevice)
+        ImGui_ImplDX9_Init(HW.pDevice);
 #endif
 }
 void dxImGuiRender::OnDeviceDestroy()
 {
 #if defined(USE_DX11)
-    ImGui_ImplDX11_Shutdown();
+    if (HW.pDevice)
+        ImGui_ImplDX11_Shutdown();
 #elif defined(USE_DX10)
-    ImGui_ImplDX10_Shutdown();
+    if (HW.pDevice)
+        ImGui_ImplDX10_Shutdown();
 #else
-    ImGui_ImplDX9_Shutdown();
+    if (HW.pDevice)
+        ImGui_ImplDX9_Shutdown();
 #endif
 }
 
 void dxImGuiRender::OnDeviceResetBegin()
 {
 #if defined(USE_DX11)
-    ImGui_ImplDX11_InvalidateDeviceObjects();
+    if (HW.pDevice)
+        ImGui_ImplDX11_InvalidateDeviceObjects();
 #elif defined(USE_DX10)
-    ImGui_ImplDX10_InvalidateDeviceObjects();
+    if (HW.pDevice)
+        ImGui_ImplDX10_InvalidateDeviceObjects();
 #else
-    ImGui_ImplDX9_InvalidateDeviceObjects();
+    if (HW.pDevice)
+        ImGui_ImplDX9_InvalidateDeviceObjects();
 #endif
 }
 
 void dxImGuiRender::OnDeviceResetEnd()
 {
 #if defined(USE_DX11)
-    ImGui_ImplDX11_CreateDeviceObjects();
+    if (HW.pDevice)
+        ImGui_ImplDX11_CreateDeviceObjects();
 #elif defined(USE_DX10)
-    ImGui_ImplDX10_CreateDeviceObjects();
+    if (HW.pDevice)
+        ImGui_ImplDX10_CreateDeviceObjects();
 #else
-    ImGui_ImplDX9_CreateDeviceObjects();
+    if (HW.pDevice)
+        ImGui_ImplDX9_CreateDeviceObjects();
 #endif
 }
