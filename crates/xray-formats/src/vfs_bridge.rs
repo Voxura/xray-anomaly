@@ -5,13 +5,22 @@
 use xray_core::ltx_loader::{collect_ltx_sources, glob_matches_ascii, LtxFileProvider, OwnedLtxDocument};
 use xray_vfs::{normalize_virtual_path, normalize_virtual_prefix, VfsError, VirtualFileSystem};
 
+use crate::ai_graph::{GameGraph, LevelCrossTable, LevelGraph};
 use crate::cform::CformModel;
 use crate::chunk::FormatError;
 use crate::details::{DetailMesh, LevelDetails};
 use crate::gamemtl::GameMaterialLibrary;
+use crate::hom::HomMesh;
 use crate::level::{LevelData, LevelGeometry};
 use crate::ogf::{OgfModel, OgfTextureLink};
 use crate::omf::OmfMotions;
+use crate::shaders_xr::{
+    EngineShaderLibrary, LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles,
+    ShaderXrlcLibrary,
+};
+use crate::sound_env::{
+    LevelSoundEnv, LevelStaticSounds, SoundEnvironmentLibrary, SoundOcclusionMesh,
+};
 use crate::thm::{
     strip_texture_extension, texture_stem_to_dds_vpath, texture_stem_to_thm_vpath,
     ResolvedTextureLinks, TextureParams,
@@ -266,6 +275,143 @@ pub fn load_level_from_vfs(
     let vpath = resolve_level_file_path(level_dir_or_path, "level");
     let bytes = vfs.read_bytes(&vpath)?;
     Ok(LevelData::parse(&bytes)?)
+}
+
+/// Stream `level.hom` occlusion mesh (accepting full path or level directory).
+pub fn load_hom_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<HomMesh, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.hom");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(HomMesh::parse(&bytes)?)
+}
+
+/// Stream `level.ai` navigation mesh (accepting full path or level directory).
+pub fn load_level_ai_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<LevelGraph, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.ai");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelGraph::parse(&bytes)?)
+}
+
+/// Stream `level.gct` AI-to-game-graph cross-table (accepting full path or level directory).
+pub fn load_level_gct_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<LevelCrossTable, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.gct");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelCrossTable::parse(&bytes)?)
+}
+
+/// Stream global `game.graph` (defaults to `$game_data$/game.graph` when `path_override` is `None`).
+pub fn load_game_graph_from_vfs(
+    vfs: &VirtualFileSystem,
+    path_override: Option<&str>,
+) -> Result<GameGraph, AssetLoadError> {
+    let vpath = path_override.unwrap_or("$game_data$/game.graph");
+    let bytes = vfs.read_bytes(vpath)?;
+    Ok(GameGraph::parse(&bytes)?)
+}
+
+/// Stream `$game_data$/senvironment.xr` acoustic reverb library.
+pub fn load_sound_environments_from_vfs(
+    vfs: &VirtualFileSystem,
+) -> Result<SoundEnvironmentLibrary, AssetLoadError> {
+    let bytes = vfs.read_bytes("$game_data$/senvironment.xr")?;
+    Ok(SoundEnvironmentLibrary::parse(&bytes)?)
+}
+
+/// Stream `level.som` sound occlusion mesh (accepting full path or level directory).
+pub fn load_som_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<SoundOcclusionMesh, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.som");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(SoundOcclusionMesh::parse(&bytes)?)
+}
+
+/// Stream `level.snd_env` spatial reverb zone mesh (accepting full path or level directory).
+pub fn load_level_sound_env_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<LevelSoundEnv, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.snd_env");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelSoundEnv::parse(&bytes)?)
+}
+
+/// Stream `level.snd_static` ambient point sounds (accepting full path or level directory).
+pub fn load_static_sounds_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<LevelStaticSounds, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.snd_static");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelStaticSounds::parse(&bytes)?)
+}
+
+/// Stream `$game_data$/shaders_xrlc.xr` compiler shader library.
+pub fn load_shaders_xrlc_from_vfs(
+    vfs: &VirtualFileSystem,
+) -> Result<ShaderXrlcLibrary, AssetLoadError> {
+    let bytes = vfs.read_bytes("$game_data$/shaders_xrlc.xr")?;
+    Ok(ShaderXrlcLibrary::parse(&bytes)?)
+}
+
+/// Stream `$game_data$/shaders.xr` engine constant/matrix/blender library.
+pub fn load_shaders_xr_from_vfs(
+    vfs: &VirtualFileSystem,
+) -> Result<EngineShaderLibrary, AssetLoadError> {
+    let bytes = vfs.read_bytes("$game_data$/shaders.xr")?;
+    Ok(EngineShaderLibrary::parse(&bytes)?)
+}
+
+/// Stream level environment modifiers, preferring Anomaly `$game_configs$/environment/env_mods/<level>.ltx`
+/// when `level_name` matches a mounted LTX config, otherwise reading binary `level.env_mod`.
+pub fn load_env_mods_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+    level_name: Option<&str>,
+) -> Result<LevelEnvModifiers, AssetLoadError> {
+    if let Some(name) = level_name {
+        for base in [
+            format!("$game_configs$/environment/env_mods/{name}.ltx"),
+            format!("$game_config$/environment/env_mods/{name}.ltx"),
+        ] {
+            if vfs.exists(&base) {
+                let doc = load_ltx_tree_from_vfs(vfs, &base, &[])?;
+                return Ok(LevelEnvModifiers::from_owned_ltx(&doc));
+            }
+        }
+    }
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.env_mod");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelEnvModifiers::parse(&bytes)?)
+}
+
+/// Stream `level.ps_static` placed particle emitters (accepting full path or level directory).
+pub fn load_ps_static_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<LevelStaticParticles, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.ps_static");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelStaticParticles::parse(&bytes)?)
+}
+
+/// Stream `level.fog_vol` volumetric fog regions (accepting full path or level directory).
+pub fn load_fog_volumes_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<LevelFogVolumes, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "level.fog_vol");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(LevelFogVolumes::parse(&bytes)?)
 }
 
 #[cfg(test)]
@@ -790,5 +936,245 @@ mod tests {
         let bind_pal = BonePalette::bind_pose(skel_model.skeleton.as_ref().unwrap()).unwrap();
         let skinned = skin_vertices(skel_model.vertices.as_ref().unwrap(), &bind_pal).unwrap();
         assert_eq!(skinned.len(), 1);
+    }
+
+    #[test]
+    fn test_stream_hom_ai_sound_and_shader_assets_from_vfs() {
+        use crate::ai_graph::{pv_compress_normal, INVALID_AI_LINK_V10, XRAI_CURRENT_VERSION};
+        use crate::ogf::XRAY_IDENTITY_MATRIX;
+        use crate::shaders_xr::{env_mod_flags, shader_xrlc_flags};
+
+        // 1. level.hom
+        let mut hom_poly = Vec::new();
+        for p in [[-4.0f32, -4.0, 5.0], [-4.0, 4.0, 5.0], [4.0, 4.0, 5.0]] {
+            for f in p {
+                hom_poly.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        hom_poly.extend_from_slice(&1u32.to_le_bytes());
+        let mut hom_w = ChunkWriter::new();
+        hom_w.write_chunk(1, &hom_poly);
+        let hom_raw = hom_w.into_bytes();
+
+        // 2. level.ai (1 vertex v10)
+        let mut ai_raw = Vec::new();
+        ai_raw.extend_from_slice(&XRAI_CURRENT_VERSION.to_le_bytes());
+        ai_raw.extend_from_slice(&1u32.to_le_bytes());
+        ai_raw.extend_from_slice(&0.7f32.to_le_bytes());
+        ai_raw.extend_from_slice(&10.0f32.to_le_bytes());
+        for f in [-5.0f32, 0.0, -5.0, 5.0, 10.0, 5.0] {
+            ai_raw.extend_from_slice(&f.to_le_bytes());
+        }
+        ai_raw.extend_from_slice(&1u64.to_le_bytes());
+        ai_raw.extend_from_slice(&2u64.to_le_bytes());
+        let bits = (INVALID_AI_LINK_V10 as u128)
+            | ((INVALID_AI_LINK_V10 as u128) << 23)
+            | ((INVALID_AI_LINK_V10 as u128) << 46)
+            | ((INVALID_AI_LINK_V10 as u128) << 69);
+        ai_raw.extend_from_slice(&bits.to_le_bytes()[..12]);
+        ai_raw.extend_from_slice(&0u16.to_le_bytes());
+        ai_raw.extend_from_slice(&0u16.to_le_bytes());
+        ai_raw.extend_from_slice(&pv_compress_normal([0.0, 1.0, 0.0]).to_le_bytes());
+        ai_raw.extend_from_slice(&0u32.to_le_bytes()[..3]);
+        ai_raw.extend_from_slice(&0u16.to_le_bytes());
+
+        // 3. level.gct
+        let mut gct_hdr = Vec::new();
+        gct_hdr.extend_from_slice(&9u32.to_le_bytes());
+        gct_hdr.extend_from_slice(&1u32.to_le_bytes());
+        gct_hdr.extend_from_slice(&1u32.to_le_bytes());
+        gct_hdr.extend_from_slice(&[0u8; 32]);
+        let mut gct_cells = Vec::new();
+        gct_cells.extend_from_slice(&0u16.to_le_bytes());
+        gct_cells.extend_from_slice(&0.25f32.to_le_bytes());
+        let mut gct_w = ChunkWriter::new();
+        gct_w.write_chunk(0, &gct_hdr);
+        gct_w.write_chunk(1, &gct_cells);
+        let gct_raw = gct_w.into_bytes();
+
+        // 4. game.graph
+        let mut gg_raw = Vec::new();
+        gg_raw.push(10u8);
+        gg_raw.extend_from_slice(&1u16.to_le_bytes());
+        gg_raw.extend_from_slice(&0u32.to_le_bytes());
+        gg_raw.extend_from_slice(&0u32.to_le_bytes());
+        gg_raw.extend_from_slice(&[0u8; 16]);
+        gg_raw.push(1u8);
+        gg_raw.extend_from_slice(b"test_lvl\0");
+        gg_raw.extend_from_slice(&[0u8; 12]);
+        gg_raw.push(1u8);
+        gg_raw.extend_from_slice(b"sec_test\0");
+        gg_raw.extend_from_slice(&[0u8; 16]);
+        gg_raw.extend_from_slice(&[0u8; 24]); // local + global
+        gg_raw.extend_from_slice(&1u32.to_le_bytes()); // level_id = 1, node = 0
+        gg_raw.extend_from_slice(&[0u8; 14]); // vertex_types + offsets + counts
+
+        // 5. senvironment.xr + som + snd_env + snd_static
+        let mut senv_p = Vec::new();
+        senv_p.extend_from_slice(&4u32.to_le_bytes());
+        senv_p.extend_from_slice(b"room\0");
+        senv_p.extend_from_slice(&[0u8; 52]);
+        let mut senv_w = ChunkWriter::new();
+        senv_w.write_chunk(0, &senv_p);
+        let senv_raw = senv_w.into_bytes();
+
+        let mut som_p = Vec::new();
+        for p in [[-2.0f32, -2.0, 2.0], [-2.0, 2.0, 2.0], [2.0, 0.0, 2.0]] {
+            for f in p {
+                som_p.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        som_p.extend_from_slice(&1u32.to_le_bytes());
+        som_p.extend_from_slice(&0.5f32.to_le_bytes());
+        let mut som_w = ChunkWriter::new();
+        som_w.write_chunk(0, &0u32.to_le_bytes());
+        som_w.write_chunk(1, &som_p);
+        let som_raw = som_w.into_bytes();
+
+        let mut snd_env_cf = Vec::new();
+        snd_env_cf.extend_from_slice(&4u32.to_le_bytes());
+        snd_env_cf.extend_from_slice(&3u32.to_le_bytes());
+        snd_env_cf.extend_from_slice(&1u32.to_le_bytes());
+        snd_env_cf.extend_from_slice(&[0u8; 24]);
+        for p in [[-5.0f32, 0.0, -5.0], [-5.0, 0.0, 5.0], [5.0, 0.0, -5.0]] {
+            for f in p {
+                snd_env_cf.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        for i in [0u32, 1, 2, 0] {
+            snd_env_cf.extend_from_slice(&i.to_le_bytes());
+        }
+        let mut snde_w = ChunkWriter::new();
+        snde_w.write_chunk(0, b"room\0");
+        snde_w.write_chunk(1, &snd_env_cf);
+        let snde_raw = snde_w.into_bytes();
+
+        let mut snd_obj = Vec::new();
+        snd_obj.extend_from_slice(b"amb\\hum\0");
+        snd_obj.extend_from_slice(&[0u8; 44]);
+        let mut snd_sub = ChunkWriter::new();
+        snd_sub.write_chunk(0, &snd_obj);
+        let mut snds_w = ChunkWriter::new();
+        snds_w.write_chunk(0, &snd_sub.into_bytes());
+        let snds_raw = snds_w.into_bytes();
+
+        // 6. shaders_xrlc.xr + shaders.xr + env_mod + ltx + ps_static + fog_vol
+        let mut xrlc_raw = vec![0u8; 144];
+        xrlc_raw[..4].copy_from_slice(b"wall");
+        xrlc_raw[128..132].copy_from_slice(&shader_xrlc_flags::COLLISION.to_le_bytes());
+
+        let mut c0 = Vec::new();
+        c0.extend_from_slice(b"c0\0");
+        c0.extend_from_slice(&[0u8; 80]);
+        let mut shd_w = ChunkWriter::new();
+        shd_w.write_chunk(0, &c0);
+        let shd_raw = shd_w.into_bytes();
+
+        let mut em_p = Vec::new();
+        for f in [0.0f32, 0.0, 0.0, 10.0, 1.0, 200.0] {
+            em_p.extend_from_slice(&f.to_le_bytes());
+        }
+        em_p.extend_from_slice(&[0u8; 52]);
+        em_p.extend_from_slice(&env_mod_flags::VIEW_DIST.to_le_bytes());
+        let mut em_w = ChunkWriter::new();
+        em_w.write_chunk(0, &0x0016u32.to_le_bytes());
+        em_w.write_chunk(1, &em_p);
+        let em_raw = em_w.into_bytes();
+
+        let em_ltx = b"[zone_fog]\nposition = 0,0,0\nradius = 25\npower = 1.0\nfog_density = 0.75\n";
+
+        let mut ps_entry = Vec::new();
+        ps_entry.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        ps_entry.extend_from_slice(b"pfx\\sparks\0");
+        for r in XRAY_IDENTITY_MATRIX {
+            for c in r {
+                ps_entry.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        let mut ps_w = ChunkWriter::new();
+        ps_w.write_chunk(0, &1u32.to_le_bytes());
+        ps_w.write_chunk(1, &ps_entry);
+        let ps_raw = ps_w.into_bytes();
+
+        let mut fv_raw = Vec::new();
+        fv_raw.extend_from_slice(&2u16.to_le_bytes());
+        fv_raw.extend_from_slice(&1u32.to_le_bytes());
+        for r in XRAY_IDENTITY_MATRIX {
+            for c in r {
+                fv_raw.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        fv_raw.extend_from_slice(&0u32.to_le_bytes());
+
+        let entries = vec![
+            ("levels\\test_lvl\\level.hom", hom_raw.clone(), compress_lzo1x(&hom_raw)),
+            ("levels\\test_lvl\\level.ai", ai_raw.clone(), compress_lzo1x(&ai_raw)),
+            ("levels\\test_lvl\\level.gct", gct_raw.clone(), compress_lzo1x(&gct_raw)),
+            ("game.graph", gg_raw.clone(), compress_lzo1x(&gg_raw)),
+            ("senvironment.xr", senv_raw.clone(), compress_lzo1x(&senv_raw)),
+            ("levels\\test_lvl\\level.som", som_raw.clone(), compress_lzo1x(&som_raw)),
+            ("levels\\test_lvl\\level.snd_env", snde_raw.clone(), compress_lzo1x(&snde_raw)),
+            ("levels\\test_lvl\\level.snd_static", snds_raw.clone(), compress_lzo1x(&snds_raw)),
+            ("shaders_xrlc.xr", xrlc_raw.clone(), compress_lzo1x(&xrlc_raw)),
+            ("shaders.xr", shd_raw.clone(), compress_lzo1x(&shd_raw)),
+            ("levels\\test_lvl\\level.env_mod", em_raw.clone(), compress_lzo1x(&em_raw)),
+            ("configs\\environment\\env_mods\\ltx_map.ltx", em_ltx.to_vec(), em_ltx.to_vec()),
+            ("levels\\test_lvl\\level.ps_static", ps_raw.clone(), compress_lzo1x(&ps_raw)),
+            ("levels\\test_lvl\\level.fog_vol", fv_raw.clone(), compress_lzo1x(&fv_raw)),
+        ];
+
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_bytes("world_extras.db0", pack_synthetic_db(entries))
+            .unwrap();
+
+        assert_eq!(load_hom_from_vfs(&vfs, "levels/test_lvl").unwrap().triangles.len(), 1);
+        assert_eq!(load_level_ai_from_vfs(&vfs, "levels/test_lvl").unwrap().vertices.len(), 1);
+        assert_eq!(load_level_gct_from_vfs(&vfs, "levels/test_lvl").unwrap().cells.len(), 1);
+        assert_eq!(load_game_graph_from_vfs(&vfs, None).unwrap().vertices.len(), 1);
+        assert!(load_sound_environments_from_vfs(&vfs).unwrap().find_by_name("room").is_some());
+        assert!(
+            (load_som_from_vfs(&vfs, "levels/test_lvl")
+                .unwrap()
+                .query_occlusion([0.0, 0.0, 0.0], [0.0, 0.0, 5.0])
+                - 0.5)
+                .abs()
+                < 1e-5
+        );
+        assert_eq!(
+            load_level_sound_env_from_vfs(&vfs, "levels/test_lvl")
+                .unwrap()
+                .query_env_name_at([0.0, 1.0, 0.0]),
+            Some("room")
+        );
+        assert_eq!(
+            load_static_sounds_from_vfs(&vfs, "levels/test_lvl")
+                .unwrap()
+                .sounds[0]
+                .wav_name,
+            "amb\\hum"
+        );
+        assert!(load_shaders_xrlc_from_vfs(&vfs).unwrap().find("wall").is_some());
+        assert!(load_shaders_xr_from_vfs(&vfs).unwrap().find_constant("c0").is_some());
+
+        let bin_mods = load_env_mods_from_vfs(&vfs, "levels/test_lvl", None).unwrap();
+        assert!((bin_mods.evaluate_at([0.0, 0.0, 0.0]).far_plane - 200.0).abs() < 1e-4);
+
+        let ltx_mods = load_env_mods_from_vfs(&vfs, "levels/test_lvl", Some("ltx_map")).unwrap();
+        assert!((ltx_mods.evaluate_at([0.0, 0.0, 0.0]).fog_density - 0.75).abs() < 1e-4);
+
+        assert_eq!(
+            load_ps_static_from_vfs(&vfs, "levels/test_lvl")
+                .unwrap()
+                .particles[0]
+                .ref_name,
+            "pfx\\sparks"
+        );
+        assert_eq!(
+            load_fog_volumes_from_vfs(&vfs, "levels/test_lvl")
+                .unwrap()
+                .volumes
+                .len(),
+            1
+        );
     }
 }

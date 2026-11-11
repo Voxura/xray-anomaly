@@ -1,28 +1,42 @@
 //! # xray-formats
 //!
 //! Pure Rust X-Ray Monolith binary asset & model format parsers:
+//! - `ai_graph`: `level.ai` (v10/v13 + A* pathfinder + `pv_compress_normal`/`pv_decompress_normal`), `level.gct` cross-tables & global `game.graph`
 //! - `cform`: `level.cform` collision database, pure-Rust AABB BVH raycast (`OPT_CULL`/`OPT_ONLYFIRST`/`OPT_ONLYNEAREST`) & SAT box queries
 //! - `chunk`: Zero-copy X-Ray Chunked File Format reader (`ID + size + payload` + `CFS_CompressMark` LZHuf)
 //! - `details`: `.dm` & `level.details` (`DETAIL_VERSION_3` / `DETAIL_VERSION_4`) flora/grass slots
 //! - `gamemtl`: X-Ray `gamemtl.xr` physical/surface material & interaction pair library parser
+//! - `hom`: `level.hom` Hierarchical Occlusion Mapping parser, `ClipFrustum` & 64x64->8 `OccRasterizer`
 //! - `level`: `level` & `level.geom`/`level.geomx` scene, visuals, sectors, portals, lights & `D3DVERTEXELEMENT9` VB/IB/SWIS decoders
 //! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, and skeletal mesh + bone/IK parser
 //! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
+//! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
 //! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, OMF pose evaluation & `1W`–`4W` CPU skinning
+//! - `sound_env`: `senvironment.xr` v4/v5, `level.som` BVH acoustic occlusion, `level.snd_env` & `level.snd_static`
 //! - `thm`: X-Ray `.thm` / `.ltx` texture descriptor parser (`_bump` / `_bump#` / detail / material links)
 //! - `vfs_bridge`: Direct `xray-vfs` streaming integration for `.ogf`, `.omf`, `.thm`, `gamemtl.xr`, `level*`, `.dm` & DLTX `.ltx` trees
 
+pub mod ai_graph;
 pub mod cform;
 pub mod chunk;
 pub mod details;
 pub mod gamemtl;
+pub mod hom;
 pub mod level;
 pub mod ogf;
 pub mod omf;
+pub mod shaders_xr;
 pub mod skinning;
+pub mod sound_env;
 pub mod thm;
 pub mod vfs_bridge;
 
+pub use ai_graph::{
+    pv_compress_normal, pv_decompress_normal, AiGraphHeader, AiVertex, CrossTableCell,
+    CrossTableHeader, GameDeathPoint, GameEdge, GameGraph, GameGraphHeader, GameLevelInfo,
+    GameVertex, LevelCrossTable, LevelGraph, INVALID_AI_LINK_V10, INVALID_AI_LINK_V13,
+    INVALID_AI_VERTEX, INVALID_GAME_VERTEX, XRAI_CURRENT_VERSION, XRAI_LARGE_VERSION,
+};
 pub use cform::{
     ray_options, BoxQueryHit, CformBvh, CformHeader, CformModel, CformTriangle, RaycastHit,
     RaycastOptions, CFORM_CURRENT_VERSION,
@@ -37,6 +51,11 @@ pub use gamemtl::{
     gamemtl_chunks, gamemtl_flags, gamemtl_pair_chunks, gamemtl_pair_flags,
     gamemtl_root_chunks, GameMaterial, GameMaterialLibrary, GameMaterialPair,
     GAMEMTL_CURRENT_VERSION, GAMEMTL_NONE_ID,
+};
+pub use hom::{
+    frustum_planes, viewport_matrix_01, viewport_matrix_64, ClipFrustum, HomMesh, HomTriangle,
+    OccRasterizer, Plane, RawHomTriangle, HOM_POLY_SIZE, OCC_BORDER, OCC_DIM, OCC_DIM_0,
+    OCC_DIM_1, OCC_DIM_2, OCC_DIM_3, OCC_Q_S32,
 };
 pub use level::{
     d3d_decl_type, d3d_decl_usage, level_chunks, sector_chunks, LevelData, LevelGeometry,
@@ -58,9 +77,20 @@ pub use omf::{
     MotionPartitionBone, OmfMotions, QuantizedRotKey, KEY_QUANT, KEY_QUANT_INV,
     MOTION_QUANTIZER_RANGE_EXT, SAMPLE_FPS, SAMPLE_SPF, XR_OGF_SM_PARAMS_VERSION,
 };
+pub use shaders_xr::{
+    clsid_to_string, env_mod_flags, shader_xrlc_flags, BlenderDesc, BlenderProperty,
+    BlenderPropertyValue, BlenderShader, EngineShaderLibrary, EnvModAccum, EnvModifier, FogVolume,
+    LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles, ShaderConstant, ShaderMatrix,
+    ShaderXrlcEntry, ShaderXrlcLibrary, StaticParticle, WaveForm, WaveFunction, CBLENDER_DESC_SIZE,
+    SHADER_XRLC_ENTRY_SIZE,
+};
 pub use skinning::{
     compute_skinned_aabb, matrix_transform_dir, normalize_vec3, skin_ogf_hierarchy,
     skin_vertices, BoneMatrix4x3, BonePalette, SkinnedMeshPart, SkinnedVertex,
+};
+pub use sound_env::{
+    LevelSoundEnv, LevelStaticSounds, SomPolygon, SoundEnvironment, SoundEnvironmentLibrary,
+    SoundOcclusionMesh, StaticSound, SDEF_ENV_VERSION, SNDENV_VER_EXTENDED, SOM_POLY_SIZE,
 };
 pub use thm::{
     strip_texture_extension, texture_flags, texture_stem_to_dds_vpath, texture_stem_to_thm_vpath,
@@ -68,8 +98,12 @@ pub use thm::{
     TextureMaterial, TextureParams, TextureType,
 };
 pub use vfs_bridge::{
-    load_cform_from_vfs, load_details_from_vfs, load_dm_from_vfs, load_gamemtl_from_vfs,
-    load_level_from_vfs, load_level_geometry_from_vfs, load_ltx_tree_from_vfs, load_ogf_from_vfs,
-    load_omf_from_vfs, load_thm_from_vfs, resolve_ogf_texture_links, AssetLoadError,
+    load_cform_from_vfs, load_details_from_vfs, load_dm_from_vfs, load_env_mods_from_vfs,
+    load_fog_volumes_from_vfs, load_game_graph_from_vfs, load_gamemtl_from_vfs,
+    load_hom_from_vfs, load_level_ai_from_vfs, load_level_from_vfs, load_level_gct_from_vfs,
+    load_level_geometry_from_vfs, load_level_sound_env_from_vfs, load_ltx_tree_from_vfs,
+    load_ogf_from_vfs, load_omf_from_vfs, load_ps_static_from_vfs, load_shaders_xr_from_vfs,
+    load_shaders_xrlc_from_vfs, load_som_from_vfs, load_sound_environments_from_vfs,
+    load_static_sounds_from_vfs, load_thm_from_vfs, resolve_ogf_texture_links, AssetLoadError,
     VfsLtxProvider,
 };
