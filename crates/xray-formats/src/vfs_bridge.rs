@@ -35,8 +35,9 @@ use crate::thm::{
     ResolvedTextureLinks, TextureParams,
 };
 use crate::weather::{EnvGlobalParams, SunPositionsConfig, WeatherCycle, WeatherLibrary};
+use crate::world_maps::{GameLevelsConfig, WorldMapsConfig};
 use crate::xml_ui::{
-    LocalizationTable, UiColorDefs, UiTextureAtlasMap, XmlDocument, XmlFileProvider,
+    LocalizationTable, UiColorDefs, UiTextureAtlasMap, UiViewport, XmlDocument, XmlFileProvider,
 };
 
 /// Adapter implementing `xray_core::ltx_loader::LtxFileProvider` over a mounted `VirtualFileSystem`.
@@ -994,6 +995,62 @@ pub fn load_spawn_overlays_from_vfs(
     };
     let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/spawn_overlays.ltx", &mod_refs)?;
     Ok(SpawnOverlaysConfig::from_owned_ltx(&doc))
+}
+
+/// Stream `$game_configs$/game_levels.ltx` (and any DLTX mods) into `GameLevelsConfig`.
+pub fn load_game_levels_from_vfs(
+    vfs: &VirtualFileSystem,
+    dltx_mod_paths: &[&str],
+) -> Result<GameLevelsConfig, AssetLoadError> {
+    let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/game_levels.ltx", dltx_mod_paths)?;
+    Ok(GameLevelsConfig::from_owned_ltx(&doc))
+}
+
+/// Stream `$game_configs$/game_maps_single.ltx` into `WorldMapsConfig`, optionally applying
+/// per-level `$game_levels$/<level>/level.ltx` `[level_map]` overrides present in VFS.
+pub fn load_world_maps_from_vfs(
+    vfs: &VirtualFileSystem,
+    dltx_mod_paths: &[&str],
+    apply_level_ltx_overrides: bool,
+) -> Result<WorldMapsConfig, AssetLoadError> {
+    let doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/game_maps_single.ltx", dltx_mod_paths)?;
+    let mut cfg = WorldMapsConfig::from_owned_ltx(&doc)?;
+    if apply_level_ltx_overrides {
+        let level_names: Vec<String> = cfg.level_maps.keys().cloned().collect();
+        for name in level_names {
+            let level_ltx_vpath = format!("$game_levels$/{name}/level.ltx");
+            if vfs.exists(&level_ltx_vpath) {
+                let text = vfs.read_to_string_lossy(&level_ltx_vpath)?;
+                let ltx = xray_core::LtxDocument::parse(&text);
+                cfg.apply_level_ltx_override(&name, &ltx);
+            }
+        }
+    }
+    Ok(cfg)
+}
+
+/// Resolve and stream a UI XML file using aspect-ratio suffixes (`_21.xml` -> `_16.xml` -> `.xml`)
+/// from `$game_configs$/ui/` (or an explicit VFS path).
+pub fn load_ui_xml_for_viewport_from_vfs(
+    vfs: &VirtualFileSystem,
+    xml_name_or_vpath: &str,
+    viewport: &UiViewport,
+) -> Result<XmlDocument, AssetLoadError> {
+    let trimmed = xml_name_or_vpath.trim();
+    let has_prefix = trimmed.starts_with('$')
+        || trimmed.contains('/')
+        || trimmed.contains('\\');
+    for cand in viewport.xml_variant_candidates(trimmed) {
+        let vpath = if has_prefix {
+            cand
+        } else {
+            format!("$game_configs$/ui/{cand}")
+        };
+        if vfs.exists(&vpath) {
+            return load_xml_from_vfs(vfs, &vpath);
+        }
+    }
+    Err(AssetLoadError::Vfs(VfsError::FileNotFound))
 }
 
 #[cfg(test)]
@@ -2755,6 +2812,342 @@ story_id = 5500
                 .unwrap()
                 .story_id,
             5500
+        );
+    }
+
+    #[test]
+    fn test_stream_world_maps_viewport_ui_xml_and_stalker_alife_from_vfs() {
+        use crate::ai_graph::{
+            GameGraphHeader, GameLevelInfo, GameVertex, XRAI_CURRENT_VERSION,
+        };
+        use crate::fonts::{FontAlignment, FontDrawParams};
+        use crate::spawns::{
+            alife_object_flags, m_spawn_flags, ph_skeleton_flags, AlifeAnomalousZoneState,
+            AlifeCreatureAbstractState, AlifeCustomZoneState, AlifeDynamicVisualState,
+            AlifeHumanAbstractState, AlifeHumanStalkerState, AlifeMonsterAbstractState,
+            AlifeObjectState, AlifeSpaceRestrictorState, AlifeTraderAbstractState,
+            ServerPhBoneState, ServerPhBonesData, ServerPhSkeletonState, ServerShapeDef,
+            ServerVisualState, SpawnHeader, SpawnPacket, SpawnVertex, INVALID_OBJECT_ID,
+            INVALID_SPAWN_STORY_ID, INVALID_STORY_ID, M_UPDATE, SPAWN_VERSION,
+        };
+        use crate::xml_ui::{color_argb, UiWindowDef};
+
+        let game_levels_ltx = br#"[levels]
+level01 =
+
+[level01]
+name = l01_escape
+caption = "Cordon"
+offset = 0.0, 0.0, 0.0
+id = 1
+"#;
+        let game_maps_ltx = br#"[global_map]
+texture = ui\ui_global_map
+bound_rect = 0.0, 0.0, 1024.0, 2634.0
+max_zoom = 6.0
+
+[level_maps_single]
+l01_escape =
+
+[l01_escape]
+texture = map\map_escape
+bound_rect = -100.0, -100.0, 100.0, 100.0
+global_rect = 300.0, 2000.0, 500.0, 2200.0
+label = "st_cordon"
+label_color = 255, 220, 150
+"#;
+        let level_ltx = br#"[level_map]
+texture = map\map_escape_hd
+bound_rect = -200.0, -200.0, 200.0, 200.0
+"#;
+        let color_defs_xml = br#"<colors><color name="hud_amber" r="255" g="180" b="50" a="255"/></colors>"#;
+        let pda_ui_16_xml = br#"<w>
+    <pda_caption x="50" y="100" width="200" height="40">
+        <text font="letterica18" align="l" vert_align="c" color="hud_amber">Esc %c[default]Ok</text>
+    </pda_caption>
+</w>"#;
+        let fonts_ltx = br#"[ui_font_letterica18_russian]
+shader = font
+texture = ui\ui_font_letter_18_1024
+size = 18
+"#;
+        let font_ini = br#"[symbol_coords]
+height = 18
+032 = 0, 0, 6
+069 = 8, 0, 20
+079 = 24, 0, 36
+099 = 40, 0, 50
+107 = 52, 0, 62
+115 = 64, 0, 74
+"#;
+
+        let base_alife = AlifeObjectState {
+            game_vertex_id: 0,
+            distance: 0.0,
+            direct_control: true,
+            level_vertex_id: 1,
+            flags: alife_object_flags::CAN_SAVE,
+            custom_data: String::new(),
+            story_id: INVALID_STORY_ID,
+            spawn_story_id: INVALID_SPAWN_STORY_ID,
+            subclass_payload: Vec::new(),
+        };
+        let stalker = AlifeHumanStalkerState {
+            human: AlifeHumanAbstractState {
+                trader: AlifeTraderAbstractState {
+                    money: 1200,
+                    specific_character: "esc_stalker".into(),
+                    trader_flags: 0,
+                    character_profile: "esc_stalker".into(),
+                    community_index: 1,
+                    rank: 300,
+                    reputation: 0,
+                    character_name: "Petruha".into(),
+                    deadbody_can_take: true,
+                    deadbody_closed: false,
+                },
+                monster: AlifeMonsterAbstractState {
+                    creature: AlifeCreatureAbstractState {
+                        base: AlifeDynamicVisualState {
+                            alife: base_alife.clone(),
+                            visual: ServerVisualState {
+                                visual_name: "actors\\stalker_neutral\\stalker_neutral_1".into(),
+                                flags: 0,
+                            },
+                            trailing: Vec::new(),
+                        },
+                        team: 0,
+                        squad: 0,
+                        group: 0,
+                        health: 1.0,
+                        dynamic_out_restrictions: Vec::new(),
+                        dynamic_in_restrictions: Vec::new(),
+                        killer_id: INVALID_OBJECT_ID,
+                        game_death_time: 0,
+                        trailing: Vec::new(),
+                    },
+                    out_space_restrictors: String::new(),
+                    in_space_restrictors: String::new(),
+                    smart_terrain_id: 3,
+                    task_reached: false,
+                    trailing: Vec::new(),
+                },
+                equipment_prefs: vec![1, 0, 1, 2, 0],
+                main_weapon_prefs: vec![2, 2, 1, 0],
+                trailing: Vec::new(),
+            },
+            skeleton: ServerPhSkeletonState {
+                startup_animation: "$editor".into(),
+                flags: ph_skeleton_flags::SAVED_DATA,
+                source_id: INVALID_OBJECT_ID,
+                saved_bones: Some(ServerPhBonesData {
+                    bones_mask: 1,
+                    root_bone: 0,
+                    min: [-5.0; 3],
+                    max: [5.0; 3],
+                    bones: vec![ServerPhBoneState::from_world_position_quat(
+                        [0.0; 3],
+                        [0.0, 0.0, 0.0, 1.0],
+                        [-5.0; 3],
+                        [5.0; 3],
+                        true,
+                    )],
+                }),
+            },
+            trailing: Vec::new(),
+        };
+        let zone = AlifeAnomalousZoneState {
+            zone: AlifeCustomZoneState {
+                restrictor: AlifeSpaceRestrictorState {
+                    alife: base_alife,
+                    shapes: vec![ServerShapeDef::Sphere {
+                        center: [0.0; 3],
+                        radius: 3.5,
+                    }],
+                    restrictor_type: 1,
+                    trailing: Vec::new(),
+                },
+                max_power: 2.0,
+                owner_id: u32::MAX,
+                enabled_time: 0,
+                disabled_time: 0,
+                start_time_shift: 0,
+                trailing: Vec::new(),
+            },
+            offline_interactive_radius: 30.0,
+            artefact_spawn_count: 8,
+            artefact_position_offset: 0,
+            trailing: Vec::new(),
+        };
+
+        let gg = GameGraph {
+            header: GameGraphHeader {
+                version: 10,
+                vertex_count: 1,
+                edge_count: 0,
+                death_point_count: 0,
+                guid: [0x11, 0x22],
+                levels: vec![GameLevelInfo {
+                    name: "l01_escape".into(),
+                    offset: [0.0; 3],
+                    id: 1,
+                    section: "level01".into(),
+                    guid: [1, 1],
+                }],
+            },
+            vertices: vec![GameVertex {
+                local_point: [0.0; 3],
+                global_point: [0.0; 3],
+                level_id: 1,
+                level_vertex_id: 1,
+                vertex_types: [0; 4],
+                edge_offset: 48,
+                point_offset: 48,
+                neighbour_count: 0,
+                death_point_count: 0,
+            }],
+            edges: Vec::new(),
+            death_points: Vec::new(),
+            cross_tables: Vec::new(),
+        };
+        let archive = AlifeSpawnArchive {
+            header: SpawnHeader {
+                version: XRAI_CURRENT_VERSION,
+                guid: [0x22; 16],
+                graph_guid: [0x11u64, 0x22]
+                    .into_iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+                spawn_count: 2,
+                level_count: 1,
+            },
+            spawns: vec![
+                SpawnVertex {
+                    spawn_id: 0,
+                    spawn: SpawnPacket {
+                        section: "stalker".into(),
+                        name_replace: "esc_petruha".into(),
+                        game_id_legacy: 0,
+                        rp: 0xFE,
+                        position: [0.0; 3],
+                        angle: [0.0; 3],
+                        respawn_time: 0,
+                        id: INVALID_OBJECT_ID,
+                        parent_id: INVALID_OBJECT_ID,
+                        phantom_id: INVALID_OBJECT_ID,
+                        flags: m_spawn_flags::VERSION,
+                        version: SPAWN_VERSION,
+                        game_type: u16::MAX,
+                        script_version: 10,
+                        client_data: Vec::new(),
+                        spawn_id: 0,
+                        state_payload: stalker.to_bytes(),
+                        trailing_update_payload: Vec::new(),
+                    },
+                    update_packet: M_UPDATE.to_le_bytes().to_vec(),
+                },
+                SpawnVertex {
+                    spawn_id: 1,
+                    spawn: SpawnPacket {
+                        section: "zone_mine_gravitational_weak".into(),
+                        name_replace: "esc_anom_01".into(),
+                        game_id_legacy: 0,
+                        rp: 0xFE,
+                        position: [5.0, 0.0, 5.0],
+                        angle: [0.0; 3],
+                        respawn_time: 0,
+                        id: INVALID_OBJECT_ID,
+                        parent_id: INVALID_OBJECT_ID,
+                        phantom_id: INVALID_OBJECT_ID,
+                        flags: m_spawn_flags::VERSION,
+                        version: SPAWN_VERSION,
+                        game_type: u16::MAX,
+                        script_version: 10,
+                        client_data: Vec::new(),
+                        spawn_id: 1,
+                        state_payload: zone.to_bytes(),
+                        trailing_update_payload: Vec::new(),
+                    },
+                    update_packet: M_UPDATE.to_le_bytes().to_vec(),
+                },
+            ],
+            edges: Vec::new(),
+            artefact_spawn_positions: Vec::new(),
+            patrol_paths: Vec::new(),
+            game_graph: gg,
+        }
+        .to_bytes();
+
+        let entries = vec![
+            ("configs\\game_levels.ltx", game_levels_ltx.to_vec(), game_levels_ltx.to_vec()),
+            ("configs\\game_maps_single.ltx", game_maps_ltx.to_vec(), game_maps_ltx.to_vec()),
+            ("levels\\l01_escape\\level.ltx", level_ltx.to_vec(), level_ltx.to_vec()),
+            ("configs\\ui\\color_defs.xml", color_defs_xml.to_vec(), color_defs_xml.to_vec()),
+            ("configs\\ui\\pda_16.xml", pda_ui_16_xml.to_vec(), pda_ui_16_xml.to_vec()),
+            ("configs\\fonts.ltx", fonts_ltx.to_vec(), fonts_ltx.to_vec()),
+            (
+                "textures\\ui\\ui_font_letter_18_1024.ini",
+                font_ini.to_vec(),
+                font_ini.to_vec(),
+            ),
+            ("spawns\\all.spawn", archive.clone(), compress_lzo1x(&archive)),
+        ];
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_bytes("world_ui_alife.db0", pack_synthetic_db(entries))
+            .unwrap();
+
+        let levels = load_game_levels_from_vfs(&vfs, &[]).unwrap();
+        assert_eq!(levels.find_by_name("l01_escape").unwrap().caption, "Cordon");
+
+        let maps = load_world_maps_from_vfs(&vfs, &[], true).unwrap();
+        let esc = maps.get_level("l01_escape").unwrap();
+        assert_eq!(esc.texture, "map\\map_escape_hd");
+        assert_eq!(esc.bound_rect, [-200.0, -200.0, 200.0, 200.0]);
+        assert_eq!(esc.label_color_argb, color_argb(255, 255, 220, 150));
+        let uv = maps.world_xz_to_level_uv("l01_escape", [0.0, 0.0]).unwrap();
+        assert!((uv[0] - 0.5).abs() < 1e-6);
+        assert!((uv[1] - 0.5).abs() < 1e-6);
+
+        let vp = UiViewport::new(1920.0, 1080.0);
+        let ui_doc = load_ui_xml_for_viewport_from_vfs(&vfs, "pda.xml", &vp).unwrap();
+        let colors = load_color_defs_from_vfs(&vfs).unwrap();
+        let wnd = UiWindowDef::from_xml_node(ui_doc.navigate("pda_caption", 0).unwrap(), &colors);
+        let fonts_doc = load_ltx_tree_from_vfs(&vfs, "$game_configs$/fonts.ltx", &[]).unwrap();
+        let (_fcfg, atlas) =
+            load_font_from_vfs(&vfs, &fonts_doc, "ui_font_letterica18_russian", 768).unwrap();
+        let quads = atlas.build_ui_window_text_quads(
+            [512, 256],
+            &wnd,
+            &vp,
+            Some(&colors),
+            Some("E %c[255,0,255,0]s %c[default]Ok"),
+            FontDrawParams::default(),
+        );
+        assert_eq!(quads.len(), 6); // 'E', ' ', 's', ' ', 'O', 'k'
+        assert_eq!(quads[0].color_top_argb, color_argb(255, 255, 180, 50));
+        assert_eq!(quads[2].color_top_argb, color_argb(255, 0, 255, 0));
+        assert_eq!(quads[5].color_top_argb, color_argb(255, 255, 180, 50));
+        assert_eq!(
+            FontAlignment::parse_xml_align(&wnd.text.as_ref().unwrap().align),
+            FontAlignment::Left
+        );
+
+        let loaded_spawn = load_all_spawn_from_vfs(&vfs, "all").unwrap();
+        assert_eq!(
+            loaded_spawn.spawns[0]
+                .spawn
+                .decode_human_stalker_state()
+                .unwrap(),
+            stalker
+        );
+        assert_eq!(
+            loaded_spawn.spawns[1]
+                .spawn
+                .decode_anomalous_zone_state()
+                .unwrap(),
+            zone
         );
     }
 }

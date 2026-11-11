@@ -24,7 +24,8 @@
 //! - `spawns`: `level.game` (`RPoint`/`PatrolPath`), `patrol_paths.ltx`, `level.spawn`, `all.spawn` (`AlifeSpawnArchive`) & ALife `NET_Packet` entity/subclass codecs
 //! - `thm`: X-Ray `.thm` / `.ltx` texture descriptor parser (`_bump` / `_bump#` / detail / material links)
 //! - `weather`: Weather cycles (`weathers\*.ltx`), weather effects, sun positions, ambients, lens flares, thunderbolts & atmospheric mixer
-//! - `xml_ui`: Pure-Rust Windows-1251/UTF-8 UI XML DOM (`#include` & `a:b:c` nav), localization tables, UI atlases & color defs
+//! - `world_maps`: `game_levels.ltx` (`GameLevelsConfig`), `game_maps_single.ltx` + `level.ltx` PDA/minimap bounds (`WorldMapsConfig`) & coordinate transforms
+//! - `xml_ui`: Pure-Rust Windows-1251/UTF-8 UI XML DOM (`#include` & `a:b:c` nav), virtual `1024x768` viewport scaling (`UiViewport`), localization tables, UI atlases & color defs
 //! - `vfs_bridge`: Direct `xray-vfs` streaming integration across all binary/LTX/XML/font/savegame assets
 
 pub mod ai_graph;
@@ -51,6 +52,7 @@ pub mod spawns;
 pub mod thm;
 pub mod vfs_bridge;
 pub mod weather;
+pub mod world_maps;
 pub mod xml_ui;
 
 pub use ai_graph::{
@@ -83,10 +85,12 @@ pub use envelopes::{
 };
 pub use fonts::{
     font_atlas_ini_vpath, font_flags, is_alpha_character, is_bad_end_character,
-    is_bad_start_character, is_need_space_character, mbh_multi2wide, rank_font_candidates,
-    rank_font_candidates_owned, resolve_font_section, resolve_font_section_owned,
-    resolve_font_texture_name, FontAlignment, FontAtlas, FontAtlasKind, FontDrawParams,
-    FontGlyphCoord, FontGlyphQuad, FontRungCandidate, FontSectionConfig, STANDARD_FONT_SECTIONS,
+    is_bad_start_character, is_need_space_character, mbh_multi2wide, parse_colored_text_lines,
+    rank_font_candidates, rank_font_candidates_owned, resolve_font_section,
+    resolve_font_section_owned, resolve_font_texture_name, resolve_ui_font_section,
+    FontAlignment, FontAtlas, FontAtlasKind, FontDrawParams, FontGlyphCoord, FontGlyphQuad,
+    FontRungCandidate, FontSectionConfig, UiColoredSegment, UiMultilineTextOptions,
+    UiTextVerticalAlign, STANDARD_FONT_SECTIONS,
 };
 pub use gamemtl::{
     gamemtl_chunks, gamemtl_flags, gamemtl_pair_chunks, gamemtl_pair_flags,
@@ -166,10 +170,16 @@ pub use spawn_overlays::{
     OverlaySpawnPatch, SpawnOverlaysConfig, DEFAULT_LINK_TOLERANCE, MATCH_TOLERANCE,
 };
 pub use spawns::{
-    alife_object_flags, cse_spawn_flags, m_spawn_flags, wayobject_chunks, AlifeDynamicVisualState,
-    AlifeInventoryItemState, AlifeItemWeaponState, AlifeLevelChangerState, AlifeObjectState,
-    AlifeSpaceRestrictorState, AlifeSpawnArchive, AlifeTraderAbstractState, GraphPointState,
-    LevelGameData, LevelSpawnData, PatrolEdge, PatrolPath, PatrolPoint, RPoint, RPointType,
+    alife_object_flags, cse_spawn_flags, m_spawn_flags, ph_skeleton_flags, wayobject_chunks,
+    AlifeAnomalousZoneState, AlifeCreatureAbstractState, AlifeCreatureActorState,
+    AlifeCustomZoneState, AlifeDynamicVisualState, AlifeHumanAbstractState,
+    AlifeHumanStalkerState, AlifeInventoryBoxState, AlifeInventoryItemState, AlifeItemAmmoState,
+    AlifeItemDocumentState, AlifeItemPdaState, AlifeItemWeaponState, AlifeLevelChangerState,
+    AlifeMonsterAbstractState, AlifeMonsterBaseState, AlifeObjectPhysicState, AlifeObjectState,
+    AlifeSmartZoneState, AlifeSpaceRestrictorState, AlifeSpawnArchive, AlifeTeamBaseZoneState,
+    AlifeTorridZoneState, AlifeTraderAbstractState, AlifeTraderState, AlifeZoneVisualState,
+    GraphPointState, LevelGameData, LevelSpawnData, PatrolEdge, PatrolPath, PatrolPoint, RPoint,
+    RPointType, ServerMotionState, ServerPhBoneState, ServerPhBonesData, ServerPhSkeletonState,
     ServerShapeDef, ServerVisualState, SpawnEdge, SpawnHeader, SpawnPacket, SpawnVertex,
     INVALID_OBJECT_ID, INVALID_SPAWN_STORY_ID, INVALID_STORY_ID, M_SPAWN, M_UPDATE, POINT_BASE,
     RPOINT_CHUNK, SPAWN_VERSION, WAYOBJECT_VERSION, WAY_BASE, WAY_PATROLPATH_CHUNK,
@@ -184,16 +194,17 @@ pub use vfs_bridge::{
     load_anms_from_vfs, load_blood_wallmarks_from_vfs, load_bone_parts_ltx_from_vfs,
     load_cform_from_vfs, load_color_defs_from_vfs, load_details_from_vfs, load_dm_from_vfs,
     load_env_mods_from_vfs, load_fog_volumes_from_vfs, load_font_atlas_from_vfs,
-    load_font_from_vfs, load_game_graph_from_vfs, load_gamemtl_from_vfs, load_hom_from_vfs,
-    load_lanims_from_vfs, load_level_ai_from_vfs, load_level_from_vfs, load_level_game_from_vfs,
-    load_level_gct_from_vfs, load_level_geometry_from_vfs, load_level_sound_env_from_vfs,
-    load_level_spawn_from_vfs, load_localization_table_from_vfs, load_ltx_tree_from_vfs,
-    load_ogg_sound_metadata_from_vfs, load_ogf_from_vfs, load_omf_from_vfs,
-    load_particles_from_vfs, load_patrol_paths_ltx_from_vfs, load_ppe_from_vfs,
-    load_ps_static_from_vfs, load_scop_from_vfs, load_shaders_xr_from_vfs,
+    load_font_from_vfs, load_game_graph_from_vfs, load_game_levels_from_vfs,
+    load_gamemtl_from_vfs, load_hom_from_vfs, load_lanims_from_vfs, load_level_ai_from_vfs,
+    load_level_from_vfs, load_level_game_from_vfs, load_level_gct_from_vfs,
+    load_level_geometry_from_vfs, load_level_sound_env_from_vfs, load_level_spawn_from_vfs,
+    load_localization_table_from_vfs, load_ltx_tree_from_vfs, load_ogg_sound_metadata_from_vfs,
+    load_ogf_from_vfs, load_omf_from_vfs, load_particles_from_vfs, load_patrol_paths_ltx_from_vfs,
+    load_ppe_from_vfs, load_ps_static_from_vfs, load_scop_from_vfs, load_shaders_xr_from_vfs,
     load_shaders_xrlc_from_vfs, load_som_from_vfs, load_sound_environments_from_vfs,
     load_spawn_overlays_from_vfs, load_static_sounds_from_vfs, load_thm_from_vfs,
-    load_ui_texture_atlases_from_vfs, load_weather_library_from_vfs, load_xml_from_vfs,
+    load_ui_texture_atlases_from_vfs, load_ui_xml_for_viewport_from_vfs,
+    load_weather_library_from_vfs, load_world_maps_from_vfs, load_xml_from_vfs,
     resolve_font_config_from_vfs, resolve_ogf_texture_links, AssetLoadError, VfsLtxProvider,
     VfsXmlProvider,
 };
@@ -204,9 +215,13 @@ pub use weather::{
     MixedEnvironment, SunPositionsConfig, ThunderboltCollectionDef, ThunderboltDescDef,
     ThunderboltFlareDef, WeatherCycle, WeatherLibrary, DAY_LENGTH, WFX_TRANS_TIME,
 };
+pub use world_maps::{
+    parse_ltx_color_argb, DefaultMapDef, GameLevelsConfig, GlobalMapDef, LevelIdSpec,
+    LevelListEntry, LevelMapDef, WorldMapsConfig, DEFAULT_MAP_LABEL_COLOR_ARGB,
+};
 pub use xml_ui::{
     argb_to_rgba_f32, color_argb, decode_cp1251, decode_xray_text, expand_action_placeholders,
-    expand_xml_includes, unescape_xray_newlines, LocalizationTable, UiColorDefs,
-    UiTextureAtlasMap, UiTextureRef, UiTextureRegion, UiTextDef, UiWindowDef, XmlDocument,
-    XmlFileProvider, XmlNode,
+    expand_xml_includes, subst_alpha, unescape_xray_newlines, LocalizationTable, UiColorDefs,
+    UiTextureAtlasMap, UiTextureRef, UiTextureRegion, UiTextDef, UiViewport, UiWindowDef,
+    XmlDocument, XmlFileProvider, XmlNode, UI_BASE_HEIGHT, UI_BASE_WIDTH,
 };

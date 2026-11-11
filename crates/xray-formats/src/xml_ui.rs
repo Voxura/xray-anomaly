@@ -1007,9 +1007,119 @@ impl UiTextureAtlasMap {
     }
 }
 
+/// Canonical X-Ray UI virtual canvas resolution (`UI_BASE_WIDTH` x `UI_BASE_HEIGHT` in `ui_base.h`).
+pub const UI_BASE_WIDTH: f32 = 1024.0;
+pub const UI_BASE_HEIGHT: f32 = 768.0;
+
+/// Virtual 1024x768 <-> physical swapchain viewport scaling & widescreen aspect selection
+/// (`ui_core::OnDeviceReset`, `screenmode`, `get_current_kx`, `get_xml_name`, `src/xrGame/ui_base.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UiViewport {
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Default for UiViewport {
+    fn default() -> Self {
+        Self {
+            width: UI_BASE_WIDTH,
+            height: UI_BASE_HEIGHT,
+        }
+    }
+}
+
+impl UiViewport {
+    pub fn new(width: f32, height: f32) -> Self {
+        Self {
+            width: width.max(1.0),
+            height: height.max(1.0),
+        }
+    }
+
+    pub fn scale(&self) -> [f32; 2] {
+        [self.width / UI_BASE_WIDTH, self.height / UI_BASE_HEIGHT]
+    }
+
+    pub fn aspect_ratio(&self) -> f32 {
+        self.width / self.height.max(1.0)
+    }
+
+    pub fn is_widescreen(&self) -> bool {
+        self.aspect_ratio() > (UI_BASE_WIDTH / UI_BASE_HEIGHT + 0.01)
+    }
+
+    /// `ui_core::screenmode()`: `0` = 4:3, `1` = 16:9 (`> 1.343`), `2` = 21:9 (`> 1.8`).
+    pub fn screen_mode(&self) -> u8 {
+        let aspect = self.aspect_ratio();
+        if aspect > 1.8 {
+            2
+        } else if aspect > (UI_BASE_WIDTH / UI_BASE_HEIGHT + 0.01) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// X-axis aspect compensation factor `kx` (`ui_core::get_current_kx()`).
+    pub fn kx(&self) -> f32 {
+        (self.height / self.width.max(1.0)) / (UI_BASE_HEIGHT / UI_BASE_WIDTH)
+    }
+
+    pub fn virtual_to_screen_xy(&self, xy: [f32; 2]) -> [f32; 2] {
+        let s = self.scale();
+        [xy[0] * s[0], xy[1] * s[1]]
+    }
+
+    pub fn virtual_to_screen_rect(&self, xywh: [f32; 4]) -> [f32; 4] {
+        let s = self.scale();
+        [xywh[0] * s[0], xywh[1] * s[1], xywh[2] * s[0], xywh[3] * s[1]]
+    }
+
+    pub fn screen_to_virtual_width(&self, w: f32) -> f32 {
+        let sx = self.scale()[0];
+        if sx > 0.0 { w / sx } else { w }
+    }
+
+    pub fn screen_to_virtual_height(&self, h: f32) -> f32 {
+        let sy = self.scale()[1];
+        if sy > 0.0 { h / sy } else { h }
+    }
+
+    /// Ordered candidate UI XML filenames matching `ui_core::get_xml_name` (`_21.xml` -> `_16.xml` -> `.xml`).
+    pub fn xml_variant_candidates(&self, xml_name: &str) -> Vec<String> {
+        let clean = xml_name.trim().replace('/', "\\");
+        let base = if clean.len() >= 4 && clean[clean.len() - 4..].eq_ignore_ascii_case(".xml") {
+            &clean[..clean.len() - 4]
+        } else {
+            clean.as_str()
+        };
+        let mut out = Vec::with_capacity(3);
+        match self.screen_mode() {
+            2 => {
+                out.push(format!("{base}_21.xml"));
+                out.push(format!("{base}_16.xml"));
+                out.push(format!("{base}.xml"));
+            }
+            1 => {
+                out.push(format!("{base}_16.xml"));
+                out.push(format!("{base}.xml"));
+            }
+            _ => {
+                out.push(format!("{base}.xml"));
+            }
+        }
+        out
+    }
+}
+
 /// Pack 8-bit components into X-Ray `u32` `color_argb(a, r, g, b)`.
 pub const fn color_argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// Replace only the alpha byte of `argb` (`subst_alpha` in `xrCore/_color.h`).
+pub const fn subst_alpha(argb: u32, alpha: u8) -> u32 {
+    (argb & 0x00FF_FFFF) | ((alpha as u32) << 24)
 }
 
 /// Unpack X-Ray `color_argb` into normalized `[r, g, b, a]` floats in `0.0..=1.0`.
@@ -1387,5 +1497,40 @@ mod tests {
         assert_eq!(region.pixel_rect(), [10.0, 20.0, 40.0, 60.0]);
         assert_eq!(region.border_l, 1);
         assert_eq!(region.dds_vpath(), "textures\\ui\\ui_common.dds");
+    }
+
+    #[test]
+    fn test_ui_viewport_scaling_and_xml_aspect_variants() {
+        let vp_4_3 = UiViewport::new(1024.0, 768.0);
+        assert_eq!(vp_4_3.screen_mode(), 0);
+        assert!(!vp_4_3.is_widescreen());
+        assert!((vp_4_3.kx() - 1.0).abs() < 1e-6);
+        assert_eq!(vp_4_3.xml_variant_candidates("ui_ctrl_hdr.xml"), vec!["ui_ctrl_hdr.xml"]);
+
+        let vp_16_9 = UiViewport::new(1920.0, 1080.0);
+        assert_eq!(vp_16_9.screen_mode(), 1);
+        assert!(vp_16_9.is_widescreen());
+        assert!((vp_16_9.kx() - 0.75).abs() < 1e-5);
+        assert_eq!(
+            vp_16_9.xml_variant_candidates("ui_ctrl_hdr"),
+            vec!["ui_ctrl_hdr_16.xml", "ui_ctrl_hdr.xml"]
+        );
+        assert_eq!(
+            vp_16_9.virtual_to_screen_rect([100.0, 200.0, 50.0, 20.0]),
+            [
+                100.0 * (1920.0 / 1024.0),
+                200.0 * (1080.0 / 768.0),
+                50.0 * (1920.0 / 1024.0),
+                20.0 * (1080.0 / 768.0),
+            ]
+        );
+
+        let vp_21_9 = UiViewport::new(3440.0, 1440.0);
+        assert_eq!(vp_21_9.screen_mode(), 2);
+        assert_eq!(
+            vp_21_9.xml_variant_candidates("pda.xml"),
+            vec!["pda_21.xml", "pda_16.xml", "pda.xml"]
+        );
+        assert_eq!(subst_alpha(color_argb(255, 10, 20, 30), 128), color_argb(128, 10, 20, 30));
     }
 }

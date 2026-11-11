@@ -623,9 +623,11 @@ pub struct AlifeObjectState {
 }
 
 impl AlifeObjectState {
-    /// Parse `CSE_ALifeObject::STATE_Read` prefix and preserve remaining subclass state bytes.
-    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
-        let mut cur = ByteCursor::new(state_bytes);
+    /// Parse `CSE_ALifeObject::STATE_Read` prefix from a shared cursor (`subclass_payload` is left empty).
+    pub fn parse_prefix_from_cursor(
+        version: u16,
+        cur: &mut ByteCursor<'_>,
+    ) -> Result<Self, FormatError> {
         let mut game_vertex_id = INVALID_GAME_VERTEX;
         let mut distance = 0.0;
         let mut direct_control = true;
@@ -678,8 +680,6 @@ impl AlifeObjectState {
             spawn_story_id = cur.read_u32()?;
         }
 
-        let subclass_payload = state_bytes[cur.position()..].to_vec();
-
         Ok(Self {
             game_vertex_id,
             distance,
@@ -689,13 +689,12 @@ impl AlifeObjectState {
             custom_data,
             story_id,
             spawn_story_id,
-            subclass_payload,
+            subclass_payload: Vec::new(),
         })
     }
 
-    /// Encode in `SPAWN_VERSION` (128) wire layout (`CSE_ALifeObject::STATE_Write`).
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(32 + self.custom_data.len() + self.subclass_payload.len());
+    /// Encode only the `CSE_ALifeObject` header fields into `out` (omitting `subclass_payload`).
+    pub fn write_prefix_to(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.game_vertex_id.to_le_bytes());
         out.extend_from_slice(&self.distance.to_le_bytes());
         out.extend_from_slice(&u32::from(self.direct_control).to_le_bytes());
@@ -705,6 +704,20 @@ impl AlifeObjectState {
         out.push(0);
         out.extend_from_slice(&self.story_id.to_le_bytes());
         out.extend_from_slice(&self.spawn_story_id.to_le_bytes());
+    }
+
+    /// Parse `CSE_ALifeObject::STATE_Read` prefix and preserve remaining subclass state bytes.
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let mut parsed = Self::parse_prefix_from_cursor(version, &mut cur)?;
+        parsed.subclass_payload = state_bytes[cur.position()..].to_vec();
+        Ok(parsed)
+    }
+
+    /// Encode in `SPAWN_VERSION` (128) wire layout (`CSE_ALifeObject::STATE_Write`).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + self.custom_data.len() + self.subclass_payload.len());
+        self.write_prefix_to(&mut out);
         out.extend_from_slice(&self.subclass_payload);
         out
     }
@@ -1384,30 +1397,37 @@ pub struct AlifeDynamicVisualState {
 }
 
 impl AlifeDynamicVisualState {
-    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
-        let mut alife = AlifeObjectState::parse(version, state_bytes)?;
-        let payload = std::mem::take(&mut alife.subclass_payload);
-        let mut cur = ByteCursor::new(&payload);
+    pub fn parse_from_cursor(version: u16, cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let alife = AlifeObjectState::parse_prefix_from_cursor(version, cur)?;
         let visual = if version > 31 {
-            ServerVisualState::parse_from_cursor(version, &mut cur)?
+            ServerVisualState::parse_from_cursor(version, cur)?
         } else {
             ServerVisualState::default()
         };
-        let trailing = payload[cur.position()..].to_vec();
         Ok(Self {
             alife,
             visual,
-            trailing,
+            trailing: Vec::new(),
         })
     }
 
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        self.alife.write_prefix_to(out);
+        self.visual.write_to(out);
+        out.extend_from_slice(&self.trailing);
+    }
+
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let mut parsed = Self::parse_from_cursor(version, &mut cur)?;
+        parsed.trailing = state_bytes[cur.position()..].to_vec();
+        Ok(parsed)
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut sub = Vec::new();
-        self.visual.write_to(&mut sub);
-        sub.extend_from_slice(&self.trailing);
-        let mut base = self.alife.clone();
-        base.subclass_payload = sub;
-        base.to_bytes()
+        let mut out = Vec::new();
+        self.write_to(&mut out);
+        out
     }
 }
 
@@ -1421,29 +1441,36 @@ pub struct AlifeSpaceRestrictorState {
 }
 
 impl AlifeSpaceRestrictorState {
-    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
-        let mut alife = AlifeObjectState::parse(version, state_bytes)?;
-        let payload = std::mem::take(&mut alife.subclass_payload);
-        let mut cur = ByteCursor::new(&payload);
-        let shapes = ServerShapeDef::parse_cform_shapes(&mut cur)?;
+    pub fn parse_from_cursor(version: u16, cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let alife = AlifeObjectState::parse_prefix_from_cursor(version, cur)?;
+        let shapes = ServerShapeDef::parse_cform_shapes(cur)?;
         let restrictor_type = if version > 74 { cur.read_u8()? } else { 0 };
-        let trailing = payload[cur.position()..].to_vec();
         Ok(Self {
             alife,
             shapes,
             restrictor_type,
-            trailing,
+            trailing: Vec::new(),
         })
     }
 
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        self.alife.write_prefix_to(out);
+        ServerShapeDef::encode_cform_shapes(&self.shapes, out);
+        out.push(self.restrictor_type);
+        out.extend_from_slice(&self.trailing);
+    }
+
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let mut parsed = Self::parse_from_cursor(version, &mut cur)?;
+        parsed.trailing = state_bytes[cur.position()..].to_vec();
+        Ok(parsed)
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut sub = Vec::new();
-        ServerShapeDef::encode_cform_shapes(&self.shapes, &mut sub);
-        sub.push(self.restrictor_type);
-        sub.extend_from_slice(&self.trailing);
-        let mut base = self.alife.clone();
-        base.subclass_payload = sub;
-        base.to_bytes()
+        let mut out = Vec::new();
+        self.write_to(&mut out);
+        out
     }
 }
 
@@ -1539,16 +1566,9 @@ pub struct AlifeInventoryItemState {
 }
 
 impl AlifeInventoryItemState {
-    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
-        let mut base = AlifeDynamicVisualState::parse(version, state_bytes)?;
-        let payload = std::mem::take(&mut base.trailing);
-        let mut cur = ByteCursor::new(&payload);
-
-        let condition = if version > 52 {
-            cur.read_f32()?
-        } else {
-            1.0
-        };
+    pub fn parse_from_cursor(version: u16, cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let base = AlifeDynamicVisualState::parse_from_cursor(version, cur)?;
+        let condition = if version > 52 { cur.read_f32()? } else { 1.0 };
         let mut upgrades = Vec::new();
         if version > 123 {
             let count = cur.read_u32()? as usize;
@@ -1557,29 +1577,36 @@ impl AlifeInventoryItemState {
                 upgrades.push(cur.read_zstring()?);
             }
         }
-        let trailing = payload[cur.position()..].to_vec();
-
         Ok(Self {
             base,
             condition,
             upgrades,
-            trailing,
+            trailing: Vec::new(),
         })
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut tail = Vec::new();
-        tail.extend_from_slice(&self.condition.to_le_bytes());
-        tail.extend_from_slice(&(self.upgrades.len() as u32).to_le_bytes());
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        self.base.write_to(out);
+        out.extend_from_slice(&self.condition.to_le_bytes());
+        out.extend_from_slice(&(self.upgrades.len() as u32).to_le_bytes());
         for u in &self.upgrades {
-            tail.extend_from_slice(u.as_bytes());
-            tail.push(0);
+            out.extend_from_slice(u.as_bytes());
+            out.push(0);
         }
-        tail.extend_from_slice(&self.trailing);
+        out.extend_from_slice(&self.trailing);
+    }
 
-        let mut b = self.base.clone();
-        b.trailing = tail;
-        b.to_bytes()
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let mut parsed = Self::parse_from_cursor(version, &mut cur)?;
+        parsed.trailing = state_bytes[cur.position()..].to_vec();
+        Ok(parsed)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_to(&mut out);
+        out
     }
 }
 
@@ -1739,6 +1766,1162 @@ impl AlifeTraderAbstractState {
     }
 }
 
+/// Animation reference embedded by `CSE_Motion` (`xrServer_Objects_Abstract.cpp:106-114`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerMotionState {
+    pub motion_name: String,
+}
+
+impl ServerMotionState {
+    pub fn parse_from_cursor(cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        Ok(Self {
+            motion_name: cur.read_zstring()?,
+        })
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.motion_name.as_bytes());
+        out.push(0);
+    }
+}
+
+/// Bitflags on `CSE_PHSkeleton::_flags` (`xrServer_Objects.h:194-200`).
+pub mod ph_skeleton_flags {
+    pub const ACTIVE: u8 = 1 << 0;
+    pub const SPAWN_COPY: u8 = 1 << 1;
+    pub const SAVED_DATA: u8 = 1 << 2;
+    pub const NOT_SAVE: u8 = 1 << 3;
+}
+
+/// Quantized ragdoll/skeleton bone state (`SPHNetState`, `PHNetState.cpp:8-71, 183-210`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerPhBoneState {
+    pub pos_q8: [u8; 3],
+    pub quat_q8: [u8; 4],
+    pub enabled: bool,
+}
+
+impl ServerPhBoneState {
+    #[inline]
+    pub fn quantize_float_q8(val: f32, min: f32, max: f32) -> u8 {
+        let span = max - min;
+        if span.abs() <= f32::EPSILON {
+            return 0;
+        }
+        let clamped = val.clamp(min, max);
+        let q = (clamped - min) / span;
+        (q * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8
+    }
+
+    #[inline]
+    pub fn dequantize_float_q8(q: u8, min: f32, max: f32) -> f32 {
+        (f32::from(q) / 255.0 * (max - min) + min).clamp(min, max)
+    }
+
+    pub fn from_world_position_quat(
+        pos: [f32; 3],
+        quat_xyzw: [f32; 4],
+        min: [f32; 3],
+        max: [f32; 3],
+        enabled: bool,
+    ) -> Self {
+        Self {
+            pos_q8: [
+                Self::quantize_float_q8(pos[0], min[0], max[0]),
+                Self::quantize_float_q8(pos[1], min[1], max[1]),
+                Self::quantize_float_q8(pos[2], min[2], max[2]),
+            ],
+            quat_q8: [
+                Self::quantize_float_q8(quat_xyzw[0], -1.0, 1.0),
+                Self::quantize_float_q8(quat_xyzw[1], -1.0, 1.0),
+                Self::quantize_float_q8(quat_xyzw[2], -1.0, 1.0),
+                Self::quantize_float_q8(quat_xyzw[3], -1.0, 1.0),
+            ],
+            enabled,
+        }
+    }
+
+    pub fn decode_position(&self, min: [f32; 3], max: [f32; 3]) -> [f32; 3] {
+        [
+            Self::dequantize_float_q8(self.pos_q8[0], min[0], max[0]),
+            Self::dequantize_float_q8(self.pos_q8[1], min[1], max[1]),
+            Self::dequantize_float_q8(self.pos_q8[2], min[2], max[2]),
+        ]
+    }
+
+    pub fn decode_quaternion(&self) -> [f32; 4] {
+        [
+            Self::dequantize_float_q8(self.quat_q8[0], -1.0, 1.0),
+            Self::dequantize_float_q8(self.quat_q8[1], -1.0, 1.0),
+            Self::dequantize_float_q8(self.quat_q8[2], -1.0, 1.0),
+            Self::dequantize_float_q8(self.quat_q8[3], -1.0, 1.0),
+        ]
+    }
+
+    pub fn parse_from_cursor(cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let p = cur.read_bytes(3)?;
+        let q = cur.read_bytes(4)?;
+        let enabled = cur.read_u8()? != 0;
+        Ok(Self {
+            pos_q8: [p[0], p[1], p[2]],
+            quat_q8: [q[0], q[1], q[2], q[3]],
+            enabled,
+        })
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.pos_q8);
+        out.extend_from_slice(&self.quat_q8);
+        out.push(u8::from(self.enabled));
+    }
+}
+
+/// Physics skeleton saved bone state (`SPHBonesData`, `PHNetState.cpp:236-279`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerPhBonesData {
+    pub bones_mask: u64,
+    pub root_bone: u16,
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub bones: Vec<ServerPhBoneState>,
+}
+
+impl Default for ServerPhBonesData {
+    fn default() -> Self {
+        Self {
+            bones_mask: u64::MAX,
+            root_bone: 0,
+            min: [-100.0; 3],
+            max: [100.0; 3],
+            bones: Vec::new(),
+        }
+    }
+}
+
+impl ServerPhBonesData {
+    pub fn parse_from_cursor(cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let bones_mask = cur.read_u64()?;
+        let root_bone = cur.read_u16()?;
+        let min = cur.read_f32_3()?;
+        let max = cur.read_f32_3()?;
+        let count = usize::from(cur.read_u16()?);
+        let mut bones = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            bones.push(ServerPhBoneState::parse_from_cursor(cur)?);
+        }
+        Ok(Self {
+            bones_mask,
+            root_bone,
+            min,
+            max,
+            bones,
+        })
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bones_mask.to_le_bytes());
+        out.extend_from_slice(&self.root_bone.to_le_bytes());
+        for f in self.min {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        for f in self.max {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.bones.len().min(u16::MAX as usize) as u16).to_le_bytes());
+        for bone in self.bones.iter().take(u16::MAX as usize) {
+            bone.write_to(out);
+        }
+    }
+}
+
+/// Decoded `CSE_PHSkeleton::STATE_Read` (`xrServer_Objects.cpp:233-258`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerPhSkeletonState {
+    pub startup_animation: String,
+    pub flags: u8,
+    pub source_id: u16,
+    pub saved_bones: Option<ServerPhBonesData>,
+}
+
+impl Default for ServerPhSkeletonState {
+    fn default() -> Self {
+        Self {
+            startup_animation: String::new(),
+            flags: 0,
+            source_id: INVALID_OBJECT_ID,
+            saved_bones: None,
+        }
+    }
+}
+
+impl ServerPhSkeletonState {
+    pub fn parse_from_cursor(cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let startup_animation = cur.read_zstring()?;
+        let flags = cur.read_u8()?;
+        let source_id = cur.read_u16()?;
+        let saved_bones = if (flags & ph_skeleton_flags::SAVED_DATA) != 0 {
+            Some(ServerPhBonesData::parse_from_cursor(cur)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            startup_animation,
+            flags,
+            source_id,
+            saved_bones,
+        })
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.startup_animation.as_bytes());
+        out.push(0);
+        let effective_flags = if self.saved_bones.is_some() {
+            self.flags | ph_skeleton_flags::SAVED_DATA
+        } else {
+            self.flags & !ph_skeleton_flags::SAVED_DATA
+        };
+        out.push(effective_flags);
+        out.extend_from_slice(&self.source_id.to_le_bytes());
+        if let Some(bones) = &self.saved_bones {
+            bones.write_to(out);
+        }
+    }
+}
+
+/// Decoded `CSE_ALifeCustomZone::STATE_Read` (`xrServer_Objects_ALife.cpp:723-763`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeCustomZoneState {
+    pub restrictor: AlifeSpaceRestrictorState,
+    pub max_power: f32,
+    pub owner_id: u32,
+    pub enabled_time: u32,
+    pub disabled_time: u32,
+    pub start_time_shift: u32,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeCustomZoneState {
+    pub fn parse_from_cursor(version: u16, cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let restrictor = AlifeSpaceRestrictorState::parse_from_cursor(version, cur)?;
+        let max_power = cur.read_f32()?;
+        if version < 113 {
+            let _ = cur.read_f32()?;
+            let _ = cur.read_u32()?;
+        }
+        if version > 66 && version < 118 {
+            let _ = cur.read_u32()?;
+        }
+        let owner_id = if version > 102 {
+            cur.read_u32()?
+        } else {
+            u32::MAX
+        };
+        let (enabled_time, disabled_time) = if version > 105 {
+            (cur.read_u32()?, cur.read_u32()?)
+        } else {
+            (0, 0)
+        };
+        let start_time_shift = if version > 106 { cur.read_u32()? } else { 0 };
+        Ok(Self {
+            restrictor,
+            max_power,
+            owner_id,
+            enabled_time,
+            disabled_time,
+            start_time_shift,
+            trailing: Vec::new(),
+        })
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        self.restrictor.write_to(out);
+        out.extend_from_slice(&self.max_power.to_le_bytes());
+        out.extend_from_slice(&self.owner_id.to_le_bytes());
+        out.extend_from_slice(&self.enabled_time.to_le_bytes());
+        out.extend_from_slice(&self.disabled_time.to_le_bytes());
+        out.extend_from_slice(&self.start_time_shift.to_le_bytes());
+        out.extend_from_slice(&self.trailing);
+    }
+
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let mut parsed = Self::parse_from_cursor(version, &mut cur)?;
+        parsed.trailing = state_bytes[cur.position()..].to_vec();
+        Ok(parsed)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_to(&mut out);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeAnomalousZone::STATE_Read` (`xrServer_Objects_ALife.cpp:830-888`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeAnomalousZoneState {
+    pub zone: AlifeCustomZoneState,
+    pub offline_interactive_radius: f32,
+    pub artefact_spawn_count: u16,
+    pub artefact_position_offset: u32,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeAnomalousZoneState {
+    pub fn parse_from_cursor(version: u16, cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let zone = AlifeCustomZoneState::parse_from_cursor(version, cur)?;
+        let offline_interactive_radius = if version > 21 {
+            let r = cur.read_f32()?;
+            if version < 113 {
+                let _ = cur.read_f32()?;
+                let n = cur.read_u16()?;
+                for _ in 0..n {
+                    let _ = cur.read_zstring()?;
+                    let _ = cur.read_u32()?;
+                }
+            }
+            r
+        } else {
+            30.0
+        };
+        let (artefact_spawn_count, artefact_position_offset) = if version > 25 {
+            (cur.read_u16()?, cur.read_u32()?)
+        } else {
+            (32, 0)
+        };
+        if version > 27 && version < 67 {
+            let _ = cur.read_u32()?;
+        }
+        if version > 38 && version < 113 {
+            let _ = cur.read_f32()?;
+        }
+        if version > 78 && version < 113 {
+            let _ = cur.read_f32()?;
+            let _ = cur.read_f32()?;
+            let _ = cur.read_f32()?;
+        }
+        if version == 102 {
+            let _ = cur.read_u32()?;
+        }
+        Ok(Self {
+            zone,
+            offline_interactive_radius,
+            artefact_spawn_count,
+            artefact_position_offset,
+            trailing: Vec::new(),
+        })
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        self.zone.write_to(out);
+        out.extend_from_slice(&self.offline_interactive_radius.to_le_bytes());
+        out.extend_from_slice(&self.artefact_spawn_count.to_le_bytes());
+        out.extend_from_slice(&self.artefact_position_offset.to_le_bytes());
+        out.extend_from_slice(&self.trailing);
+    }
+
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let mut parsed = Self::parse_from_cursor(version, &mut cur)?;
+        parsed.trailing = state_bytes[cur.position()..].to_vec();
+        Ok(parsed)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_to(&mut out);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeTorridZone::STATE_Read` (`xrServer_Objects_ALife.cpp:927-938`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeTorridZoneState {
+    pub zone: AlifeCustomZoneState,
+    pub motion: ServerMotionState,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeTorridZoneState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let zone = AlifeCustomZoneState::parse_from_cursor(version, &mut cur)?;
+        let motion = ServerMotionState::parse_from_cursor(&mut cur)?;
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            zone,
+            motion,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.zone.write_to(&mut out);
+        self.motion.write_to(&mut out);
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeZoneVisual::STATE_Read` (`xrServer_Objects_ALife.cpp:979-993`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeZoneVisualState {
+    pub anomaly: AlifeAnomalousZoneState,
+    pub visual: ServerVisualState,
+    pub startup_animation: String,
+    pub attack_animation: String,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeZoneVisualState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let anomaly = AlifeAnomalousZoneState::parse_from_cursor(version, &mut cur)?;
+        let visual = ServerVisualState::parse_from_cursor(version, &mut cur)?;
+        let startup_animation = cur.read_zstring()?;
+        let attack_animation = cur.read_zstring()?;
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            anomaly,
+            visual,
+            startup_animation,
+            attack_animation,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.anomaly.write_to(&mut out);
+        self.visual.write_to(&mut out);
+        out.extend_from_slice(self.startup_animation.as_bytes());
+        out.push(0);
+        out.extend_from_slice(self.attack_animation.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// `CSE_ALifeSmartZone::STATE_Read` (`xrServer_Objects_ALife.cpp:2463-2471`) is wire-identical to `CSE_ALifeSpaceRestrictor`.
+pub type AlifeSmartZoneState = AlifeSpaceRestrictorState;
+
+/// Decoded `CSE_ALifeTeamBaseZone::STATE_Read` (`xrServer_Objects_ALife.cpp:2403-2413`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeTeamBaseZoneState {
+    pub restrictor: AlifeSpaceRestrictorState,
+    pub team: u8,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeTeamBaseZoneState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let restrictor = AlifeSpaceRestrictorState::parse_from_cursor(version, &mut cur)?;
+        let team = cur.read_u8()?;
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            restrictor,
+            team,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.restrictor.write_to(&mut out);
+        out.push(self.team);
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeObjectPhysic::STATE_Read` (`xrServer_Objects_ALife.cpp:1030-1079`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeObjectPhysicState {
+    pub base: AlifeDynamicVisualState,
+    pub skeleton: ServerPhSkeletonState,
+    /// Physics type (`0=Box`, `1=FixedChain`, `2=FreeChain`, `3=Skeleton`).
+    pub physic_type: u32,
+    pub mass: f32,
+    pub fixed_bones: String,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeObjectPhysicState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let base = if version >= 14 {
+            let alife = AlifeObjectState::parse_prefix_from_cursor(version, &mut cur)?;
+            let visual = ServerVisualState::parse_from_cursor(version, &mut cur)?;
+            AlifeDynamicVisualState {
+                alife,
+                visual,
+                trailing: Vec::new(),
+            }
+        } else {
+            AlifeDynamicVisualState {
+                alife: AlifeObjectState {
+                    game_vertex_id: INVALID_GAME_VERTEX,
+                    distance: 0.0,
+                    direct_control: true,
+                    level_vertex_id: INVALID_AI_VERTEX,
+                    flags: 0,
+                    custom_data: String::new(),
+                    story_id: INVALID_STORY_ID,
+                    spawn_story_id: INVALID_SPAWN_STORY_ID,
+                    subclass_payload: Vec::new(),
+                },
+                visual: ServerVisualState::default(),
+                trailing: Vec::new(),
+            }
+        };
+
+        let mut skeleton = if version >= 64 {
+            ServerPhSkeletonState::parse_from_cursor(&mut cur)?
+        } else {
+            ServerPhSkeletonState::default()
+        };
+
+        let physic_type = cur.read_u32()?;
+        let mass = cur.read_f32()?;
+        let fixed_bones = if version > 9 {
+            cur.read_zstring()?
+        } else {
+            String::new()
+        };
+
+        if version < 65 && version > 28 {
+            skeleton.startup_animation = cur.read_zstring()?;
+        }
+        if version < 64 {
+            if version > 39 {
+                skeleton.flags = cur.read_u8()?;
+            }
+            if version > 56 {
+                skeleton.source_id = cur.read_u16()?;
+            }
+            if version > 60 && (skeleton.flags & ph_skeleton_flags::SAVED_DATA) != 0 {
+                skeleton.saved_bones = Some(ServerPhBonesData::parse_from_cursor(&mut cur)?);
+            }
+        }
+
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            base,
+            skeleton,
+            physic_type,
+            mass,
+            fixed_bones,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.base.write_to(&mut out);
+        self.skeleton.write_to(&mut out);
+        out.extend_from_slice(&self.physic_type.to_le_bytes());
+        out.extend_from_slice(&self.mass.to_le_bytes());
+        out.extend_from_slice(self.fixed_bones.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeInventoryBox::STATE_Read` (`xrServer_Objects_ALife.cpp:2518-2540`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeInventoryBoxState {
+    pub base: AlifeDynamicVisualState,
+    pub can_take: bool,
+    pub closed: bool,
+    pub tip_text: String,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeInventoryBoxState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let base = AlifeDynamicVisualState::parse_from_cursor(version, &mut cur)?;
+        let (can_take, closed, tip_text) = if version > 124 {
+            let can_take = cur.read_u8()? == 1;
+            let closed = cur.read_u8()? == 1;
+            let tip_text = cur.read_zstring()?;
+            (can_take, closed, tip_text)
+        } else {
+            (true, false, "inventory_box_use".to_string())
+        };
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            base,
+            can_take,
+            closed,
+            tip_text,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.base.write_to(&mut out);
+        out.push(u8::from(self.can_take));
+        out.push(u8::from(self.closed));
+        out.extend_from_slice(self.tip_text.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeItemAmmo::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:860-870`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeItemAmmoState {
+    pub item: AlifeInventoryItemState,
+    pub ammo_left: u16,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeItemAmmoState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let item = AlifeInventoryItemState::parse_from_cursor(version, &mut cur)?;
+        let ammo_left = cur.read_u16()?;
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            item,
+            ammo_left,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.item.write_to(&mut out);
+        out.extend_from_slice(&self.ammo_left.to_le_bytes());
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeItemPDA::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:1011-1048`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeItemPdaState {
+    pub item: AlifeInventoryItemState,
+    pub original_owner: u16,
+    pub specific_character: String,
+    pub info_portion: String,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeItemPdaState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let item = AlifeInventoryItemState::parse_from_cursor(version, &mut cur)?;
+        let original_owner = if version > 58 {
+            cur.read_u16()?
+        } else {
+            INVALID_OBJECT_ID
+        };
+        let (specific_character, info_portion) = if version > 89 && version < 98 {
+            let _ = cur.read_i32()?;
+            let _ = cur.read_i32()?;
+            (String::new(), String::new())
+        } else if version >= 98 {
+            (cur.read_zstring()?, cur.read_zstring()?)
+        } else {
+            (String::new(), String::new())
+        };
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            item,
+            original_owner,
+            specific_character,
+            info_portion,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.item.write_to(&mut out);
+        out.extend_from_slice(&self.original_owner.to_le_bytes());
+        out.extend_from_slice(self.specific_character.as_bytes());
+        out.push(0);
+        out.extend_from_slice(self.info_portion.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeItemDocument::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:1079-1097`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeItemDocumentState {
+    pub item: AlifeInventoryItemState,
+    pub info_portion: String,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeItemDocumentState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let item = AlifeInventoryItemState::parse_from_cursor(version, &mut cur)?;
+        let info_portion = if version < 98 {
+            let _ = cur.read_u16()?;
+            String::new()
+        } else {
+            cur.read_zstring()?
+        };
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            item,
+            info_portion,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.item.write_to(&mut out);
+        out.extend_from_slice(self.info_portion.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeCreatureAbstract::STATE_Read` (`xrServer_Objects_ALife_Monsters.cpp:1074-1117`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeCreatureAbstractState {
+    pub base: AlifeDynamicVisualState,
+    pub team: u8,
+    pub squad: u8,
+    pub group: u8,
+    pub health: f32,
+    pub dynamic_out_restrictions: Vec<u16>,
+    pub dynamic_in_restrictions: Vec<u16>,
+    pub killer_id: u16,
+    pub game_death_time: u64,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeCreatureAbstractState {
+    fn read_u16_vec(cur: &mut ByteCursor<'_>) -> Result<Vec<u16>, FormatError> {
+        let count = cur.read_u32()? as usize;
+        let mut out = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            out.push(cur.read_u16()?);
+        }
+        Ok(out)
+    }
+
+    pub fn parse_from_cursor(version: u16, cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let mut base = AlifeDynamicVisualState::parse_from_cursor(version, cur)?;
+        let team = cur.read_u8()?;
+        let squad = cur.read_u8()?;
+        let group = cur.read_u8()?;
+        let mut health = if version > 18 { cur.read_f32()? } else { 1.0 };
+        if version < 115 {
+            health /= 100.0;
+        }
+        if version < 32 {
+            base.visual = ServerVisualState::parse_from_cursor(version, cur)?;
+        }
+        let (dynamic_out_restrictions, dynamic_in_restrictions) = if version > 87 {
+            (Self::read_u16_vec(cur)?, Self::read_u16_vec(cur)?)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let killer_id = if version > 94 {
+            cur.read_u16()?
+        } else {
+            INVALID_OBJECT_ID
+        };
+        let game_death_time = if version > 115 { cur.read_u64()? } else { 0 };
+        Ok(Self {
+            base,
+            team,
+            squad,
+            group,
+            health,
+            dynamic_out_restrictions,
+            dynamic_in_restrictions,
+            killer_id,
+            game_death_time,
+            trailing: Vec::new(),
+        })
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        self.base.write_to(out);
+        out.push(self.team);
+        out.push(self.squad);
+        out.push(self.group);
+        out.extend_from_slice(&self.health.to_le_bytes());
+        out.extend_from_slice(&(self.dynamic_out_restrictions.len() as u32).to_le_bytes());
+        for id in &self.dynamic_out_restrictions {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.dynamic_in_restrictions.len() as u32).to_le_bytes());
+        for id in &self.dynamic_in_restrictions {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        out.extend_from_slice(&self.killer_id.to_le_bytes());
+        out.extend_from_slice(&self.game_death_time.to_le_bytes());
+        out.extend_from_slice(&self.trailing);
+    }
+
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let mut parsed = Self::parse_from_cursor(version, &mut cur)?;
+        parsed.trailing = state_bytes[cur.position()..].to_vec();
+        Ok(parsed)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_to(&mut out);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeMonsterAbstract::STATE_Read` (`xrServer_Objects_ALife_Monsters.cpp:1326-1363`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeMonsterAbstractState {
+    pub creature: AlifeCreatureAbstractState,
+    pub out_space_restrictors: String,
+    pub in_space_restrictors: String,
+    pub smart_terrain_id: u16,
+    pub task_reached: bool,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeMonsterAbstractState {
+    pub fn parse_from_cursor(version: u16, cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let creature = AlifeCreatureAbstractState::parse_from_cursor(version, cur)?;
+        let (out_space_restrictors, in_space_restrictors) = if version > 72 {
+            let out_r = cur.read_zstring()?;
+            let in_r = if version > 73 {
+                cur.read_zstring()?
+            } else {
+                String::new()
+            };
+            (out_r, in_r)
+        } else {
+            (String::new(), String::new())
+        };
+        let smart_terrain_id = if version > 111 {
+            cur.read_u16()?
+        } else {
+            INVALID_OBJECT_ID
+        };
+        let task_reached = if version > 113 {
+            cur.read_u8()? != 0
+        } else {
+            false
+        };
+        Ok(Self {
+            creature,
+            out_space_restrictors,
+            in_space_restrictors,
+            smart_terrain_id,
+            task_reached,
+            trailing: Vec::new(),
+        })
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        self.creature.write_to(out);
+        out.extend_from_slice(self.out_space_restrictors.as_bytes());
+        out.push(0);
+        out.extend_from_slice(self.in_space_restrictors.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.smart_terrain_id.to_le_bytes());
+        out.push(u8::from(self.task_reached));
+        out.extend_from_slice(&self.trailing);
+    }
+
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let mut parsed = Self::parse_from_cursor(version, &mut cur)?;
+        parsed.trailing = state_bytes[cur.position()..].to_vec();
+        Ok(parsed)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_to(&mut out);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeMonsterBase::STATE_Read` (`xrServer_Objects_ALife_Monsters.cpp:1996-2012`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeMonsterBaseState {
+    pub monster: AlifeMonsterAbstractState,
+    pub skeleton: ServerPhSkeletonState,
+    pub spec_object_id: u16,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeMonsterBaseState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let monster = AlifeMonsterAbstractState::parse_from_cursor(version, &mut cur)?;
+        let skeleton = if version >= 68 {
+            ServerPhSkeletonState::parse_from_cursor(&mut cur)?
+        } else {
+            ServerPhSkeletonState::default()
+        };
+        let spec_object_id = if version >= 109 {
+            cur.read_u16()?
+        } else {
+            INVALID_OBJECT_ID
+        };
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            monster,
+            skeleton,
+            spec_object_id,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.monster.write_to(&mut out);
+        self.skeleton.write_to(&mut out);
+        out.extend_from_slice(&self.spec_object_id.to_le_bytes());
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeTrader::STATE_Read` (`xrServer_Objects_ALife_Monsters.cpp:634-676`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeTraderState {
+    pub base: AlifeDynamicVisualState,
+    pub trader: AlifeTraderAbstractState,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeTraderState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let base = AlifeDynamicVisualState::parse_from_cursor(version, &mut cur)?;
+        let trader = AlifeTraderAbstractState::parse_from_cursor(version, &mut cur)?;
+        if version > 35 && version < 118 {
+            let _ = cur.read_u32()?;
+        }
+        if version > 29 && version < 118 {
+            let count = cur.read_u32()?;
+            for _ in 0..count {
+                let _ = cur.read_zstring()?;
+                let _ = cur.read_u32()?;
+                let n = cur.read_u32()?;
+                for _ in 0..n {
+                    let _ = cur.read_zstring()?;
+                    let _ = cur.read_u32()?;
+                    let _ = cur.read_u32()?;
+                }
+            }
+        }
+        if version > 30 && version < 118 {
+            let count = cur.read_u32()?;
+            for _ in 0..count {
+                let _ = cur.read_zstring()?;
+                let _ = cur.read_u32()?;
+                let _ = cur.read_f32()?;
+                let _ = cur.read_f32()?;
+            }
+        }
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            base,
+            trader,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.base.write_to(&mut out);
+        self.trader.write_to(&mut out);
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeHumanAbstract::STATE_Read` (`xrServer_Objects_ALife_Monsters.cpp:2081-2128` + `alife_human_brain.cpp:75-121`).
+/// Note the C++ multiple-inheritance wire order: `CSE_ALifeTraderAbstract` comes BEFORE `CSE_ALifeMonsterAbstract`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeHumanAbstractState {
+    pub trader: AlifeTraderAbstractState,
+    pub monster: AlifeMonsterAbstractState,
+    pub equipment_prefs: Vec<u8>,
+    pub main_weapon_prefs: Vec<u8>,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeHumanAbstractState {
+    pub fn parse_from_cursor(version: u16, cur: &mut ByteCursor<'_>) -> Result<Self, FormatError> {
+        let trader = AlifeTraderAbstractState::parse_from_cursor(version, cur)?;
+        let mut monster = AlifeMonsterAbstractState::parse_from_cursor(version, cur)?;
+
+        // CALifeHumanBrain::on_state_read
+        let mut equipment_prefs = Vec::new();
+        let mut main_weapon_prefs = Vec::new();
+        if version > 19 {
+            if version < 110 {
+                let n = cur.read_u32()? as usize;
+                let _ = cur.read_bytes(n.saturating_mul(4))?;
+                let b = cur.read_u32()? as usize;
+                let _ = cur.read_bytes(b)?;
+            }
+            if version > 35 {
+                if version < 110 {
+                    let _ = cur.read_zstring()?;
+                }
+                if version < 118 {
+                    let n = cur.read_u32()? as usize;
+                    let _ = cur.read_bytes(n.saturating_mul(2))?;
+                }
+                let eq_len = cur.read_u32()? as usize;
+                equipment_prefs = cur.read_bytes(eq_len)?.to_vec();
+                let wp_len = cur.read_u32()? as usize;
+                main_weapon_prefs = cur.read_bytes(wp_len)?.to_vec();
+            }
+        }
+        if (110..112).contains(&version) {
+            monster.smart_terrain_id = cur.read_u16()?;
+        }
+
+        Ok(Self {
+            trader,
+            monster,
+            equipment_prefs,
+            main_weapon_prefs,
+            trailing: Vec::new(),
+        })
+    }
+
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        self.trader.write_to(out);
+        self.monster.write_to(out);
+        out.extend_from_slice(&(self.equipment_prefs.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.equipment_prefs);
+        out.extend_from_slice(&(self.main_weapon_prefs.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.main_weapon_prefs);
+        out.extend_from_slice(&self.trailing);
+    }
+
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let mut parsed = Self::parse_from_cursor(version, &mut cur)?;
+        parsed.trailing = state_bytes[cur.position()..].to_vec();
+        Ok(parsed)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_to(&mut out);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeHumanStalker::STATE_Read` (`xrServer_Objects_ALife_Monsters.cpp:2172-2187`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeHumanStalkerState {
+    pub human: AlifeHumanAbstractState,
+    pub skeleton: ServerPhSkeletonState,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeHumanStalkerState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let human = AlifeHumanAbstractState::parse_from_cursor(version, &mut cur)?;
+        let skeleton = if version > 67 {
+            ServerPhSkeletonState::parse_from_cursor(&mut cur)?
+        } else {
+            ServerPhSkeletonState::default()
+        };
+        if version > 90 && version < 111 {
+            let _ = cur.read_u8()?;
+        }
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            human,
+            skeleton,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.human.write_to(&mut out);
+        self.skeleton.write_to(&mut out);
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeCreatureActor::STATE_Read` (`xrServer_Objects_ALife_Monsters.cpp:1474-1510`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeCreatureActorState {
+    pub creature: AlifeCreatureAbstractState,
+    pub trader: AlifeTraderAbstractState,
+    pub skeleton: ServerPhSkeletonState,
+    pub holder_id: u16,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeCreatureActorState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let creature = AlifeCreatureAbstractState::parse_from_cursor(version, &mut cur)?;
+        let trader = if version >= 21 {
+            let t = AlifeTraderAbstractState::parse_from_cursor(version, &mut cur)?;
+            if version < 32 {
+                let _ = ServerVisualState::parse_from_cursor(version, &mut cur)?;
+            }
+            t
+        } else {
+            AlifeTraderAbstractState::default()
+        };
+        let skeleton = if version > 91 {
+            ServerPhSkeletonState::parse_from_cursor(&mut cur)?
+        } else {
+            ServerPhSkeletonState::default()
+        };
+        let holder_id = if version > 88 {
+            cur.read_u16()?
+        } else {
+            INVALID_OBJECT_ID
+        };
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            creature,
+            trader,
+            skeleton,
+            holder_id,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.creature.write_to(&mut out);
+        self.trader.write_to(&mut out);
+        self.skeleton.write_to(&mut out);
+        out.extend_from_slice(&self.holder_id.to_le_bytes());
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
 impl SpawnPacket {
     pub fn decode_dynamic_visual_state(&self) -> Result<AlifeDynamicVisualState, FormatError> {
         AlifeDynamicVisualState::parse(self.version, &self.state_payload)
@@ -1758,6 +2941,76 @@ impl SpawnPacket {
 
     pub fn decode_weapon_state(&self) -> Result<AlifeItemWeaponState, FormatError> {
         AlifeItemWeaponState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_custom_zone_state(&self) -> Result<AlifeCustomZoneState, FormatError> {
+        AlifeCustomZoneState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_anomalous_zone_state(&self) -> Result<AlifeAnomalousZoneState, FormatError> {
+        AlifeAnomalousZoneState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_torrid_zone_state(&self) -> Result<AlifeTorridZoneState, FormatError> {
+        AlifeTorridZoneState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_zone_visual_state(&self) -> Result<AlifeZoneVisualState, FormatError> {
+        AlifeZoneVisualState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_team_base_zone_state(&self) -> Result<AlifeTeamBaseZoneState, FormatError> {
+        AlifeTeamBaseZoneState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_object_physic_state(&self) -> Result<AlifeObjectPhysicState, FormatError> {
+        AlifeObjectPhysicState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_inventory_box_state(&self) -> Result<AlifeInventoryBoxState, FormatError> {
+        AlifeInventoryBoxState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_ammo_state(&self) -> Result<AlifeItemAmmoState, FormatError> {
+        AlifeItemAmmoState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_pda_state(&self) -> Result<AlifeItemPdaState, FormatError> {
+        AlifeItemPdaState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_document_state(&self) -> Result<AlifeItemDocumentState, FormatError> {
+        AlifeItemDocumentState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_creature_abstract_state(
+        &self,
+    ) -> Result<AlifeCreatureAbstractState, FormatError> {
+        AlifeCreatureAbstractState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_monster_abstract_state(&self) -> Result<AlifeMonsterAbstractState, FormatError> {
+        AlifeMonsterAbstractState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_monster_base_state(&self) -> Result<AlifeMonsterBaseState, FormatError> {
+        AlifeMonsterBaseState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_trader_state(&self) -> Result<AlifeTraderState, FormatError> {
+        AlifeTraderState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_human_abstract_state(&self) -> Result<AlifeHumanAbstractState, FormatError> {
+        AlifeHumanAbstractState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_human_stalker_state(&self) -> Result<AlifeHumanStalkerState, FormatError> {
+        AlifeHumanStalkerState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_creature_actor_state(&self) -> Result<AlifeCreatureActorState, FormatError> {
+        AlifeCreatureActorState::parse(self.version, &self.state_payload)
     }
 }
 
@@ -2179,5 +3432,163 @@ p1:position = 4, 2, 6
         let trader_decoded = AlifeTraderAbstractState::parse_from_cursor(SPAWN_VERSION, &mut tcur).unwrap();
         assert_eq!(trader_decoded, trader);
         assert!(tcur.is_eof());
+    }
+
+    #[test]
+    fn test_deeper_alife_zone_skeleton_stalker_and_actor_codecs() {
+        let base_alife = AlifeObjectState {
+            game_vertex_id: 25,
+            distance: 2.0,
+            direct_control: true,
+            level_vertex_id: 9001,
+            flags: alife_object_flags::CAN_SAVE | alife_object_flags::SWITCH_ONLINE,
+            custom_data: "[smart_terrains]\nesc_smart = true\n".to_string(),
+            story_id: INVALID_STORY_ID,
+            spawn_story_id: INVALID_SPAWN_STORY_ID,
+            subclass_payload: Vec::new(),
+        };
+
+        // Quantized bone state + CSE_PHSkeleton
+        let bone = ServerPhBoneState::from_world_position_quat(
+            [1.5, -2.0, 3.0],
+            [0.0, std::f32::consts::FRAC_1_SQRT_2, 0.0, std::f32::consts::FRAC_1_SQRT_2],
+            [-10.0, -10.0, -10.0],
+            [10.0, 10.0, 10.0],
+            true,
+        );
+        let decoded_pos = bone.decode_position([-10.0; 3], [10.0; 3]);
+        assert!((decoded_pos[0] - 1.5).abs() < 0.1);
+        assert!((decoded_pos[1] + 2.0).abs() < 0.1);
+        assert!((decoded_pos[2] - 3.0).abs() < 0.1);
+
+        let skel = ServerPhSkeletonState {
+            startup_animation: "idle".to_string(),
+            flags: ph_skeleton_flags::ACTIVE | ph_skeleton_flags::SAVED_DATA,
+            source_id: 42,
+            saved_bones: Some(ServerPhBonesData {
+                bones_mask: 0xFFFF_FFFF_FFFF_FFFF,
+                root_bone: 0,
+                min: [-10.0; 3],
+                max: [10.0; 3],
+                bones: vec![bone],
+            }),
+        };
+
+        // Anomalous zone
+        let anom = AlifeAnomalousZoneState {
+            zone: AlifeCustomZoneState {
+                restrictor: AlifeSpaceRestrictorState {
+                    alife: base_alife.clone(),
+                    shapes: vec![ServerShapeDef::Sphere {
+                        center: [0.0; 3],
+                        radius: 4.0,
+                    }],
+                    restrictor_type: 1,
+                    trailing: Vec::new(),
+                },
+                max_power: 1.5,
+                owner_id: u32::MAX,
+                enabled_time: 10,
+                disabled_time: 5,
+                start_time_shift: 2,
+                trailing: Vec::new(),
+            },
+            offline_interactive_radius: 30.0,
+            artefact_spawn_count: 16,
+            artefact_position_offset: 64,
+            trailing: Vec::new(),
+        };
+        assert_eq!(
+            AlifeAnomalousZoneState::parse(SPAWN_VERSION, &anom.to_bytes()).unwrap(),
+            anom
+        );
+
+        // Physic object w/ saved ragdoll bones
+        let phys = AlifeObjectPhysicState {
+            base: AlifeDynamicVisualState {
+                alife: base_alife.clone(),
+                visual: ServerVisualState {
+                    visual_name: "physics\\box\\box_metall_01".to_string(),
+                    flags: 0,
+                },
+                trailing: Vec::new(),
+            },
+            skeleton: skel.clone(),
+            physic_type: 3,
+            mass: 25.0,
+            fixed_bones: "link".to_string(),
+            trailing: Vec::new(),
+        };
+        assert_eq!(
+            AlifeObjectPhysicState::parse(SPAWN_VERSION, &phys.to_bytes()).unwrap(),
+            phys
+        );
+
+        // Human stalker (TraderAbstract BEFORE MonsterAbstract + HumanBrain + PHSkeleton)
+        let stalker = AlifeHumanStalkerState {
+            human: AlifeHumanAbstractState {
+                trader: AlifeTraderAbstractState {
+                    money: 5000,
+                    specific_character: "esc_2_12_stalker_fanat".to_string(),
+                    trader_flags: 1,
+                    character_profile: "esc_2_12_stalker_fanat".to_string(),
+                    community_index: 3,
+                    rank: 600,
+                    reputation: 250,
+                    character_name: "Fanatic".to_string(),
+                    deadbody_can_take: true,
+                    deadbody_closed: false,
+                },
+                monster: AlifeMonsterAbstractState {
+                    creature: AlifeCreatureAbstractState {
+                        base: AlifeDynamicVisualState {
+                            alife: base_alife.clone(),
+                            visual: ServerVisualState {
+                                visual_name: "actors\\stalker_neutral\\stalker_neutral_2"
+                                    .to_string(),
+                                flags: 0,
+                            },
+                            trailing: Vec::new(),
+                        },
+                        team: 0,
+                        squad: 1,
+                        group: 2,
+                        health: 1.0,
+                        dynamic_out_restrictions: vec![10, 11],
+                        dynamic_in_restrictions: vec![12],
+                        killer_id: INVALID_OBJECT_ID,
+                        game_death_time: 0,
+                        trailing: Vec::new(),
+                    },
+                    out_space_restrictors: String::new(),
+                    in_space_restrictors: "esc_base_restrictor".to_string(),
+                    smart_terrain_id: 17,
+                    task_reached: true,
+                    trailing: Vec::new(),
+                },
+                equipment_prefs: vec![1, 2, 0, 1, 2],
+                main_weapon_prefs: vec![2, 1, 0, 1],
+                trailing: Vec::new(),
+            },
+            skeleton: skel.clone(),
+            trailing: Vec::new(),
+        };
+        assert_eq!(
+            AlifeHumanStalkerState::parse(SPAWN_VERSION, &stalker.to_bytes()).unwrap(),
+            stalker
+        );
+
+        // CreatureActor (CreatureAbstract -> TraderAbstract -> PHSkeleton -> holder_id)
+        let actor = AlifeCreatureActorState {
+            creature: stalker.human.monster.creature.clone(),
+            trader: stalker.human.trader.clone(),
+            skeleton: skel,
+            holder_id: INVALID_OBJECT_ID,
+            trailing: Vec::new(),
+        };
+        assert_eq!(
+            AlifeCreatureActorState::parse(SPAWN_VERSION, &actor.to_bytes()).unwrap(),
+            actor
+        );
     }
 }

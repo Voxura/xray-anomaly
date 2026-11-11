@@ -17,7 +17,9 @@ use xray_core::LtxDocument;
 
 use crate::chunk::FormatError;
 use crate::thm::{strip_texture_extension, texture_stem_to_dds_vpath};
-use crate::xml_ui::color_argb;
+use crate::xml_ui::{
+    argb_to_rgba_f32, color_argb, subst_alpha, UiColorDefs, UiTextDef, UiViewport, UiWindowDef,
+};
 
 /// Standard font configuration section names loaded by `CFontManager::InitializeFonts`.
 pub const STANDARD_FONT_SECTIONS: [&str; 11] = [
@@ -345,6 +347,251 @@ pub struct FontGlyphQuad {
     pub uv_max: [f32; 2],
     pub color_top_argb: u32,
     pub color_bottom_argb: u32,
+}
+
+impl FontGlyphQuad {
+    /// Bounding box as `[x, y, width, height]` matching `xray_render_dx12::ui_canvas::GlyphQuad::screen_rect`.
+    #[inline]
+    pub fn rect_xywh(&self) -> [f32; 4] {
+        [
+            self.min_xy[0],
+            self.min_xy[1],
+            self.max_xy[0] - self.min_xy[0],
+            self.max_xy[1] - self.min_xy[1],
+        ]
+    }
+
+    /// Normalized atlas UVs `[u1, v1, u2, v2]` matching `xray_render_dx12::ui_canvas::GlyphQuad::uv_rect`.
+    #[inline]
+    pub fn uv_rect(&self) -> [f32; 4] {
+        [self.uv_min[0], self.uv_min[1], self.uv_max[0], self.uv_max[1]]
+    }
+
+    /// Combined `(screen_rect_xywh, uv_rect_u1v1u2v2)` tuple ready for `UiCanvas::draw_glyph_quads`.
+    #[inline]
+    pub fn screen_and_uv_rects(&self) -> ([f32; 4], [f32; 4]) {
+        (self.rect_xywh(), self.uv_rect())
+    }
+
+    /// Normalized `[r, g, b, a]` color for the top vertices (`dxFontRender` tint).
+    #[inline]
+    pub fn top_color_rgba_f32(&self) -> [f32; 4] {
+        argb_to_rgba_f32(self.color_top_argb)
+    }
+
+    /// Normalized `[r, g, b, a]` color for the bottom vertices.
+    #[inline]
+    pub fn bottom_color_rgba_f32(&self) -> [f32; 4] {
+        argb_to_rgba_f32(self.color_bottom_argb)
+    }
+}
+
+/// Vertical alignment inside a UI control (`EVTextAlignment`, `src/xrGame/ui/UILines.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiTextVerticalAlign {
+    #[default]
+    Top = 0,
+    Center = 1,
+    Bottom = 2,
+}
+
+impl FontAlignment {
+    /// Parse XML `align="l"|"c"|"r"` attribute (`CUIXmlInit::InitText`).
+    pub fn parse_xml_align(s: &str) -> Self {
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("c") || t.eq_ignore_ascii_case("center") {
+            Self::Center
+        } else if t.eq_ignore_ascii_case("r") || t.eq_ignore_ascii_case("right") {
+            Self::Right
+        } else {
+            Self::Left
+        }
+    }
+}
+
+impl UiTextVerticalAlign {
+    /// Parse XML `vert_align="t"|"c"|"b"` attribute (`CUIXmlInit::InitText`).
+    pub fn parse_xml_align(s: &str) -> Self {
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("c") || t.eq_ignore_ascii_case("center") {
+            Self::Center
+        } else if t.eq_ignore_ascii_case("b") || t.eq_ignore_ascii_case("bottom") {
+            Self::Bottom
+        } else {
+            Self::Top
+        }
+    }
+}
+
+/// Resolve an XML `<text font="...">` short alias (`"letterica18"`, `"graffiti19"`, `"medium"`, ...)
+/// into its `fonts.ltx` section name (`CUIXmlInit::InitFont`, `UIXmlInit.cpp:811-859`).
+pub fn resolve_ui_font_section(xml_font_name: &str) -> &str {
+    match xml_font_name.trim() {
+        "arial" | "arial_14" => "ui_font_arial_14",
+        "medium" => "hud_font_medium",
+        "di" => "hud_font_di",
+        "small" => "stat_font",
+        "graffiti19" => "ui_font_graffiti19_russian",
+        "graffiti22" => "ui_font_graffiti22_russian",
+        "graffiti32" => "ui_font_graff_32",
+        "graffiti50" => "ui_font_graff_50",
+        "letterica16" => "ui_font_letterica16_russian",
+        "letterica18" => "ui_font_letterica18_russian",
+        "letterica25" => "ui_font_letter_25",
+        other => other,
+    }
+}
+
+/// Single color-tagged substring run produced by `CUILines::ParseTextToColoredLine`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiColoredSegment {
+    pub text: String,
+    pub color_argb: u32,
+}
+
+/// Options controlling `FontAtlas::build_multiline_quads` (`CUILines::Draw`, `src/xrGame/ui/UILines.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UiMultilineTextOptions {
+    pub draw: FontDrawParams,
+    pub vert_align: UiTextVerticalAlign,
+    pub complex_mode: bool,
+    pub word_wrap: bool,
+    pub coloring_mode: bool,
+    pub recognize_newline: bool,
+    pub ellipsis: bool,
+    pub password_mode: bool,
+    pub offset: [f32; 2],
+}
+
+impl Default for UiMultilineTextOptions {
+    fn default() -> Self {
+        Self {
+            draw: FontDrawParams::default(),
+            vert_align: UiTextVerticalAlign::Top,
+            complex_mode: false,
+            word_wrap: true,
+            coloring_mode: true,
+            recognize_newline: true,
+            ellipsis: false,
+            password_mode: false,
+            offset: [0.0, 0.0],
+        }
+    }
+}
+
+fn parse_color_tag_argb(
+    tag_inner: &str,
+    default_color_argb: u32,
+    color_defs: Option<&UiColorDefs>,
+) -> Option<u32> {
+    let inner = tag_inner.trim();
+    if inner.eq_ignore_ascii_case("default") {
+        return Some(default_color_argb);
+    }
+    if let Some(defs) = color_defs
+        && let Some(&clr) = defs.colors.get(inner)
+    {
+        return Some(clr);
+    }
+    let mut nums = [0i32; 4];
+    let mut count = 0usize;
+    for part in inner.split(',') {
+        if count >= 4 {
+            return None;
+        }
+        nums[count] = part.trim().parse::<i32>().ok()?;
+        count += 1;
+    }
+    if count == 4 {
+        Some(color_argb(
+            nums[0].clamp(0, 255) as u8,
+            nums[1].clamp(0, 255) as u8,
+            nums[2].clamp(0, 255) as u8,
+            nums[3].clamp(0, 255) as u8,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Parse `%c[...]` inline color tags and `\\n`/`\n` line breaks into logical lines of colored segments
+/// (`CUILines::ParseTextToColoredLine` + `ProcessNewLines`, `UILines.cpp:507-618`).
+pub fn parse_colored_text_lines(
+    text: &str,
+    default_color_argb: u32,
+    color_defs: Option<&UiColorDefs>,
+    coloring_mode: bool,
+    recognize_newline: bool,
+) -> Vec<Vec<UiColoredSegment>> {
+    let normalized_nl = if recognize_newline {
+        text.replace("\r\n", "\n").replace("\\n", "\n")
+    } else {
+        text.to_owned()
+    };
+
+    let base_alpha = ((default_color_argb >> 24) & 0xFF) as u8;
+    let mut raw_segments: Vec<UiColoredSegment> = Vec::new();
+
+    if !coloring_mode {
+        raw_segments.push(UiColoredSegment {
+            text: normalized_nl,
+            color_argb: default_color_argb,
+        });
+    } else {
+        let mut cursor = 0usize;
+        let mut active_color = default_color_argb;
+        while let Some(rel) = normalized_nl[cursor..].find("%c[") {
+            let tag_start = cursor + rel;
+            if tag_start > cursor {
+                raw_segments.push(UiColoredSegment {
+                    text: normalized_nl[cursor..tag_start].to_owned(),
+                    color_argb: subst_alpha(active_color, base_alpha),
+                });
+            }
+            let after_open = tag_start + 3;
+            if let Some(close_rel) = normalized_nl[after_open..].find(']') {
+                let inner = &normalized_nl[after_open..after_open + close_rel];
+                if let Some(clr) = parse_color_tag_argb(inner, default_color_argb, color_defs) {
+                    active_color = clr;
+                    cursor = after_open + close_rel + 1;
+                    continue;
+                }
+            }
+            // Literal fallback if unclosed/malformed tag
+            raw_segments.push(UiColoredSegment {
+                text: "%c[".to_owned(),
+                color_argb: subst_alpha(active_color, base_alpha),
+            });
+            cursor = after_open;
+        }
+        if cursor < normalized_nl.len() || raw_segments.is_empty() {
+            raw_segments.push(UiColoredSegment {
+                text: normalized_nl[cursor..].to_owned(),
+                color_argb: subst_alpha(active_color, base_alpha),
+            });
+        }
+    }
+
+    if !recognize_newline {
+        return vec![raw_segments];
+    }
+
+    let mut lines: Vec<Vec<UiColoredSegment>> = vec![Vec::new()];
+    for seg in raw_segments {
+        let mut parts = seg.text.split('\n').peekable();
+        while let Some(part) = parts.next() {
+            if !part.is_empty() {
+                lines.last_mut().expect("non-empty").push(UiColoredSegment {
+                    text: part.to_owned(),
+                    color_argb: seg.color_argb,
+                });
+            }
+            if parts.peek().is_some() {
+                lines.push(Vec::new());
+            }
+        }
+    }
+    lines
 }
 
 trait LtxQueryView {
@@ -985,6 +1232,369 @@ impl FontAtlas {
 
         quads
     }
+
+    /// Screen-space horizontal cursor advance matching `build_string_quads` for one code unit.
+    pub fn glyph_screen_advance(&self, code: u16, params: &FontDrawParams) -> f32 {
+        let hs = if self.line_height.abs() <= 1.0e-5 {
+            1.0
+        } else {
+            params.current_height / self.line_height
+        };
+        let scw = self.glyph(code).width * hs * params.scale[0];
+        let mut adv = scw * params.interval[0];
+        if self.is_multibyte {
+            adv -= 2.0;
+            if is_need_space_character(code) {
+                adv += self.x_step;
+            }
+        }
+        adv
+    }
+
+    /// Screen-space horizontal width of a text run matching `build_string_quads` cursor advance.
+    pub fn measure_screen_width(&self, text: &str, params: &FontDrawParams) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        if self.is_multibyte {
+            let (codes, _) = mbh_multi2wide(text);
+            codes
+                .into_iter()
+                .map(|c| self.glyph_screen_advance(c, params))
+                .sum()
+        } else {
+            text.as_bytes()
+                .iter()
+                .map(|&b| self.glyph_screen_advance(u16::from(b), params))
+                .sum()
+        }
+    }
+
+    /// Word-wrap logical lines of colored segments to fit within `max_width_px` (`CUILines::ParseText`,
+    /// `UILines.cpp:192-310`).
+    pub fn wrap_colored_lines(
+        &self,
+        lines: &[Vec<UiColoredSegment>],
+        max_width_px: f32,
+        params: &FontDrawParams,
+        word_wrap: bool,
+    ) -> Vec<Vec<UiColoredSegment>> {
+        if !word_wrap || max_width_px <= 0.0 {
+            return lines.to_vec();
+        }
+
+        let mut wrapped: Vec<Vec<UiColoredSegment>> = Vec::with_capacity(lines.len());
+        if self.is_multibyte {
+            let hs = if self.line_height.abs() <= 1.0e-5 {
+                1.0
+            } else {
+                params.current_height / self.line_height
+            };
+            let px_scale = (hs * params.scale[0] * params.interval[0]).max(1.0e-5);
+            let target_unscaled = max_width_px / px_scale;
+            for line in lines {
+                if line.is_empty() {
+                    wrapped.push(Vec::new());
+                    continue;
+                }
+                let mut cur_line: Vec<UiColoredSegment> = Vec::new();
+                for seg in line {
+                    let splits = self.split_by_width(target_unscaled, &seg.text);
+                    if splits.is_empty() {
+                        if !seg.text.is_empty() {
+                            cur_line.push(seg.clone());
+                        }
+                        continue;
+                    }
+                    let mut start = 0usize;
+                    for split in splits {
+                        if split > start {
+                            cur_line.push(UiColoredSegment {
+                                text: seg.text[start..split].to_owned(),
+                                color_argb: seg.color_argb,
+                            });
+                        }
+                        wrapped.push(std::mem::take(&mut cur_line));
+                        start = split;
+                    }
+                    if start < seg.text.len() {
+                        cur_line.push(UiColoredSegment {
+                            text: seg.text[start..].to_owned(),
+                            color_argb: seg.color_argb,
+                        });
+                    }
+                }
+                wrapped.push(cur_line);
+            }
+            return wrapped;
+        }
+
+        // Single-byte word wrapping (`UILines.cpp:253-308`): wrap on last whitespace when exceeding `max_width_px`.
+        let eps = self.glyph_screen_advance(u16::from(b'o'), params);
+        for line in lines {
+            if line.is_empty() {
+                wrapped.push(Vec::new());
+                continue;
+            }
+            let mut cur_line: Vec<UiColoredSegment> = Vec::new();
+            let mut curr_width = 0.0f32;
+            for seg in line {
+                let bytes = seg.text.as_bytes();
+                if bytes.is_empty() {
+                    continue;
+                }
+                let mut start = 0usize;
+                let mut last_space: Option<usize> = None;
+                let mut i = 0usize;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if b.is_ascii_whitespace() {
+                        last_space = Some(i);
+                    }
+                    let ch_w = self.glyph_screen_advance(u16::from(b), params);
+                    let over = (curr_width + ch_w + eps) > max_width_px;
+                    let is_last = i + 1 == bytes.len();
+                    if over {
+                        let break_end = if let Some(sp) = last_space.filter(|&sp| sp >= start) {
+                            last_space = None;
+                            sp + 1
+                        } else if i > start || !cur_line.is_empty() {
+                            i
+                        } else {
+                            i + 1
+                        };
+                        if break_end > start {
+                            cur_line.push(UiColoredSegment {
+                                text: String::from_utf8_lossy(&bytes[start..break_end]).into_owned(),
+                                color_argb: seg.color_argb,
+                            });
+                        }
+                        wrapped.push(std::mem::take(&mut cur_line));
+                        curr_width = 0.0;
+                        start = break_end;
+                        i = break_end;
+                    } else if is_last {
+                        if i + 1 > start {
+                            cur_line.push(UiColoredSegment {
+                                text: String::from_utf8_lossy(&bytes[start..]).into_owned(),
+                                color_argb: seg.color_argb,
+                            });
+                        }
+                        curr_width += ch_w;
+                        i += 1;
+                    } else {
+                        curr_width += ch_w;
+                        i += 1;
+                    }
+                }
+            }
+            wrapped.push(cur_line);
+        }
+        wrapped
+    }
+
+    /// Truncate single-line text with `".."` suffix when wider than `max_width_px`
+    /// (`GetElipsisText`, `UILines.cpp:349-383`).
+    pub fn elide_line(&self, text: &str, max_width_px: f32, params: &FontDrawParams) -> String {
+        let total = self.measure_screen_width(text, params);
+        if total < max_width_px || max_width_px <= 0.0 {
+            return text.to_owned();
+        }
+        let el_len = self.measure_screen_width("..", params);
+        let mut acc = 0.0f32;
+        let mut cut = 0usize;
+        for (byte_idx, ch) in text.char_indices() {
+            let w = if self.is_multibyte {
+                let mut buf = [0u16; 2];
+                let enc = ch.encode_utf16(&mut buf);
+                enc.iter()
+                    .map(|&c| self.glyph_screen_advance(c, params))
+                    .sum::<f32>()
+            } else {
+                self.glyph_screen_advance((ch as u32 & 0xFF) as u16, params)
+            };
+            if acc + w + el_len < max_width_px {
+                acc += w;
+                cut = byte_idx + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let mut out = text[..cut].to_owned();
+        out.push_str("..");
+        out
+    }
+
+    /// Build glyph quads for a bounded UI text box supporting `%c[...]` colors, multi-line word wrapping,
+    /// `complex_mode`, `ellipsis`, `password_mode`, and horizontal + vertical alignments (`CUILines::Draw`).
+    pub fn build_multiline_quads(
+        &self,
+        atlas_size: [u32; 2],
+        bounds_xywh: [f32; 4],
+        text: &str,
+        color_defs: Option<&UiColorDefs>,
+        options: &UiMultilineTextOptions,
+    ) -> Vec<FontGlyphQuad> {
+        if text.is_empty() || atlas_size[0] == 0 || atlas_size[1] == 0 {
+            return Vec::new();
+        }
+
+        let base_x = bounds_xywh[0] + options.offset[0];
+        let base_y = bounds_xywh[1] + options.offset[1];
+        let wnd_w = bounds_xywh[2];
+        let wnd_h = bounds_xywh[3];
+        let line_step_y = options.draw.current_height * options.draw.scale[1] * options.draw.interval[1];
+
+        if !options.complex_mode {
+            let masked;
+            let effective_text = if options.password_mode {
+                masked = "*".repeat(text.chars().count());
+                masked.as_str()
+            } else if options.ellipsis && wnd_w > 0.0 {
+                masked = self.elide_line(text, wnd_w, &options.draw);
+                masked.as_str()
+            } else {
+                text
+            };
+
+            let lines = parse_colored_text_lines(
+                effective_text,
+                options.draw.color_argb,
+                color_defs,
+                options.coloring_mode && !options.password_mode,
+                false,
+            );
+            let line = lines.into_iter().next().unwrap_or_default();
+            let line_w: f32 = line
+                .iter()
+                .map(|seg| self.measure_screen_width(&seg.text, &options.draw))
+                .sum();
+            let start_x = match options.draw.align {
+                FontAlignment::Left => base_x,
+                FontAlignment::Center => base_x + (wnd_w - line_w) * 0.5,
+                FontAlignment::Right => base_x + (wnd_w - line_w),
+            };
+            let start_y = match options.vert_align {
+                UiTextVerticalAlign::Top => base_y,
+                UiTextVerticalAlign::Center => base_y + (wnd_h - line_step_y) * 0.5,
+                UiTextVerticalAlign::Bottom => base_y + (wnd_h - line_step_y),
+            };
+
+            let mut out = Vec::new();
+            let mut cursor_x = start_x;
+            for seg in line {
+                let mut seg_params = options.draw;
+                seg_params.align = FontAlignment::Left;
+                seg_params.color_argb = seg.color_argb;
+                out.extend(self.build_string_quads(
+                    atlas_size,
+                    [cursor_x, start_y],
+                    &seg.text,
+                    &seg_params,
+                ));
+                cursor_x += self.measure_screen_width(&seg.text, &seg_params);
+            }
+            return out;
+        }
+
+        let logical = parse_colored_text_lines(
+            text,
+            options.draw.color_argb,
+            color_defs,
+            options.coloring_mode,
+            options.recognize_newline,
+        );
+        let wrapped = self.wrap_colored_lines(&logical, wnd_w, &options.draw, options.word_wrap);
+        let vis_height = line_step_y * (wrapped.len() as f32);
+        let mut cursor_y = match options.vert_align {
+            UiTextVerticalAlign::Top => base_y,
+            UiTextVerticalAlign::Center => base_y + (wnd_h - vis_height) * 0.5,
+            UiTextVerticalAlign::Bottom => base_y + (wnd_h - vis_height),
+        };
+
+        let mut out = Vec::new();
+        for line in wrapped {
+            let line_w: f32 = line
+                .iter()
+                .map(|seg| self.measure_screen_width(&seg.text, &options.draw))
+                .sum();
+            let mut cursor_x = match options.draw.align {
+                FontAlignment::Left => base_x,
+                FontAlignment::Center => base_x + (wnd_w - line_w) * 0.5,
+                FontAlignment::Right => base_x + (wnd_w - line_w),
+            };
+            for seg in line {
+                let mut seg_params = options.draw;
+                seg_params.align = FontAlignment::Left;
+                seg_params.color_argb = seg.color_argb;
+                out.extend(self.build_string_quads(
+                    atlas_size,
+                    [cursor_x, cursor_y],
+                    &seg.text,
+                    &seg_params,
+                ));
+                cursor_x += self.measure_screen_width(&seg.text, &seg_params);
+            }
+            cursor_y += line_step_y;
+        }
+        out
+    }
+
+    /// Layout text quads for a parsed `UiWindowDef` + optional `UiTextDef` scaled through `UiViewport`.
+    pub fn build_ui_window_text_quads(
+        &self,
+        atlas_size: [u32; 2],
+        window: &UiWindowDef,
+        viewport: &UiViewport,
+        color_defs: Option<&UiColorDefs>,
+        translated_text: Option<&str>,
+        base_draw: FontDrawParams,
+    ) -> Vec<FontGlyphQuad> {
+        let Some(text_def) = window.text.as_ref() else {
+            return Vec::new();
+        };
+        self.build_ui_text_def_quads(
+            atlas_size,
+            [window.x, window.y, window.width, window.height],
+            text_def,
+            viewport,
+            color_defs,
+            translated_text,
+            base_draw,
+        )
+    }
+
+    /// Layout text quads from a `UiTextDef` and virtual `(1024x768)` bounds `[x, y, width, height]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_ui_text_def_quads(
+        &self,
+        atlas_size: [u32; 2],
+        virtual_bounds_xywh: [f32; 4],
+        text_def: &UiTextDef,
+        viewport: &UiViewport,
+        color_defs: Option<&UiColorDefs>,
+        translated_text: Option<&str>,
+        mut base_draw: FontDrawParams,
+    ) -> Vec<FontGlyphQuad> {
+        let text = translated_text.unwrap_or(&text_def.text);
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let scale = viewport.scale();
+        let screen_bounds = viewport.virtual_to_screen_rect(virtual_bounds_xywh);
+        base_draw.align = FontAlignment::parse_xml_align(&text_def.align);
+        base_draw.color_argb = text_def.color_argb;
+        base_draw.scale = [base_draw.scale[0] * scale[0], base_draw.scale[1] * scale[1]];
+
+        let opts = UiMultilineTextOptions {
+            draw: base_draw,
+            vert_align: UiTextVerticalAlign::parse_xml_align(&text_def.vert_align),
+            complex_mode: text_def.complex_mode,
+            offset: [text_def.offset[0] * scale[0], text_def.offset[1] * scale[1]],
+            ..UiMultilineTextOptions::default()
+        };
+        self.build_multiline_quads(atlas_size, screen_bounds, text, color_defs, &opts)
+    }
 }
 
 #[cfg(test)]
@@ -1147,5 +1757,119 @@ height = 17
         let (w_dumb, pos_dumb) = mbh_multi2wide_dumb(b"A\xC6");
         assert_eq!(w_dumb, vec![b'A' as u16, 0x00C6]);
         assert_eq!(pos_dumb, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn glyph_quad_adapters_colored_multiline_wrap_ellipsis_and_ui_window() {
+        let ini = r#"
+[symbol_coords]
+height = 20
+032 = 0, 0, 6
+042 = 6, 0, 14
+046 = 14, 0, 19
+065 = 20, 0, 32
+066 = 34, 0, 46
+067 = 48, 0, 60
+111 = 60, 0, 70
+"#;
+        let atlas = FontAtlas::parse_ini_str(ini).unwrap();
+        let mut colors = UiColorDefs::default();
+        colors
+            .colors
+            .insert("ui_red".to_string(), color_argb(255, 255, 40, 40));
+
+        // 1. %c[...] inline coloring + \\n explicit breaks + base alpha preservation
+        let parsed = parse_colored_text_lines(
+            "A %c[ui_red]B%c[default]\\n%c[255,10,20,30]C",
+            color_argb(128, 255, 255, 255),
+            Some(&colors),
+            true,
+            true,
+        );
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0][0].text, "A ");
+        assert_eq!(parsed[0][0].color_argb, color_argb(128, 255, 255, 255));
+        assert_eq!(parsed[0][1].text, "B");
+        assert_eq!(parsed[0][1].color_argb, color_argb(128, 255, 40, 40));
+        assert_eq!(parsed[1][0].text, "C");
+        assert_eq!(parsed[1][0].color_argb, color_argb(128, 10, 20, 30));
+
+        // 2. Single-byte word wrapping & center/bottom multi-line quad layout + rect_xywh adapters
+        let quads = atlas.build_multiline_quads(
+            [256, 128],
+            [10.0, 20.0, 42.0, 100.0],
+            "AB C",
+            Some(&colors),
+            &UiMultilineTextOptions {
+                draw: FontDrawParams {
+                    current_height: 20.0,
+                    align: FontAlignment::Center,
+                    color_argb: color_argb(255, 200, 100, 50),
+                    dx_half_pixel_offset: false,
+                    ..FontDrawParams::default()
+                },
+                vert_align: UiTextVerticalAlign::Bottom,
+                complex_mode: true,
+                ..UiMultilineTextOptions::default()
+            },
+        );
+        // Line 1: "AB " (A=12,B=12,' '=6 => 30px + 'o'(10px)=40<=42; plus 'C'(12) => 52>42 -> wraps to line 2!)
+        assert_eq!(quads.len(), 4);
+        let (rect, uv) = quads[0].screen_and_uv_rects();
+        assert!((rect[2] - 12.0).abs() < 1e-5);
+        assert!((rect[3] - 20.0).abs() < 1e-5);
+        assert!((uv[0] - 20.0 / 256.0).abs() < 1e-5);
+        assert!((quads[0].min_xy[1] - 80.0).abs() < 1e-5); // Bottom aligned 2 lines (40px) inside 20..120 -> y0=80
+
+        // 3. Ellipsis truncation
+        assert_eq!(
+            atlas.elide_line("ABCABC", 40.0, &FontDrawParams { current_height: 20.0, ..FontDrawParams::default() }),
+            "AB.."
+        );
+
+        // 4. UiWindowDef + UiViewport (1920x1080) integration + resolve_ui_font_section
+        assert_eq!(resolve_ui_font_section("letterica18"), "ui_font_letterica18_russian");
+        let wnd = UiWindowDef {
+            tag: "cap".into(),
+            id: None,
+            window_name: None,
+            x: 100.0,
+            y: 50.0,
+            width: 200.0,
+            height: 40.0,
+            align: String::new(),
+            alignment: String::new(),
+            stretch: false,
+            hint: None,
+            texture: None,
+            text: Some(UiTextDef {
+                font: Some("letterica18".into()),
+                color_argb: color_argb(255, 255, 255, 255),
+                align: "l".into(),
+                vert_align: "t".into(),
+                complex_mode: false,
+                offset: [0.0, 0.0],
+                text: "AB".into(),
+            }),
+            attributes: Default::default(),
+            children: Vec::new(),
+        };
+        let vp = UiViewport::new(2048.0, 1536.0);
+        let ui_quads = atlas.build_ui_window_text_quads(
+            [256, 128],
+            &wnd,
+            &vp,
+            Some(&colors),
+            None,
+            FontDrawParams {
+                current_height: 20.0,
+                dx_half_pixel_offset: false,
+                ..FontDrawParams::default()
+            },
+        );
+        assert_eq!(ui_quads.len(), 2);
+        // Scaled 2x from virtual (100, 50) -> (200, 100)
+        assert!((ui_quads[0].min_xy[0] - 200.0).abs() < 1e-5);
+        assert!((ui_quads[0].min_xy[1] - 100.0).abs() < 1e-5);
     }
 }
