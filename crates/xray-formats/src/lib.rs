@@ -8,9 +8,11 @@
 //! - `envelopes`: LightWave `CEnvelope` splines (`TCB`/`Hermite`/`Bezier`/`Linear`/`Step`/`Bezier2D`), `.anm` `ObjectMotion` & `.ppe` `PostprocessEffect`
 //! - `gamemtl`: X-Ray `gamemtl.xr` physical/surface material & interaction pair library parser
 //! - `hom`: `level.hom` Hierarchical Occlusion Mapping parser, `ClipFrustum` & 64x64->8 `OccRasterizer`
+//! - `lanims`: `$game_data$/lanims.xr` keyframed `LightAnimItem` / `LightAnimLibrary` color anims
 //! - `level`: `level` & `level.geom`/`level.geomx` scene, visuals, sectors, portals, lights & `D3DVERTEXELEMENT9` VB/IB/SWIS decoders
-//! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, and skeletal mesh + bone/IK parser
+//! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, LOD, tree, and skeletal mesh + bone/IK parser
 //! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
+//! - `particle_sim`: Pure-Rust PAPI runtime simulator, 3D Perlin noise, `ParticleGroupInstance` timeline & billboard emitter
 //! - `particles`: `particles.xr` / loose `.pe` & `.pg` PAPI bytecode systems + LTX blood wallmark configs (no binary `level.wallmarks` in Anomaly/CoP)
 //! - `savegames`: Anomaly `.scop` LZO1X ALife savegame reader/writer (`GameDateTime`, spawn header, dynamic objects & 7 binary registries)
 //! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
@@ -29,9 +31,11 @@ pub mod details;
 pub mod envelopes;
 pub mod gamemtl;
 pub mod hom;
+pub mod lanims;
 pub mod level;
 pub mod ogf;
 pub mod omf;
+pub mod particle_sim;
 pub mod particles;
 pub mod savegames;
 pub mod shaders_xr;
@@ -75,6 +79,10 @@ pub use hom::{
     OccRasterizer, Plane, RawHomTriangle, HOM_POLY_SIZE, OCC_BORDER, OCC_DIM, OCC_DIM_0,
     OCC_DIM_1, OCC_DIM_2, OCC_DIM_3, OCC_Q_S32,
 };
+pub use lanims::{
+    lanim_chunks, lanim_item_chunks, pack_argb, pack_rgba_f32, swap_rb_keep_ag, unpack_argb_f32,
+    LightAnimItem, LightAnimLibrary, LANIM_VERSION,
+};
 pub use level::{
     d3d_decl_type, d3d_decl_usage, level_chunks, sector_chunks, LevelData, LevelGeometry,
     LevelLight, LevelPortal, LevelSector, LevelShaderRef, LevelVertexBuffer, ResolvedLevelMesh,
@@ -83,10 +91,12 @@ pub use level::{
 pub use ogf::{
     fvf_flags, matrix_invert_43, matrix_mul_43, matrix_set_hpb, matrix_set_xyzi_translate,
     matrix_transform_point, ogf_chunks, skel_vert_type, BoneIkData, BoneIkSection,
-    BonePoseMatrices, BoneShape, BoneShapeType, OgfBBox, OgfBSphere, OgfBone, OgfBufferRef,
-    OgfDesc, OgfGContainerRef, OgfHeader, OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows,
-    OgfTextureLink, OgfVertices, OgfVisualType, SlideWindow, StaticVertex, StaticVertexLayout,
+    BonePoseMatrices, BoneShape, BoneShapeType, LodImposterSample, OgfBBox, OgfBSphere, OgfBone,
+    OgfBufferRef, OgfDesc, OgfGContainerRef, OgfHeader, OgfLodDef, OgfLodFacet, OgfLodVertex,
+    OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows, OgfTextureLink, OgfTreeDef, OgfVertices,
+    OgfVisualType, SlideWindow, StaticVertex, StaticVertexLayout, TreeLightingColor,
     UnifiedSkinnedVertex, VertBoned1W, VertBoned2W, VertBoned3W, VertBoned4W, XRayMatrix,
+    LOD_IMPOSTER_QUAD_ORDER, OGF_LODDEF2_SIZE, OGF_LOD_VERTEX_SIZE, OGF_TREEDEF2_SIZE,
     XRAY_IDENTITY_MATRIX,
 };
 pub use omf::{
@@ -94,6 +104,11 @@ pub use omf::{
     BoneTranslationKeys, MotionClip, MotionDef, MotionMark, MotionPartition,
     MotionPartitionBone, OmfMotions, QuantizedRotKey, KEY_QUANT, KEY_QUANT_INV,
     MOTION_QUANTIZER_RANGE_EXT, SAMPLE_FPS, SAMPLE_SPF, XR_OGF_SM_PARAMS_VERSION,
+};
+pub use particle_sim::{
+    ParticleBillboardDrawBatch, ParticleBillboardInstance, ParticleEffectInstance,
+    ParticleGroupInstance, ParticleLifeEvent, ParticleQuadVertex, ParticleRng, ParticleState,
+    ParticleStepEvents, PerlinNoise3,
 };
 pub use particles::{
     encode_compiled_action_list, papi_flags, parse_compiled_action_list, ped_chunks, ped_flags,
@@ -141,7 +156,7 @@ pub use vfs_bridge::{
     load_all_spawn_from_vfs, load_anm_from_vfs, load_blood_wallmarks_from_vfs, load_cform_from_vfs,
     load_color_defs_from_vfs, load_details_from_vfs, load_dm_from_vfs, load_env_mods_from_vfs,
     load_fog_volumes_from_vfs, load_game_graph_from_vfs, load_gamemtl_from_vfs, load_hom_from_vfs,
-    load_level_ai_from_vfs, load_level_from_vfs, load_level_game_from_vfs,
+    load_lanims_from_vfs, load_level_ai_from_vfs, load_level_from_vfs, load_level_game_from_vfs,
     load_level_gct_from_vfs, load_level_geometry_from_vfs, load_level_sound_env_from_vfs,
     load_level_spawn_from_vfs, load_localization_table_from_vfs, load_ltx_tree_from_vfs,
     load_ogf_from_vfs, load_omf_from_vfs, load_particles_from_vfs, load_patrol_paths_ltx_from_vfs,

@@ -507,6 +507,138 @@ pub struct OgfSlideWindows {
     pub windows: Vec<SlideWindow>,
 }
 
+impl OgfSlideWindows {
+    /// Select progressive mesh window for `lod` (`0.0..=1.0`, `1.0 = max detail`)
+    /// matching `FProgressive::Render` / `FTreeVisual_PM::Render`.
+    pub fn select_window(&self, lod: f32) -> Option<SlideWindow> {
+        if self.windows.is_empty() {
+            return None;
+        }
+        let clamped = lod.clamp(0.0, 1.0);
+        let max_idx = (self.windows.len() - 1) as f32;
+        let lod_id = ((1.0 - clamped) * max_idx + 0.5).floor() as usize;
+        self.windows.get(lod_id.min(self.windows.len() - 1)).copied()
+    }
+}
+
+/// Quad vertex reordering index order used by `R_dsgraph_structure::r_dsgraph_render_lods` with `QuadIB`.
+pub const LOD_IMPOSTER_QUAD_ORDER: [usize; 4] = [3, 0, 2, 1];
+
+/// Wire stride (bytes) of `FLOD::_vertex` (`Fvector v + Fvector2 t + u32 c_rgb_hemi + u8 c_sun + 3B align`).
+pub const OGF_LOD_VERTEX_SIZE: usize = 28;
+/// Total byte size of `OGF_LODDEF2` (`8 * 4 * 28 = 896` bytes).
+pub const OGF_LODDEF2_SIZE: usize = 8 * 4 * OGF_LOD_VERTEX_SIZE;
+/// Total byte size of `OGF_TREEDEF2` (`XRayMatrix (64B) + c_scale (20B) + c_bias (20B)`).
+pub const OGF_TREEDEF2_SIZE: usize = 104;
+
+/// Single imposter vertex inside an `OGF_LODDEF2` facet (`FLOD::_vertex`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OgfLodVertex {
+    pub position: [f32; 3],
+    pub uv: [f32; 2],
+    pub rgb_hemi: u32,
+    pub sun: u8,
+}
+
+/// One of the 8 octahedral billboard facets stored in `OGF_LODDEF2` (`FLOD::_face`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OgfLodFacet {
+    pub vertices: [OgfLodVertex; 4],
+    /// Outward-facing unit normal computed matching `FLOD::Load`.
+    pub normal: [f32; 3],
+}
+
+/// Selected pair of adjacent imposter facets and blend factor (`r__dsgraph_render_lods.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LodImposterSample {
+    /// Primary (highest dot product) facet index (`FA`).
+    pub best_facet_index: usize,
+    /// Secondary (second highest dot product) facet index (`FB`).
+    pub next_facet_index: usize,
+    /// Blend weight in `0.0..=1.0` between `next_facet_index` and `best_facet_index` (`uF / 255`).
+    pub blend_factor: f32,
+    /// Forward depth bias shift `-0.5 * bsphere.radius * normalize(bsphere.center - camera_pos)`.
+    pub shift: [f32; 3],
+}
+
+/// Complete `OGF_LODDEF2` billboard imposter definition + spherical `lod_factor` (`FLOD`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OgfLodDef {
+    pub facets: [OgfLodFacet; 8],
+    /// Ratio `Sf / Ss` derived from OGF bounding box & bounding sphere (`FLOD::Load`).
+    pub lod_factor: f32,
+}
+
+impl OgfLodDef {
+    /// Select the top 2 view-aligned facets and compute blend weight matching `r__dsgraph_render_lods.cpp`.
+    pub fn sample_imposter_pair(
+        &self,
+        camera_pos: [f32; 3],
+        bsphere: OgfBSphere,
+    ) -> LodImposterSample {
+        let mut l_dir = [
+            bsphere.center[0] - camera_pos[0],
+            bsphere.center[1] - camera_pos[1],
+            bsphere.center[2] - camera_pos[2],
+        ];
+        let len_sq = l_dir[0] * l_dir[0] + l_dir[1] * l_dir[1] + l_dir[2] * l_dir[2];
+        if len_sq > 1e-12 {
+            let inv = 1.0 / len_sq.sqrt();
+            l_dir[0] *= inv;
+            l_dir[1] *= inv;
+            l_dir[2] *= inv;
+        } else {
+            l_dir = [0.0, 0.0, 1.0];
+        }
+        let shift = [
+            -0.5 * bsphere.radius * l_dir[0],
+            -0.5 * bsphere.radius * l_dir[1],
+            -0.5 * bsphere.radius * l_dir[2],
+        ];
+
+        let mut scored: [(f32, usize); 8] = std::array::from_fn(|s| {
+            let n = self.facets[s].normal;
+            (l_dir[0] * n[0] + l_dir[1] * n[1] + l_dir[2] * n[2], s)
+        });
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let (f_a, best_idx) = scored[7];
+        let (f_b, next_idx) = scored[6];
+        let f_c = scored[5].0;
+        let denom = f_a - f_c;
+        let blend_factor = if denom.abs() > 1e-6 {
+            (0.5 + 0.5 * (1.0 - (f_b - f_c) / denom)).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        LodImposterSample {
+            best_facet_index: best_idx,
+            next_facet_index: next_idx,
+            blend_factor,
+            shift,
+        }
+    }
+}
+
+/// 5-channel vertex lighting scale/bias parameters from `OGF_TREEDEF2` (`FTreeVisual::_5color`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TreeLightingColor {
+    pub rgb: [f32; 3],
+    pub hemi: f32,
+    pub sun: f32,
+}
+
+/// Foliage placement transform and lighting parameters parsed from `OGF_TREEDEF2` (`FTreeVisual`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OgfTreeDef {
+    pub xform: XRayMatrix,
+    /// Pre-halved diffuse/hemi/sun scale (`* 0.5` applied at load matching `FTreeVisual::Load`).
+    pub c_scale: TreeLightingColor,
+    /// Pre-halved diffuse/hemi/sun bias (`* 0.5` applied at load matching `FTreeVisual::Load`).
+    pub c_bias: TreeLightingColor,
+}
+
 /// Individual VB or IB slice reference (`OGF_VCONTAINER` / `OGF_ICONTAINER`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OgfBufferRef {
@@ -791,6 +923,8 @@ pub struct OgfModel {
     pub icontainer: Option<OgfBufferRef>,
     pub fastpath_gcontainer: Option<OgfGContainerRef>,
     pub fastpath_swi: Option<OgfSlideWindows>,
+    pub lod_def: Option<OgfLodDef>,
+    pub tree_def: Option<OgfTreeDef>,
     pub skeleton: Option<OgfSkeleton>,
     pub desc: Option<OgfDesc>,
     pub child_links: Vec<u32>,
@@ -911,6 +1045,16 @@ impl OgfModel {
             None => Vec::new(),
         };
 
+        let lod_def = match reader.open_chunk(OGF_LODDEF2)? {
+            Some(bytes) => Some(parse_loddef2(&bytes, &header)?),
+            None => None,
+        };
+
+        let tree_def = match reader.open_chunk(OGF_TREEDEF2)? {
+            Some(bytes) => Some(parse_treedef2(&bytes)?),
+            None => None,
+        };
+
         let skeleton = parse_skeleton_if_present(&reader)?;
 
         Ok(Self {
@@ -925,6 +1069,8 @@ impl OgfModel {
             icontainer,
             fastpath_gcontainer,
             fastpath_swi,
+            lod_def,
+            tree_def,
             skeleton,
             desc,
             child_links,
@@ -934,6 +1080,37 @@ impl OgfModel {
 
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
+    }
+
+    /// Resolve active `OgfSlideWindows` from either inline `OGF_SWIDATA` or `OGF_SWICONTAINER`
+    /// (`use_fastpath = true` checks `fastpath_swi`).
+    pub fn resolve_swi<'a>(
+        &'a self,
+        external_swis: &'a [OgfSlideWindows],
+        use_fastpath: bool,
+    ) -> Option<&'a OgfSlideWindows> {
+        if use_fastpath {
+            return self.fastpath_swi.as_ref();
+        }
+        self.swi
+            .as_ref()
+            .or_else(|| self.swi_container.and_then(|id| external_swis.get(id as usize)))
+    }
+
+    /// Return LOD-sliced inline indices using `OGF_SWIDATA` (or `external_swis` via `swi_container`).
+    pub fn progressive_indices(&self, lod: f32, external_swis: &[OgfSlideWindows]) -> &[u16] {
+        let Some(swi) = self.resolve_swi(external_swis, false) else {
+            return &self.indices;
+        };
+        let Some(win) = swi.select_window(lod) else {
+            return &self.indices;
+        };
+        let start = win.offset as usize;
+        let len = (win.num_tris as usize) * 3;
+        start
+            .checked_add(len)
+            .and_then(|end| self.indices.get(start..end))
+            .unwrap_or(&self.indices)
     }
 }
 
@@ -955,6 +1132,132 @@ fn parse_gcontainer(data: &[u8]) -> Result<OgfGContainerRef, FormatError> {
         ib_id: cur.read_u32()?,
         ib_base: cur.read_u32()?,
         ib_count: cur.read_u32()?,
+    })
+}
+
+#[inline]
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+#[inline]
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+#[inline]
+fn normalize_safe3(v: [f32; 3]) -> [f32; 3] {
+    let m = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    if m > f32::MIN_POSITIVE {
+        let inv = (1.0 / m).sqrt();
+        [v[0] * inv, v[1] * inv, v[2] * inv]
+    } else {
+        v
+    }
+}
+
+#[inline]
+fn mk_normal(p0: [f32; 3], p1: [f32; 3], p2: [f32; 3]) -> [f32; 3] {
+    normalize_safe3(cross3(sub3(p1, p0), sub3(p2, p1)))
+}
+
+fn parse_loddef2(data: &[u8], header: &OgfHeader) -> Result<OgfLodDef, FormatError> {
+    if data.len() < OGF_LODDEF2_SIZE {
+        return Err(FormatError::UnexpectedEof);
+    }
+    let mut cur = ByteCursor::new(data);
+    let mut facets = Vec::with_capacity(8);
+    for _ in 0..8 {
+        let mut verts = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let position = cur.read_f32_3()?;
+            let uv = cur.read_f32_2()?;
+            let rgb_hemi = cur.read_u32()?;
+            let sun = cur.read_u8()?;
+            let _pad = cur.read_bytes(3)?;
+            verts.push(OgfLodVertex {
+                position,
+                uv,
+                rgb_hemi,
+                sun,
+            });
+        }
+        let v: [OgfLodVertex; 4] = verts.try_into().expect("exactly 4 LOD vertices");
+        let n0 = mk_normal(v[0].position, v[1].position, v[2].position);
+        let n1 = mk_normal(v[1].position, v[2].position, v[3].position);
+        let n2 = mk_normal(v[2].position, v[3].position, v[0].position);
+        let n3 = mk_normal(v[3].position, v[0].position, v[1].position);
+        let avg = [
+            (n0[0] + n1[0] + n2[0] + n3[0]) * 0.25,
+            (n0[1] + n1[1] + n2[1] + n3[1]) * 0.25,
+            (n0[2] + n1[2] + n2[2] + n3[2]) * 0.25,
+        ];
+        let unit = normalize_safe3(avg);
+        facets.push(OgfLodFacet {
+            vertices: v,
+            normal: [-unit[0], -unit[1], -unit[2]],
+        });
+    }
+
+    let mut half_ext = [
+        (header.bbox.max[0] - header.bbox.min[0]) * 0.5,
+        (header.bbox.max[1] - header.bbox.min[1]) * 0.5,
+        (header.bbox.max[2] - header.bbox.min[2]) * 0.5,
+    ];
+    half_ext.sort_by(f32::total_cmp);
+    let r = header.bsphere.radius;
+    let lod_factor = if r > 1e-6 {
+        let a = half_ext[1].clamp(0.0, r);
+        let sf = 4.0 * (0.5 * (r * r * (a / r).asin() + a * (r * r - a * a).max(0.0).sqrt()));
+        let ss = std::f32::consts::PI * r * r;
+        sf / ss
+    } else {
+        1.0
+    };
+
+    Ok(OgfLodDef {
+        facets: facets.try_into().expect("exactly 8 LOD facets"),
+        lod_factor,
+    })
+}
+
+fn parse_treedef2(data: &[u8]) -> Result<OgfTreeDef, FormatError> {
+    if data.len() < OGF_TREEDEF2_SIZE {
+        return Err(FormatError::UnexpectedEof);
+    }
+    let mut cur = ByteCursor::new(data);
+    let xform = [
+        cur.read_f32_4()?,
+        cur.read_f32_4()?,
+        cur.read_f32_4()?,
+        cur.read_f32_4()?,
+    ];
+    let c_scale = TreeLightingColor {
+        rgb: [
+            cur.read_f32()? * 0.5,
+            cur.read_f32()? * 0.5,
+            cur.read_f32()? * 0.5,
+        ],
+        hemi: cur.read_f32()? * 0.5,
+        sun: cur.read_f32()? * 0.5,
+    };
+    let c_bias = TreeLightingColor {
+        rgb: [
+            cur.read_f32()? * 0.5,
+            cur.read_f32()? * 0.5,
+            cur.read_f32()? * 0.5,
+        ],
+        hemi: cur.read_f32()? * 0.5,
+        sun: cur.read_f32()? * 0.5,
+    };
+    Ok(OgfTreeDef {
+        xform,
+        c_scale,
+        c_bias,
     })
 }
 
@@ -1716,5 +2019,100 @@ mod tests {
         let u4 = m4.vertices.unwrap().to_unified_skinned();
         assert_eq!(u4[0].bone_indices, [2, 4, 6, 8]);
         assert!((u4[0].bone_weights[3] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_ogf_loddef2_treedef2_and_progressive_swi_selection() {
+        // 1. OGF_LODDEF2 (8 facets * 4 vertices * 28B = 896B)
+        let mut lod_raw = Vec::new();
+        for f in 0..8 {
+            let ang = (f as f32) * std::f32::consts::FRAC_PI_4;
+            let (s, c) = ang.sin_cos();
+            // Tangent plane facing (+c, 0, +s): FLOD::Load inverts cross(p1-p0, p2-p1), so build
+            // quad where cross(up, right) points inward (-c, 0, -s) -> inverted normal = (+c, 0, +s)
+            let right = [s, 0.0, -c];
+            let up = [0.0f32, 1.0, 0.0];
+            let corners = [
+                [-right[0] - up[0], -up[1], -right[2] - up[2]],
+                [-right[0] + up[0], up[1], -right[2] + up[2]],
+                [right[0] + up[0], up[1], right[2] + up[2]],
+                [right[0] - up[0], -up[1], right[2] - up[2]],
+            ];
+            for (k, pos) in corners.iter().enumerate() {
+                write_vec3(&mut lod_raw, *pos);
+                lod_raw.extend_from_slice(&(k as f32 * 0.25).to_le_bytes());
+                lod_raw.extend_from_slice(&0.5f32.to_le_bytes());
+                lod_raw.extend_from_slice(&0xFF80_8080u32.to_le_bytes());
+                lod_raw.push(200u8);
+                lod_raw.extend_from_slice(&[0u8; 3]); // C struct align tail pad
+            }
+        }
+        assert_eq!(lod_raw.len(), OGF_LODDEF2_SIZE);
+
+        let mut lod_w = ChunkWriter::new();
+        lod_w.write_chunk(OGF_HEADER, &build_header_chunk(OgfVisualType::Lod, 0));
+        lod_w.write_chunk(OGF_LODDEF2, &lod_raw);
+        let lod_model = OgfModel::parse(&lod_w.into_bytes()).unwrap();
+        let lod_def = lod_model.lod_def.expect("OGF_LODDEF2 must parse");
+        assert!((lod_def.facets[0].normal[0] - 1.0).abs() < 1e-5);
+        assert!(lod_def.lod_factor > 0.0 && lod_def.lod_factor.is_finite());
+
+        // Camera along -X looking at sphere center at (0, 1, 0) -> Ldir = (+1, 0, 0) picks facet 0
+        let sample = lod_def.sample_imposter_pair([-20.0, 1.0, 0.0], lod_model.header.bsphere);
+        assert_eq!(sample.best_facet_index, 0);
+        assert!(sample.blend_factor >= 0.0 && sample.blend_factor <= 1.0);
+        assert!((sample.shift[0] + 0.75).abs() < 1e-4);
+
+        // 2. OGF_TREEDEF2 (64B XRayMatrix + 20B scale + 20B bias = 104B)
+        let mut tree_raw = Vec::new();
+        for r in XRAY_IDENTITY_MATRIX {
+            for f in r {
+                tree_raw.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        // c_scale (rgb=[2, 2, 2], hemi=1.0, sun=0.8) -> loaded halved (*0.5)
+        for f in [2.0f32, 2.0, 2.0, 1.0, 0.8] {
+            tree_raw.extend_from_slice(&f.to_le_bytes());
+        }
+        // c_bias (rgb=[0.2, 0.4, 0.6], hemi=0.1, sun=0.05) -> loaded halved (*0.5)
+        for f in [0.2f32, 0.4, 0.6, 0.1, 0.05] {
+            tree_raw.extend_from_slice(&f.to_le_bytes());
+        }
+        assert_eq!(tree_raw.len(), OGF_TREEDEF2_SIZE);
+
+        let mut tree_w = ChunkWriter::new();
+        tree_w.write_chunk(OGF_HEADER, &build_header_chunk(OgfVisualType::TreeSt, 1));
+        tree_w.write_chunk(OGF_TREEDEF2, &tree_raw);
+        let tree_model = OgfModel::parse(&tree_w.into_bytes()).unwrap();
+        let td = tree_model.tree_def.expect("OGF_TREEDEF2 must parse");
+        assert_eq!(td.xform, XRAY_IDENTITY_MATRIX);
+        assert!((td.c_scale.rgb[0] - 1.0).abs() < 1e-6);
+        assert!((td.c_scale.sun - 0.4).abs() < 1e-6);
+        assert!((td.c_bias.rgb[1] - 0.2).abs() < 1e-6);
+
+        // 3. Progressive SWI window selection
+        let swis = OgfSlideWindows {
+            reserved: [0; 4],
+            windows: vec![
+                SlideWindow {
+                    offset: 0,
+                    num_tris: 4,
+                    num_verts: 6,
+                },
+                SlideWindow {
+                    offset: 12,
+                    num_tris: 2,
+                    num_verts: 4,
+                },
+                SlideWindow {
+                    offset: 18,
+                    num_tris: 1,
+                    num_verts: 3,
+                },
+            ],
+        };
+        assert_eq!(swis.select_window(1.0).unwrap().num_tris, 4);
+        assert_eq!(swis.select_window(0.5).unwrap().num_tris, 2);
+        assert_eq!(swis.select_window(0.0).unwrap().num_tris, 1);
     }
 }

@@ -422,6 +422,39 @@ pub struct ResolvedLevelMesh {
     pub indices: Vec<u16>,
 }
 
+impl ResolvedLevelMesh {
+    /// Extract compact XYZ vertex positions suitable for Z-prepass or directional shadow depth passes.
+    pub fn to_position_only(&self) -> Vec<[f32; 3]> {
+        self.vertices.iter().map(|v| v.position).collect()
+    }
+
+    /// Sub-slice this mesh using an `FSlideWindow` progressive LOD record.
+    pub fn slice_window(&self, window: SlideWindow) -> Result<Self, FormatError> {
+        let start = window.offset as usize;
+        let len = (window.num_tris as usize) * 3;
+        let end = start
+            .checked_add(len)
+            .ok_or(FormatError::InvalidValue("SWI window index overflow"))?;
+        let indices = self
+            .indices
+            .get(start..end)
+            .ok_or(FormatError::InvalidValue("SWI window index slice out of bounds"))?
+            .to_vec();
+        let max_ref = indices.iter().copied().max().map(usize::from).unwrap_or(0);
+        let vert_count = (window.num_verts as usize).min(self.vertices.len());
+        let vertices = if vert_count > 0 && max_ref < vert_count {
+            self.vertices[..vert_count].to_vec()
+        } else {
+            self.vertices.clone()
+        };
+        Ok(Self {
+            shader: self.shader.clone(),
+            vertices,
+            indices,
+        })
+    }
+}
+
 /// Parsed `level` scene description (`hdrLEVEL`, shaders, visuals, portals, sectors, lights).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LevelData {
@@ -678,6 +711,141 @@ impl LevelData {
             vertices,
             indices,
         }))
+    }
+
+    /// Resolve vertices & indices for a visual at a given progressive `lod` (`0.0..=1.0`),
+    /// honoring inline `OGF_SWIDATA` or `OGF_SWICONTAINER` (`level.geom` `FSL_SWIS`).
+    pub fn resolve_visual_mesh_lod(
+        &self,
+        visual_index: usize,
+        geom: &LevelGeometry,
+        lod: f32,
+    ) -> Result<ResolvedLevelMesh, FormatError> {
+        let visual = self
+            .visuals
+            .get(visual_index)
+            .ok_or(FormatError::InvalidValue("level visual index out of range"))?;
+        let win = visual
+            .resolve_swi(&geom.swis, false)
+            .and_then(|s| s.select_window(lod));
+        let Some(sw) = win else {
+            return self.resolve_visual_mesh(visual_index, geom);
+        };
+
+        let shader = self.visual_shader(visual).cloned();
+        if let Some(gc) = visual.gcontainer {
+            let ib_start = gc
+                .ib_base
+                .checked_add(sw.offset)
+                .ok_or(FormatError::InvalidValue("SWI ib_base overflow"))?;
+            let indices = geom
+                .slice_indices(gc.ib_id, ib_start, (sw.num_tris as u32) * 3)?
+                .to_vec();
+            let all_verts = geom.slice_vertices(gc.vb_id, gc.vb_base, gc.vb_count)?;
+            let max_ref = indices.iter().copied().max().map(usize::from).unwrap_or(0);
+            let vertices = if sw.num_verts > 0 && max_ref < (sw.num_verts as usize) && (sw.num_verts as usize) <= all_verts.len() {
+                all_verts[..sw.num_verts as usize].to_vec()
+            } else {
+                all_verts
+            };
+            return Ok(ResolvedLevelMesh {
+                shader,
+                vertices,
+                indices,
+            });
+        }
+
+        if let Some(vc) = visual.vcontainer {
+            let all_verts = geom.slice_vertices(vc.id, vc.base, vc.count)?;
+            let indices = if let Some(ic) = visual.icontainer {
+                let ib_start = ic
+                    .base
+                    .checked_add(sw.offset)
+                    .ok_or(FormatError::InvalidValue("SWI icontainer base overflow"))?;
+                geom.slice_indices(ic.id, ib_start, (sw.num_tris as u32) * 3)?
+                    .to_vec()
+            } else {
+                visual.progressive_indices(lod, &geom.swis).to_vec()
+            };
+            return Ok(ResolvedLevelMesh {
+                shader,
+                vertices: all_verts,
+                indices,
+            });
+        }
+
+        self.resolve_visual_mesh(visual_index, geom)?.slice_window(sw)
+    }
+
+    /// Resolve `OGF_FASTPATH` Z-prepass / directional shadow mesh at progressive `lod` (`0.0..=1.0`),
+    /// matching `FProgressive::Render` (`PHASE_SMAP` using `fastpath_swi`).
+    pub fn resolve_fastpath_mesh_lod(
+        &self,
+        visual_index: usize,
+        geomx: &LevelGeometry,
+        lod: f32,
+    ) -> Result<Option<ResolvedLevelMesh>, FormatError> {
+        let visual = self
+            .visuals
+            .get(visual_index)
+            .ok_or(FormatError::InvalidValue("level visual index out of range"))?;
+        let Some(gc) = visual.fastpath_gcontainer else {
+            return Ok(None);
+        };
+        let win = visual
+            .resolve_swi(&geomx.swis, true)
+            .and_then(|s| s.select_window(lod));
+        let Some(sw) = win else {
+            return self.resolve_fastpath_mesh(visual_index, geomx);
+        };
+
+        let shader = self.visual_shader(visual).cloned();
+        let ib_start = gc
+            .ib_base
+            .checked_add(sw.offset)
+            .ok_or(FormatError::InvalidValue("fastpath SWI ib_base overflow"))?;
+        let indices = geomx
+            .slice_indices(gc.ib_id, ib_start, (sw.num_tris as u32) * 3)?
+            .to_vec();
+        let all_verts = geomx.slice_vertices(gc.vb_id, gc.vb_base, gc.vb_count)?;
+        let max_ref = indices.iter().copied().max().map(usize::from).unwrap_or(0);
+        let vertices = if sw.num_verts > 0 && max_ref < (sw.num_verts as usize) && (sw.num_verts as usize) <= all_verts.len() {
+            all_verts[..sw.num_verts as usize].to_vec()
+        } else {
+            all_verts
+        };
+        Ok(Some(ResolvedLevelMesh {
+            shader,
+            vertices,
+            indices,
+        }))
+    }
+
+    /// Collect all leaf visual indices reachable from `root_visual_index` (e.g. a sector root)
+    /// across `OGF_CHILDREN_L` hierarchy links, guarding against cycles.
+    pub fn collect_hierarchy_leaves(&self, root_visual_index: usize) -> Vec<usize> {
+        if root_visual_index >= self.visuals.len() {
+            return Vec::new();
+        }
+        let mut visited = vec![false; self.visuals.len()];
+        let mut leaves = Vec::new();
+        let mut stack = vec![root_visual_index];
+
+        while let Some(idx) = stack.pop() {
+            if idx >= self.visuals.len() || visited[idx] {
+                continue;
+            }
+            visited[idx] = true;
+            let vis = &self.visuals[idx];
+            if vis.child_links.is_empty() {
+                leaves.push(idx);
+            } else {
+                for &child_id in vis.child_links.iter().rev() {
+                    stack.push(child_id as usize);
+                }
+            }
+        }
+        leaves
     }
 }
 
@@ -990,5 +1158,138 @@ mod tests {
         assert!((f16_to_f32(0x3C00) - 1.0).abs() < 1e-6);
         assert!((f16_to_f32(0xBC00) + 1.0).abs() < 1e-6);
         assert!((f16_to_f32(0x3800) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_level_swicontainer_fastpath_lod_and_hierarchy_traversal() {
+        use d3d_decl_type::*;
+        use d3d_decl_usage::*;
+        use level_chunks::*;
+
+        // Build geom with 1 VB (4 verts), 1 IB (9 indices = 2 progressive LOD windows: 2 tris at offset 0, 1 tri at offset 6),
+        // and 1 shared SWI item in FSL_SWIS!
+        let mut vb_stream = Vec::new();
+        vb_stream.extend_from_slice(&1u32.to_le_bytes());
+        write_decl_elem(
+            &mut vb_stream,
+            VertexElement9 {
+                stream: 0,
+                offset: 0,
+                decl_type: FLOAT3,
+                method: 0,
+                usage: POSITION,
+                usage_index: 0,
+            },
+        );
+        write_decl_elem(&mut vb_stream, VertexElement9::END);
+        vb_stream.extend_from_slice(&4u32.to_le_bytes());
+        for p in [
+            [0.0f32, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ] {
+            for c in p {
+                vb_stream.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+
+        let mut ib_stream = Vec::new();
+        ib_stream.extend_from_slice(&1u32.to_le_bytes());
+        ib_stream.extend_from_slice(&9u32.to_le_bytes());
+        for i in [0u16, 1, 2, 0, 2, 3, 0, 1, 3] {
+            ib_stream.extend_from_slice(&i.to_le_bytes());
+        }
+
+        let mut swis_stream = Vec::new();
+        swis_stream.extend_from_slice(&1u32.to_le_bytes()); // 1 SWI item
+        for r in [0u32; 4] {
+            swis_stream.extend_from_slice(&r.to_le_bytes());
+        }
+        swis_stream.extend_from_slice(&2u32.to_le_bytes()); // 2 windows
+        // Window 0 (high LOD): offset 0, 2 tris, 4 verts
+        swis_stream.extend_from_slice(&0u32.to_le_bytes());
+        swis_stream.extend_from_slice(&2u16.to_le_bytes());
+        swis_stream.extend_from_slice(&4u16.to_le_bytes());
+        // Window 1 (low LOD): offset 6, 1 tri, 3 verts
+        swis_stream.extend_from_slice(&6u32.to_le_bytes());
+        swis_stream.extend_from_slice(&1u16.to_le_bytes());
+        swis_stream.extend_from_slice(&4u16.to_le_bytes());
+
+        let mut geom_w = ChunkWriter::new();
+        geom_w.write_chunk(FSL_VB, &vb_stream);
+        geom_w.write_chunk(FSL_IB, &ib_stream);
+        geom_w.write_chunk(FSL_SWIS, &swis_stream);
+        let geom = LevelGeometry::parse(&geom_w.into_bytes()).unwrap();
+
+        // Visual 0: root Hierarchy linking children [1, 2]
+        let mut vis0 = ChunkWriter::new();
+        let mut h0 = vec![4u8, OgfVisualType::Hierarchy as u8, 0, 0];
+        h0.extend_from_slice(&[0u8; 40]);
+        vis0.write_chunk(OGF_HEADER, &h0);
+        let mut links = Vec::new();
+        for v in [2u32, 1, 2] {
+            links.extend_from_slice(&v.to_le_bytes());
+        }
+        vis0.write_chunk(OGF_CHILDREN_L, &links);
+
+        // Visual 1: TreePm using OGF_SWICONTAINER(0) + OGF_FASTPATH with embedded OGF_SWIDATA
+        let mut vis1 = ChunkWriter::new();
+        let mut h1 = vec![4u8, OgfVisualType::TreePm as u8, 0, 0];
+        h1.extend_from_slice(&[0u8; 40]);
+        vis1.write_chunk(OGF_HEADER, &h1);
+        let mut gcont = Vec::new();
+        for v in [0u32, 0, 4, 0, 0, 9] {
+            gcont.extend_from_slice(&v.to_le_bytes());
+        }
+        vis1.write_chunk(OGF_GCONTAINER, &gcont);
+        vis1.write_chunk(OGF_SWICONTAINER, &0u32.to_le_bytes());
+
+        let mut fp_w = ChunkWriter::new();
+        fp_w.write_chunk(OGF_GCONTAINER, &gcont);
+        let mut fp_swi = Vec::new();
+        for r in [0u32; 4] {
+            fp_swi.extend_from_slice(&r.to_le_bytes());
+        }
+        fp_swi.extend_from_slice(&2u32.to_le_bytes());
+        fp_swi.extend_from_slice(&0u32.to_le_bytes());
+        fp_swi.extend_from_slice(&2u16.to_le_bytes());
+        fp_swi.extend_from_slice(&4u16.to_le_bytes());
+        fp_swi.extend_from_slice(&6u32.to_le_bytes());
+        fp_swi.extend_from_slice(&1u16.to_le_bytes());
+        fp_swi.extend_from_slice(&4u16.to_le_bytes());
+        fp_w.write_chunk(OGF_SWIDATA, &fp_swi);
+        vis1.write_chunk(OGF_FASTPATH, &fp_w.into_bytes());
+
+        // Visual 2: simple static Normal leaf
+        let mut vis2 = ChunkWriter::new();
+        let mut h2 = vec![4u8, OgfVisualType::Normal as u8, 0, 0];
+        h2.extend_from_slice(&[0u8; 40]);
+        vis2.write_chunk(OGF_HEADER, &h2);
+        vis2.write_chunk(OGF_GCONTAINER, &gcont);
+
+        let mut vis_wrap = ChunkWriter::new();
+        vis_wrap.write_chunk(0, &vis0.into_bytes());
+        vis_wrap.write_chunk(1, &vis1.into_bytes());
+        vis_wrap.write_chunk(2, &vis2.into_bytes());
+
+        let mut lvl_w = ChunkWriter::new();
+        lvl_w.write_chunk(FSL_VISUALS, &vis_wrap.into_bytes());
+        let level = LevelData::parse(&lvl_w.into_bytes()).unwrap();
+
+        assert_eq!(level.collect_hierarchy_leaves(0), vec![1, 2]);
+
+        let hi_lod = level.resolve_visual_mesh_lod(1, &geom, 1.0).unwrap();
+        assert_eq!(hi_lod.indices, vec![0, 1, 2, 0, 2, 3]);
+        assert_eq!(hi_lod.to_position_only().len(), 4);
+
+        let lo_lod = level.resolve_visual_mesh_lod(1, &geom, 0.0).unwrap();
+        assert_eq!(lo_lod.indices, vec![0, 1, 3]);
+
+        let fp_lo = level
+            .resolve_fastpath_mesh_lod(1, &geom, 0.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fp_lo.indices, vec![0, 1, 3]);
     }
 }

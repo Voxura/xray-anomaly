@@ -12,6 +12,7 @@ use crate::details::{DetailMesh, LevelDetails};
 use crate::envelopes::{ObjectMotion, PostprocessEffect};
 use crate::gamemtl::GameMaterialLibrary;
 use crate::hom::HomMesh;
+use crate::lanims::LightAnimLibrary;
 use crate::level::{LevelData, LevelGeometry};
 use crate::ogf::{OgfModel, OgfTextureLink};
 use crate::omf::OmfMotions;
@@ -835,6 +836,12 @@ pub fn load_ui_texture_atlases_from_vfs(
 pub fn load_color_defs_from_vfs(vfs: &VirtualFileSystem) -> Result<UiColorDefs, AssetLoadError> {
     let doc = load_xml_from_vfs(vfs, "$game_configs$/ui/color_defs.xml")?;
     Ok(UiColorDefs::from_doc(&doc))
+}
+
+/// Stream `$game_data$/lanims.xr` keyframed light/UI color animations (`LightAnimLibrary`).
+pub fn load_lanims_from_vfs(vfs: &VirtualFileSystem) -> Result<LightAnimLibrary, AssetLoadError> {
+    let bytes = vfs.read_bytes("$game_data$/lanims.xr")?;
+    Ok(LightAnimLibrary::parse(&bytes)?)
 }
 
 #[cfg(test)]
@@ -2061,5 +2068,122 @@ mod tests {
         let mut keys = std::collections::BTreeMap::new();
         keys.insert("USE".into(), "E".into());
         assert_eq!(loc_rus.translate_formatted("st_only_english", &keys), "Fallback E");
+    }
+
+    #[test]
+    fn test_stream_lanims_and_simulate_particle_billboards_from_vfs() {
+        use crate::lanims::{pack_argb, LightAnimItem, LightAnimLibrary, LANIM_VERSION};
+        use crate::particle_sim::ParticleGroupInstance;
+        use crate::particles::{
+            papi_flags, ped_flags, pg_effect_flags, CompiledParticleAction, GroupEffectItem,
+            ParticleActionKind, ParticleDomain, ParticleDomainType, ParticleEffectDef,
+            ParticleGroupDef, ParticlesLibrary,
+        };
+
+        let mut pulse = LightAnimItem::new("lights\\campfire");
+        pulse.fps = 10.0;
+        pulse.frame_count = 10;
+        pulse.keys.clear();
+        pulse.insert_key(0, pack_argb(0xFF, 0xFF, 0x80, 0x00)).unwrap();
+        pulse.insert_key(10, pack_argb(0xFF, 0xFF, 0xFF, 0x40)).unwrap();
+        let lanim_raw = LightAnimLibrary {
+            version: LANIM_VERSION,
+            items: vec![pulse],
+        }
+        .to_bytes();
+
+        let spark_eff = ParticleEffectDef {
+            name: "fire\\sparks".to_string(),
+            flags: ped_flags::DF_SPRITE,
+            max_particles: 8,
+            // Binary particles.xr (`CPEDef::Load`) always decodes with `m_uStep = 33` ms
+            update_step_ms: 33,
+            shader: Some("effects\\add".to_string()),
+            texture: Some("fx\\fx_spark".to_string()),
+            frame: None,
+            time_limit: None,
+            collision: None,
+            velocity_scale: None,
+            align_to_path_rotation: None,
+            actions: vec![
+                CompiledParticleAction {
+                    outer_type: 21,
+                    flags: papi_flags::PASOURCE_VERTEXB_TRACKS,
+                    inner_type: 21,
+                    kind: ParticleActionKind::Source {
+                        position: ParticleDomain::default(),
+                        velocity: ParticleDomain::from_editor_params(
+                            ParticleDomainType::Point,
+                            [0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        ),
+                        rot: ParticleDomain::default(),
+                        size: ParticleDomain::from_editor_params(
+                            ParticleDomainType::Point,
+                            [0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        ),
+                        color: ParticleDomain::from_editor_params(
+                            ParticleDomainType::Point,
+                            [1.0, 0.7, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        ),
+                        alpha: 1.0,
+                        particle_rate: 100.0,
+                        age: 0.0,
+                        age_sigma: 0.0,
+                        parent_vel: [0.0; 3],
+                        parent_motion: 0.0,
+                    },
+                },
+                CompiledParticleAction {
+                    outer_type: 12,
+                    flags: 0,
+                    inner_type: 12,
+                    kind: ParticleActionKind::Move,
+                },
+            ],
+        };
+        let campfire_grp = ParticleGroupDef {
+            name: "fire\\campfire".to_string(),
+            flags: 0,
+            time_limit: 5.0,
+            effects: vec![GroupEffectItem {
+                effect_name: "fire\\sparks".to_string(),
+                on_play_child: String::new(),
+                on_birth_child: String::new(),
+                on_dead_child: String::new(),
+                time0: 0.0,
+                time1: 5.0,
+                flags: pg_effect_flags::FL_ENABLED,
+            }],
+        };
+        let pxr_raw = ParticlesLibrary {
+            effects: vec![spark_eff],
+            groups: vec![campfire_grp],
+        }
+        .to_bytes();
+
+        let entries = vec![
+            ("lanims.xr", lanim_raw.clone(), compress_lzo1x(&lanim_raw)),
+            ("particles.xr", pxr_raw.clone(), compress_lzo1x(&pxr_raw)),
+        ];
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_bytes("fx_pack.db0", pack_synthetic_db(entries))
+            .unwrap();
+
+        let lalib = load_lanims_from_vfs(&vfs).unwrap();
+        let campfire = lalib.find_item("lights\\campfire").unwrap();
+        assert_eq!(campfire.calculate_rgb(0.5).1, 5);
+
+        let plib = load_particles_from_vfs(&vfs).unwrap();
+        let grp_def = plib.find_group("fire\\campfire").unwrap().clone();
+        let mut grp_inst = ParticleGroupInstance::compile(grp_def, &plib, 123).unwrap();
+        grp_inst.play();
+        grp_inst.step(66, &plib);
+        let batches = grp_inst.emit_billboards([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+        assert_eq!(batches.len(), 1);
+        // 2 ticks of 33ms * 100 particles/sec = 6.6 -> 6..=8 particles capped by max_particles=8
+        assert!((6..=8).contains(&batches[0].instances.len()));
+        let (verts, idx) = batches[0].instances[0].expand_quad(0);
+        assert_eq!(verts.len(), 4);
+        assert_eq!(idx, [0, 1, 2, 3, 2, 1]);
     }
 }
