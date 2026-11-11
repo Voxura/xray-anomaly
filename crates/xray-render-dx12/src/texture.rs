@@ -1,13 +1,35 @@
 //! Pure Rust DirectDraw Surface (DDS) Texture Decoder & Descriptor Registry
 //!
 //! Provides zero-copy parsing of DDS headers, subresource footprint calculation,
-//! format detection (BC1-BC7, uncompressed RGBA), and layout planning for DirectX 12
-//! texture placement in default heaps and bindless descriptor heaps.
+//! format detection (BC1-BC7, uncompressed RGBA), layout planning for DirectX 12
+//! texture placement in default heaps, staging buffer uploading, and bindless SRV registration.
 
+use std::collections::HashMap;
+use std::mem::ManuallyDrop;
+use windows::core::{Result as WinResult, HRESULT};
+use windows::Win32::Graphics::Direct3D12::{
+    ID3D12Device, ID3D12GraphicsCommandList, ID3D12Resource,
+    D3D12_CPU_DESCRIPTOR_HANDLE,
+    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_UPLOAD,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RANGE,
+    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+    D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+    D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_GENERIC_READ,
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_TRANSITION_BARRIER,
+    D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
+    D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_TEX2D_SRV,
+    D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+    D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+    D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM,
-    DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
+
+use crate::bindless::DescriptorIndex;
 
 pub const DDS_MAGIC: u32 = 0x20534444; // "DDS "
 
@@ -31,6 +53,10 @@ pub const FOURCC_DXT3: u32 = u32::from_le_bytes(*b"DXT3");
 pub const FOURCC_DXT4: u32 = u32::from_le_bytes(*b"DXT4");
 pub const FOURCC_DXT5: u32 = u32::from_le_bytes(*b"DXT5");
 pub const FOURCC_DX10: u32 = u32::from_le_bytes(*b"DX10");
+
+fn failure() -> windows::core::Error {
+    windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextureError {
@@ -196,6 +222,252 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
     })
 }
 
+/// GPU Texture placed in high-performance VRAM (D3D12_HEAP_TYPE_DEFAULT)
+#[derive(Clone)]
+pub struct GpuTexture {
+    pub resource: ID3D12Resource,
+    pub descriptor_index: DescriptorIndex,
+    pub width: u32,
+    pub height: u32,
+    pub mip_count: u32,
+    pub format: DXGI_FORMAT,
+}
+
+/// Helper that allocates a Default heap texture, a linear staging buffer, and records
+/// the copy commands and transitions onto the supplied command list.
+pub fn upload_dds_texture(
+    device: &ID3D12Device,
+    cmd: &ID3D12GraphicsCommandList,
+    dds: &DdsImage,
+) -> WinResult<(ID3D12Resource, ID3D12Resource)> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Alignment: 0,
+        Width: dds.width as u64,
+        Height: dds.height,
+        DepthOrArraySize: dds.depth as u16,
+        MipLevels: dds.mip_count as u16,
+        Format: dds.format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+    };
+
+    let default_heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+        ..Default::default()
+    };
+
+    let mut texture_res: Option<ID3D12Resource> = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &default_heap,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut texture_res,
+        )?;
+    }
+    let texture_res = texture_res.ok_or_else(failure)?;
+
+    let mip_count = dds.mip_count as usize;
+    let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); mip_count];
+    let mut num_rows = vec![0u32; mip_count];
+    let mut row_sizes = vec![0u64; mip_count];
+    let mut total_bytes = 0u64;
+
+    unsafe {
+        device.GetCopyableFootprints(
+            &desc,
+            0,
+            dds.mip_count,
+            0,
+            Some(layouts.as_mut_ptr()),
+            Some(num_rows.as_mut_ptr()),
+            Some(row_sizes.as_mut_ptr()),
+            Some(&mut total_bytes),
+        );
+    }
+
+    let upload_heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_UPLOAD,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+        ..Default::default()
+    };
+    let upload_desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Alignment: 0,
+        Width: total_bytes,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_UNKNOWN,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+    };
+
+    let mut upload_res: Option<ID3D12Resource> = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &upload_heap,
+            D3D12_HEAP_FLAG_NONE,
+            &upload_desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut upload_res,
+        )?;
+    }
+    let upload_res = upload_res.ok_or_else(failure)?;
+
+    unsafe {
+        let mut mapped_ptr: *mut u8 = std::ptr::null_mut();
+        upload_res.Map(
+            0,
+            Some(&D3D12_RANGE { Begin: 0, End: 0 }),
+            Some((&mut mapped_ptr as *mut *mut u8).cast()),
+        )?;
+
+        for (i, mip) in dds.mips.iter().enumerate() {
+            let layout = &layouts[i];
+            let subresource_dst = mapped_ptr.add(layout.Offset as usize);
+            let dst_pitch = layout.Footprint.RowPitch as usize;
+            let rows = num_rows[i] as usize;
+            let src_pitch = mip.row_pitch as usize;
+            let copy_row_bytes = (row_sizes[i] as usize).min(src_pitch);
+
+            for row in 0..rows {
+                let src_row = mip.data.as_ptr().add(row * src_pitch);
+                let dst_row = subresource_dst.add(row * dst_pitch);
+                std::ptr::copy_nonoverlapping(src_row, dst_row, copy_row_bytes);
+            }
+        }
+
+        upload_res.Unmap(
+            0,
+            Some(&D3D12_RANGE {
+                Begin: 0,
+                End: total_bytes as usize,
+            }),
+        );
+
+        // Record CopyTextureRegion for each subresource
+        for (i, layout) in layouts.iter().enumerate() {
+            let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture_res),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: i as u32,
+                },
+            };
+            let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload_res),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: *layout,
+                },
+            };
+            cmd.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+        }
+
+        // Transition texture from COPY_DEST to PIXEL_SHADER_RESOURCE
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::transmute_copy(&texture_res),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                    StateAfter: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                }),
+            },
+        };
+        cmd.ResourceBarrier(&[barrier]);
+    }
+
+    Ok((texture_res, upload_res))
+}
+
+/// Register a Shader Resource View into the bindless descriptor heap slot
+pub fn register_srv(
+    device: &ID3D12Device,
+    texture: &ID3D12Resource,
+    format: DXGI_FORMAT,
+    mip_count: u32,
+    cpu_handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+) {
+    let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: mip_count,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: 0.0,
+            },
+        },
+    };
+    unsafe {
+        device.CreateShaderResourceView(Some(texture), Some(&srv_desc), cpu_handle);
+    }
+}
+
+/// Manages loaded textures and staging buffer retirement across GPU fence completions
+#[derive(Default)]
+pub struct TextureRegistry {
+    by_name: HashMap<String, GpuTexture>,
+    by_index: HashMap<u32, GpuTexture>,
+    recording_staging: Vec<ID3D12Resource>,
+    submitted_staging: Vec<(u64, Vec<ID3D12Resource>)>,
+}
+
+impl TextureRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, name: String, texture: GpuTexture) {
+        self.by_index.insert(texture.descriptor_index.0, texture.clone());
+        self.by_name.insert(name, texture);
+    }
+
+    pub fn get_by_name(&self, name: &str) -> Option<&GpuTexture> {
+        self.by_name.get(name)
+    }
+
+    pub fn get_by_index(&self, index: DescriptorIndex) -> Option<&GpuTexture> {
+        self.by_index.get(&index.0)
+    }
+
+    pub fn track_staging(&mut self, staging: ID3D12Resource) {
+        self.recording_staging.push(staging);
+    }
+
+    pub fn tag_submission(&mut self, fence_value: u64) {
+        if !self.recording_staging.is_empty() {
+            let list = std::mem::take(&mut self.recording_staging);
+            self.submitted_staging.push((fence_value, list));
+        }
+    }
+
+    pub fn retire(&mut self, completed_fence: u64) {
+        self.submitted_staging.retain(|(fence, _)| *fence > completed_fence);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +521,13 @@ mod tests {
     fn test_truncated_data() {
         let buf = create_test_dds(8, 8, FOURCC_DXT5, 32); // Needs 64, provided only 32
         assert_eq!(parse_dds(&buf), Err(TextureError::BufferTooShort));
+    }
+
+    #[test]
+    fn test_registry_tracking_and_retirement() {
+        let mut registry = TextureRegistry::new();
+        assert!(registry.get_by_name("act_stalker").is_none());
+        assert!(registry.get_by_index(DescriptorIndex(0)).is_none());
+        registry.retire(100);
     }
 }

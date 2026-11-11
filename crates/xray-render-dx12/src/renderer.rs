@@ -18,12 +18,13 @@ use windows::Win32::Graphics::Direct3D12::{
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 
 use crate::allocators::MultiThreadedCommandManager;
-use crate::bindless::BindlessIndexAllocator;
+use crate::bindless::{BindlessIndexAllocator, DescriptorIndex};
 use crate::device::Dx12DeviceContext;
-use crate::heaps::TransientHeapManager;
 use crate::geometry::GeometryState;
+use crate::heaps::TransientHeapManager;
 use crate::pipeline::PipelineManager;
 use crate::swapchain::SwapChainManager;
+use crate::texture::{GpuTexture, TextureRegistry};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,8 @@ pub struct Dx12Renderer {
     pub command_mgr: MultiThreadedCommandManager,
     pub pipeline_mgr: PipelineManager,
     pub bindless_allocator: BindlessIndexAllocator,
+    pub bindless_heap: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap,
+    pub srv_descriptor_size: u32,
     pub transient_heap: TransientHeapManager,
     pub fence: ID3D12Fence,
     pub fence_event: HANDLE,
@@ -61,6 +64,7 @@ pub struct Dx12Renderer {
     pub in_frame: bool,
     pub current_cmd_list: Option<ID3D12GraphicsCommandList>,
     pub(crate) geometry: GeometryState,
+    pub(crate) textures: TextureRegistry,
 }
 
 impl Dx12Renderer {
@@ -76,6 +80,22 @@ impl Dx12Renderer {
         let bindless_allocator = BindlessIndexAllocator::new(100_000);
         let transient_heap = TransientHeapManager::new(&device_ctx.device, 128 * 1024 * 1024)?; // 128 MB
 
+        let bindless_heap: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap = unsafe {
+            device_ctx.device.CreateDescriptorHeap(
+                &windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 100_000,
+                    Flags: windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                },
+            )?
+        };
+        let srv_descriptor_size = unsafe {
+            device_ctx.device.GetDescriptorHandleIncrementSize(
+                windows::Win32::Graphics::Direct3D12::D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            )
+        };
+
         let fence: ID3D12Fence = unsafe {
             device_ctx.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?
         };
@@ -87,6 +107,8 @@ impl Dx12Renderer {
             command_mgr,
             pipeline_mgr,
             bindless_allocator,
+            bindless_heap,
+            srv_descriptor_size,
             transient_heap,
             fence,
             fence_event,
@@ -98,6 +120,7 @@ impl Dx12Renderer {
             in_frame: false,
             current_cmd_list: None,
             geometry: GeometryState::default(),
+            textures: TextureRegistry::default(),
         })
     }
 
@@ -145,6 +168,7 @@ impl Dx12Renderer {
 
         let completed_fence = unsafe { self.fence.GetCompletedValue() };
         self.geometry.retire(completed_fence);
+        self.textures.retire(completed_fence);
         let allocator = self
             .command_mgr
             .worker(0)
@@ -168,7 +192,10 @@ impl Dx12Renderer {
                 }),
             },
         };
-        unsafe { cmd.ResourceBarrier(&[barrier]); }
+        unsafe {
+            cmd.ResourceBarrier(&[barrier]);
+            cmd.SetDescriptorHeaps(&[Some(self.bindless_heap.clone())]);
+        }
 
         self.current_cmd_list = Some(cmd);
         self.in_frame = true;
@@ -228,11 +255,13 @@ impl Dx12Renderer {
             .unwrap()
             .tag_submission_fence(self.frame_index, self.fence_value);
         self.geometry.tag_submission(self.fence_value);
+        self.textures.tag_submission(self.fence_value);
 
         // Retire bindless descriptors whose GPU execution has completed
         let completed = unsafe { self.fence.GetCompletedValue() };
         self.bindless_allocator.retire_fences(completed);
         self.geometry.retire(completed);
+        self.textures.retire(completed);
 
         self.command_mgr.release_command_list(cmd);
         self.frame_index += 1;
@@ -252,8 +281,75 @@ impl Dx12Renderer {
                 .SetEventOnCompletion(self.fence_value, self.fence_event)?;
             WaitForSingleObject(self.fence_event, INFINITE);
         }
-        self.geometry.retire(unsafe { self.fence.GetCompletedValue() });
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        self.geometry.retire(completed);
+        self.textures.retire(completed);
         Ok(())
+    }
+
+    /// Upload a DDS texture into GPU VRAM (default heap) and register into the bindless descriptor heap.
+    pub fn load_texture_from_dds(&mut self, name: &str, bytes: &[u8]) -> WinResult<DescriptorIndex> {
+        let dds = crate::texture::parse_dds(bytes).map_err(|_| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+
+        let descriptor_index = self
+            .bindless_allocator
+            .allocate()
+            .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+
+        let (texture_res, _staging_res) = if let Some(cmd) = &self.current_cmd_list {
+            let (tex, staging) = crate::texture::upload_dds_texture(&self.device_ctx.device, cmd, &dds)?;
+            self.textures.track_staging(staging);
+            (tex, ())
+        } else {
+            // Out of frame upload: execute synchronously
+            let allocator = self.command_mgr.worker(0).unwrap().begin_frame(self.frame_index, unsafe { self.fence.GetCompletedValue() })
+                .map_err(|_| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+            let cmd = self.command_mgr.acquire_command_list(allocator)?;
+            let (tex, staging) = crate::texture::upload_dds_texture(&self.device_ctx.device, &cmd, &dds)?;
+            unsafe {
+                cmd.Close()?;
+                self.device_ctx.direct_queue.ExecuteCommandLists(&[Some(cmd.cast()?)]);
+            }
+            self.command_mgr.release_command_list(cmd);
+            self.wait_for_gpu()?;
+            drop(staging);
+            (tex, ())
+        };
+
+        let heap_start = unsafe { self.bindless_heap.GetCPUDescriptorHandleForHeapStart() };
+        let cpu_handle = windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: heap_start.ptr + (descriptor_index.0 as usize) * (self.srv_descriptor_size as usize),
+        };
+
+        crate::texture::register_srv(
+            &self.device_ctx.device,
+            &texture_res,
+            dds.format,
+            dds.mip_count,
+            cpu_handle,
+        );
+
+        let gpu_tex = GpuTexture {
+            resource: texture_res,
+            descriptor_index,
+            width: dds.width,
+            height: dds.height,
+            mip_count: dds.mip_count,
+            format: dds.format,
+        };
+
+        self.textures.insert(name.to_string(), gpu_tex);
+        Ok(descriptor_index)
+    }
+
+    /// Retrieve loaded texture metadata and GPU resource by name
+    pub fn get_texture(&self, name: &str) -> Option<&GpuTexture> {
+        self.textures.get_by_name(name)
+    }
+
+    /// Retrieve loaded texture metadata and GPU resource by bindless descriptor index
+    pub fn get_texture_by_index(&self, index: DescriptorIndex) -> Option<&GpuTexture> {
+        self.textures.get_by_index(index)
     }
 
     /// Get physical GPU adapter name
@@ -320,6 +416,38 @@ mod tests {
 
             // Wait for GPU on empty queue should succeed immediately
             assert!(renderer.wait_for_gpu().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_renderer_texture_upload_and_bindless_indexing() {
+        if let Ok(mut renderer) = Dx12Renderer::new(2) {
+            // Create a valid 4x4 DXT1 DDS texture
+            let mut dds = vec![0u8; 128 + 8];
+            dds[0..4].copy_from_slice(&crate::texture::DDS_MAGIC.to_le_bytes());
+            dds[4..8].copy_from_slice(&124u32.to_le_bytes());
+            dds[8..12].copy_from_slice(&(crate::texture::DDSD_WIDTH | crate::texture::DDSD_HEIGHT | crate::texture::DDSD_PIXELFORMAT).to_le_bytes());
+            dds[12..16].copy_from_slice(&4u32.to_le_bytes()); // height
+            dds[16..20].copy_from_slice(&4u32.to_le_bytes()); // width
+            dds[76..80].copy_from_slice(&32u32.to_le_bytes());
+            dds[80..84].copy_from_slice(&crate::texture::DDPF_FOURCC.to_le_bytes());
+            dds[84..88].copy_from_slice(&crate::texture::FOURCC_DXT1.to_le_bytes());
+
+            let idx = renderer.load_texture_from_dds("act_stalker_albedo", &dds)
+                .expect("Failed to upload DDS texture to GPU default heap");
+
+            assert!(idx.is_valid());
+            assert_eq!(idx.0, 0);
+
+            let tex = renderer.get_texture("act_stalker_albedo").expect("Texture not found in registry");
+            assert_eq!(tex.width, 4);
+            assert_eq!(tex.height, 4);
+            assert_eq!(tex.descriptor_index, idx);
+            assert_eq!(tex.format, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC1_UNORM);
+
+            let tex_by_idx = renderer.get_texture_by_index(idx).expect("Texture not found by descriptor index");
+            assert_eq!(tex_by_idx.width, 4);
+            assert_eq!(tex_by_idx.height, 4);
         }
     }
 }
