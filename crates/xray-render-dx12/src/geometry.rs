@@ -18,6 +18,7 @@ struct UploadBuffer(ID3D12Resource);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct PushDrawConstants {
     pub albedo_index: u32,
     pub normal_index: u32,
@@ -36,10 +37,10 @@ impl Default for PushDrawConstants {
             normal_index: u32::MAX,
             material_index: u32::MAX,
             transform_index: u32::MAX,
-            custom_param0: 0,
-            custom_param1: 0,
-            custom_param2: 0,
-            custom_param3: 0,
+            custom_param0: u32::MAX,
+            custom_param1: u32::MAX,
+            custom_param2: u32::MAX,
+            custom_param3: u32::MAX,
         }
     }
 }
@@ -106,6 +107,8 @@ struct Mesh {
 struct GeometryPipeline {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    depth_pso: ID3D12PipelineState,
+    equal_depth_pso: ID3D12PipelineState,
     srv_heap: ID3D12DescriptorHeap,
 }
 
@@ -143,7 +146,7 @@ impl GeometryPipeline {
         };
         let mut transforms = D3D12_ROOT_PARAMETER::default();
         transforms.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        transforms.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        transforms.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         transforms.Anonymous.Descriptor = D3D12_ROOT_DESCRIPTOR {
             ShaderRegister: 0,
             RegisterSpace: 1,
@@ -217,6 +220,17 @@ impl GeometryPipeline {
                 return Err(failure());
             }
         };
+        let vs_depth = match compiler.compile(&ShaderCompileRequest::new(
+            source,
+            "vs_depth_main",
+            ShaderTarget::Vertex6_0,
+        )) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[GeometryPipeline] vs_depth compile failed: {:?}", e);
+                return Err(failure());
+            }
+        };
         let layout = [
             (s!("POSITION"), DXGI_FORMAT_R32G32B32_FLOAT, 0),
             (s!("NORMAL"), DXGI_FORMAT_R32G32B32_FLOAT, 12),
@@ -277,6 +291,38 @@ impl GeometryPipeline {
             Count: 1,
             Quality: 0,
         };
+        // Prepare Depth-only prepass / shadow mapping pipeline state (null pixel shader)
+        let mut depth_desc = desc.clone();
+        depth_desc.pRootSignature = ManuallyDrop::new(Some(root.clone()));
+        depth_desc.VS = D3D12_SHADER_BYTECODE {
+            pShaderBytecode: vs_depth.as_ptr().cast(),
+            BytecodeLength: vs_depth.len(),
+        };
+        depth_desc.PS = D3D12_SHADER_BYTECODE {
+            pShaderBytecode: std::ptr::null(),
+            BytecodeLength: 0,
+        };
+        depth_desc.NumRenderTargets = 0;
+        depth_desc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+        depth_desc.DepthStencilState = D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+            DepthFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+            StencilEnable: false.into(),
+            ..Default::default()
+        };
+
+        // Prepare Equal depth-test pipeline for early-Z prepass color shading
+        let mut equal_desc = desc.clone();
+        equal_desc.pRootSignature = ManuallyDrop::new(Some(root.clone()));
+        equal_desc.DepthStencilState = D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+            DepthFunc: D3D12_COMPARISON_FUNC_EQUAL,
+            StencilEnable: false.into(),
+            ..Default::default()
+        };
+
         let pso = unsafe { device.CreateGraphicsPipelineState(&desc) };
         unsafe {
             ManuallyDrop::drop(&mut desc.pRootSignature);
@@ -284,26 +330,31 @@ impl GeometryPipeline {
         let pso = match pso {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[GeometryPipeline] CreateGraphicsPipelineState failed: {:?}", e);
-                unsafe {
-                    use windows::core::Interface;
-                    if let Ok(info_queue) = device.cast::<windows::Win32::Graphics::Direct3D12::ID3D12InfoQueue>() {
-                        let num_messages = info_queue.GetNumStoredMessagesAllowedByRetrievalFilter();
-                        for i in 0..num_messages {
-                            let mut message_size = 0;
-                            let _ = info_queue.GetMessage(i, None, &mut message_size);
-                            if message_size > 0 {
-                                let mut buffer = vec![0u8; message_size];
-                                let msg_ptr = buffer.as_mut_ptr() as *mut windows::Win32::Graphics::Direct3D12::D3D12_MESSAGE;
-                                if info_queue.GetMessage(i, Some(msg_ptr), &mut message_size).is_ok() {
-                                    let msg = &*msg_ptr;
-                                    let desc = std::ffi::CStr::from_ptr(msg.pDescription.cast()).to_string_lossy();
-                                    eprintln!("[D3D12 Debug InfoQueue] {}", desc);
-                                }
-                            }
-                        }
-                    }
-                }
+                eprintln!("[GeometryPipeline] CreateGraphicsPipelineState (main) failed: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        let depth_pso = unsafe { device.CreateGraphicsPipelineState(&depth_desc) };
+        unsafe {
+            ManuallyDrop::drop(&mut depth_desc.pRootSignature);
+        }
+        let depth_pso = match depth_pso {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[GeometryPipeline] CreateGraphicsPipelineState (depth) failed: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        let equal_depth_pso = unsafe { device.CreateGraphicsPipelineState(&equal_desc) };
+        unsafe {
+            ManuallyDrop::drop(&mut equal_desc.pRootSignature);
+        }
+        let equal_depth_pso = match equal_depth_pso {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[GeometryPipeline] CreateGraphicsPipelineState (equal_depth) failed: {:?}", e);
                 return Err(e);
             }
         };
@@ -346,6 +397,8 @@ impl GeometryPipeline {
         Ok(Self {
             root,
             pso,
+            depth_pso,
+            equal_depth_pso,
             srv_heap,
         })
     }
@@ -401,6 +454,14 @@ impl GeometryState {
 
     pub fn has_camera(&self) -> bool {
         self.camera.is_some()
+    }
+
+    pub fn camera_gpu_va(&self) -> Option<u64> {
+        self.camera.as_ref().map(|c| unsafe { c.0.GetGPUVirtualAddress() })
+    }
+
+    pub fn track_resource(&mut self, res: ID3D12Resource) {
+        self.recording_resources.push(res);
     }
 
     pub fn update_camera(
@@ -512,6 +573,168 @@ impl GeometryState {
             }]);
             let dsv_ptr = dsv.as_ref().map(|d| d as *const D3D12_CPU_DESCRIPTOR_HANDLE);
             cmd.OMSetRenderTargets(1, Some(&rtv), false, dsv_ptr);
+            cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmd.IASetVertexBuffers(0, Some(&[mesh.vertex_view]));
+            cmd.IASetIndexBuffer(Some(&mesh.index_view));
+            cmd.DrawIndexedInstanced(mesh.index_count, 1, 0, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Record a fast depth-only prepass or shadow pass draw call (null pixel shader)
+    pub fn draw_depth(
+        &mut self,
+        device: &ID3D12Device,
+        cmd: &ID3D12GraphicsCommandList,
+        dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        width: u32,
+        height: u32,
+        handle: MeshHandle,
+        transform_index: u32,
+    ) -> WinResult<()> {
+        if self.pipeline.is_none() {
+            self.pipeline = Some(GeometryPipeline::new(device)?);
+        }
+        let pipeline = self.pipeline.as_ref().unwrap();
+        let mesh = self.meshes.get(handle).unwrap();
+        let camera = self.camera.as_ref().unwrap();
+
+        if self.default_transform.is_none() {
+            let identity: [[[f32; 4]; 4]; 1] = [[
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]];
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    identity.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&identity),
+                )
+            };
+            self.default_transform = Some(UploadBuffer::new(device, bytes)?);
+        }
+        let default_tf = self.default_transform.as_ref().unwrap();
+        let tf_buf = self.transforms.as_ref().unwrap_or(default_tf);
+
+        self.recording_resources.extend([
+            mesh.vertices.0.clone(),
+            mesh.indices.0.clone(),
+            camera.0.clone(),
+            tf_buf.0.clone(),
+        ]);
+        let push = PushDrawConstants {
+            transform_index,
+            ..Default::default()
+        };
+        unsafe {
+            cmd.SetPipelineState(&pipeline.depth_pso);
+            cmd.SetGraphicsRootSignature(&pipeline.root);
+            cmd.SetGraphicsRootConstantBufferView(0, camera.0.GetGPUVirtualAddress());
+            cmd.SetGraphicsRoot32BitConstants(
+                2,
+                8,
+                (&push as *const PushDrawConstants).cast(),
+                0,
+            );
+            cmd.SetGraphicsRootShaderResourceView(3, tf_buf.0.GetGPUVirtualAddress());
+            cmd.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: width as f32,
+                Height: height as f32,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+            cmd.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            }]);
+            cmd.OMSetRenderTargets(0, None, false, Some(&dsv));
+            cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmd.IASetVertexBuffers(0, Some(&[mesh.vertex_view]));
+            cmd.IASetIndexBuffer(Some(&mesh.index_view));
+            cmd.DrawIndexedInstanced(mesh.index_count, 1, 0, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Record a draw call with EQUAL depth testing (zero depth write) for early-Z shading
+    pub fn draw_equal_depth(
+        &mut self,
+        device: &ID3D12Device,
+        cmd: &ID3D12GraphicsCommandList,
+        rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        width: u32,
+        height: u32,
+        handle: MeshHandle,
+        bindless_heap: Option<&ID3D12DescriptorHeap>,
+        push_constants: Option<&PushDrawConstants>,
+    ) -> WinResult<()> {
+        if self.pipeline.is_none() {
+            self.pipeline = Some(GeometryPipeline::new(device)?);
+        }
+        let pipeline = self.pipeline.as_ref().unwrap();
+        let mesh = self.meshes.get(handle).unwrap();
+        let camera = self.camera.as_ref().unwrap();
+        let srv_heap = bindless_heap.unwrap_or(&pipeline.srv_heap);
+        let default_push = PushDrawConstants::default();
+        let push = push_constants.unwrap_or(&default_push);
+
+        if self.default_transform.is_none() {
+            let identity: [[[f32; 4]; 4]; 1] = [[
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]];
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    identity.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&identity),
+                )
+            };
+            self.default_transform = Some(UploadBuffer::new(device, bytes)?);
+        }
+        let default_tf = self.default_transform.as_ref().unwrap();
+        let tf_buf = self.transforms.as_ref().unwrap_or(default_tf);
+
+        self.recording_resources.extend([
+            mesh.vertices.0.clone(),
+            mesh.indices.0.clone(),
+            camera.0.clone(),
+            tf_buf.0.clone(),
+        ]);
+        unsafe {
+            cmd.SetPipelineState(&pipeline.equal_depth_pso);
+            cmd.SetGraphicsRootSignature(&pipeline.root);
+            cmd.SetDescriptorHeaps(&[Some(srv_heap.clone())]);
+            cmd.SetGraphicsRootConstantBufferView(0, camera.0.GetGPUVirtualAddress());
+            cmd.SetGraphicsRootDescriptorTable(
+                1,
+                srv_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            cmd.SetGraphicsRoot32BitConstants(
+                2,
+                8,
+                (push as *const PushDrawConstants).cast(),
+                0,
+            );
+            cmd.SetGraphicsRootShaderResourceView(3, tf_buf.0.GetGPUVirtualAddress());
+            cmd.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: width as f32,
+                Height: height as f32,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+            cmd.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            }]);
+            cmd.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
             cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             cmd.IASetVertexBuffers(0, Some(&[mesh.vertex_view]));
             cmd.IASetIndexBuffer(Some(&mesh.index_view));

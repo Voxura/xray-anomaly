@@ -63,6 +63,8 @@ pub struct Dx12Renderer {
     pub height: u32,
     pub in_frame: bool,
     pub current_cmd_list: Option<ID3D12GraphicsCommandList>,
+    pub shadow_map: Option<crate::shadow::DirectionalShadowMap>,
+    pub particle_renderer: Option<crate::particle::ParticleSystemRenderer>,
     pub(crate) geometry: GeometryState,
     pub(crate) textures: TextureRegistry,
 }
@@ -119,6 +121,8 @@ impl Dx12Renderer {
             height: 0,
             in_frame: false,
             current_cmd_list: None,
+            shadow_map: None,
+            particle_renderer: None,
             geometry: GeometryState::default(),
             textures: TextureRegistry::default(),
         })
@@ -555,6 +559,270 @@ impl Dx12Renderer {
             Some(&self.bindless_heap),
             Some(&push_constants),
         )
+    }
+
+    /// Initialize a high-resolution directional sunlight shadow map and allocate its bindless SRV
+    pub fn init_shadow_map(&mut self, resolution: u32) -> WinResult<DescriptorIndex> {
+        let shadow = crate::shadow::DirectionalShadowMap::new(
+            &self.device_ctx.device,
+            resolution,
+            &mut self.bindless_allocator,
+            &self.bindless_heap,
+            self.srv_descriptor_size,
+            self.fence_value,
+        )?;
+        let idx = shadow.descriptor_index();
+        self.shadow_map = Some(shadow);
+        Ok(idx)
+    }
+
+    /// Retrieve the allocated bindless descriptor index of the directional shadow map
+    pub fn shadow_map_index(&self) -> Option<DescriptorIndex> {
+        self.shadow_map.as_ref().map(|s| s.descriptor_index())
+    }
+
+    /// Update light matrices for directional sunlight projection
+    pub fn set_light_camera(&mut self, light_view_proj: [[f32; 4]; 4], light_dir: [f32; 4]) {
+        if let Some(shadow) = &mut self.shadow_map {
+            shadow.set_light_camera(light_view_proj, light_dir);
+        }
+    }
+
+    /// Begin the directional sunlight shadow map rendering pass
+    pub fn begin_shadow_pass(&mut self) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let shadow = match self.shadow_map.as_mut() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        shadow.begin_shadow_pass(cmd);
+        Ok(())
+    }
+
+    /// Draw a mesh into the directional shadow depth map
+    pub fn draw_shadow_mesh(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        transform_index: u32,
+    ) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let shadow = match self.shadow_map.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let dsv = shadow.dsv_handle();
+        let res = shadow.resolution;
+        self.geometry.draw_depth(
+            &self.device_ctx.device,
+            cmd,
+            dsv,
+            res,
+            res,
+            handle,
+            transform_index,
+        )
+    }
+
+    /// Complete the directional sunlight shadow pass and transition shadow map to PIXEL_SHADER_RESOURCE
+    pub fn end_shadow_pass(&mut self) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let shadow = match self.shadow_map.as_mut() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        shadow.end_shadow_pass(cmd);
+        Ok(())
+    }
+
+    /// Record a draw call with an albedo texture and bindless shadow map index
+    pub fn draw_textured_mesh_with_shadow(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        albedo_index: crate::bindless::DescriptorIndex,
+        shadow_map_index: crate::bindless::DescriptorIndex,
+    ) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
+        let push_constants = crate::geometry::PushDrawConstants {
+            albedo_index: albedo_index.0,
+            custom_param0: shadow_map_index.0,
+            ..Default::default()
+        };
+        self.geometry.draw(
+            &self.device_ctx.device,
+            cmd,
+            rtv,
+            Some(dsv),
+            self.width,
+            self.height,
+            handle,
+            Some(&self.bindless_heap),
+            Some(&push_constants),
+        )
+    }
+
+    /// Record a fast depth-only prepass draw call (null pixel shader)
+    pub fn draw_depth_prepass(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        transform_index: u32,
+    ) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let dsv = sc.dsv_handle();
+        self.geometry.draw_depth(
+            &self.device_ctx.device,
+            cmd,
+            dsv,
+            self.width,
+            self.height,
+            handle,
+            transform_index,
+        )
+    }
+
+    /// Record a draw call with EQUAL depth testing (zero depth write) for early-Z shading
+    pub fn draw_mesh_equal_depth(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        albedo_index: Option<crate::bindless::DescriptorIndex>,
+        normal_index: Option<crate::bindless::DescriptorIndex>,
+        transform_index: u32,
+        shadow_map_index: Option<crate::bindless::DescriptorIndex>,
+    ) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
+        let push_constants = crate::geometry::PushDrawConstants {
+            albedo_index: albedo_index.map(|i| i.0).unwrap_or(u32::MAX),
+            normal_index: normal_index.map(|i| i.0).unwrap_or(u32::MAX),
+            transform_index,
+            custom_param0: shadow_map_index.map(|i| i.0).unwrap_or(u32::MAX),
+            ..Default::default()
+        };
+        self.geometry.draw_equal_depth(
+            &self.device_ctx.device,
+            cmd,
+            rtv,
+            dsv,
+            self.width,
+            self.height,
+            handle,
+            Some(&self.bindless_heap),
+            Some(&push_constants),
+        )
+    }
+
+    /// Record an instanced particle billboard draw call with camera alignment and blending
+    pub fn draw_particles(
+        &mut self,
+        instances: &[crate::particle::GpuParticleInstance],
+        additive: bool,
+    ) -> WinResult<()> {
+        if instances.is_empty() {
+            return Ok(());
+        }
+        if self.particle_renderer.is_none() {
+            self.particle_renderer = Some(crate::particle::ParticleSystemRenderer::new(&self.device_ctx.device)?);
+        }
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
+
+        // Upload particle instance records to transient upload buffer
+        let byte_len = std::mem::size_of_val(instances);
+        let heap_props = windows::Win32::Graphics::Direct3D12::D3D12_HEAP_PROPERTIES {
+            Type: windows::Win32::Graphics::Direct3D12::D3D12_HEAP_TYPE_UPLOAD,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+            ..Default::default()
+        };
+        let desc = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC {
+            Dimension: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: byte_len as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut upload_res: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> = None;
+        unsafe {
+            self.device_ctx.device.CreateCommittedResource(
+                &heap_props,
+                windows::Win32::Graphics::Direct3D12::D3D12_HEAP_FLAG_NONE,
+                &desc,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut upload_res,
+            )?;
+        }
+        let upload_res = upload_res.ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        unsafe {
+            let mut mapped = std::ptr::null_mut();
+            upload_res.Map(0, None, Some(&mut mapped))?;
+            std::ptr::copy_nonoverlapping(instances.as_ptr() as *const u8, mapped.cast(), byte_len);
+            upload_res.Unmap(0, None);
+        }
+
+        let camera_va = self.geometry.camera_gpu_va().ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        let particle_va = unsafe { upload_res.GetGPUVirtualAddress() };
+
+        let renderer = self.particle_renderer.as_ref().unwrap();
+        renderer.draw(
+            cmd,
+            rtv,
+            Some(dsv),
+            camera_va,
+            &self.bindless_heap,
+            particle_va,
+            instances.len() as u32,
+            additive,
+            self.width,
+            self.height,
+        );
+
+        // Keep buffer alive across frame submission
+        self.geometry.track_resource(upload_res);
+        Ok(())
     }
 
     /// Get physical GPU adapter name

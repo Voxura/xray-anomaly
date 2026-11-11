@@ -1,4 +1,4 @@
-// Phase 4 baseline raster shader & Phase 5 bindless textured shader.
+// Phase 4 baseline raster shader & Phase 5/6/7 bindless textured, depth-prepass & shadow shader.
 cbuffer CameraConstants : register(b0)
 {
     column_major float4x4 view;
@@ -14,8 +14,8 @@ cbuffer cb_draw : register(b1)
     uint normal_index;
     uint material_index;
     uint transform_index;
-    uint custom_param0;
-    uint custom_param1;
+    uint custom_param0; // shadow_map_index
+    uint custom_param1; // shadow_transform_index
     uint custom_param2;
     uint custom_param3;
 };
@@ -49,7 +49,25 @@ struct PSInput
     float2 uv : TEXCOORD0;
     float3 tangent : TANGENT;
     float3 bitangent : BINORMAL;
+    float4 world_pos : TEXCOORD1;
 };
+
+// Fast depth-only prepass & shadow map rasterization vertex shader
+float4 vs_depth_main(VSInput input) : SV_Position
+{
+    float4 local_pos = float4(input.position, 1.0);
+    float4 world_pos;
+    if (transform_index != 0xFFFFFFFF)
+    {
+        float4x4 world = load_transform(transform_index);
+        world_pos = mul(local_pos, world);
+    }
+    else
+    {
+        world_pos = local_pos;
+    }
+    return mul(view_proj, world_pos);
+}
 
 PSInput vs_main(VSInput input)
 {
@@ -78,6 +96,7 @@ PSInput vs_main(VSInput input)
     output.uv = input.uv;
     output.tangent = world_tangent;
     output.bitangent = cross(world_normal, world_tangent);
+    output.world_pos = world_pos;
     return output;
 }
 
@@ -112,19 +131,51 @@ float4 ps_main(PSInput input) : SV_Target0
         world_normal = normalize(mul(tangent_normal, TBN));
     }
 
+    // Directional sunlight and shadow evaluation
+    float3 sun_dir = normalize(float3(0.577, 0.577, 0.577));
+    float shadow_factor = 1.0;
+
+    // custom_param0 binds shadow map bindless index
+    if (custom_param0 != 0xFFFFFFFF)
+    {
+        float4x4 light_mat = (custom_param1 != 0xFFFFFFFF) ? load_transform(custom_param1) : view_proj;
+        float4 light_clip = mul(light_mat, input.world_pos);
+        if (light_clip.w > 0.0001)
+        {
+            float3 light_ndc = light_clip.xyz / light_clip.w;
+            // Direct3D NDC: X in [-1, 1], Y in [-1, 1], Z in [0, 1]
+            float2 shadow_uv = float2(light_ndc.x * 0.5 + 0.5, -light_ndc.y * 0.5 + 0.5);
+            if (shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 && shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0)
+            {
+                float shadow_depth = g_textures[NonUniformResourceIndex(custom_param0)].SampleLevel(g_sampler, shadow_uv, 0).r;
+                float current_depth = light_ndc.z;
+                float bias = 0.003;
+                if (current_depth - bias > shadow_depth)
+                {
+                    shadow_factor = 0.25;
+                }
+            }
+        }
+    }
+
+    float diff = saturate(dot(world_normal, sun_dir));
+
     if (albedo_index != 0xFFFFFFFF)
     {
         float4 albedo = g_textures[NonUniformResourceIndex(albedo_index)].Sample(g_sampler, input.uv);
-        if (normal_index != 0xFFFFFFFF)
+        if (normal_index != 0xFFFFFFFF || custom_param0 != 0xFFFFFFFF)
         {
-            float3 light_dir = normalize(float3(0.577, 0.577, 0.577));
-            float diff = saturate(dot(world_normal, light_dir));
-            float3 lit = albedo.rgb * (0.3 + 0.7 * diff);
+            float3 lit = albedo.rgb * (0.2 + 0.8 * diff * shadow_factor);
             return float4(lit, albedo.a);
         }
         return albedo;
     }
 
     // Normal visualization fallback (perturbed if normal map bound, geometric otherwise)
-    return float4(abs(world_normal), 1.0);
+    float3 base_color = abs(world_normal);
+    if (custom_param0 != 0xFFFFFFFF)
+    {
+        return float4(base_color * (0.25 + 0.75 * diff * shadow_factor), 1.0);
+    }
+    return float4(base_color, 1.0);
 }
