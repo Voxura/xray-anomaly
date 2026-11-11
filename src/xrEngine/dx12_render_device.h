@@ -17,6 +17,14 @@ typedef int (*PFN_xr_dx12_renderer_end_frame)(XrDx12Renderer* renderer, unsigned
 typedef int (*PFN_xr_dx12_renderer_wait_for_gpu)(XrDx12Renderer* renderer);
 typedef int (*PFN_xr_dx12_renderer_get_device_state)(XrDx12Renderer* renderer, int* out_state);
 
+// Phase 4 Geometry & Camera interop
+typedef int32_t (*PFN_xr_dx12_create_mesh)(XrDx12Renderer* renderer, const void* vertices,
+    uint32_t vert_count, uint32_t vert_stride, const void* indices,
+    uint32_t idx_count, uint32_t idx_format, uint64_t* out_handle);
+typedef int32_t (*PFN_xr_dx12_destroy_mesh)(XrDx12Renderer* renderer, uint64_t handle);
+typedef int32_t (*PFN_xr_dx12_update_camera)(XrDx12Renderer* renderer, const void* camera_constants_ptr);
+typedef int32_t (*PFN_xr_dx12_draw_indexed)(XrDx12Renderer* renderer, uint64_t mesh_handle);
+
 class ENGINE_API dx12RenderDeviceRender : public IRenderDeviceRender
 {
 private:
@@ -25,6 +33,9 @@ private:
     float m_fGamma;
     float m_fBrightness;
     float m_fContrast;
+    uint64_t m_hTestMesh;
+    uint32_t m_dwWidth;
+    uint32_t m_dwHeight;
 
     // Dynamically resolved function pointers
     PFN_xr_dx12_renderer_create pfn_create;
@@ -36,9 +47,16 @@ private:
     PFN_xr_dx12_renderer_end_frame pfn_end_frame;
     PFN_xr_dx12_renderer_wait_for_gpu pfn_wait_for_gpu;
     PFN_xr_dx12_renderer_get_device_state pfn_get_device_state;
+    PFN_xr_dx12_create_mesh pfn_create_mesh;
+    PFN_xr_dx12_destroy_mesh pfn_destroy_mesh;
+    PFN_xr_dx12_update_camera pfn_update_camera;
+    PFN_xr_dx12_draw_indexed pfn_draw_indexed;
 
     bool LoadRustBackend();
     void UnloadRustBackend();
+    void CreateTestGeometry();
+    void DestroyTestGeometry();
+    void UpdateTestCamera();
 
 public:
     dx12RenderDeviceRender();
