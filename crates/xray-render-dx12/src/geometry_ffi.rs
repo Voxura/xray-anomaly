@@ -3,6 +3,7 @@ use crate::ffi::{
     XR_DX12_ERR_D3D12, XR_DX12_ERR_INVALID_ARGUMENT, XR_DX12_ERR_INVALID_HANDLE,
     XR_DX12_ERR_INVALID_STATE, XR_DX12_ERR_NULL_PTR, XR_DX12_ERR_PANIC, XR_DX12_OK,
 };
+use crate::geometry::PushDrawConstants;
 use crate::geometry_abi::{CameraConstants, MeshHandle, indices_in_bounds, mesh_byte_sizes};
 use crate::renderer::Dx12Renderer;
 use std::ffi::c_void;
@@ -131,6 +132,50 @@ pub unsafe extern "C" fn xr_dx12_draw_indexed(
             r.width,
             r.height,
             mesh_handle,
+            Some(&r.bindless_heap),
+            None,
+        ) {
+            Ok(()) => XR_DX12_OK,
+            Err(_) => XR_DX12_ERR_D3D12,
+        }
+    })
+    .unwrap_or(XR_DX12_ERR_PANIC)
+}
+
+/// Record an indexed draw call with a bindless albedo texture descriptor index.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xr_dx12_draw_textured(
+    renderer: *mut Dx12Renderer,
+    mesh_handle: MeshHandle,
+    albedo_index: u32,
+) -> i32 {
+    catch_unwind(|| {
+        if renderer.is_null() {
+            return XR_DX12_ERR_NULL_PTR;
+        }
+        let r = unsafe { &mut *renderer };
+        if !r.geometry.has_mesh(mesh_handle) {
+            return XR_DX12_ERR_INVALID_HANDLE;
+        }
+        let (Some(cmd), Some(sc)) = (&r.current_cmd_list, &r.swapchain) else {
+            return XR_DX12_ERR_INVALID_STATE;
+        };
+        if !r.in_frame || !r.geometry.has_camera() {
+            return XR_DX12_ERR_INVALID_STATE;
+        }
+        let push = PushDrawConstants {
+            albedo_index,
+            ..Default::default()
+        };
+        match r.geometry.draw(
+            &r.device_ctx.device,
+            cmd,
+            sc.current_rtv_handle(),
+            r.width,
+            r.height,
+            mesh_handle,
+            Some(&r.bindless_heap),
+            Some(&push),
         ) {
             Ok(()) => XR_DX12_OK,
             Err(_) => XR_DX12_ERR_D3D12,

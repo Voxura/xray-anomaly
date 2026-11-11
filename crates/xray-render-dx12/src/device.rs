@@ -235,6 +235,8 @@ mod tests {
     fn test_dx12_device_context_creation() {
         match Dx12DeviceContext::new(false) {
             Ok(ctx) => {
+                println!("Adapter: {}, Supports SM6.6: {}, BindingTier: {:?}, HeapTier: {:?}",
+                    ctx.adapter_name(), ctx.caps.supports_sm66, ctx.caps.resource_binding_tier, ctx.caps.resource_heap_tier);
                 assert!(ctx.caps.max_feature_level.0 >= D3D_FEATURE_LEVEL_11_0.0);
             }
             Err(e) => {

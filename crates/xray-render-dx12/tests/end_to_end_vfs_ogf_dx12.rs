@@ -226,13 +226,13 @@ fn test_end_to_end_vfs_streaming_ogf_dds_render() {
         .expect("Failed to create GPU mesh from OGF vertices");
     assert!(mesh_handle != 0);
 
-    // 10. Update Camera, Record Frame, and Draw Mesh on Live Swapchain Backbuffer
+    // 10. Update Camera, Record Frame, and Draw Textured Mesh on Live Swapchain Backbuffer
     let camera = create_identity_camera();
     renderer.update_camera(&camera).unwrap();
 
     let _ = renderer.begin_frame().unwrap();
     renderer.clear_backbuffer([0.0, 0.0, 0.0, 1.0]);
-    renderer.draw_mesh(mesh_handle).unwrap();
+    renderer.draw_textured_mesh(mesh_handle, srv_index).unwrap();
     renderer.end_frame(false).unwrap();
     renderer.wait_for_gpu().unwrap();
 

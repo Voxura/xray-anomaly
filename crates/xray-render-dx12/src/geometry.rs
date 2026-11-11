@@ -16,6 +16,34 @@ fn failure() -> Error {
 
 struct UploadBuffer(ID3D12Resource);
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushDrawConstants {
+    pub albedo_index: u32,
+    pub normal_index: u32,
+    pub material_index: u32,
+    pub transform_index: u32,
+    pub custom_param0: u32,
+    pub custom_param1: u32,
+    pub custom_param2: u32,
+    pub custom_param3: u32,
+}
+
+impl Default for PushDrawConstants {
+    fn default() -> Self {
+        Self {
+            albedo_index: u32::MAX,
+            normal_index: u32::MAX,
+            material_index: u32::MAX,
+            transform_index: u32::MAX,
+            custom_param0: 0,
+            custom_param1: 0,
+            custom_param2: 0,
+            custom_param3: 0,
+        }
+    }
+}
+
 impl UploadBuffer {
     fn new(device: &ID3D12Device, bytes: &[u8]) -> WinResult<Self> {
         let heap = D3D12_HEAP_PROPERTIES {
@@ -86,7 +114,7 @@ impl GeometryPipeline {
     fn new(device: &ID3D12Device) -> WinResult<Self> {
         let range = D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-            NumDescriptors: 16,
+            NumDescriptors: u32::MAX,
             BaseShaderRegister: 0,
             RegisterSpace: 0,
             OffsetInDescriptorsFromTableStart: 0,
@@ -105,7 +133,15 @@ impl GeometryPipeline {
             NumDescriptorRanges: 1,
             pDescriptorRanges: &range,
         };
-        let parameters = [camera, textures];
+        let mut push = D3D12_ROOT_PARAMETER::default();
+        push.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        push.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        push.Anonymous.Constants = D3D12_ROOT_CONSTANTS {
+            ShaderRegister: 1,
+            RegisterSpace: 0,
+            Num32BitValues: 8,
+        };
+        let parameters = [camera, textures, push];
         // The contract permits clamp/wrap; choose linear wrap on all axes.
         let sampler = D3D12_STATIC_SAMPLER_DESC {
             Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -121,7 +157,7 @@ impl GeometryPipeline {
             ..Default::default()
         };
         let root_desc = D3D12_ROOT_SIGNATURE_DESC {
-            NumParameters: 2,
+            NumParameters: 3,
             pParameters: parameters.as_ptr(),
             NumStaticSamplers: 1,
             pStaticSamplers: &sampler,
@@ -383,6 +419,8 @@ impl GeometryState {
         width: u32,
         height: u32,
         handle: MeshHandle,
+        bindless_heap: Option<&ID3D12DescriptorHeap>,
+        push_constants: Option<&PushDrawConstants>,
     ) -> WinResult<()> {
         if self.pipeline.is_none() {
             self.pipeline = Some(GeometryPipeline::new(device)?);
@@ -390,6 +428,10 @@ impl GeometryState {
         let pipeline = self.pipeline.as_ref().unwrap();
         let mesh = self.meshes.get(handle).unwrap();
         let camera = self.camera.as_ref().unwrap();
+        let srv_heap = bindless_heap.unwrap_or(&pipeline.srv_heap);
+        let default_push = PushDrawConstants::default();
+        let push = push_constants.unwrap_or(&default_push);
+
         // Clone BEFORE command recording so CPU destruction cannot invalidate a draw.
         self.recording_resources.extend([
             mesh.vertices.0.clone(),
@@ -399,11 +441,17 @@ impl GeometryState {
         unsafe {
             cmd.SetPipelineState(&pipeline.pso);
             cmd.SetGraphicsRootSignature(&pipeline.root);
-            cmd.SetDescriptorHeaps(&[Some(pipeline.srv_heap.clone())]);
+            cmd.SetDescriptorHeaps(&[Some(srv_heap.clone())]);
             cmd.SetGraphicsRootConstantBufferView(0, camera.0.GetGPUVirtualAddress());
             cmd.SetGraphicsRootDescriptorTable(
                 1,
-                pipeline.srv_heap.GetGPUDescriptorHandleForHeapStart(),
+                srv_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            cmd.SetGraphicsRoot32BitConstants(
+                2,
+                8,
+                (push as *const PushDrawConstants).cast(),
+                0,
             );
             cmd.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: width as f32,

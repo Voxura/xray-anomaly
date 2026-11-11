@@ -1,0 +1,288 @@
+//! Phase 5 Bindless Texture Sampling Hardware Readback Test
+//!
+//! Validates that a texture uploaded to a default heap and registered in the
+//! global shader-visible descriptor heap is sampled correctly by the geometry pipeline
+//! using 32-bit push constants and SM6.0 / SM6.6 bindless descriptor indexing on physical hardware.
+
+use std::mem::ManuallyDrop;
+use std::ptr;
+use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, WS_OVERLAPPEDWINDOW,
+};
+use windows::core::w;
+use xray_render_dx12::renderer::Dx12Renderer;
+use xray_render_dx12::texture::{
+    DDPF_ALPHAPIXELS, DDPF_RGB, DDS_MAGIC, DDSD_HEIGHT, DDSD_PIXELFORMAT, DDSD_WIDTH,
+};
+use xray_render_dx12::{CameraConstants, XRayVertex};
+
+struct Window(HWND);
+impl Drop for Window {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.0);
+        }
+    }
+}
+
+fn identity_camera() -> CameraConstants {
+    let mut c = CameraConstants::default();
+    for i in 0..4 {
+        c.view[i][i] = 1.0;
+        c.proj[i][i] = 1.0;
+        c.view_proj[i][i] = 1.0;
+    }
+    c
+}
+
+unsafe fn transition(
+    cmd: &ID3D12GraphicsCommandList,
+    resource: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) {
+    let mut barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: ManuallyDrop::new(Some(resource.clone())),
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: before,
+                StateAfter: after,
+            }),
+        },
+        ..Default::default()
+    };
+    unsafe {
+        cmd.ResourceBarrier(std::slice::from_ref(&barrier));
+        ManuallyDrop::drop(&mut (*barrier.Anonymous.Transition).pResource);
+    }
+}
+
+fn create_solid_color_rgba8_dds(width: u32, height: u32, r: u8, g: u8, b: u8, a: u8) -> Vec<u8> {
+    let pixel_count = (width * height) as usize;
+    let data_bytes = pixel_count * 4;
+    let mut dds = vec![0u8; 128 + data_bytes];
+
+    dds[0..4].copy_from_slice(&DDS_MAGIC.to_le_bytes());
+    dds[4..8].copy_from_slice(&124u32.to_le_bytes()); // header size
+    dds[8..12].copy_from_slice(&(DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT).to_le_bytes());
+    dds[12..16].copy_from_slice(&height.to_le_bytes());
+    dds[16..20].copy_from_slice(&width.to_le_bytes());
+    dds[76..80].copy_from_slice(&32u32.to_le_bytes()); // pf_size
+    dds[80..84].copy_from_slice(&(DDPF_RGB | DDPF_ALPHAPIXELS).to_le_bytes());
+    dds[88..92].copy_from_slice(&32u32.to_le_bytes()); // pf_rgb_bits
+    dds[92..96].copy_from_slice(&0x000000FFu32.to_le_bytes()); // r_mask
+    dds[96..100].copy_from_slice(&0x0000FF00u32.to_le_bytes()); // g_mask
+    dds[100..104].copy_from_slice(&0x00FF0000u32.to_le_bytes()); // b_mask
+    dds[104..108].copy_from_slice(&0xFF000000u32.to_le_bytes()); // a_mask
+
+    for i in 0..pixel_count {
+        let offset = 128 + i * 4;
+        dds[offset] = r;
+        dds[offset + 1] = g;
+        dds[offset + 2] = b;
+        dds[offset + 3] = a;
+    }
+    dds
+}
+
+#[test]
+fn test_bindless_textured_mesh_hardware_readback() {
+    let window = Window(unsafe {
+        CreateWindowExW(
+            Default::default(),
+            w!("STATIC"),
+            w!("Phase 5 Bindless Readback"),
+            WS_OVERLAPPEDWINDOW,
+            0,
+            0,
+            64,
+            64,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    });
+
+    let mut renderer = Dx12Renderer::new(1).expect("DirectX 12 hardware required");
+    println!("Phase 5 bindless adapter: {}", renderer.adapter_name());
+    renderer.attach_window(window.0, 64, 64).unwrap();
+
+    // Create a 4x4 pure green RGBA8 DDS texture
+    let green_dds = create_solid_color_rgba8_dds(4, 4, 0, 255, 0, 255);
+    let srv_index = renderer
+        .load_texture_from_dds("test_green_surface.dds", &green_dds)
+        .expect("Failed to upload green DDS texture");
+
+    assert!(srv_index.is_valid());
+    println!("Allocated bindless SRV descriptor index: {:?}", srv_index);
+
+    // Quad or triangle covering viewport center (-0.8 to +0.8)
+    let vertices = [
+        XRayVertex {
+            position: [-0.8, -0.8, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 1.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+        XRayVertex {
+            position: [0.0, 0.8, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.5, 0.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+        XRayVertex {
+            position: [0.8, -0.8, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [1.0, 1.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+    ];
+    let indices = [0u16, 1, 2];
+
+    let mesh_handle = renderer
+        .create_mesh(&vertices, &indices)
+        .expect("Failed to create mesh");
+    renderer
+        .update_camera(&identity_camera())
+        .expect("Failed to update camera");
+
+    // Create readback buffer
+    let readback: ID3D12Resource = unsafe {
+        let mut resource = None;
+        renderer
+            .device_ctx
+            .device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 64 * 256,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut resource,
+            )
+            .unwrap();
+        resource.unwrap()
+    };
+
+    // Frame 1: Draw textured mesh using bindless albedo index
+    renderer.begin_frame().unwrap();
+    renderer.clear_backbuffer([0.0, 0.0, 0.0, 1.0]);
+    renderer
+        .draw_textured_mesh(mesh_handle, srv_index)
+        .expect("Failed to draw textured mesh");
+
+    // Copy backbuffer to readback buffer
+    let cmd = renderer.current_cmd_list.as_ref().unwrap();
+    let backbuffer = renderer
+        .swapchain
+        .as_ref()
+        .unwrap()
+        .current_backbuffer_resource();
+
+    unsafe {
+        transition(
+            cmd,
+            backbuffer,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+
+        let mut source = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(backbuffer.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let mut destination = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(readback.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: 64,
+                        Height: 64,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+
+        cmd.CopyTextureRegion(&destination, 0, 0, 0, &source, None);
+        ManuallyDrop::drop(&mut source.pResource);
+        ManuallyDrop::drop(&mut destination.pResource);
+
+        transition(
+            cmd,
+            backbuffer,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        );
+    }
+
+    renderer.end_frame(false).unwrap();
+    renderer.wait_for_gpu().unwrap();
+
+    // Verify sampled pixel values
+    unsafe {
+        let mut mapped = ptr::null_mut();
+        readback
+            .Map(
+                0,
+                Some(&D3D12_RANGE {
+                    Begin: 0,
+                    End: 64 * 256,
+                }),
+                Some(&mut mapped),
+            )
+            .unwrap();
+
+        let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), 64 * 256);
+        // Center pixel at (32, 32)
+        let center = bytes[32 * 256 + 32 * 4..32 * 256 + 32 * 4 + 4].to_vec();
+        // Corner pixel at (0, 0)
+        let corner = bytes[..4].to_vec();
+        readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+
+        println!("Center pixel sampled color: {:?}", center);
+        println!("Corner pixel clear color: {:?}", corner);
+
+        assert_eq!(
+            center,
+            [0, 255, 0, 255],
+            "Center pixel must match sampled green texture"
+        );
+        assert_eq!(
+            corner,
+            [0, 0, 0, 255],
+            "Corner pixel must match black backbuffer clear"
+        );
+    }
+
+    println!("Phase 5 bindless textured mesh hardware readback verified successfully!");
+}

@@ -405,8 +405,47 @@ impl Dx12Renderer {
             None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
         };
         let rtv = sc.current_rtv_handle();
-        self.geometry
-            .draw(&self.device_ctx.device, cmd, rtv, self.width, self.height, handle)
+        self.geometry.draw(
+            &self.device_ctx.device,
+            cmd,
+            rtv,
+            self.width,
+            self.height,
+            handle,
+            Some(&self.bindless_heap),
+            None,
+        )
+    }
+
+    /// Record a textured mesh draw call with a bindless albedo texture descriptor index
+    pub fn draw_textured_mesh(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        albedo_index: crate::bindless::DescriptorIndex,
+    ) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let rtv = sc.current_rtv_handle();
+        let push_constants = crate::geometry::PushDrawConstants {
+            albedo_index: albedo_index.0,
+            ..Default::default()
+        };
+        self.geometry.draw(
+            &self.device_ctx.device,
+            cmd,
+            rtv,
+            self.width,
+            self.height,
+            handle,
+            Some(&self.bindless_heap),
+            Some(&push_constants),
+        )
     }
 
     /// Get physical GPU adapter name
