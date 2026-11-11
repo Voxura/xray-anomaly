@@ -18,5 +18,6 @@ pub mod pipeline;
 pub mod renderer;
 pub mod shaders;
 pub mod swapchain;
+pub mod texture;
 
 pub use geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
