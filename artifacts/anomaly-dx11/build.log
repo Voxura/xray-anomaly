@@ -1,0 +1,752 @@
+MSBuild version 18.6.3+84d3e95b4 for .NET Framework
+Build started 11/11/2026 7:54:38 PM.
+
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\engine-vs2022.sln" on node 1 (xrEngine target(s)).
+ValidateSolutionConfiguration:
+  Building solution configuration "DX11|x64".
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\engine-vs2022.sln" (1) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (2) on node 1 (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (2) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\theora\libtheora_static.vcxproj" (3) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libtheora_static\libtheora_static.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libtheora_static\libtheora_static.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  libtheora_static.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\libtheora_static.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libtheora_static\libtheora_static.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libtheora_static\libtheora_static.tlog\libtheora_static.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\theora\libtheora_static.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (2) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\vorbis\libvorbis_static.vcxproj" (4) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libvorbis_static\libvorbis_static.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libvorbis_static\libvorbis_static.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  libvorbis_static.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\libvorbis_static.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libvorbis_static\libvorbis_static.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libvorbis_static\libvorbis_static.tlog\libvorbis_static.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\vorbis\libvorbis_static.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (2) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\luajit-2\src\luajit.vcxproj" (5) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\LuaJIT-2.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\LuaJIT-2.tlog\unsuccessfulbuild".
+PreBuildEvent:
+  Ensuring LuaJIT generated files exist
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\luajit-2\src\gen_luajit_artifacts.bat" "x64"
+  :VCEnd
+  [LuaJIT] Determine DynASM path and if platform is x64
+  [LuaJIT] Platform is x64, set -D P64
+  [LuaJIT] Running DynASM to generate host\buildvm_arch.h
+  [LuaJIT] Generating lj_vm.obj and headers
+  [LuaJIT] Generation complete
+CustomBuild:
+  All outputs are up-to-date.
+ClCompile:
+  C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\bin\HostX64\x64\CL.exe /c /I"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\luajit-2\src\\" /I"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\luajit-2\src\host" /Zi /nologo /W3 /WX- /diagnostics:column /MP /O2 /Oi /Ot /Oy /GT /GL /D WIN32 /D NDEBUG /D _CRT_SECURE_NO_DEPRECATE /D WIN32 /D NDEBUG /D _CRT_SECURE_NO_DEPRECATE /D _VC80_UPGRADE=0x0710 /D _SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS /D _VC80_UPGRADE=0x0710 /UUSE_LUAJIT_ONE /GF /Gm- /EHsc /MD /GS- /Gy /fp:precise /Zc:wchar_t /Zc:forScope /Zc:inline /Fo"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\\" /Fd"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\_game\bin_dbg\x64\Release\lua51.pdb" /external:W3 /Gd /TC /FC /errorReport:queue /Ob3 lib_base.c lib_bit.c lib_debug.c lib_ffi.c lib_io.c lib_jit.c lib_math.c lib_os.c lib_string.c lib_table.c lj_bc.c lj_crecord.c lj_dispatch.c lj_err.c lj_ffrecord.c lj_opt_fold.c lj_record.c
+  lib_base.c
+  lib_bit.c
+  lib_debug.c
+  lib_ffi.c
+  lib_io.c
+  lib_jit.c
+  lib_math.c
+  lib_os.c
+  lib_string.c
+  lib_table.c
+  lj_bc.c
+  lj_crecord.c
+  lj_dispatch.c
+  lj_err.c
+  lj_ffrecord.c
+  lj_opt_fold.c
+  lj_record.c
+Lib:
+  C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\bin\HostX64\x64\Lib.exe /OUT:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\_game\bin_dbg\x64\Release\lua51.lib" lj_vm.obj /NOLOGO /MACHINE:X64 /LTCG lj_vm.obj
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_alloc.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_api.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_asm.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_bc.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_bcread.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_bcwrite.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_carith.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_ccall.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_ccallback.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_cconv.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_cdata.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_char.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_clib.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_cparse.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_crecord.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_ctype.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_debug.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_dispatch.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_profile.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_allocprof.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_err.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_ffrecord.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_func.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_gc.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_gdbjit.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_ir.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_lex.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_lib.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_load.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_mcode.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_meta.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_obj.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_opt_dce.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_opt_fold.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_opt_loop.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_opt_mem.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_opt_narrow.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_opt_sink.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_opt_split.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_parse.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_record.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_snap.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_state.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_str.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_strscan.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_tab.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_trace.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_udata.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_vmevent.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lj_vmmath.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_aux.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_base.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_bit.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_debug.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_ffi.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_init.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_io.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_jit.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_math.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_os.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_package.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_string.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\lib_table.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\xr_alloc.obj"
+lj_vm.obj : warning LNK4042: object specified more than once; extras ignored [E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\luajit-2\src\luajit.vcxproj]
+  luajit.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\lua51.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\LuaJIT-2.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\LuaJIT-2\LuaJIT-2.tlog\LuaJIT-2.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\luajit-2\src\luajit.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (2) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\ogg\libogg_static.vcxproj" (6) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libogg_static\libogg_static.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libogg_static\libogg_static.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  libogg_static.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\libogg_static.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libogg_static\libogg_static.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libogg_static\libogg_static.tlog\libogg_static.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\ogg\libogg_static.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (2) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\luabind\luabind.vcxproj" (7) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\luabind\luabind.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\luabind\luabind.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  luabind.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\luabind.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\luabind\luabind.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\luabind\luabind.tlog\luabind.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\luabind\luabind.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (2) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\ReShadeCompat\ReShadeCompat.vcxproj" (8) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\ReShadeCompat\ReShadeCompat.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\ReShadeCompat\ReShadeCompat.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  ReShadeCompat.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\ReShadeCompat.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\ReShadeCompat\ReShadeCompat.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\ReShadeCompat\ReShadeCompat.tlog\ReShadeCompat.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\ReShadeCompat\ReShadeCompat.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (2) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\vorbis\libvorbisfile_static.vcxproj" (9) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libvorbisfile_static\libvorbi.CEBDE98B.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libvorbisfile_static\libvorbi.CEBDE98B.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  libvorbisfile_static.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\libvorbisfile_static.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libvorbisfile_static\libvorbi.CEBDE98B.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libvorbisfile_static\libvorbi.CEBDE98B.tlog\libvorbisfile_static.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\vorbis\libvorbisfile_static.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (2) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\imgui\imgui.vcxproj.metaproj" (10) on node 1 (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\imgui\imgui.vcxproj.metaproj" (10) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrCore\xrCore.vcxproj.metaproj" (11) on node 1 (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrCore\xrCore.vcxproj.metaproj" (11) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\DXERR\DXERR.vcxproj" (12) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\DXERR\DXERR.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\DXERR\DXERR.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  DXERR.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\DxErr.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\DXERR\DXERR.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\DXERR\DXERR.tlog\DXERR.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\DXERR\DXERR.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrCore\xrCore.vcxproj.metaproj" (11) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrCore\xrCore.vcxproj" (13) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCore\xrCore.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCore\xrCore.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+ResourceCompile:
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  xrCore.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrCore.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCore\xrCore.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCore\xrCore.tlog\xrCore.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrCore\xrCore.vcxproj" (default targets).
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrCore\xrCore.vcxproj.metaproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\imgui\imgui.vcxproj.metaproj" (10) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\imgui\imgui.vcxproj" (14) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\imgui\imgui.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\imgui\imgui.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  imgui.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\imgui.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\imgui\imgui.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\imgui\imgui.tlog\imgui.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\imgui\imgui.vcxproj" (default targets).
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\imgui\imgui.vcxproj.metaproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (2) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\giflib\giflib.vcxproj" (15) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\giflib\giflib.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\giflib\giflib.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  giflib.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\giflib.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\giflib\giflib.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\giflib\giflib.tlog\giflib.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\giflib\giflib.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (2) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) on node 1 (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\Layers\xrAPI\xrAPI.vcxproj" (17) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrAPI\xrAPI.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrAPI\xrAPI.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  xrAPI.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrAPI.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrAPI\xrAPI.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrAPI\xrAPI.tlog\xrAPI.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\Layers\xrAPI\xrAPI.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrNetServer\xrNetServer.vcxproj" (18) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrNetServer\xrNetServer.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrNetServer\xrNetServer.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  xrNetServer.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrNetServer.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrNetServer\xrNetServer.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrNetServer\xrNetServer.tlog\xrNetServer.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrNetServer\xrNetServer.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrSound\xrSound.vcxproj" (19) on node 1 (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrSound\xrSound.vcxproj" (19) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrCDB\xrCDB.vcxproj" (20) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCDB\xrCDB.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCDB\xrCDB.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  xrCDB.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrCDB.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCDB\xrCDB.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCDB\xrCDB.tlog\xrCDB.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrCDB\xrCDB.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrSound\xrSound.vcxproj" (19) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\OpenAL-new\OpenAL-new.vcxproj" (21) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\OpenAL32\OpenAL32.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\OpenAL32\OpenAL32.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  OpenAL-new.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\OpenAL32.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\OpenAL32\OpenAL32.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\OpenAL32\OpenAL32.tlog\OpenAL32.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\OpenAL-new\OpenAL-new.vcxproj" (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrSound\xrSound.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrSound\xrSound.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  xrSound.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrSound.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrSound\xrSound.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrSound\xrSound.tlog\xrSound.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrSound\xrSound.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\NVTT\NVTT.vcxproj" (22) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\NVTT\NVTT.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\NVTT\NVTT.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  NVTT.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\NVTT.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\NVTT\NVTT.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\NVTT\NVTT.tlog\NVTT.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\NVTT\NVTT.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\jpeg\libjpeg.vcxproj" (23) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libjpeg\libjpeg.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libjpeg\libjpeg.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  libjpeg.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\libjpeg.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libjpeg\libjpeg.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\libjpeg\libjpeg.tlog\libjpeg.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\jpeg\libjpeg.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\crypto\crypto.vcxproj" (24) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\crypto\crypto.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\crypto\crypto.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  crypto.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\crypto.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\crypto\crypto.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\crypto\crypto.tlog\crypto.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\crypto\crypto.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\cximage\cximage.vcxproj" (25) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\CxImage\CxImage.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\CxImage\CxImage.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  cximage.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\CxImage.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\CxImage\CxImage.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\CxImage\CxImage.tlog\CxImage.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\cximage\cximage.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\lua-extensions\lua_extensions.vcxproj" (26) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\lua_extensions\lua_extensions.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\lua_extensions\lua_extensions.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  lua_extensions.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\lua_extensions.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\lua_extensions\lua_extensions.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\lua_extensions\lua_extensions.tlog\lua_extensions.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\lua-extensions\lua_extensions.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\ode\contrib\msvc7\ode_default\default.vcxproj" (27) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\ode\ode.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\ode\ode.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  default.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\ode.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\ode\ode.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\ode\ode.tlog\ode.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\ode\contrib\msvc7\ode_default\default.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrCPU_Pipe\xrCPU_Pipe.vcxproj" (28) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCPU_Pipe\xrCPU_Pipe.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCPU_Pipe\xrCPU_Pipe.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+ResourceCompile:
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  xrCPU_Pipe.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrCPU_Pipe.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCPU_Pipe\xrCPU_Pipe.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrCPU_Pipe\xrCPU_Pipe.tlog\xrCPU_Pipe.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrCPU_Pipe\xrCPU_Pipe.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrGame\xrGame.vcxproj" (29) on node 1 (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrGame\xrGame.vcxproj" (29) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrPhysics\xrPhysics.vcxproj" (30) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrPhysics\xrPhysics.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrPhysics\xrPhysics.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  xrPhysics.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrPhysics.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrPhysics\xrPhysics.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrPhysics\xrPhysics.tlog\xrPhysics.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrPhysics\xrPhysics.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrGame\xrGame.vcxproj" (29) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrXMLParser\xrXMLParser.vcxproj" (31) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrXMLParser\xrXMLParser.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrXMLParser\xrXMLParser.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  xrXMLParser.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrXMLParser.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrXMLParser\xrXMLParser.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrXMLParser\xrXMLParser.tlog\xrXMLParser.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrXMLParser\xrXMLParser.vcxproj" (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrGame\xrGame.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrGame\xrGame.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  xrGame.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrGame.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrGame\xrGame.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrGame\xrGame.tlog\xrGame.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrGame\xrGame.vcxproj" (default targets).
+Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (16) is building "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrParticles\xrParticles.vcxproj" (32) on node 1 (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Creating "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrParticles\xrParticles.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrParticles\xrParticles.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+Lib:
+  All outputs are up-to-date.
+  xrParticles.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrParticles.lib
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrParticles\xrParticles.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\Release\xrParticles\xrParticles.tlog\xrParticles.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrParticles\xrParticles.vcxproj" (default targets).
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+InitializeBuildStatus:
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xrEngine.tlog\unsuccessfulbuild".
+ClCompile:
+  All outputs are up-to-date.
+  All outputs are up-to-date.
+ResourceCompile:
+  All outputs are up-to-date.
+Link:
+  C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\bin\HostX64\x64\link.exe /ERRORREPORT:QUEUE /OUT:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\_game\bin_dbg\AnomalyDX11.exe" /INCREMENTAL:NO /NOLOGO /LIBPATH:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\_game\bin_dbg\x64\Release\\" /LIBPATH:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\luajit-2\src\\" /LIBPATH:OpenAutomate\libraries /LIBPATH:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\lib\x64\Release" /LIBPATH:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\x64\Release" /LIBPATH:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\sdk\libraries\x64" /LIBPATH:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\lib\ReleaseR4\\" vfw32.lib libogg_static.lib libtheora_static.lib winmm.lib OpenAL32.lib giflib.lib kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib odbc32.lib odbccp32.lib /MANIFEST /MANIFESTUAC:"level='asInvoker' uiAccess='false'" /manifest:embed /manifestinput:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\as-invoker-manifest-part.xml" /DEBUG /PDB:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\_game\bin_dbg\AnomalyDX11.pdb" /LARGEADDRESSAWARE /OPT:REF /OPT:ICF /LTCG /LTCGOUT:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\AnomalyDX11.iobj" /TLBID:1 /DYNAMICBASE:NO /NXCOMPAT /IMPLIB:"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\lib\ReleaseR4\AnomalyDX11.lib" /MACHINE:X64 /ignore:4099 /LTCG:INCREMENTAL "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\resource.res"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\achievement_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\activity_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\application_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\core.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\image_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\lobby_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\network_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\overlay_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\relationship_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\storage_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\store_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\types.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\user_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\voice_manager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\ai_script_lua_debug.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\ai_script_lua_extension.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\bone.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\CameraBase.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\CameraManager.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\cf_dynamic_mesh.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\CustomHUD.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\defines.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\device.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\GIFResource.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\MonitorList.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Device_create.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\dx12_render_device.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Device_destroy.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Device_Initialize.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Device_Misc.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Device_overdraw.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Device_wndproc.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\edit_actions.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Effector.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\EffectorPP.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Engine.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\EngineAPI.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Envelope.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Environment.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Environment_misc.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Environment_render.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\EventAPI.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\FDemoPlay.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\FDemoRecord.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Feel_Touch.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Feel_Vision.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\fmesh.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\GameFont.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\GameMtlLib.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\GameMtlLib_Engine.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\ICollidable.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\IGame_Level.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\IGame_Level_check_textures.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\IGame_ObjectPool.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\IGame_Persistent.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\IInputReceiver.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\imgui_base.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\imgui_base_input.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\imgui_helper.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\interp.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\IRenderable.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\ISheduled.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\LightAnimLibrary.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\line_editor.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\line_edit_control.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\mailSlot.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\MbHelpers.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\motion.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\ObjectAnimator.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\ObjectDump.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\perlin.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\phdebug.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\PS_instance.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\pure.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\pure_relcase.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Rain.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Render.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\shader_bus.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\SkeletonMotions.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\StatGraph.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Stats.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\stdafx.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Text_Console.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Text_Console_WndProc.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\thunderbolt.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\tntQAVI.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xrHemisphere.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xrImage_Resampler.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xrSASH.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xrSheduler.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xrTheora_Stream.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xrTheora_Surface.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xrTheora_Surface_mmx.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xr_collide_form.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xr_efflensflare.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\Xr_input.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xr_input_xinput.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\XR_IOConsole.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\XR_IOConsole_callback.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\XR_IOConsole_control.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\XR_IOConsole_get.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xr_ioc_cmd.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xr_object.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xr_object_list.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\x_ray.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\_scripting.obj"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\luabind.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrAPI.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\DxErr.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrCore.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrNetServer.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrCDB.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\OpenAL32.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\libvorbis_static.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\libogg_static.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\libvorbisfile_static.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrSound.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\NVTT.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\libjpeg.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\libtheora_static.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\crypto.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\CxImage.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\lua51.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\lua_extensions.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\ode.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrCPU_Pipe.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrPhysics.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrXMLParser.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrGame.lib"
+  "E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\x64\Release\xrParticles.lib"
+     Creating library E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\lib\ReleaseR4\AnomalyDX11.lib and object E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\lib\ReleaseR4\AnomalyDX11.exp
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrGame\ui\UIActorMenuInventory.cpp(588): warning C4715: 'CUIActorMenu::current_sort_mode': not all control paths return a value [E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj]
+E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrGame\ui\UIPdaWnd.cpp(535): warning C4715: 'CUIPdaWnd::OnKeyboardAction': not all control paths return a value [E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj]
+E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\jpeg\jcapimin.c(51): warning C4789: in function 'bool __cdecl CxImageJPG::Encode(class CxFile * __ptr64) __ptr64' buffer 'cinfo' of size 504 bytes will be overrun; 520 bytes will be written starting at offset 0 [E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj]
+E:\Antigravity imp\xray-anomaly\xray-anomaly\src\Layers\xrRenderDX10\dx10HW.cpp(645): warning C4700: uninitialized local variable 'R' used [E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj]
+  All 308960 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  xrEngine.vcxproj -> E:\Antigravity imp\xray-anomaly\xray-anomaly\_build\_game\bin_dbg\AnomalyDX11.exe
+FinalizeBuildStatus:
+  Deleting file "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xrEngine.tlog\unsuccessfulbuild".
+  Touching "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\..\_build\intermediate\ReleaseR4\xrEngine\xrEngine.tlog\xrEngine.lastbuildstate".
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (default targets).
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (default targets).
+Done Building Project "E:\Antigravity imp\xray-anomaly\xray-anomaly\src\engine-vs2022.sln" (xrEngine target(s)).
+
+Build succeeded.
+
+"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\engine-vs2022.sln" (xrEngine target) (1) ->
+"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (default target) (2) ->
+"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\luajit-2\src\luajit.vcxproj" (default target) (5) ->
+(Lib target) ->
+  lj_vm.obj : warning LNK4042: object specified more than once; extras ignored [E:\Antigravity imp\xray-anomaly\xray-anomaly\src\3rd party\luajit-2\src\luajit.vcxproj]
+
+
+"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\engine-vs2022.sln" (xrEngine target) (1) ->
+"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj.metaproj" (default target) (2) ->
+"E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj" (default target) (16) ->
+(Link target) ->
+  E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrGame\ui\UIActorMenuInventory.cpp(588): warning C4715: 'CUIActorMenu::current_sort_mode': not all control paths return a value [E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj]
+  E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrGame\ui\UIPdaWnd.cpp(535): warning C4715: 'CUIPdaWnd::OnKeyboardAction': not all control paths return a value [E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj]
+  E:\Antigravity imp\xray-anomaly\xray-anomaly\sdk\include\jpeg\jcapimin.c(51): warning C4789: in function 'bool __cdecl CxImageJPG::Encode(class CxFile * __ptr64) __ptr64' buffer 'cinfo' of size 504 bytes will be overrun; 520 bytes will be written starting at offset 0 [E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj]
+  E:\Antigravity imp\xray-anomaly\xray-anomaly\src\Layers\xrRenderDX10\dx10HW.cpp(645): warning C4700: uninitialized local variable 'R' used [E:\Antigravity imp\xray-anomaly\xray-anomaly\src\xrEngine\xrEngine.vcxproj]
+
+    5 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:07:40.99

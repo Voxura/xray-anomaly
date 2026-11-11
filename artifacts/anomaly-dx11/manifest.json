@@ -1,0 +1,33 @@
+{
+  "source_commit": "55c7faec9fa7f276f698cdeaec703a17d792603a",
+  "configuration": "DX11|x64",
+  "platform_toolset": "v145",
+  "command": "MSBuild.exe src\\engine-vs2022.sln /p:Configuration=DX11 /p:Platform=x64 /p:PlatformToolset=v145 /t:xrEngine",
+  "build": {
+    "exit_code": 0,
+    "started": "2026-11-11T19:54:38.7741384+05:30",
+    "ended": "2026-11-11T20:02:19.9817803+05:30",
+    "elapsed_seconds": 461.2076419,
+    "log": "E:\\Antigravity imp\\xray-anomaly\\xray-anomaly\\.phase4-check\\xrEngine-DX11-v145-codex-20261111.log"
+  },
+  "warnings": 5,
+  "errors": 0,
+  "artifact": "AnomalyDX11.exe",
+  "bytes": 26651136,
+  "sha256": "94c73bf28e47091d99ec408ada9db2c6ff8529445aa63bcb5ac9a1cb3de606f1",
+  "pe": {
+    "signature_valid": true,
+    "machine": "AMD64 (0x8664)",
+    "raw_sections_within_file": true
+  },
+  "phase4_symbol_strings": {
+    "xr_dx12_create_mesh": true,
+    "xr_dx12_destroy_mesh": true,
+    "xr_dx12_update_camera": true,
+    "xr_dx12_draw_indexed": true
+  },
+  "phase4_mesh_success_message_present": true,
+  "runtime_rendering_verified": false,
+  "packaging_scope": "Engine executable only; existing game installation and compatible xray_render_dx12.dll required for the Rust backend.",
+  "packaged_log_normalization": "Trailing whitespace removed; original build log remains at build.log receipt path."
+}
