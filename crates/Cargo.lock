@@ -160,6 +160,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "xray-formats"
+version = "0.1.0"
+dependencies = [
+ "xray-core",
+ "xray-vfs",
+]
+
+[[package]]
 name = "xray-render-dx12"
 version = "0.1.0"
 dependencies = [

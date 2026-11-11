@@ -3,6 +3,7 @@ members = [
     "xray-core",
     "xray-core-ffi",
     "xray-vfs",
+    "xray-formats",
     "xray-render-dx12",
 ]
 resolver = "2"

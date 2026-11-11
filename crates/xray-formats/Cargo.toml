@@ -1,0 +1,8 @@
+[package]
+name = "xray-formats"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xray-core = { path = "../xray-core" }
+xray-vfs = { path = "../xray-vfs" }
