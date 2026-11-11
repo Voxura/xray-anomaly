@@ -359,6 +359,56 @@ impl Dx12Renderer {
         self.textures.get_by_index(index)
     }
 
+    /// Create a GPU vertex & index buffer mesh from typed XRay vertices and 16-bit indices
+    pub fn create_mesh(
+        &mut self,
+        vertices: &[crate::geometry_abi::XRayVertex],
+        indices: &[u16],
+    ) -> WinResult<crate::geometry_abi::MeshHandle> {
+        let v_bytes = unsafe {
+            std::slice::from_raw_parts(
+                vertices.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(vertices),
+            )
+        };
+        let i_bytes = unsafe {
+            std::slice::from_raw_parts(
+                indices.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(indices),
+            )
+        };
+        self.geometry.create_mesh(
+            &self.device_ctx.device,
+            v_bytes,
+            i_bytes,
+            indices.len() as u32,
+            crate::geometry_abi::INDEX_FORMAT_U16,
+        )
+    }
+
+    /// Update view/projection camera constants
+    pub fn update_camera(
+        &mut self,
+        camera: &crate::geometry_abi::CameraConstants,
+    ) -> WinResult<()> {
+        self.geometry.update_camera(&self.device_ctx.device, camera)
+    }
+
+    /// Record a mesh draw call onto the active frame command list
+    pub fn draw_mesh(&mut self, handle: crate::geometry_abi::MeshHandle) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let rtv = sc.current_rtv_handle();
+        self.geometry
+            .draw(&self.device_ctx.device, cmd, rtv, self.width, self.height, handle)
+    }
+
     /// Get physical GPU adapter name
     pub fn adapter_name(&self) -> String {
         self.device_ctx.adapter_name()

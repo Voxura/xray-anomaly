@@ -173,6 +173,8 @@ version = "0.1.0"
 dependencies = [
  "windows",
  "xray-core",
+ "xray-formats",
+ "xray-vfs",
 ]
 
 [[package]]
