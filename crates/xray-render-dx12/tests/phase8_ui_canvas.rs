@@ -522,3 +522,133 @@ fn test_real_repo_cursor_cross_dds_ui_canvas_render() {
     assert!(center_px[3] > 0, "Cursor pixel alpha must be non-zero");
 }
 
+#[test]
+fn test_ui_canvas_font_atlas_and_string_rendering_readback() {
+    use xray_formats::fonts::{FontAlignment, FontAtlas, FontDrawParams};
+    use xray_render_dx12::GlyphQuad;
+
+    let sym_ini = r#"
+[symbol_coords]
+height = 20
+065 = 0, 0, 16
+066 = 16, 0, 32
+"#;
+    let font_atlas = FontAtlas::parse_ini_str(sym_ini).expect("Failed to parse font ini");
+
+    // 32x32 font texture with solid white for glyph 'A' (0..16) and glyph 'B' (16..32)
+    let font_pixels = vec![[255u8, 255, 255, 255]; 32 * 32];
+    let dds_bytes = create_custom_rgba8_dds(32, 32, &font_pixels);
+
+    let window = Window(unsafe {
+        CreateWindowExW(
+            Default::default(),
+            w!("STATIC"),
+            w!("UiFontStringTest"),
+            WS_OVERLAPPEDWINDOW,
+            0,
+            0,
+            64,
+            64,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    });
+
+    let mut renderer = match Dx12Renderer::new(1) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("Skipping hardware font test: D3D12 device unavailable");
+            return;
+        }
+    };
+    renderer.attach_window(window.0, 64, 64).expect("attach_window failed");
+
+    let font_tex_idx = renderer
+        .load_texture_from_dds("ui_font_test.dds", &dds_bytes)
+        .expect("upload font dds failed");
+
+    let quads = font_atlas.build_string_quads(
+        [32, 32],
+        [10.0, 20.0],
+        "AB",
+        &FontDrawParams {
+            current_height: 20.0,
+            interval: [1.0, 1.0],
+            scale: [1.0, 1.0],
+            align: FontAlignment::Left,
+            color_argb: 0xFFFF_FF00, // Yellow
+            gradient: false,
+            dx_half_pixel_offset: false,
+        },
+    );
+
+    assert_eq!(quads.len(), 2);
+
+    let glyphs: Vec<GlyphQuad> = quads
+        .iter()
+        .map(|q| GlyphQuad {
+            screen_rect: [
+                q.min_xy[0],
+                q.min_xy[1],
+                q.max_xy[0] - q.min_xy[0],
+                q.max_xy[1] - q.min_xy[1],
+            ],
+            uv_rect: [q.uv_min[0], q.uv_min[1], q.uv_max[0], q.uv_max[1]],
+        })
+        .collect();
+
+    let readback = create_readback_buffer(&renderer.device_ctx.device, 64, 64);
+
+    renderer.begin_frame().expect("begin_frame failed");
+    renderer.clear_backbuffer([0.0, 0.0, 0.0, 1.0]);
+
+    renderer.ui_draw_glyph_quads(&glyphs, font_tex_idx, [1.0, 1.0, 0.0, 1.0]);
+    renderer.ui_flush(0, 0).expect("ui_flush failed");
+
+    let cmd = renderer.current_cmd_list.as_ref().unwrap();
+    let backbuffer = renderer.swapchain.as_ref().unwrap().current_backbuffer_resource();
+    unsafe {
+        transition(cmd, backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(backbuffer.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let row_pitch = ((64 * 4 + 255) / 256) * 256;
+        let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(readback.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: 64,
+                        Height: 64,
+                        Depth: 1,
+                        RowPitch: row_pitch,
+                    },
+                },
+            },
+        };
+        cmd.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+        transition(cmd, backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+
+    renderer.end_frame(false).expect("end_frame failed");
+    renderer.wait_for_gpu().expect("wait_for_gpu failed");
+
+    // Outside glyphs (2, 2): Black
+    let bg_px = readback_rgba8(&readback, 64, 64, 2, 2);
+    // Inside glyph 'A' (14, 25): Yellow [255, 255, 0, 255]
+    let glyph_a_px = readback_rgba8(&readback, 64, 64, 14, 25);
+
+    println!("Font Glyph Readback: bg = {:?}, glyph_a = {:?}", bg_px, glyph_a_px);
+    assert_eq!(bg_px, [0, 0, 0, 255], "Background must be black");
+    assert_eq!(glyph_a_px, [255, 255, 0, 255], "Glyph 'A' must be yellow");
+}
+
+
