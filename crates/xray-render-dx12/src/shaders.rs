@@ -102,6 +102,8 @@ pub struct ShaderCompiler {
     dxc_path: PathBuf,
 }
 
+static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl ShaderCompiler {
     /// Discover DXC from environment variable, Windows SDK, or system PATH
     pub fn new() -> Result<Self, ShaderError> {
@@ -153,8 +155,10 @@ impl ShaderCompiler {
     pub fn compile(&self, req: &ShaderCompileRequest) -> Result<Vec<u8>, ShaderError> {
         let temp_dir = std::env::temp_dir();
         let hash = req.calculate_hash();
-        let in_file = temp_dir.join(format!("xray_shader_in_{:016x}.hlsl", hash));
-        let out_file = temp_dir.join(format!("xray_shader_out_{:016x}.cso", hash));
+        let pid = std::process::id();
+        let uid = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let in_file = temp_dir.join(format!("xray_shader_in_{:016x}_{}_{}.hlsl", hash, pid, uid));
+        let out_file = temp_dir.join(format!("xray_shader_out_{:016x}_{}_{}.cso", hash, pid, uid));
 
         std::fs::write(&in_file, &req.source)
             .map_err(|e| ShaderError::IoError(format!("Failed to write temp HLSL: {}", e)))?;

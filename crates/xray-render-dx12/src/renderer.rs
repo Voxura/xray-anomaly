@@ -448,6 +448,41 @@ impl Dx12Renderer {
         )
     }
 
+    /// Record a draw call with optional albedo, normal/bump, and material texture descriptor indices
+    pub fn draw_textured_material_mesh(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        albedo_index: Option<crate::bindless::DescriptorIndex>,
+        normal_index: Option<crate::bindless::DescriptorIndex>,
+        material_index: Option<crate::bindless::DescriptorIndex>,
+    ) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let rtv = sc.current_rtv_handle();
+        let push_constants = crate::geometry::PushDrawConstants {
+            albedo_index: albedo_index.map(|i| i.0).unwrap_or(u32::MAX),
+            normal_index: normal_index.map(|i| i.0).unwrap_or(u32::MAX),
+            material_index: material_index.map(|i| i.0).unwrap_or(u32::MAX),
+            ..Default::default()
+        };
+        self.geometry.draw(
+            &self.device_ctx.device,
+            cmd,
+            rtv,
+            self.width,
+            self.height,
+            handle,
+            Some(&self.bindless_heap),
+            Some(&push_constants),
+        )
+    }
+
     /// Get physical GPU adapter name
     pub fn adapter_name(&self) -> String {
         self.device_ctx.adapter_name()

@@ -286,3 +286,267 @@ fn test_bindless_textured_mesh_hardware_readback() {
 
     println!("Phase 5 bindless textured mesh hardware readback verified successfully!");
 }
+
+#[test]
+fn test_bindless_normal_mapped_mesh_hardware_readback() {
+    let window = Window(unsafe {
+        CreateWindowExW(
+            Default::default(),
+            w!("STATIC"),
+            w!("Phase 5 Normal Map Readback"),
+            WS_OVERLAPPEDWINDOW,
+            0,
+            0,
+            64,
+            64,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    });
+
+    let mut renderer = Dx12Renderer::new(1).expect("DirectX 12 hardware required");
+    renderer.attach_window(window.0, 64, 64).unwrap();
+
+    // 1. Albedo: Solid White RGBA8 (255, 255, 255, 255)
+    let white_dds = create_solid_color_rgba8_dds(4, 4, 255, 255, 255, 255);
+    let albedo_idx = renderer
+        .load_texture_from_dds("test_white_albedo.dds", &white_dds)
+        .unwrap();
+
+    // 2. Normal map: Flat normal (128, 128, 255, 255) in tangent space (pointing straight out [0, 0, 1])
+    let flat_normal_dds = create_solid_color_rgba8_dds(4, 4, 128, 128, 255, 255);
+    let normal_idx = renderer
+        .load_texture_from_dds("test_flat_bump.dds", &flat_normal_dds)
+        .unwrap();
+
+    let vertices = [
+        XRayVertex {
+            position: [-0.8, -0.8, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 1.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+        XRayVertex {
+            position: [0.0, 0.8, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.5, 0.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+        XRayVertex {
+            position: [0.8, -0.8, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [1.0, 1.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+    ];
+    let indices = [0u16, 1, 2];
+
+    let mesh_handle = renderer.create_mesh(&vertices, &indices).unwrap();
+    renderer.update_camera(&identity_camera()).unwrap();
+
+    let readback: ID3D12Resource = unsafe {
+        let mut resource = None;
+        renderer
+            .device_ctx
+            .device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 64 * 256,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut resource,
+            )
+            .unwrap();
+        resource.unwrap()
+    };
+
+    renderer.begin_frame().unwrap();
+    renderer.clear_backbuffer([0.0, 0.0, 0.0, 1.0]);
+    renderer
+        .draw_textured_material_mesh(mesh_handle, Some(albedo_idx), Some(normal_idx), None)
+        .expect("Failed to draw material mesh with normal map");
+
+    let cmd = renderer.current_cmd_list.as_ref().unwrap();
+    let backbuffer = renderer
+        .swapchain
+        .as_ref()
+        .unwrap()
+        .current_backbuffer_resource();
+
+    unsafe {
+        transition(
+            cmd,
+            backbuffer,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+
+        let mut source = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(backbuffer.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let mut destination = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(readback.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: 64,
+                        Height: 64,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+
+        cmd.CopyTextureRegion(&destination, 0, 0, 0, &source, None);
+        ManuallyDrop::drop(&mut source.pResource);
+        ManuallyDrop::drop(&mut destination.pResource);
+
+        transition(
+            cmd,
+            backbuffer,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        );
+    }
+
+    renderer.end_frame(false).unwrap();
+    renderer.wait_for_gpu().unwrap();
+
+    unsafe {
+        let mut mapped = ptr::null_mut();
+        readback
+            .Map(
+                0,
+                Some(&D3D12_RANGE {
+                    Begin: 0,
+                    End: 64 * 256,
+                }),
+                Some(&mut mapped),
+            )
+            .unwrap();
+
+        let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), 64 * 256);
+        let center = bytes[32 * 256 + 32 * 4..32 * 256 + 32 * 4 + 4].to_vec();
+        readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+
+        println!("Normal-mapped lit center color: {:?}", center);
+        assert!(center[0] > 100 && center[0] < 220, "Red channel must be lit by normal map");
+        assert!(center[1] > 100 && center[1] < 220, "Green channel must be lit by normal map");
+        assert!(center[2] > 100 && center[2] < 220, "Blue channel must be lit by normal map");
+        assert_eq!(center[3], 255, "Alpha channel must be full opacity");
+    }
+
+    println!("Phase 5 normal-mapped mesh readback verified successfully!");
+}
+
+#[test]
+fn test_real_repo_cursor_cross_dds_vfs_streaming_and_render() {
+    let repo_cursor = std::path::Path::new("../../gamedata/textures/ui/cursor_cross.dds")
+        .canonicalize()
+        .or_else(|_| std::path::Path::new("gamedata/textures/ui/cursor_cross.dds").canonicalize())
+        .or_else(|_| std::path::Path::new("../gamedata/textures/ui/cursor_cross.dds").canonicalize());
+
+    let cursor_path = match repo_cursor {
+        Ok(p) => p,
+        Err(_) => {
+            println!("Skipping real asset test: cursor_cross.dds not found in repository root");
+            return;
+        }
+    };
+
+    let dds_bytes = std::fs::read(&cursor_path).expect("Failed to read cursor_cross.dds from disk");
+    assert_eq!(dds_bytes.len(), 262272);
+
+    let window = Window(unsafe {
+        CreateWindowExW(
+            Default::default(),
+            w!("STATIC"),
+            w!("Real Cursor Render"),
+            WS_OVERLAPPEDWINDOW,
+            0,
+            0,
+            64,
+            64,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    });
+
+    let mut renderer = Dx12Renderer::new(1).expect("DirectX 12 hardware required");
+    renderer.attach_window(window.0, 64, 64).unwrap();
+
+    let srv_idx = renderer
+        .load_texture_from_dds("ui/cursor_cross.dds", &dds_bytes)
+        .expect("Failed to upload real cursor_cross.dds to default heap");
+
+    assert!(srv_idx.is_valid());
+
+    let vertices = [
+        XRayVertex {
+            position: [-1.0, -1.0, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 1.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+        XRayVertex {
+            position: [-1.0, 1.0, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 0.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+        XRayVertex {
+            position: [1.0, 1.0, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [1.0, 0.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+        XRayVertex {
+            position: [1.0, -1.0, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [1.0, 1.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+    ];
+    let indices = [0u16, 1, 2, 0, 2, 3];
+
+    let mesh_handle = renderer.create_mesh(&vertices, &indices).unwrap();
+    renderer.update_camera(&identity_camera()).unwrap();
+
+    renderer.begin_frame().unwrap();
+    renderer.clear_backbuffer([0.0, 0.0, 0.0, 1.0]);
+    renderer.draw_textured_mesh(mesh_handle, srv_idx).unwrap();
+    renderer.end_frame(false).unwrap();
+    renderer.wait_for_gpu().unwrap();
+
+    println!("Real repo cursor_cross.dds streamed, uploaded to default heap, and rendered on hardware GPU!");
+}

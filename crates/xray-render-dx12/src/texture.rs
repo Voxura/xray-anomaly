@@ -27,6 +27,7 @@ use windows::Win32::Graphics::Direct3D12::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC2_UNORM,
     DXGI_FORMAT_BC2_UNORM_SRGB, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC3_UNORM_SRGB,
+    DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC4_SNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC5_SNORM,
     DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_BC7_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM,
     DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
     DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
@@ -55,6 +56,12 @@ pub const FOURCC_DXT2: u32 = u32::from_le_bytes(*b"DXT2");
 pub const FOURCC_DXT3: u32 = u32::from_le_bytes(*b"DXT3");
 pub const FOURCC_DXT4: u32 = u32::from_le_bytes(*b"DXT4");
 pub const FOURCC_DXT5: u32 = u32::from_le_bytes(*b"DXT5");
+pub const FOURCC_ATI1: u32 = u32::from_le_bytes(*b"ATI1");
+pub const FOURCC_BC4U: u32 = u32::from_le_bytes(*b"BC4U");
+pub const FOURCC_BC4S: u32 = u32::from_le_bytes(*b"BC4S");
+pub const FOURCC_ATI2: u32 = u32::from_le_bytes(*b"ATI2");
+pub const FOURCC_BC5U: u32 = u32::from_le_bytes(*b"BC5U");
+pub const FOURCC_BC5S: u32 = u32::from_le_bytes(*b"BC5S");
 pub const FOURCC_DX10: u32 = u32::from_le_bytes(*b"DX10");
 
 fn failure() -> windows::core::Error {
@@ -151,6 +158,10 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
                 75 => (DXGI_FORMAT_BC2_UNORM_SRGB, true, 16),
                 77 => (DXGI_FORMAT_BC3_UNORM, true, 16),
                 78 => (DXGI_FORMAT_BC3_UNORM_SRGB, true, 16),
+                80 => (DXGI_FORMAT_BC4_UNORM, true, 8),
+                81 => (DXGI_FORMAT_BC4_SNORM, true, 8),
+                83 => (DXGI_FORMAT_BC5_UNORM, true, 16),
+                84 => (DXGI_FORMAT_BC5_SNORM, true, 16),
                 87 => (DXGI_FORMAT_B8G8R8A8_UNORM, false, 4),
                 91 => (DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, false, 4),
                 98 => (DXGI_FORMAT_BC7_UNORM, true, 16),
@@ -165,6 +176,14 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
             (DXGI_FORMAT_BC2_UNORM, true, 16)
         } else if pf_fourcc == FOURCC_DXT4 || pf_fourcc == FOURCC_DXT5 {
             (DXGI_FORMAT_BC3_UNORM, true, 16)
+        } else if pf_fourcc == FOURCC_ATI1 || pf_fourcc == FOURCC_BC4U {
+            (DXGI_FORMAT_BC4_UNORM, true, 8)
+        } else if pf_fourcc == FOURCC_BC4S {
+            (DXGI_FORMAT_BC4_SNORM, true, 8)
+        } else if pf_fourcc == FOURCC_ATI2 || pf_fourcc == FOURCC_BC5U {
+            (DXGI_FORMAT_BC5_UNORM, true, 16)
+        } else if pf_fourcc == FOURCC_BC5S {
+            (DXGI_FORMAT_BC5_SNORM, true, 16)
         } else {
             return Err(TextureError::UnsupportedFormat);
         }
@@ -573,5 +592,29 @@ mod tests {
         assert!(registry.get_by_name("act_stalker").is_none());
         assert!(registry.get_by_index(DescriptorIndex(0)).is_none());
         registry.retire(100);
+    }
+
+    #[test]
+    fn test_ati1_bc4_parsing() {
+        // 4x4 ATI1 is 1 block * 8 bytes = 8 bytes
+        let buf = create_test_dds(4, 4, FOURCC_ATI1, 8);
+        let img = parse_dds(&buf).expect("Failed to parse valid ATI1/BC4 DDS");
+        assert_eq!(img.width, 4);
+        assert_eq!(img.height, 4);
+        assert_eq!(img.format, DXGI_FORMAT_BC4_UNORM);
+        assert!(img.is_block_compressed);
+        assert_eq!(img.block_size, 8);
+    }
+
+    #[test]
+    fn test_ati2_bc5_parsing() {
+        // 8x8 ATI2 (3Dc/BC5 normal map) is 2x2 blocks = 4 blocks * 16 bytes = 64 bytes
+        let buf = create_test_dds(8, 8, FOURCC_ATI2, 64);
+        let img = parse_dds(&buf).expect("Failed to parse valid ATI2/BC5 DDS");
+        assert_eq!(img.width, 8);
+        assert_eq!(img.height, 8);
+        assert_eq!(img.format, DXGI_FORMAT_BC5_UNORM);
+        assert!(img.is_block_compressed);
+        assert_eq!(img.block_size, 16);
     }
 }

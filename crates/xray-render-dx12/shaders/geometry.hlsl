@@ -37,6 +37,8 @@ struct PSInput
     float4 position : SV_Position;
     float3 normal : NORMAL;
     float2 uv : TEXCOORD0;
+    float3 tangent : TANGENT;
+    float3 bitangent : BINORMAL;
 };
 
 PSInput vs_main(VSInput input)
@@ -45,15 +47,55 @@ PSInput vs_main(VSInput input)
     output.position = mul(view_proj, float4(input.position, 1.0));
     output.normal = input.normal;
     output.uv = input.uv;
+    output.tangent = input.tangent;
+    output.bitangent = cross(input.normal, input.tangent);
     return output;
 }
 
 float4 ps_main(PSInput input) : SV_Target0
 {
+    // Decode perturbed normal if normal_index is bound
+    float3 world_normal = input.normal;
+    if (cb_draw.normal_index != 0xFFFFFFFF)
+    {
+        float4 n_tex = g_textures[NonUniformResourceIndex(cb_draw.normal_index)].Sample(g_sampler, input.uv);
+        // Supports BC5/ATI2 (RG), DXT5nm (Alpha/Green), and standard 3-channel RGB normal maps
+        float2 xy;
+        if (n_tex.a > 0.0 && n_tex.b < 0.1)
+        {
+            xy = float2(n_tex.a, n_tex.g) * 2.0 - 1.0;
+        }
+        else
+        {
+            xy = n_tex.rg * 2.0 - 1.0;
+        }
+        float z = sqrt(max(0.0, 1.0 - dot(xy, xy)));
+        float3 tangent_normal = float3(xy, z);
+        if (n_tex.b >= 0.1)
+        {
+            tangent_normal = n_tex.rgb * 2.0 - 1.0;
+        }
+
+        float3 N = normalize(input.normal);
+        float3 T = normalize(input.tangent - N * dot(input.tangent, N));
+        float3 B = cross(N, T);
+        float3x3 TBN = float3x3(T, B, N);
+        world_normal = normalize(mul(tangent_normal, TBN));
+    }
+
     if (cb_draw.albedo_index != 0xFFFFFFFF)
     {
-        return g_textures[NonUniformResourceIndex(cb_draw.albedo_index)].Sample(g_sampler, input.uv);
+        float4 albedo = g_textures[NonUniformResourceIndex(cb_draw.albedo_index)].Sample(g_sampler, input.uv);
+        if (cb_draw.normal_index != 0xFFFFFFFF)
+        {
+            float3 light_dir = normalize(float3(0.577, 0.577, 0.577));
+            float diff = saturate(dot(world_normal, light_dir));
+            float3 lit = albedo.rgb * (0.3 + 0.7 * diff);
+            return float4(lit, albedo.a);
+        }
+        return albedo;
     }
-    // Normal visualization fallback when no texture is bound
-    return float4(abs(input.normal), 1.0);
+
+    // Normal visualization fallback (perturbed if normal map bound, geometric otherwise)
+    return float4(abs(world_normal), 1.0);
 }

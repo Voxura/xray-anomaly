@@ -183,3 +183,49 @@ pub unsafe extern "C" fn xr_dx12_draw_textured(
     })
     .unwrap_or(XR_DX12_ERR_PANIC)
 }
+
+/// Record an indexed draw call with albedo, normal/bump, and material texture descriptor indices.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xr_dx12_draw_material_mesh(
+    renderer: *mut Dx12Renderer,
+    mesh_handle: MeshHandle,
+    albedo_index: u32,
+    normal_index: u32,
+    material_index: u32,
+) -> i32 {
+    catch_unwind(|| {
+        if renderer.is_null() {
+            return XR_DX12_ERR_NULL_PTR;
+        }
+        let r = unsafe { &mut *renderer };
+        if !r.geometry.has_mesh(mesh_handle) {
+            return XR_DX12_ERR_INVALID_HANDLE;
+        }
+        let (Some(cmd), Some(sc)) = (&r.current_cmd_list, &r.swapchain) else {
+            return XR_DX12_ERR_INVALID_STATE;
+        };
+        if !r.in_frame || !r.geometry.has_camera() {
+            return XR_DX12_ERR_INVALID_STATE;
+        }
+        let push = PushDrawConstants {
+            albedo_index,
+            normal_index,
+            material_index,
+            ..Default::default()
+        };
+        match r.geometry.draw(
+            &r.device_ctx.device,
+            cmd,
+            sc.current_rtv_handle(),
+            r.width,
+            r.height,
+            mesh_handle,
+            Some(&r.bindless_heap),
+            Some(&push),
+        ) {
+            Ok(()) => XR_DX12_OK,
+            Err(_) => XR_DX12_ERR_D3D12,
+        }
+    })
+    .unwrap_or(XR_DX12_ERR_PANIC)
+}
