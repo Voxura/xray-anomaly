@@ -52,6 +52,16 @@ impl Default for GpuUiQuad {
     }
 }
 
+/// Single character glyph quad for font string rendering
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct GlyphQuad {
+    /// Screen or virtual coordinates `[x, y, width, height]`
+    pub screen_rect: [f32; 4],
+    /// Normalized texture coordinates `[u1, v1, u2, v2]` inside font atlas
+    pub uv_rect: [f32; 4],
+}
+
 /// 16-byte root push constants for UI projection
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(C)]
@@ -365,5 +375,22 @@ impl UiCanvas {
         self.fill_rect([rect[0], rect[1] + thickness, thickness, rect[3] - thickness * 2.0], color);
         // Right
         self.fill_rect([rect[0] + rect[2] - thickness, rect[1] + thickness, thickness, rect[3] - thickness * 2.0], color);
+    }
+
+    /// Queue a batch of font glyph quads with a specific font atlas texture and text color
+    pub fn draw_glyph_quads(
+        &mut self,
+        glyphs: &[GlyphQuad],
+        font_texture_index: DescriptorIndex,
+        color: [f32; 4],
+    ) {
+        for glyph in glyphs {
+            self.draw_textured_rect(
+                glyph.screen_rect,
+                glyph.uv_rect,
+                font_texture_index,
+                color,
+            );
+        }
     }
 }

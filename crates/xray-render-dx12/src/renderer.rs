@@ -869,6 +869,16 @@ impl Dx12Renderer {
         self.ui_canvas.draw_meter_bar(rect, fraction, bg_color, bar_color);
     }
 
+    /// Queue a batch of font glyph quads with a specific font atlas texture and text color
+    pub fn ui_draw_glyph_quads(
+        &mut self,
+        glyphs: &[crate::ui_canvas::GlyphQuad],
+        font_texture_index: crate::bindless::DescriptorIndex,
+        color: [f32; 4],
+    ) {
+        self.ui_canvas.draw_glyph_quads(glyphs, font_texture_index, color);
+    }
+
     /// Flush all queued UI Canvas elements and render directly to active swapchain backbuffer
     pub fn ui_flush(
         &mut self,
