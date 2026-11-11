@@ -23,6 +23,7 @@ ConstantBuffer<PushDrawConstants> cb_draw : register(b1);
 
 Texture2D g_textures[] : register(t0);
 SamplerState g_sampler : register(s0);
+StructuredBuffer<float4x4> g_transforms : register(t0, space1);
 
 struct VSInput
 {
@@ -44,11 +45,30 @@ struct PSInput
 PSInput vs_main(VSInput input)
 {
     PSInput output;
-    output.position = mul(view_proj, float4(input.position, 1.0));
-    output.normal = input.normal;
+    float4 local_pos = float4(input.position, 1.0);
+    float4 world_pos;
+    float3 world_normal;
+    float3 world_tangent;
+
+    if (cb_draw.transform_index != 0xFFFFFFFF)
+    {
+        float4x4 world = g_transforms[cb_draw.transform_index];
+        world_pos = mul(world, local_pos);
+        world_normal = normalize(mul((float3x3)world, input.normal));
+        world_tangent = normalize(mul((float3x3)world, input.tangent));
+    }
+    else
+    {
+        world_pos = local_pos;
+        world_normal = input.normal;
+        world_tangent = input.tangent;
+    }
+
+    output.position = mul(view_proj, world_pos);
+    output.normal = world_normal;
     output.uv = input.uv;
-    output.tangent = input.tangent;
-    output.bitangent = cross(input.normal, input.tangent);
+    output.tangent = world_tangent;
+    output.bitangent = cross(world_normal, world_tangent);
     return output;
 }
 

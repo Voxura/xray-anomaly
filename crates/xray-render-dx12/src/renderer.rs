@@ -394,6 +394,14 @@ impl Dx12Renderer {
         self.geometry.update_camera(&self.device_ctx.device, camera)
     }
 
+    /// Update GPU instance or bone transform palette matrices
+    pub fn update_transforms(
+        &mut self,
+        matrices: &[[[f32; 4]; 4]],
+    ) -> WinResult<()> {
+        self.geometry.update_transforms(&self.device_ctx.device, matrices)
+    }
+
     /// Record a mesh draw call onto the active frame command list
     pub fn draw_mesh(&mut self, handle: crate::geometry_abi::MeshHandle) -> WinResult<()> {
         let cmd = match self.current_cmd_list.as_ref() {
@@ -434,6 +442,39 @@ impl Dx12Renderer {
         let rtv = sc.current_rtv_handle();
         let push_constants = crate::geometry::PushDrawConstants {
             albedo_index: albedo_index.0,
+            ..Default::default()
+        };
+        self.geometry.draw(
+            &self.device_ctx.device,
+            cmd,
+            rtv,
+            self.width,
+            self.height,
+            handle,
+            Some(&self.bindless_heap),
+            Some(&push_constants),
+        )
+    }
+
+    /// Record a draw call with an albedo texture and instance/bone transform index
+    pub fn draw_textured_mesh_with_transform(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        albedo_index: crate::bindless::DescriptorIndex,
+        transform_index: u32,
+    ) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let rtv = sc.current_rtv_handle();
+        let push_constants = crate::geometry::PushDrawConstants {
+            albedo_index: albedo_index.0,
+            transform_index,
             ..Default::default()
         };
         self.geometry.draw(

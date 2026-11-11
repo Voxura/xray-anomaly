@@ -141,7 +141,14 @@ impl GeometryPipeline {
             RegisterSpace: 0,
             Num32BitValues: 8,
         };
-        let parameters = [camera, textures, push];
+        let mut transforms = D3D12_ROOT_PARAMETER::default();
+        transforms.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        transforms.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        transforms.Anonymous.Descriptor = D3D12_ROOT_DESCRIPTOR {
+            ShaderRegister: 0,
+            RegisterSpace: 1,
+        };
+        let parameters = [camera, textures, push, transforms];
         // The contract permits clamp/wrap; choose linear wrap on all axes.
         let sampler = D3D12_STATIC_SAMPLER_DESC {
             Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -157,7 +164,7 @@ impl GeometryPipeline {
             ..Default::default()
         };
         let root_desc = D3D12_ROOT_SIGNATURE_DESC {
-            NumParameters: 3,
+            NumParameters: 4,
             pParameters: parameters.as_ptr(),
             NumStaticSamplers: 1,
             pStaticSamplers: &sampler,
@@ -349,6 +356,8 @@ impl GeometryPipeline {
 pub(crate) struct GeometryState {
     meshes: MeshRegistry<Mesh>,
     camera: Option<UploadBuffer>,
+    transforms: Option<UploadBuffer>,
+    default_transform: Option<UploadBuffer>,
     pipeline: Option<GeometryPipeline>,
     recording_resources: Vec<ID3D12Resource>,
     submitted_resources: Vec<(u64, Vec<ID3D12Resource>)>,
@@ -410,6 +419,22 @@ impl GeometryState {
         Ok(())
     }
 
+    /// Update instance or bone transform matrices
+    pub fn update_transforms(
+        &mut self,
+        device: &ID3D12Device,
+        matrices: &[[[f32; 4]; 4]],
+    ) -> WinResult<()> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                matrices.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(matrices),
+            )
+        };
+        self.transforms = Some(UploadBuffer::new(device, bytes)?);
+        Ok(())
+    }
+
     /// Caller validates frame, mesh and camera before recording any commands.
     pub fn draw(
         &mut self,
@@ -432,11 +457,30 @@ impl GeometryState {
         let default_push = PushDrawConstants::default();
         let push = push_constants.unwrap_or(&default_push);
 
+        if self.default_transform.is_none() {
+            let identity: [[[f32; 4]; 4]; 1] = [[
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]];
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    identity.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&identity),
+                )
+            };
+            self.default_transform = Some(UploadBuffer::new(device, bytes)?);
+        }
+        let default_tf = self.default_transform.as_ref().unwrap();
+        let tf_buf = self.transforms.as_ref().unwrap_or(default_tf);
+
         // Clone BEFORE command recording so CPU destruction cannot invalidate a draw.
         self.recording_resources.extend([
             mesh.vertices.0.clone(),
             mesh.indices.0.clone(),
             camera.0.clone(),
+            tf_buf.0.clone(),
         ]);
         unsafe {
             cmd.SetPipelineState(&pipeline.pso);
@@ -453,6 +497,7 @@ impl GeometryState {
                 (push as *const PushDrawConstants).cast(),
                 0,
             );
+            cmd.SetGraphicsRootShaderResourceView(3, tf_buf.0.GetGPUVirtualAddress());
             cmd.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: width as f32,
                 Height: height as f32,

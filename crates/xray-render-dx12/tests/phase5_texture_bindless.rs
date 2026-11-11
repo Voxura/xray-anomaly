@@ -550,3 +550,191 @@ fn test_real_repo_cursor_cross_dds_vfs_streaming_and_render() {
 
     println!("Real repo cursor_cross.dds streamed, uploaded to default heap, and rendered on hardware GPU!");
 }
+
+#[test]
+fn test_bindless_gpu_transform_structured_buffer_readback() {
+    let window = Window(unsafe {
+        CreateWindowExW(
+            Default::default(),
+            w!("STATIC"),
+            w!("Phase 5 Transform Readback"),
+            WS_OVERLAPPEDWINDOW,
+            0,
+            0,
+            64,
+            64,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    });
+
+    let mut renderer = Dx12Renderer::new(1).expect("DirectX 12 hardware required");
+    renderer.attach_window(window.0, 64, 64).unwrap();
+
+    let green_dds = create_solid_color_rgba8_dds(4, 4, 0, 255, 0, 255);
+    let albedo_idx = renderer
+        .load_texture_from_dds("test_transform_green.dds", &green_dds)
+        .unwrap();
+
+    // Two matrices in structured buffer:
+    // Index 0: Identity
+    // Index 1: Translation out of view (+10.0 on X)
+    let transforms = [
+        [
+            [1.0f32, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        [
+            [1.0f32, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [10.0, 0.0, 0.0, 1.0],
+        ],
+    ];
+    renderer.update_transforms(&transforms).unwrap();
+
+    let vertices = [
+        XRayVertex {
+            position: [-0.8, -0.8, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.0, 1.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+        XRayVertex {
+            position: [0.0, 0.8, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.5, 0.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+        XRayVertex {
+            position: [0.8, -0.8, 0.5],
+            normal: [0.0, 0.0, 1.0],
+            uv: [1.0, 1.0],
+            tangent: [1.0, 0.0, 0.0],
+        },
+    ];
+    let indices = [0u16, 1, 2];
+
+    let mesh_handle = renderer.create_mesh(&vertices, &indices).unwrap();
+    renderer.update_camera(&identity_camera()).unwrap();
+
+    let readback: ID3D12Resource = unsafe {
+        let mut resource = None;
+        renderer
+            .device_ctx
+            .device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 64 * 256,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut resource,
+            )
+            .unwrap();
+        resource.unwrap()
+    };
+
+    // Case 1: Draw with transform_index = 0 (identity) -> Triangle is visible and center pixel is green [0, 255, 0, 255]
+    renderer.begin_frame().unwrap();
+    renderer.clear_backbuffer([0.0, 0.0, 0.0, 1.0]);
+    renderer
+        .draw_textured_mesh_with_transform(mesh_handle, albedo_idx, 0)
+        .expect("Failed to draw textured mesh with transform");
+
+    let cmd = renderer.current_cmd_list.as_ref().unwrap();
+    let backbuffer = renderer
+        .swapchain
+        .as_ref()
+        .unwrap()
+        .current_backbuffer_resource();
+
+    unsafe {
+        transition(
+            cmd,
+            backbuffer,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+
+        let mut source = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(backbuffer.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        let mut destination = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(readback.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: 64,
+                        Height: 64,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+
+        cmd.CopyTextureRegion(&destination, 0, 0, 0, &source, None);
+        ManuallyDrop::drop(&mut source.pResource);
+        ManuallyDrop::drop(&mut destination.pResource);
+
+        transition(
+            cmd,
+            backbuffer,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        );
+    }
+
+    renderer.end_frame(false).unwrap();
+    renderer.wait_for_gpu().unwrap();
+
+    unsafe {
+        let mut mapped = ptr::null_mut();
+        readback
+            .Map(
+                0,
+                Some(&D3D12_RANGE {
+                    Begin: 0,
+                    End: 64 * 256,
+                }),
+                Some(&mut mapped),
+            )
+            .unwrap();
+
+        let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), 64 * 256);
+        let center = bytes[32 * 256 + 32 * 4..32 * 256 + 32 * 4 + 4].to_vec();
+        readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+
+        assert_eq!(center, [0, 255, 0, 255], "Identity transform matrix must render triangle at center");
+    }
+
+    println!("GPU StructuredBuffer transform indexing hardware readback verified successfully!");
+}
