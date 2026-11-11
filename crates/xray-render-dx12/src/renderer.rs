@@ -21,6 +21,7 @@ use crate::allocators::MultiThreadedCommandManager;
 use crate::bindless::BindlessIndexAllocator;
 use crate::device::Dx12DeviceContext;
 use crate::heaps::TransientHeapManager;
+use crate::geometry::GeometryState;
 use crate::pipeline::PipelineManager;
 use crate::swapchain::SwapChainManager;
 
@@ -59,6 +60,7 @@ pub struct Dx12Renderer {
     pub height: u32,
     pub in_frame: bool,
     pub current_cmd_list: Option<ID3D12GraphicsCommandList>,
+    pub(crate) geometry: GeometryState,
 }
 
 impl Dx12Renderer {
@@ -95,11 +97,16 @@ impl Dx12Renderer {
             height: 0,
             in_frame: false,
             current_cmd_list: None,
+            geometry: GeometryState::default(),
         })
     }
 
     /// Attach a native Win32 window and initialize presentation swapchain
     pub fn attach_window(&mut self, hwnd: HWND, width: u32, height: u32) -> WinResult<()> {
+        if self.in_frame {
+            return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        }
+        self.wait_for_gpu()?;
         let swapchain = SwapChainManager::new(
             &self.device_ctx.factory,
             &self.device_ctx.direct_queue,
@@ -118,6 +125,9 @@ impl Dx12Renderer {
 
     /// Resize swapchain backbuffers upon window dimension change
     pub fn resize(&mut self, width: u32, height: u32) -> WinResult<()> {
+        if self.in_frame {
+            return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        }
         self.wait_for_gpu()?;
         if let Some(sc) = &mut self.swapchain {
             sc.resize(&self.device_ctx.device, width, height)?;
@@ -129,11 +139,12 @@ impl Dx12Renderer {
 
     /// Begin frame recording: resets command allocator and transitions backbuffer to RenderTarget
     pub fn begin_frame(&mut self) -> WinResult<&ID3D12GraphicsCommandList> {
-        if self.swapchain.is_none() {
+        if self.swapchain.is_none() || self.in_frame {
             return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)));
         }
 
         let completed_fence = unsafe { self.fence.GetCompletedValue() };
+        self.geometry.retire(completed_fence);
         let allocator = self
             .command_mgr
             .worker(0)
@@ -198,12 +209,12 @@ impl Dx12Renderer {
         unsafe {
             cmd.ResourceBarrier(&[barrier]);
             cmd.Close()?;
+            // Retain immutable draw buffers even if presentation or signaling fails.
+            self.geometry.prepare_submission();
             self.device_ctx
                 .direct_queue
                 .ExecuteCommandLists(&[Some(cmd.cast()?)]);
         }
-
-        self.swapchain.as_ref().unwrap().present(vsync)?;
 
         // Signal GPU fence
         self.fence_value += 1;
@@ -216,15 +227,18 @@ impl Dx12Renderer {
             .worker(0)
             .unwrap()
             .tag_submission_fence(self.frame_index, self.fence_value);
+        self.geometry.tag_submission(self.fence_value);
 
         // Retire bindless descriptors whose GPU execution has completed
         let completed = unsafe { self.fence.GetCompletedValue() };
         self.bindless_allocator.retire_fences(completed);
+        self.geometry.retire(completed);
 
         self.command_mgr.release_command_list(cmd);
         self.frame_index += 1;
         self.in_frame = false;
-        Ok(())
+        // Submission is tracked before Present: failure must not release live buffers.
+        self.swapchain.as_ref().unwrap().present(vsync)
     }
 
     /// Stall CPU until GPU finishes all submitted work
@@ -238,6 +252,7 @@ impl Dx12Renderer {
                 .SetEventOnCompletion(self.fence_value, self.fence_event)?;
             WaitForSingleObject(self.fence_event, INFINITE);
         }
+        self.geometry.retire(unsafe { self.fence.GetCompletedValue() });
         Ok(())
     }
 

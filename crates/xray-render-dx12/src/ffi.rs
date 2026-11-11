@@ -9,12 +9,15 @@ use std::panic::catch_unwind;
 use windows::Win32::Foundation::HWND;
 
 use crate::renderer::{DeviceState, Dx12Renderer, RenderStats};
+pub use crate::geometry_ffi::*;
 
 pub const XR_DX12_OK: i32 = 0;
 pub const XR_DX12_ERR_NULL_PTR: i32 = -1;
 pub const XR_DX12_ERR_PANIC: i32 = -2;
 pub const XR_DX12_ERR_D3D12: i32 = -3;
 pub const XR_DX12_ERR_INVALID_STATE: i32 = -4;
+pub const XR_DX12_ERR_INVALID_ARGUMENT: i32 = -5;
+pub const XR_DX12_ERR_INVALID_HANDLE: i32 = -6;
 
 /// Allocate and initialize a new DirectX 12 renderer instance
 #[unsafe(no_mangle)]

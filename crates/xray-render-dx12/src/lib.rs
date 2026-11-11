@@ -10,8 +10,13 @@ pub mod deferred;
 pub mod device;
 pub mod ffi;
 pub mod graph;
+mod geometry;
+pub mod geometry_abi;
+mod geometry_ffi;
 pub mod heaps;
 pub mod pipeline;
 pub mod renderer;
 pub mod shaders;
 pub mod swapchain;
+
+pub use geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
