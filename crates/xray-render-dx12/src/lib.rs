@@ -21,8 +21,10 @@ pub mod shaders;
 pub mod shadow;
 pub mod swapchain;
 pub mod texture;
+pub mod ui_canvas;
 
 pub use geometry::PushDrawConstants;
 pub use geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
 pub use particle::{GpuParticleInstance, ParticleSystemRenderer};
 pub use shadow::DirectionalShadowMap;
+pub use ui_canvas::{GpuUiQuad, UiCanvas, UiCanvasPipeline, UiPushConstants};

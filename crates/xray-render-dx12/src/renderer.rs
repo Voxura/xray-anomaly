@@ -7,13 +7,14 @@
 use std::mem::ManuallyDrop;
 use windows::core::{Interface, Result as WinResult, HRESULT};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12Fence, ID3D12GraphicsCommandList, D3D12_COMMAND_LIST_TYPE_DIRECT,
     D3D12_FENCE_FLAG_NONE, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
     D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
     D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET,
-    D3D12_RESOURCE_TRANSITION_BARRIER,
+    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_VIEWPORT,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
 
@@ -65,6 +66,8 @@ pub struct Dx12Renderer {
     pub current_cmd_list: Option<ID3D12GraphicsCommandList>,
     pub shadow_map: Option<crate::shadow::DirectionalShadowMap>,
     pub particle_renderer: Option<crate::particle::ParticleSystemRenderer>,
+    pub ui_canvas_pipeline: Option<crate::ui_canvas::UiCanvasPipeline>,
+    pub ui_canvas: crate::ui_canvas::UiCanvas,
     pub(crate) geometry: GeometryState,
     pub(crate) textures: TextureRegistry,
 }
@@ -123,6 +126,8 @@ impl Dx12Renderer {
             current_cmd_list: None,
             shadow_map: None,
             particle_renderer: None,
+            ui_canvas_pipeline: None,
+            ui_canvas: crate::ui_canvas::UiCanvas::default(),
             geometry: GeometryState::default(),
             textures: TextureRegistry::default(),
         })
@@ -822,6 +827,152 @@ impl Dx12Renderer {
 
         // Keep buffer alive across frame submission
         self.geometry.track_resource(upload_res);
+        Ok(())
+    }
+
+    /// Queue a solid color 2D UI rectangle `[x, y, width, height]`
+    pub fn ui_fill_rect(&mut self, rect: [f32; 4], color: [f32; 4]) {
+        self.ui_canvas.fill_rect(rect, color);
+    }
+
+    /// Queue a textured 2D UI rectangle
+    pub fn ui_draw_textured_rect(
+        &mut self,
+        rect: [f32; 4],
+        uv: [f32; 4],
+        texture_index: crate::bindless::DescriptorIndex,
+        color: [f32; 4],
+    ) {
+        self.ui_canvas.draw_textured_rect(rect, uv, texture_index, color);
+    }
+
+    /// Queue a 2D crosshair centered at `center`
+    pub fn ui_draw_crosshair(
+        &mut self,
+        center: [f32; 2],
+        size: f32,
+        gap: f32,
+        thickness: f32,
+        color: [f32; 4],
+    ) {
+        self.ui_canvas.draw_crosshair(center, size, gap, thickness, color);
+    }
+
+    /// Queue a horizontal progress/meter bar (e.g. Health, Stamina, Radiation)
+    pub fn ui_draw_meter_bar(
+        &mut self,
+        rect: [f32; 4],
+        fraction: f32,
+        bg_color: [f32; 4],
+        bar_color: [f32; 4],
+    ) {
+        self.ui_canvas.draw_meter_bar(rect, fraction, bg_color, bar_color);
+    }
+
+    /// Flush all queued UI Canvas elements and render directly to active swapchain backbuffer
+    pub fn ui_flush(
+        &mut self,
+        virtual_width: u32,
+        virtual_height: u32,
+    ) -> WinResult<()> {
+        if self.ui_canvas.is_empty() {
+            return Ok(());
+        }
+        if self.ui_canvas_pipeline.is_none() {
+            self.ui_canvas_pipeline = Some(crate::ui_canvas::UiCanvasPipeline::new(&self.device_ctx.device)?);
+        }
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let rtv = sc.current_rtv_handle();
+
+        let quads = &self.ui_canvas.quads;
+        let byte_len = std::mem::size_of_val(quads.as_slice());
+        let heap_props = windows::Win32::Graphics::Direct3D12::D3D12_HEAP_PROPERTIES {
+            Type: windows::Win32::Graphics::Direct3D12::D3D12_HEAP_TYPE_UPLOAD,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+            ..Default::default()
+        };
+        let desc = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC {
+            Dimension: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: byte_len as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut upload_res: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> = None;
+        unsafe {
+            self.device_ctx.device.CreateCommittedResource(
+                &heap_props,
+                windows::Win32::Graphics::Direct3D12::D3D12_HEAP_FLAG_NONE,
+                &desc,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut upload_res,
+            )?;
+        }
+        let upload_res = upload_res.ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        unsafe {
+            let mut mapped = std::ptr::null_mut();
+            upload_res.Map(0, None, Some(&mut mapped))?;
+            std::ptr::copy_nonoverlapping(quads.as_ptr() as *const u8, mapped.cast(), byte_len);
+            upload_res.Unmap(0, None);
+        }
+
+        let quad_gpu_va = unsafe { upload_res.GetGPUVirtualAddress() };
+        let pipeline = self.ui_canvas_pipeline.as_ref().unwrap();
+
+        let push_constants = crate::ui_canvas::UiPushConstants {
+            screen_width: self.width,
+            screen_height: self.height,
+            virtual_width,
+            virtual_height,
+        };
+
+        unsafe {
+            cmd.SetPipelineState(&pipeline.pso);
+            cmd.SetGraphicsRootSignature(&pipeline.root_signature);
+            cmd.SetDescriptorHeaps(&[Some(self.bindless_heap.clone())]);
+            cmd.SetGraphicsRoot32BitConstants(
+                0,
+                4,
+                (&push_constants as *const crate::ui_canvas::UiPushConstants).cast(),
+                0,
+            );
+            cmd.SetGraphicsRootDescriptorTable(
+                1,
+                self.bindless_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            cmd.SetGraphicsRootShaderResourceView(2, quad_gpu_va);
+
+            cmd.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: self.width as f32,
+                Height: self.height as f32,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+            cmd.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: self.width as i32,
+                bottom: self.height as i32,
+            }]);
+            cmd.OMSetRenderTargets(1, Some(&rtv), false, None);
+            cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmd.DrawInstanced(6, quads.len() as u32, 0, 0);
+        }
+
+        self.geometry.track_resource(upload_res);
+        self.ui_canvas.clear();
         Ok(())
     }
 
