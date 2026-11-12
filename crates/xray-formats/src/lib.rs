@@ -62,19 +62,28 @@ pub mod world_maps;
 pub mod xml_ui;
 
 pub use ai_graph::{
-    pv_compress_normal, pv_decompress_normal, AiGraphHeader, AiVertex, CrossTableCell,
-    CrossTableHeader, GameDeathPoint, GameEdge, GameGraph, GameGraphHeader, GameLevelInfo,
-    GameVertex, LevelCrossTable, LevelGraph, INVALID_AI_LINK_V10, INVALID_AI_LINK_V13,
+    cover_in_direction_nibbles, pv_compress_normal, pv_decompress_normal,
+    vertex_type_matches_mask, AiGraphHeader, AiSearchOutcome, AiSearchParams, AiSearchWorkspace,
+    AiVertex, BucketPriorityQueue, CrossTableCell, CrossTableHeader, FixedVertexStorage,
+    GameDeathPoint, GameEdge, GameGraph, GameGraphHeader, GameLevelInfo, GameVertex,
+    HashVertexStorage, IndexedBinaryHeap, LevelAccessMask, LevelCrossTable, LevelGraph,
+    DEFAULT_BUCKET_COUNT, DEFAULT_MAX_VISITED_NODES, INVALID_AI_LINK_V10, INVALID_AI_LINK_V13,
     INVALID_AI_VERTEX, INVALID_GAME_VERTEX, XRAI_CURRENT_VERSION, XRAI_LARGE_VERSION,
 };
 pub use camera::{
-    hud_projection_matrix, matrix_build_camera, matrix_build_camera_dir,
-    matrix_build_projection, matrix_build_projection_hat, matrix_build_projection_ortho,
-    mix_postprocess_effectors, ui_3d_icon_atlas_projection, ui_3d_icon_projection,
-    CamEffectorInfo, CameraManagerState, CameraMotionEffector, CameraMotionPlayer,
-    PosDecompressParams, PostprocessPlayer, RenderXforms, DEFAULT_HUD_FOV_FACTOR,
-    DEFAULT_PARALLAX_H, HUD_BASE_FOV_DEG, UI_3D_ICON_DISTANCE, UI_3D_ICON_FAR_PLANE,
-    UI_3D_ICON_NEAR_PLANE, UI_3D_ICON_ORTHO_HEIGHT,
+    decode_bc5_normal_xy, decode_tangent_space_normal, f32_to_unorm8, hud_projection_matrix,
+    linearize_depth_perspective_lh, linearize_depth_xray_proj, matrix_build_camera,
+    matrix_build_camera_dir, matrix_build_projection, matrix_build_projection_hat,
+    matrix_build_projection_ortho, matrix_transpose_44, mix_postprocess_effectors,
+    ndc_to_uv_dx12, pack_gbuffer_albedo_ao, pack_gbuffer_material,
+    pack_gbuffer_normal_roughness, reconstruct_view_pos_from_depth_xray, reconstruct_view_pos_r4,
+    reconstruct_world_pos_from_depth_xray, reconstruct_world_pos_from_dx12_camera,
+    ui_3d_icon_atlas_projection, ui_3d_icon_projection, unorm8_to_f32, unpack_gbuffer_albedo_ao,
+    unpack_gbuffer_material, unpack_gbuffer_normal_roughness, uv_to_ndc_dx12, CamEffectorInfo,
+    CameraManagerState, CameraMotionEffector, CameraMotionPlayer, Dx12CameraConstants,
+    Dx12DepthDecompressParams, GbufferMrtEncoded, GbufferMrtPixel, PosDecompressParams,
+    PostprocessPlayer, RenderXforms, DEFAULT_HUD_FOV_FACTOR, DEFAULT_PARALLAX_H, HUD_BASE_FOV_DEG,
+    UI_3D_ICON_DISTANCE, UI_3D_ICON_FAR_PLANE, UI_3D_ICON_NEAR_PLANE, UI_3D_ICON_ORTHO_HEIGHT,
 };
 pub use cform::{
     classify_sphere_triangle, ray_options, ray_triangle_test, sphere_triangle_test,
@@ -204,9 +213,11 @@ pub use omf::{
     SAMPLE_SPF, XR_OGF_SM_PARAMS_VERSION,
 };
 pub use particle_sim::{
-    ParticleBillboardDrawBatch, ParticleBillboardInstance, ParticleEffectInstance,
-    ParticleGroupInstance, ParticleLifeEvent, ParticleQuadVertex, ParticleRng, ParticleState,
-    ParticleStepEvents, PerlinNoise3,
+    intersect_segment_domain, DomainDeflectorHit, ParticleBillboardDrawBatch,
+    ParticleBillboardInstance, ParticleCollisionConfig, ParticleCollisionHit,
+    ParticleCollisionReport, ParticleDynamicHit, ParticleEffectInstance, ParticleGroupInstance,
+    ParticleLifeEvent, ParticleQuadVertex, ParticleRng, ParticleState, ParticleStepEvents,
+    PerlinNoise3, DEFAULT_COLLISION_PARAMS,
 };
 pub use particles::{
     build_wallmark_view_matrix, calc_triangle_adjacency, encode_compiled_action_list,
@@ -314,16 +325,17 @@ pub use spawns::{
     POINT_BASE, RPOINT_CHUNK, SPAWN_VERSION, WAYOBJECT_VERSION, WAY_BASE, WAY_PATROLPATH_CHUNK,
 };
 pub use sun::{
-    build_accum_direct_lum_quad, compute_accum_direct_cuboid_vertices,
+    build_3split_csm_atlas, build_accum_direct_lum_quad, compute_accum_direct_cuboid_vertices,
     compute_accum_direct_depth_bounds, compute_accum_direct_volumetric_range,
-    compute_direct_mask_dir, compute_rain_shadow_setup, compute_sun_cascades,
-    compute_sun_shadow_matrix, compute_view_shadow_proj, matrix_invert_44,
-    matrix_ortho_off_center_lh, matrix_translate, snap_sun_cascade_to_texels,
-    ssfx_rain_pass_viewport, sun_pass_elements, AccumDirectLumVertex, CloudsShadowState,
-    DumbConvexVolume, FixedConvexVolume, RainShadowResult, RainWetSurfConfig, SsfxRainConfig,
-    SunCascadeBiasConfig, SunCascadeConfig, SunCascadeResult, SunCascadeSpec, SunRay,
-    ACCUM_DIRECT_CUBOID_CORNERS, ACCUM_DIRECT_CUBOID_INDICES, ACCUM_DIRECT_LUM_SMOOTH,
-    SUN_FAR_LIMIT_DEFAULT, SUN_FRUSTUM_CORNERS, SUN_FRUSTUM_FACETABLE,
+    compute_csm_cascade_blend, compute_direct_mask_dir, compute_rain_shadow_setup,
+    compute_sun_cascades, compute_sun_shadow_matrix, compute_view_shadow_proj, matrix_invert_44,
+    matrix_ortho_off_center_lh, matrix_translate, project_world_to_csm_atlas,
+    select_csm_cascade, snap_sun_cascade_to_texels, ssfx_rain_pass_viewport, sun_pass_elements,
+    AccumDirectLumVertex, CloudsShadowState, CsmAtlasPacking, CsmAtlasPlan, CsmCascadeAtlasSlot,
+    CsmCascadeBlend, DumbConvexVolume, FixedConvexVolume, GpuCsmSplitUniforms, RainShadowResult,
+    RainWetSurfConfig, SsfxRainConfig, SunCascadeBiasConfig, SunCascadeConfig, SunCascadeResult,
+    SunCascadeSpec, SunRay, ACCUM_DIRECT_CUBOID_CORNERS, ACCUM_DIRECT_CUBOID_INDICES,
+    ACCUM_DIRECT_LUM_SMOOTH, SUN_FAR_LIMIT_DEFAULT, SUN_FRUSTUM_CORNERS, SUN_FRUSTUM_FACETABLE,
 };
 pub use thm::{
     dds_caps2, detail_usage, strip_texture_extension, texture_flags, texture_stem_to_dds_vpath,

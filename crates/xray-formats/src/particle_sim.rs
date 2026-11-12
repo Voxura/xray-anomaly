@@ -14,13 +14,15 @@
 
 use std::f32::consts::{PI, TAU};
 
+use crate::cform::CformBvh;
 use crate::lanims::pack_rgba_f32;
 use crate::ogf::{
     matrix_mul_43, matrix_set_hpb, matrix_transform_point, XRayMatrix, XRAY_IDENTITY_MATRIX,
 };
 use crate::particles::{
     papi_flags, ped_flags, pg_effect_flags, CompiledParticleAction, ParticleActionKind,
-    ParticleDomain, ParticleDomainType, ParticleEffectDef, ParticleGroupDef, ParticlesLibrary,
+    ParticleCollisionParams, ParticleDomain, ParticleDomainType, ParticleEffectDef,
+    ParticleGroupDef, ParticlesLibrary,
 };
 use crate::skinning::{matrix_transform_dir, normalize_vec3};
 
@@ -28,6 +30,246 @@ const EPS_SMALL: f32 = 0.00001;
 const P_MAXFLOAT: f32 = 1.0e16;
 const STEP_DEFAULT: f32 = 0.033;
 const ONE_OVER_SQRT_2PI: f32 = 0.398_942_3;
+
+/// Default `CPEDef` collision response parameters matching `ParticleEffectDef.cpp:32-34`.
+pub const DEFAULT_COLLISION_PARAMS: ParticleCollisionParams = ParticleCollisionParams {
+    one_minus_friction: 1.0,
+    resilience: 0.0,
+    sqr_cutoff: 0.0,
+};
+
+/// Dynamic collider hit result returned by callers when `ped_flags::DF_COLLISION_DYN` is active.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParticleDynamicHit {
+    /// Distance `range` along normalized segment direction (`0.0 < range <= segment_len`).
+    pub range: f32,
+    /// Contact point in world space.
+    pub point: [f32; 3],
+    /// Contact normal in world space (C++ `RQ.O` uses `[0.0, 1.0, 0.0]`).
+    pub normal: [f32; 3],
+}
+
+/// Configuration for `CPEDef::ExecuteCollision` raycasting against `CformBvh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParticleCollisionConfig {
+    /// Whether `CformBvh` static triangle tests cull backfaces (`CDB::OPT_CULL`).
+    pub cull_backfaces: bool,
+}
+
+impl Default for ParticleCollisionConfig {
+    fn default() -> Self {
+        Self {
+            cull_backfaces: true,
+        }
+    }
+}
+
+/// Single particle collision contact produced during `ExecuteCollision`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParticleCollisionHit {
+    /// Index of the particle in `ParticleEffectInstance::particles()` at the moment of impact.
+    pub particle_index: usize,
+    /// Particle state at impact (captured before removal or velocity reflection).
+    pub particle: ParticleState,
+    /// World-space contact point (`pos_b + dir * range`).
+    pub point: [f32; 3],
+    /// Contact surface normal (`mknormal(v0, v1, v2)` for static CFORM or dynamic normal).
+    pub normal: [f32; 3],
+    /// `CformTriangle::material` for static hits, or `u16::MAX` for dynamic hits.
+    pub material: u16,
+    /// `true` when hit came from the dynamic collider callback (`DF_COLLISION_DYN`).
+    pub is_dynamic: bool,
+}
+
+/// Combined step events and collision contacts returned by collision-enabled particle stepping.
+#[derive(Debug, Clone, Default)]
+pub struct ParticleCollisionReport {
+    pub step_events: ParticleStepEvents,
+    pub hits: Vec<ParticleCollisionHit>,
+}
+
+/// Segment intersection result against a `ParticleDomain` deflector surface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DomainDeflectorHit {
+    /// Normalized segment parameter `t` in `[0.0, 1.0]` (`point = start + (end - start) * t`).
+    pub t: f32,
+    /// World-space intersection point on the deflector surface.
+    pub point: [f32; 3],
+    /// Unit surface normal at `point`.
+    pub normal: [f32; 3],
+}
+
+/// Exact segment `[start, end]` intersection test against a `ParticleDomain` deflector
+/// (`Plane`, `Disc`, `Triangle`, `Rectangle`, `Sphere`, `Box`).
+pub fn intersect_segment_domain(
+    start: [f32; 3],
+    end: [f32; 3],
+    domain: &ParticleDomain,
+) -> Option<DomainDeflectorHit> {
+    let delta = sub3(end, start);
+    match domain.domain_type {
+        ParticleDomainType::Plane => {
+            let n = normalize_vec3(domain.p2);
+            let d_old = dot3(start, domain.p2) + domain.radius1;
+            let d_new = dot3(end, domain.p2) + domain.radius1;
+            if d_old * d_new > 0.0 {
+                return None;
+            }
+            let denom = dot3(domain.p2, delta);
+            let t = if denom.abs() > 1e-9 {
+                (-d_old / denom).clamp(0.0, 1.0)
+            } else if d_old.abs() <= 1e-6 {
+                0.0
+            } else {
+                return None;
+            };
+            Some(DomainDeflectorHit {
+                t,
+                point: add3(start, scale3(delta, t)),
+                normal: n,
+            })
+        }
+        ParticleDomainType::Disc => {
+            let n = normalize_vec3(domain.p2);
+            let d_old = dot3(start, domain.p2) + domain.radius1_sqr;
+            let d_new = dot3(end, domain.p2) + domain.radius1_sqr;
+            if d_old * d_new > 0.0 {
+                return None;
+            }
+            let denom = dot3(domain.p2, delta);
+            let t = if denom.abs() > 1e-9 {
+                (-d_old / denom).clamp(0.0, 1.0)
+            } else if d_old.abs() <= 1e-6 {
+                0.0
+            } else {
+                return None;
+            };
+            let pt = add3(start, scale3(delta, t));
+            let rel = sub3(pt, domain.p1);
+            let rad2 = dot3(rel, rel);
+            let r1_sqr = domain.radius1 * domain.radius1;
+            let r2_sqr = domain.radius2 * domain.radius2;
+            if rad2 > r1_sqr || rad2 < r2_sqr {
+                return None;
+            }
+            Some(DomainDeflectorHit {
+                t,
+                point: pt,
+                normal: n,
+            })
+        }
+        ParticleDomainType::Triangle | ParticleDomainType::Rectangle => {
+            let (s1, s2) = plane_uv_basis(domain)?;
+            let n = normalize_vec3(domain.p2);
+            let d_old = dot3(start, domain.p2) + domain.radius1;
+            let d_new = dot3(end, domain.p2) + domain.radius1;
+            if d_old * d_new > 0.0 {
+                return None;
+            }
+            let denom = dot3(domain.p2, delta);
+            let t = if denom.abs() > 1e-9 {
+                (-d_old / denom).clamp(0.0, 1.0)
+            } else if d_old.abs() <= 1e-6 {
+                0.0
+            } else {
+                return None;
+            };
+            let pt = add3(start, scale3(delta, t));
+            let offset = sub3(pt, domain.p1);
+            let u_coord = dot3(offset, s1);
+            let v_coord = dot3(offset, s2);
+            let inside = if domain.domain_type == ParticleDomainType::Triangle {
+                u_coord >= 0.0 && v_coord >= 0.0 && (u_coord + v_coord) <= 1.0
+            } else {
+                (0.0..=1.0).contains(&u_coord) && (0.0..=1.0).contains(&v_coord)
+            };
+            inside.then_some(DomainDeflectorHit {
+                t,
+                point: pt,
+                normal: n,
+            })
+        }
+        ParticleDomainType::Sphere => {
+            let a = dot3(delta, delta);
+            if a <= 1e-12 {
+                return None;
+            }
+            let oc = sub3(start, domain.p1);
+            let b = dot3(oc, delta);
+            let mut best_t: Option<f32> = None;
+            for r_sqr in [domain.radius1_sqr, domain.radius2_sqr] {
+                if r_sqr <= 0.0 {
+                    continue;
+                }
+                let c = dot3(oc, oc) - r_sqr;
+                let disc = b * b - a * c;
+                if disc < 0.0 {
+                    continue;
+                }
+                let root = disc.sqrt();
+                for cand in [(-b - root) / a, (-b + root) / a] {
+                    if (0.0..=1.0).contains(&cand) && best_t.is_none_or(|cur| cand < cur) {
+                        best_t = Some(cand);
+                    }
+                }
+            }
+            let t = best_t?;
+            let pt = add3(start, scale3(delta, t));
+            let mut n = normalize_vec3(sub3(pt, domain.p1));
+            if dot3(n, delta) > 0.0 {
+                n = scale3(n, -1.0);
+            }
+            Some(DomainDeflectorHit {
+                t,
+                point: pt,
+                normal: n,
+            })
+        }
+        ParticleDomainType::Box => {
+            let mut t_enter = 0.0f32;
+            let mut t_exit = 1.0f32;
+            let mut hit_axis = 0usize;
+            let mut hit_sign = -1.0f32;
+            for axis in 0..3 {
+                let d = delta[axis];
+                if d.abs() < 1e-9 {
+                    if start[axis] < domain.p1[axis] || start[axis] > domain.p2[axis] {
+                        return None;
+                    }
+                } else {
+                    let inv = 1.0 / d;
+                    let mut t0 = (domain.p1[axis] - start[axis]) * inv;
+                    let mut t1 = (domain.p2[axis] - start[axis]) * inv;
+                    let mut s0 = -1.0f32;
+                    if t0 > t1 {
+                        std::mem::swap(&mut t0, &mut t1);
+                        s0 = 1.0;
+                    }
+                    if t0 > t_enter {
+                        t_enter = t0;
+                        hit_axis = axis;
+                        hit_sign = s0;
+                    }
+                    t_exit = t_exit.min(t1);
+                    if t_enter > t_exit {
+                        return None;
+                    }
+                }
+            }
+            if !(0.0..=1.0).contains(&t_enter) {
+                return None;
+            }
+            let mut n = [0.0f32; 3];
+            n[hit_axis] = hit_sign;
+            Some(DomainDeflectorHit {
+                t: t_enter,
+                point: add3(start, scale3(delta, t_enter)),
+                normal: n,
+            })
+        }
+        _ => None,
+    }
+}
 
 // ============================================================================
 // Deterministic PRNG & PAPI Normal Distribution
@@ -912,6 +1154,281 @@ impl ParticleEffectInstance {
         }
         self.step_single(dt_sec, &mut events);
         events
+    }
+
+    /// Advance simulation with static `CformBvh` particle collision (`CPEDef::ExecuteCollision`).
+    pub fn step_with_cform(
+        &mut self,
+        frame_dt_ms: u32,
+        static_cform: &CformBvh<'_>,
+    ) -> ParticleCollisionReport {
+        self.step_with_collision(
+            frame_dt_ms,
+            Some(static_cform),
+            ParticleCollisionConfig::default(),
+            |_, _, _| None,
+            |_| true,
+        )
+    }
+
+    /// Advance simulation with `CformBvh` + optional dynamic collider callback and hit handler,
+    /// matching `CParticleEffect::OnFrame` + `CPEDef::ExecuteCollision` (`ParticleEffectDef.cpp:133-207`).
+    pub fn step_with_collision<F, C>(
+        &mut self,
+        frame_dt_ms: u32,
+        static_cform: Option<&CformBvh<'_>>,
+        config: ParticleCollisionConfig,
+        mut dynamic_raycast: F,
+        mut on_hit: C,
+    ) -> ParticleCollisionReport
+    where
+        F: FnMut([f32; 3], [f32; 3], f32) -> Option<ParticleDynamicHit>,
+        C: FnMut(&ParticleCollisionHit) -> bool,
+    {
+        let mut report = ParticleCollisionReport::default();
+        if !self.playing {
+            self.recompute_idle_bounds();
+            return report;
+        }
+
+        self.accum_dt_ms = self.accum_dt_ms.saturating_add(frame_dt_ms);
+        let u_step = self.def.update_step_ms.max(1);
+        let f_step = (u_step as f32) / 1000.0;
+        let step_count = (self.accum_dt_ms / u_step).min(3);
+        self.accum_dt_ms %= u_step;
+
+        for _ in 0..step_count {
+            if !self.step_single_with_collision(
+                f_step,
+                static_cform,
+                config,
+                &mut dynamic_raycast,
+                &mut on_hit,
+                &mut report,
+            ) {
+                break;
+            }
+        }
+        report
+    }
+
+    /// Execute one explicit `dt_sec` substep with static/dynamic collision evaluation.
+    pub fn step_fixed_dt_with_collision<F, C>(
+        &mut self,
+        dt_sec: f32,
+        static_cform: Option<&CformBvh<'_>>,
+        config: ParticleCollisionConfig,
+        mut dynamic_raycast: F,
+        mut on_hit: C,
+    ) -> ParticleCollisionReport
+    where
+        F: FnMut([f32; 3], [f32; 3], f32) -> Option<ParticleDynamicHit>,
+        C: FnMut(&ParticleCollisionHit) -> bool,
+    {
+        let mut report = ParticleCollisionReport::default();
+        if !self.playing || dt_sec <= 0.0 {
+            self.recompute_idle_bounds();
+            return report;
+        }
+        self.step_single_with_collision(
+            dt_sec,
+            static_cform,
+            config,
+            &mut dynamic_raycast,
+            &mut on_hit,
+            &mut report,
+        );
+        report
+    }
+
+    /// Evaluate `CPEDef::ExecuteCollision` directly on the current particle array over `dt` seconds.
+    ///
+    /// - Only executes when `ped_flags::DF_COLLISION` is set on `self.def.flags`.
+    /// - Invokes `dynamic_raycast` only when `ped_flags::DF_COLLISION_DYN` is set.
+    /// - Removes particles on hit when `ped_flags::DF_COLLISION_DEL` is set, otherwise reflects
+    ///   velocity with `sqr_cutoff`, `one_minus_friction`, and `resilience` (up to 2 bounces per step).
+    pub fn execute_cform_collision<F, C>(
+        &mut self,
+        dt: f32,
+        static_cform: Option<&CformBvh<'_>>,
+        config: ParticleCollisionConfig,
+        dynamic_raycast: &mut F,
+        on_hit: &mut C,
+        events: &mut ParticleStepEvents,
+    ) -> Vec<ParticleCollisionHit>
+    where
+        F: FnMut([f32; 3], [f32; 3], f32) -> Option<ParticleDynamicHit>,
+        C: FnMut(&ParticleCollisionHit) -> bool,
+    {
+        let mut recorded_hits = Vec::new();
+        if (self.def.flags & ped_flags::DF_COLLISION) == 0 {
+            return recorded_hits;
+        }
+        let check_dyn = (self.def.flags & ped_flags::DF_COLLISION_DYN) != 0;
+        let delete_on_hit = (self.def.flags & ped_flags::DF_COLLISION_DEL) != 0;
+        let params = self.def.collision.unwrap_or(DEFAULT_COLLISION_PARAMS);
+
+        // Reverse order matches C++ `CPEDef::ExecuteCollision` so `remove_particle_swap` stays valid
+        for i in (0..self.particles.len()).rev() {
+            let mut pick_cnt = 0u8;
+            loop {
+                let mut pick_needed = false;
+                let p_copy = self.particles[i];
+                let delta = sub3(p_copy.pos, p_copy.pos_b);
+                let dist = len3(delta);
+                if dist >= EPS_SMALL {
+                    let dir = scale3(delta, 1.0 / dist);
+                    let static_hit = static_cform.and_then(|bvh| {
+                        bvh.raycast_nearest(p_copy.pos_b, dir, dist, config.cull_backfaces)
+                    });
+                    let dyn_max = static_hit.as_ref().map_or(dist, |h| h.range);
+                    let dyn_hit = if check_dyn {
+                        dynamic_raycast(p_copy.pos_b, dir, dyn_max)
+                            .filter(|h| h.range > 0.0 && h.range <= dyn_max)
+                    } else {
+                        None
+                    };
+
+                    let resolved = if let Some(dh) = dyn_hit {
+                        Some((dh.point, dh.normal, u16::MAX, true))
+                    } else {
+                        static_hit.map(|sh| {
+                            let e01 = sub3(sh.verts[1], sh.verts[0]);
+                            let e12 = sub3(sh.verts[2], sh.verts[1]);
+                            let mut n = cross3(e01, e12);
+                            let nlen = len3(n);
+                            if nlen > 1e-12 {
+                                n = scale3(n, 1.0 / nlen);
+                            } else {
+                                n = [0.0, 1.0, 0.0];
+                            }
+                            (sh.point, n, sh.material, false)
+                        })
+                    };
+
+                    if let Some((pt, n, material, is_dynamic)) = resolved {
+                        pick_cnt += 1;
+                        let hit_record = ParticleCollisionHit {
+                            particle_index: i,
+                            particle: p_copy,
+                            point: pt,
+                            normal: n,
+                            material,
+                            is_dynamic,
+                        };
+                        if pick_cnt == 1 {
+                            recorded_hits.push(hit_record);
+                            if !on_hit(&hit_record) {
+                                break;
+                            }
+                        }
+
+                        if delete_on_hit {
+                            remove_particle_swap(&mut self.particles, i, events);
+                            break;
+                        } else {
+                            let p_mut = &mut self.particles[i];
+                            let nmag = dot3(p_mut.vel, n);
+                            let vn = scale3(n, nmag);
+                            let vt = sub3(p_mut.vel, vn);
+                            let vn_scaled = scale3(vn, params.resilience);
+                            if dot3(vt, vt) <= params.sqr_cutoff {
+                                p_mut.vel = sub3(vt, vn_scaled);
+                            } else {
+                                p_mut.vel =
+                                    sub3(scale3(vt, params.one_minus_friction), vn_scaled);
+                            }
+                            p_mut.pos = add3(p_mut.pos_b, scale3(p_mut.vel, dt));
+                            pick_needed = true;
+                        }
+                    }
+                } else {
+                    self.particles[i].pos = p_copy.pos_b;
+                }
+
+                if !(pick_needed && pick_cnt < 2) {
+                    break;
+                }
+            }
+        }
+
+        recorded_hits
+    }
+
+    fn step_single_with_collision<F, C>(
+        &mut self,
+        dt: f32,
+        static_cform: Option<&CformBvh<'_>>,
+        config: ParticleCollisionConfig,
+        dynamic_raycast: &mut F,
+        on_hit: &mut C,
+        report: &mut ParticleCollisionReport,
+    ) -> bool
+    where
+        F: FnMut([f32; 3], [f32; 3], f32) -> Option<ParticleDynamicHit>,
+        C: FnMut(&ParticleCollisionHit) -> bool,
+    {
+        if (self.def.flags & ped_flags::DF_TIME_LIMIT) != 0 && !self.deferred_stop {
+            self.elapsed_limit -= dt;
+            if self.elapsed_limit < 0.0 {
+                self.elapsed_limit = self.def.time_limit.unwrap_or(0.0);
+                self.stop(true);
+                return false;
+            }
+        }
+
+        let mut tm_max = 1.0f32;
+        for idx in 0..self.actions.len() {
+            execute_action(
+                &mut self.actions[idx],
+                &mut self.particles,
+                &self.def,
+                dt,
+                &mut tm_max,
+                &mut self.rng,
+                &self.noise,
+                &mut report.step_events,
+            );
+        }
+
+        if (self.def.flags & ped_flags::DF_COLLISION) != 0 {
+            let hits = self.execute_cform_collision(
+                dt,
+                static_cform,
+                config,
+                dynamic_raycast,
+                on_hit,
+                &mut report.step_events,
+            );
+            report.hits.extend(hits);
+        }
+
+        let anim_mask = ped_flags::DF_FRAMED | ped_flags::DF_ANIMATED;
+        if (self.def.flags & anim_mask) == anim_mask
+            && let Some(frame_def) = self.def.frame
+        {
+            let speed_fac = frame_def.speed * dt;
+            let frame_count_f = frame_def.frame_count.max(1) as f32;
+            for p in &mut self.particles {
+                let dir = if p.animate_ccw { -1.0 } else { 1.0 };
+                let mut f = (p.frame_q8 as f32) / 255.0 + dir * speed_fac;
+                if f > frame_count_f {
+                    f -= frame_count_f;
+                }
+                if f < 0.0 {
+                    f += frame_count_f;
+                }
+                p.frame_q8 = (f * 255.0).floor().clamp(0.0, u16::MAX as f32) as u16;
+            }
+        }
+
+        self.recompute_bounds();
+        if self.deferred_stop && self.particles.is_empty() {
+            self.playing = false;
+            self.deferred_stop = false;
+            return false;
+        }
+        true
     }
 
     fn step_single(&mut self, dt: f32, events: &mut ParticleStepEvents) -> bool {
@@ -1858,17 +2375,19 @@ fn execute_avoid(
                     }
                 } else {
                     let foff = sub3(add3(position.u, position.v), offset);
-                    let fofs = sub3(scale3(un, dot3(un, foff)), foff);
-                    let ud = dot3(uofs, uofs);
-                    let vd = dot3(vofs, vofs);
-                    let fd = dot3(fofs, fofs);
-                    if ud <= vd && ud <= fd {
-                        normalize_vec3(uofs)
-                    } else if vd <= fd {
-                        normalize_vec3(vofs)
-                    } else {
-                        normalize_vec3(fofs)
+                    let u2ofs = sub3(scale3(un, dot3(un, foff)), foff);
+                    let v2ofs = sub3(scale3(vn_basis, dot3(vn_basis, foff)), foff);
+                    let candidates = [uofs, vofs, u2ofs, v2ofs];
+                    let mut best = uofs;
+                    let mut best_d2 = dot3(uofs, uofs);
+                    for cand in candidates.into_iter().skip(1) {
+                        let d2 = dot3(cand, cand);
+                        if d2 < best_d2 {
+                            best_d2 = d2;
+                            best = cand;
+                        }
                     }
+                    normalize_vec3(best)
                 };
                 let vm = len3(p.vel);
                 if vm > 1e-9 {
@@ -2339,6 +2858,225 @@ impl ParticleGroupInstance {
         }
     }
 
+    /// Advance group timeline and child particle effects with static `CformBvh` collision support.
+    pub fn step_with_cform(
+        &mut self,
+        dt_ms: u32,
+        lib: &ParticlesLibrary,
+        static_cform: &CformBvh<'_>,
+    ) -> Vec<ParticleCollisionHit> {
+        self.step_with_collision(
+            dt_ms,
+            lib,
+            Some(static_cform),
+            ParticleCollisionConfig::default(),
+            |_, _, _| None,
+            |_| true,
+        )
+    }
+
+    /// Advance group timeline and all active child effects with `CformBvh` + optional dynamic collision.
+    pub fn step_with_collision<F, C>(
+        &mut self,
+        dt_ms: u32,
+        lib: &ParticlesLibrary,
+        static_cform: Option<&CformBvh<'_>>,
+        config: ParticleCollisionConfig,
+        mut dynamic_raycast: F,
+        mut on_hit: C,
+    ) -> Vec<ParticleCollisionHit>
+    where
+        F: FnMut([f32; 3], [f32; 3], f32) -> Option<ParticleDynamicHit>,
+        C: FnMut(&ParticleCollisionHit) -> bool,
+    {
+        let mut all_hits = Vec::new();
+        if !self.playing {
+            self.bounds_min = [
+                self.initial_position[0] - 0.001,
+                self.initial_position[1] - 0.001,
+                self.initial_position[2] - 0.001,
+            ];
+            self.bounds_max = [
+                self.initial_position[0] + 0.001,
+                self.initial_position[1] + 0.001,
+                self.initial_position[2] + 0.001,
+            ];
+            return all_hits;
+        }
+
+        let ct = self.current_time;
+        let f_dt = (dt_ms as f32) / 1000.0;
+        for (item_def, runtime) in self.def.effects.iter().zip(self.items.iter_mut()) {
+            if (item_def.flags & pg_effect_flags::FL_ENABLED) == 0 {
+                continue;
+            }
+            if runtime.is_playing() {
+                if ct <= item_def.time1 && (ct + f_dt) >= item_def.time1 {
+                    let deferred = (item_def.flags & pg_effect_flags::FL_DEFERRED_STOP) != 0;
+                    runtime.stop(deferred);
+                }
+            } else if !self.deferred_stop && ct <= item_def.time0 && (ct + f_dt) >= item_def.time0 {
+                runtime.play();
+            }
+        }
+
+        self.current_time += f_dt;
+        if self.def.time_limit > 0.0
+            && self.current_time > self.def.time_limit
+            && !self.deferred_stop
+        {
+            self.stop(true);
+        }
+
+        let mut any_playing = false;
+        let mut mn = [f32::INFINITY; 3];
+        let mut mx = [f32::NEG_INFINITY; 3];
+        let mut any_bounds = false;
+
+        for (item_def, runtime) in self.def.effects.iter().zip(self.items.iter_mut()) {
+            if let Some(eff) = &mut runtime.effect {
+                let parent_xform = eff.world_xform;
+                let parent_use_xform = eff.use_world_xform;
+                let report = eff.step_with_collision(
+                    dt_ms,
+                    static_cform,
+                    config,
+                    &mut dynamic_raycast,
+                    &mut on_hit,
+                );
+                all_hits.extend(report.hits);
+                let events = report.step_events;
+
+                for ev in &events.died {
+                    if (item_def.flags & pg_effect_flags::FL_ON_PLAY_CHILD) != 0
+                        && ev.slot_index < runtime.related_children.len()
+                    {
+                        let mut stopped = runtime.related_children.swap_remove(ev.slot_index);
+                        stopped.stop(true);
+                        runtime.free_children.push(stopped);
+                    }
+                    if (item_def.flags & pg_effect_flags::FL_ON_DEAD_CHILD) != 0
+                        && !item_def.on_dead_child.is_empty()
+                        && let Some(cdef) = lib.find_effect(&item_def.on_dead_child)
+                    {
+                        self.child_seed_counter = self.child_seed_counter.wrapping_add(1);
+                        let child = spawn_child_effect(
+                            cdef.clone(),
+                            &ev.particle,
+                            parent_xform,
+                            parent_use_xform,
+                            self.child_seed_counter,
+                        );
+                        runtime.free_children.push(child);
+                    }
+                }
+
+                for ev in &events.born {
+                    if (item_def.flags & pg_effect_flags::FL_ON_BIRTH_CHILD) != 0
+                        && !item_def.on_birth_child.is_empty()
+                        && let Some(cdef) = lib.find_effect(&item_def.on_birth_child)
+                    {
+                        self.child_seed_counter = self.child_seed_counter.wrapping_add(1);
+                        let child = spawn_child_effect(
+                            cdef.clone(),
+                            &ev.particle,
+                            parent_xform,
+                            parent_use_xform,
+                            self.child_seed_counter,
+                        );
+                        runtime.free_children.push(child);
+                    }
+                    if (item_def.flags & pg_effect_flags::FL_ON_PLAY_CHILD) != 0
+                        && !item_def.on_play_child.is_empty()
+                        && let Some(cdef) = lib.find_effect(&item_def.on_play_child)
+                    {
+                        self.child_seed_counter = self.child_seed_counter.wrapping_add(1);
+                        let child = spawn_child_effect(
+                            cdef.clone(),
+                            &ev.particle,
+                            parent_xform,
+                            parent_use_xform,
+                            self.child_seed_counter,
+                        );
+                        runtime.related_children.push(child);
+                    }
+                }
+
+                if eff.is_playing() {
+                    any_playing = true;
+                    let (bmn, bmx) = eff.bounds_aabb();
+                    merge_aabb(&mut mn, &mut mx, bmn, bmx);
+                    any_bounds = true;
+                    if (item_def.flags & pg_effect_flags::FL_ON_PLAY_CHILD) != 0
+                        && !item_def.on_play_child.is_empty()
+                    {
+                        for (p, child) in eff
+                            .particles()
+                            .iter()
+                            .zip(runtime.related_children.iter_mut())
+                        {
+                            let child_fstep = (child.def.update_step_ms.max(1) as f32) / 1000.0;
+                            let mut m = XRAY_IDENTITY_MATRIX;
+                            m[3][0] = p.pos[0];
+                            m[3][1] = p.pos[1];
+                            m[3][2] = p.pos[2];
+                            let v = scale3(sub3(p.pos, p.pos_b), 1.0 / child_fstep);
+                            child.update_parent(m, v, false);
+                        }
+                    }
+                }
+            }
+
+            let rewind = (item_def.flags & pg_effect_flags::FL_ON_PLAY_CHILD_REWIND) != 0;
+            for child in &mut runtime.related_children {
+                let crep = child.step_with_collision(
+                    dt_ms,
+                    static_cform,
+                    config,
+                    &mut dynamic_raycast,
+                    &mut on_hit,
+                );
+                all_hits.extend(crep.hits);
+                if child.is_playing() {
+                    any_playing = true;
+                    let (bmn, bmx) = child.bounds_aabb();
+                    merge_aabb(&mut mn, &mut mx, bmn, bmx);
+                    any_bounds = true;
+                } else if rewind {
+                    child.play();
+                }
+            }
+
+            for child in &mut runtime.free_children {
+                let crep = child.step_with_collision(
+                    dt_ms,
+                    static_cform,
+                    config,
+                    &mut dynamic_raycast,
+                    &mut on_hit,
+                );
+                all_hits.extend(crep.hits);
+                if child.is_playing() {
+                    any_playing = true;
+                    let (bmn, bmx) = child.bounds_aabb();
+                    merge_aabb(&mut mn, &mut mx, bmn, bmx);
+                    any_bounds = true;
+                }
+            }
+            runtime.free_children.retain(ParticleEffectInstance::is_playing);
+        }
+
+        if self.deferred_stop && !any_playing {
+            self.playing = false;
+            self.deferred_stop = false;
+        }
+        if any_bounds {
+            self.bounds_min = mn;
+            self.bounds_max = mx;
+        }
+        all_hits
+    }
+
     /// Collect all live billboard instances organized by effect shader/texture batch.
     pub fn emit_billboards(
         &self,
@@ -2699,5 +3437,240 @@ mod tests {
         grp.step(50, &lib);
         let batches2 = grp.emit_billboards([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
         assert!(batches2.iter().any(|b| b.effect_name == "grp\\smoke"));
+    }
+
+    #[test]
+    fn test_particle_cform_collision_bounce_cutoff_delete_callback_and_deflectors() {
+        use crate::cform::{CformModel, CformTriangle};
+
+        // Horizontal floor quad at y = 0.0 (winding gives +Y mknormal: (v1-v0)x(v2-v0))
+        // v0=(-5,0,-5), v1=(5,0,-5), v2=(5,0,5), v3=(-5,0,5)
+        // Triangle 0: [v0, v2, v1] -> (10,0,10) x (10,0,0) = (0, 100, 0) -> normal +Y!
+        let verts = vec![
+            [-5.0, 0.0, -5.0],
+            [5.0, 0.0, -5.0],
+            [5.0, 0.0, 5.0],
+            [-5.0, 0.0, 5.0],
+        ];
+        let tris = vec![
+            CformTriangle {
+                verts: [0, 2, 1],
+                material: 7,
+                suppress_shadows: false,
+                suppress_wm: false,
+                sector: 0,
+            },
+            CformTriangle {
+                verts: [0, 3, 2],
+                material: 7,
+                suppress_shadows: false,
+                suppress_wm: false,
+                sector: 0,
+            },
+        ];
+        let cform = CformModel::from_parts(verts, tris).unwrap();
+        let bvh = cform.build_bvh();
+
+        // 1) Static floor bounce with tangential cutoff + friction
+        let bounce_def = ParticleEffectDef {
+            name: "fx\\spark_bounce".to_string(),
+            flags: ped_flags::DF_COLLISION | ped_flags::DF_SPRITE,
+            max_particles: 8,
+            update_step_ms: 100,
+            shader: None,
+            texture: None,
+            frame: None,
+            time_limit: None,
+            collision: Some(ParticleCollisionParams {
+                one_minus_friction: 0.5,
+                resilience: 0.8,
+                sqr_cutoff: 1.0,
+            }),
+            velocity_scale: None,
+            align_to_path_rotation: None,
+            actions: vec![CompiledParticleAction {
+                outer_type: 12,
+                flags: 0,
+                inner_type: 12,
+                kind: ParticleActionKind::Move,
+            }],
+        };
+
+        let mut inst = ParticleEffectInstance::new(bounce_def.clone(), 1);
+        inst.play();
+        inst.particles.push(ParticleState {
+            pos: [0.0, 0.5, 0.0],
+            pos_b: [0.0, 0.5, 0.0],
+            vel: [2.0, -10.0, 0.0], // tangential vel^2 = 4.0 > sqr_cutoff(1.0)
+            size: [0.1; 3],
+            rot: [0.0; 3],
+            color_rgba: [1.0; 4],
+            age: 0.0,
+            frame_q8: 0,
+            animate_ccw: false,
+        });
+        inst.particles.push(ParticleState {
+            pos: [1.0, 0.5, 0.0],
+            pos_b: [1.0, 0.5, 0.0],
+            vel: [0.5, -10.0, 0.0], // tangential vel^2 = 0.25 <= sqr_cutoff(1.0) -> no friction
+            size: [0.1; 3],
+            rot: [0.0; 3],
+            color_rgba: [1.0; 4],
+            age: 0.0,
+            frame_q8: 0,
+            animate_ccw: false,
+        });
+
+        let report = inst.step_fixed_dt_with_collision(
+            0.1,
+            Some(&bvh),
+            ParticleCollisionConfig {
+                cull_backfaces: true,
+            },
+            |_, _, _| None,
+            |_| true,
+        );
+        assert_eq!(report.hits.len(), 2);
+        assert!(report.hits.iter().all(|h| h.material == 7 && !h.is_dynamic));
+        assert!((report.hits[0].normal[1] - 1.0).abs() < 1e-5);
+        // Particle 0 reflected: vt *= 0.5 => 1.0, vn *= -0.8 => +8.0
+        assert!((inst.particles()[0].vel[0] - 1.0).abs() < 1e-5);
+        assert!((inst.particles()[0].vel[1] - 8.0).abs() < 1e-5);
+        // Particle 1 cutoff: vt preserved => 0.5, vn *= -0.8 => +8.0
+        assert!((inst.particles()[1].vel[0] - 0.5).abs() < 1e-5);
+        assert!((inst.particles()[1].vel[1] - 8.0).abs() < 1e-5);
+
+        // 2) Double-bounce corner within single step (floor y=0 + ceiling y=0.6)
+        let corner_verts = vec![
+            [-5.0, 0.0, -5.0],
+            [5.0, 0.0, -5.0],
+            [5.0, 0.0, 5.0],
+            [-5.0, 0.0, 5.0],
+            [-5.0, 0.6, -5.0],
+            [5.0, 0.6, 5.0],
+            [5.0, 0.6, -5.0],
+        ];
+        let corner_tris = vec![
+            CformTriangle {
+                verts: [0, 2, 1],
+                material: 1,
+                suppress_shadows: false,
+                suppress_wm: false,
+                sector: 0,
+            },
+            CformTriangle {
+                verts: [0, 3, 2],
+                material: 1,
+                suppress_shadows: false,
+                suppress_wm: false,
+                sector: 0,
+            },
+            CformTriangle {
+                verts: [4, 6, 5],
+                material: 2,
+                suppress_shadows: false,
+                suppress_wm: false,
+                sector: 0,
+            },
+        ];
+        let corner_cform = CformModel::from_parts(corner_verts, corner_tris).unwrap();
+        let corner_bvh = corner_cform.build_bvh();
+        let mut corner_inst = ParticleEffectInstance::new(bounce_def.clone(), 2);
+        corner_inst.play();
+        corner_inst.particles.push(ParticleState {
+            pos: [0.0, 0.2, 0.0],
+            pos_b: [0.0, 0.2, 0.0],
+            vel: [0.0, -10.0, 0.0], // moves to y=-0.8 -> bounces upward (+8.0) -> hits ceiling y=0.6 at 0.2+0.8=1.0 -> bounces down (-6.4)!
+            size: [0.1; 3],
+            rot: [0.0; 3],
+            color_rgba: [1.0; 4],
+            age: 0.0,
+            frame_q8: 0,
+            animate_ccw: false,
+        });
+        let corner_rep = corner_inst.step_fixed_dt_with_collision(
+            0.1,
+            Some(&corner_bvh),
+            ParticleCollisionConfig {
+                cull_backfaces: false,
+            },
+            |_, _, _| None,
+            |_| true,
+        );
+        // C++ callback only fires on pick_cnt == 1, while second bounce still reflects velocity
+        assert_eq!(corner_rep.hits.len(), 1);
+        assert!((corner_inst.particles()[0].vel[1] - (-6.4)).abs() < 1e-4);
+
+        // 3) DF_COLLISION_DEL + DF_COLLISION_DYN + callback false abort
+        let mut del_def = bounce_def;
+        del_def.flags =
+            ped_flags::DF_COLLISION | ped_flags::DF_COLLISION_DEL | ped_flags::DF_COLLISION_DYN;
+        let mut del_inst = ParticleEffectInstance::new(del_def, 3);
+        del_inst.play();
+        del_inst.particles.push(ParticleState {
+            pos: [0.0, 10.0, 0.0],
+            pos_b: [0.0, 10.0, 0.0],
+            vel: [0.0, -2.0, 0.0],
+            size: [0.1; 3],
+            rot: [0.0; 3],
+            color_rgba: [1.0; 4],
+            age: 0.0,
+            frame_q8: 0,
+            animate_ccw: false,
+        });
+        let del_rep = del_inst.step_fixed_dt_with_collision(
+            0.5,
+            Some(&bvh),
+            ParticleCollisionConfig::default(),
+            |orig, dir, max_r| {
+                if orig[1] > 9.0 && dir[1] < 0.0 && max_r >= 0.5 {
+                    Some(ParticleDynamicHit {
+                        range: 0.5,
+                        point: [orig[0], orig[1] - 0.5, orig[2]],
+                        normal: [0.0, 1.0, 0.0],
+                    })
+                } else {
+                    None
+                }
+            },
+            |_| true,
+        );
+        assert_eq!(del_rep.hits.len(), 1);
+        assert!(del_rep.hits[0].is_dynamic);
+        assert_eq!(del_rep.step_events.died.len(), 1);
+        assert!(del_inst.particles().is_empty());
+
+        // 4) Domain deflector intersection tests (Plane, Sphere, Box, Rectangle)
+        let plane = ParticleDomain::from_editor_params(
+            ParticleDomainType::Plane,
+            [0.0, 2.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let phit = intersect_segment_domain([0.0, 4.0, 0.0], [0.0, 0.0, 0.0], &plane).unwrap();
+        assert!((phit.t - 0.5).abs() < 1e-5);
+        assert!((phit.point[1] - 2.0).abs() < 1e-5);
+
+        let sphere = ParticleDomain::from_editor_params(
+            ParticleDomainType::Sphere,
+            [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let shit = intersect_segment_domain([-2.0, 0.0, 0.0], [0.0, 0.0, 0.0], &sphere).unwrap();
+        assert!((shit.t - 0.5).abs() < 1e-5);
+        assert!((shit.point[0] - (-1.0)).abs() < 1e-5);
+        assert!((shit.normal[0] - (-1.0)).abs() < 1e-5);
+
+        let rect = ParticleDomain::from_editor_params(
+            ParticleDomainType::Rectangle,
+            [-1.0, 0.0, -1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0],
+        );
+        assert!(intersect_segment_domain([0.0, 1.0, 0.0], [0.0, -1.0, 0.0], &rect).is_some());
+        assert!(intersect_segment_domain([5.0, 1.0, 0.0], [5.0, -1.0, 0.0], &rect).is_none());
+
+        let bx = ParticleDomain::from_editor_params(
+            ParticleDomainType::Box,
+            [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+        );
+        let bhit = intersect_segment_domain([-3.0, 0.0, 0.0], [0.0, 0.0, 0.0], &bx).unwrap();
+        assert!((bhit.point[0] - (-1.0)).abs() < 1e-5);
+        assert_eq!(bhit.normal, [-1.0, 0.0, 0.0]);
     }
 }

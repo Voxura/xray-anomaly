@@ -1417,6 +1417,286 @@ pub fn build_accum_direct_lum_quad(width: u32, height: u32) -> [AccumDirectLumVe
     ]
 }
 
+// ============================================================================
+// Phase 15 DX12 3-Split Cascaded Shadow Map (CSM) Atlas Helpers
+// ============================================================================
+
+/// Atlas tiling layout for the 3-split CSM shadow atlas in DX12 Phase 15.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsmAtlasPacking {
+    /// Horizontal 3x1 strip: width = `3 * tile_size`, height = `tile_size`.
+    Row3x1,
+    /// Vertical 1x3 strip: width = `tile_size`, height = `3 * tile_size`.
+    Column1x3,
+    /// Power-of-two 2x2 grid (`2 * tile_size` x `2 * tile_size`) using slots `(0,0), (1,0), (0,1)`.
+    Quad2x2,
+}
+
+/// Per-cascade atlas viewport, UV sub-rectangle, and GPU transforms inside a 3-split CSM atlas.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CsmCascadeAtlasSlot {
+    pub cascade_index: u32,
+    /// Cascade world-space size (`split_distance`, default `[20.0, 40.0, 160.0]`).
+    pub split_distance: f32,
+    pub depth_bias: f32,
+    /// World meters covered by a single shadow texel (`split_distance / tile_size`).
+    pub texel_world_size: f32,
+    /// Pixel viewport `[x, y, width, height]` inside the shadow atlas texture.
+    pub viewport_px: [u32; 4],
+    /// `[scale_u, scale_v, offset_u, offset_v]` mapping `[0, 1]^2` cascade UV into atlas UV.
+    pub atlas_uv_scale_offset: [f32; 4],
+    /// Half-texel inset `[min_u, min_v, max_u, max_v]` preventing PCF bleed across tiles.
+    pub texel_clamp_uv_bounds: [f32; 4],
+    /// Row-vector X-Ray view-projection matrix for this cascade.
+    pub view_proj: XRayMatrix,
+    /// Transposed column-major matrix (`transpose(view_proj)`) for HLSL `mul(M, float4(pos, 1))`.
+    pub col_major_view_proj: [[f32; 4]; 4],
+}
+
+/// Result of cross-cascade split selection and boundary cross-fade computation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CsmCascadeBlend {
+    /// Primary cascade index (`0..=2`), or `None` when depth exceeds the far cascade limit.
+    pub primary: Option<usize>,
+    /// Adjacent next cascade index (`1` or `2`) when within the fade band, if any.
+    pub secondary: Option<usize>,
+    /// Linear blend factor in `[0.0, 1.0]` toward `secondary` (`0.0` = 100% `primary`).
+    pub secondary_weight: f32,
+}
+
+/// Complete 3-split CSM atlas allocation and GPU upload descriptor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CsmAtlasPlan {
+    pub atlas_width: u32,
+    pub atlas_height: u32,
+    pub tile_size: u32,
+    pub packing: CsmAtlasPacking,
+    pub split_distances: [f32; 3],
+    pub blend_band_fraction: f32,
+    pub slots: [CsmCascadeAtlasSlot; 3],
+}
+
+/// 512-byte `#[repr(C, align(256))]` GPU constant buffer for DX12 Phase 15 3-split CSM evaluation.
+#[repr(C, align(256))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpuCsmSplitUniforms {
+    /// Column-major shadow `view_proj` per cascade (`mul(cascade_view_proj[i], float4(pos_ws, 1))`).
+    pub cascade_view_proj: [[[f32; 4]; 4]; 3],
+    /// Per-cascade atlas sub-rect `[scale_u, scale_v, offset_u, offset_v]`.
+    pub atlas_uv_scale_offset: [[f32; 4]; 3],
+    /// Per-cascade half-texel clamp `[min_u, min_v, max_u, max_v]`.
+    pub cascade_uv_clamp: [[f32; 4]; 3],
+    /// `[depth_bias, texel_world_size, split_distance, cascade_index as f32]`.
+    pub cascade_bias_texel: [[f32; 4]; 3],
+    /// `[split0, split1, split2, blend_band_fraction]`.
+    pub split_distances_and_blend: [f32; 4],
+    /// `[atlas_width, atlas_height, 1.0 / atlas_width, 1.0 / atlas_height]`.
+    pub atlas_dims_inv: [f32; 4],
+    pub padding: [f32; 36],
+}
+
+const _: () = assert!(std::mem::size_of::<GpuCsmSplitUniforms>() == 512);
+const _: () = assert!(std::mem::align_of::<GpuCsmSplitUniforms>() == 256);
+
+impl CsmAtlasPlan {
+    /// Pack this plan into a 512-byte GPU-aligned `GpuCsmSplitUniforms` CBV payload.
+    pub fn to_gpu_uniforms(&self) -> GpuCsmSplitUniforms {
+        let mut cascade_view_proj = [XRAY_IDENTITY_MATRIX; 3];
+        let mut atlas_uv_scale_offset = [[0.0f32; 4]; 3];
+        let mut cascade_uv_clamp = [[0.0f32; 4]; 3];
+        let mut cascade_bias_texel = [[0.0f32; 4]; 3];
+        for (i, slot) in self.slots.iter().enumerate() {
+            cascade_view_proj[i] = slot.col_major_view_proj;
+            atlas_uv_scale_offset[i] = slot.atlas_uv_scale_offset;
+            cascade_uv_clamp[i] = slot.texel_clamp_uv_bounds;
+            cascade_bias_texel[i] = [
+                slot.depth_bias,
+                slot.texel_world_size,
+                slot.split_distance,
+                slot.cascade_index as f32,
+            ];
+        }
+        GpuCsmSplitUniforms {
+            cascade_view_proj,
+            atlas_uv_scale_offset,
+            cascade_uv_clamp,
+            cascade_bias_texel,
+            split_distances_and_blend: [
+                self.split_distances[0],
+                self.split_distances[1],
+                self.split_distances[2],
+                self.blend_band_fraction,
+            ],
+            atlas_dims_inv: [
+                self.atlas_width as f32,
+                self.atlas_height as f32,
+                1.0 / (self.atlas_width.max(1) as f32),
+                1.0 / (self.atlas_height.max(1) as f32),
+            ],
+            padding: [0.0; 36],
+        }
+    }
+}
+
+/// Select active cascade index `[0..=2]` from positive view-space depth and split distances.
+#[inline]
+pub fn select_csm_cascade(view_depth: f32, split_distances: &[f32; 3]) -> Option<usize> {
+    if view_depth < 0.0 || view_depth > split_distances[2] {
+        return None;
+    }
+    if view_depth <= split_distances[0] {
+        Some(0)
+    } else if view_depth <= split_distances[1] {
+        Some(1)
+    } else {
+        Some(2)
+    }
+}
+
+/// Compute primary cascade and smooth cross-fade blend weight near split boundaries.
+#[inline]
+pub fn compute_csm_cascade_blend(
+    view_depth: f32,
+    split_distances: &[f32; 3],
+    blend_band_fraction: f32,
+) -> CsmCascadeBlend {
+    let Some(primary) = select_csm_cascade(view_depth, split_distances) else {
+        return CsmCascadeBlend {
+            primary: None,
+            secondary: None,
+            secondary_weight: 0.0,
+        };
+    };
+    let frac = blend_band_fraction.clamp(0.0, 0.5);
+    if primary >= 2 || frac <= 1e-5 {
+        return CsmCascadeBlend {
+            primary: Some(primary),
+            secondary: None,
+            secondary_weight: 0.0,
+        };
+    }
+    let split = split_distances[primary];
+    let band_width = (split * frac).max(1e-4);
+    let band_start = (split - band_width).max(0.0);
+    if view_depth > band_start {
+        let t = ((view_depth - band_start) / band_width).clamp(0.0, 1.0);
+        CsmCascadeBlend {
+            primary: Some(primary),
+            secondary: Some(primary + 1),
+            secondary_weight: t,
+        }
+    } else {
+        CsmCascadeBlend {
+            primary: Some(primary),
+            secondary: None,
+            secondary_weight: 0.0,
+        }
+    }
+}
+
+/// Build a complete 3-split CSM atlas plan using [`compute_sun_cascades`] and atlas packing.
+#[allow(clippy::too_many_arguments)]
+pub fn build_3split_csm_atlas(
+    config: &SunCascadeConfig,
+    cam_pos: [f32; 3],
+    cam_dir: [f32; 3],
+    view: &XRayMatrix,
+    proj: &XRayMatrix,
+    sun_pos: [f32; 3],
+    sun_dir: [f32; 3],
+    tile_size: u32,
+    packing: CsmAtlasPacking,
+    blend_band_fraction: f32,
+    sunshafts_active: bool,
+) -> Option<CsmAtlasPlan> {
+    let tile = tile_size.max(1);
+    let cascades = compute_sun_cascades(
+        config,
+        cam_pos,
+        cam_dir,
+        view,
+        proj,
+        sun_pos,
+        sun_dir,
+        tile,
+        sunshafts_active,
+    );
+    if cascades.len() < 3 {
+        return None;
+    }
+
+    let (atlas_width, atlas_height, tile_origins) = match packing {
+        CsmAtlasPacking::Row3x1 => (tile * 3, tile, [[0, 0], [tile, 0], [tile * 2, 0]]),
+        CsmAtlasPacking::Column1x3 => (tile, tile * 3, [[0, 0], [0, tile], [0, tile * 2]]),
+        CsmAtlasPacking::Quad2x2 => (tile * 2, tile * 2, [[0, 0], [tile, 0], [0, tile]]),
+    };
+
+    let aw = atlas_width as f32;
+    let ah = atlas_height as f32;
+    let half_u = 0.5 / aw;
+    let half_v = 0.5 / ah;
+    let tf = tile as f32;
+
+    let build_slot = |idx: usize| -> CsmCascadeAtlasSlot {
+        let c = &cascades[idx];
+        let [ox, oy] = tile_origins[idx];
+        let scale_u = tf / aw;
+        let scale_v = tf / ah;
+        let off_u = (ox as f32) / aw;
+        let off_v = (oy as f32) / ah;
+        CsmCascadeAtlasSlot {
+            cascade_index: idx as u32,
+            split_distance: c.size,
+            depth_bias: c.bias,
+            texel_world_size: c.size / tf,
+            viewport_px: [ox, oy, tile, tile],
+            atlas_uv_scale_offset: [scale_u, scale_v, off_u, off_v],
+            texel_clamp_uv_bounds: [
+                off_u + half_u,
+                off_v + half_v,
+                off_u + scale_u - half_u,
+                off_v + scale_v - half_v,
+            ],
+            view_proj: c.view_proj,
+            col_major_view_proj: crate::camera::matrix_transpose_44(&c.view_proj),
+        }
+    };
+
+    Some(CsmAtlasPlan {
+        atlas_width,
+        atlas_height,
+        tile_size: tile,
+        packing,
+        split_distances: [cascades[0].size, cascades[1].size, cascades[2].size],
+        blend_band_fraction: blend_band_fraction.clamp(0.0, 0.5),
+        slots: [build_slot(0), build_slot(1), build_slot(2)],
+    })
+}
+
+/// Project a world-space point into `[atlas_u, atlas_v, biased_depth]` for a CSM cascade slot,
+/// returning `None` if outside the cascade frustum.
+pub fn project_world_to_csm_atlas(
+    world_pos: [f32; 3],
+    slot: &CsmCascadeAtlasSlot,
+    extra_depth_bias: f32,
+) -> Option<[f32; 3]> {
+    let ndc = matrix_transform_projected(&slot.view_proj, world_pos)?;
+    if !(-1.0..=1.0).contains(&ndc[0])
+        || !(-1.0..=1.0).contains(&ndc[1])
+        || !(0.0..=1.0).contains(&ndc[2])
+    {
+        return None;
+    }
+    let local_u = ndc[0] * 0.5 + 0.5;
+    let local_v = 1.0 - (ndc[1] * 0.5 + 0.5);
+    let u = (local_u * slot.atlas_uv_scale_offset[0] + slot.atlas_uv_scale_offset[2])
+        .clamp(slot.texel_clamp_uv_bounds[0], slot.texel_clamp_uv_bounds[2]);
+    let v = (local_v * slot.atlas_uv_scale_offset[1] + slot.atlas_uv_scale_offset[3])
+        .clamp(slot.texel_clamp_uv_bounds[1], slot.texel_clamp_uv_bounds[3]);
+    let depth = (ndc[2] + slot.depth_bias - extra_depth_bias).clamp(0.0, 1.0);
+    Some([u, v, depth])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1669,5 +1949,63 @@ mod tests {
         assert!((quad[0].p[1] - (720.0 + EPS)).abs() < 1e-6);
         assert!((quad[3].p[0] - (1280.0 + EPS)).abs() < 1e-6);
         assert!((quad[2].uv_j[0] - (1280.0 / 64.0 + 0.5 / 64.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn phase15_3split_csm_atlas_packing_selection_and_projection() {
+        let view = matrix_build_camera_dir([0.0, 1.7, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]);
+        let proj = matrix_build_projection(75.0f32.to_radians(), 9.0 / 16.0, 0.2, 300.0);
+        let sun_dir = normalize3_or([0.3, -0.8, 0.5], [0.0, -1.0, 0.0]);
+        let cfg = SunCascadeConfig::default();
+
+        let cam_pos = [0.0, 1.7, 0.0];
+        let sun_pos = [
+            cam_pos[0] - sun_dir[0] * 500.0,
+            cam_pos[1] - sun_dir[1] * 500.0,
+            cam_pos[2] - sun_dir[2] * 500.0,
+        ];
+        let plan = build_3split_csm_atlas(
+            &cfg,
+            cam_pos,
+            [0.0, 0.0, 1.0],
+            &view,
+            &proj,
+            sun_pos,
+            sun_dir,
+            1024,
+            CsmAtlasPacking::Row3x1,
+            0.1,
+            false,
+        )
+        .expect("3-split CSM plan built");
+        assert_eq!(plan.atlas_width, 3072);
+        assert_eq!(plan.atlas_height, 1024);
+        assert_eq!(plan.slots[0].viewport_px, [0, 0, 1024, 1024]);
+        assert_eq!(plan.slots[1].viewport_px, [1024, 0, 1024, 1024]);
+        assert_eq!(plan.slots[2].viewport_px, [2048, 0, 1024, 1024]);
+        assert!((plan.slots[1].atlas_uv_scale_offset[2] - (1.0 / 3.0)).abs() < 1e-6);
+        assert!((plan.slots[0].texel_world_size - (20.0 / 1024.0)).abs() < 1e-6);
+
+        let gpu = plan.to_gpu_uniforms();
+        assert_eq!(std::mem::size_of::<GpuCsmSplitUniforms>(), 512);
+        assert_eq!(gpu.split_distances_and_blend, [20.0, 40.0, 160.0, 0.1]);
+
+        assert_eq!(select_csm_cascade(10.0, &plan.split_distances), Some(0));
+        assert_eq!(select_csm_cascade(35.0, &plan.split_distances), Some(1));
+        assert_eq!(select_csm_cascade(120.0, &plan.split_distances), Some(2));
+        assert_eq!(select_csm_cascade(180.0, &plan.split_distances), None);
+
+        let blend = compute_csm_cascade_blend(19.0, &plan.split_distances, 0.1);
+        assert_eq!(blend.primary, Some(0));
+        assert_eq!(blend.secondary, Some(1));
+        assert!((blend.secondary_weight - 0.5).abs() < 1e-5);
+
+        let pt_near = [0.0, 1.7, 5.0];
+        let raw_ndc = matrix_transform_projected(&plan.slots[0].view_proj, pt_near);
+        let uvz = project_world_to_csm_atlas(pt_near, &plan.slots[0], 0.0005)
+            .unwrap_or_else(|| panic!("pt_near outside cascade 0 frustum: ndc={raw_ndc:?}"));
+        assert!(uvz[0] > 0.0 && uvz[0] < (1.0 / 3.0));
+        assert!(uvz[1] > 0.0 && uvz[1] < 1.0);
+        assert!(uvz[2] >= 0.0 && uvz[2] <= 1.0);
     }
 }

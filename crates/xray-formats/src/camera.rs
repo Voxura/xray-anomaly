@@ -339,6 +339,452 @@ impl RenderXforms {
     }
 }
 
+// ============================================================================
+// Phase 14/15 DX12 G-Buffer MRT Codecs & Depth/World-Pos Decompression
+// ============================================================================
+
+/// Transpose a 4x4 matrix (converts between X-Ray row-vector matrices and DX12 column-major
+/// HLSL column-vector matrices).
+#[inline]
+pub fn matrix_transpose_44(m: &XRayMatrix) -> XRayMatrix {
+    [
+        [m[0][0], m[1][0], m[2][0], m[3][0]],
+        [m[0][1], m[1][1], m[2][1], m[3][1]],
+        [m[0][2], m[1][2], m[2][2], m[3][2]],
+        [m[0][3], m[1][3], m[2][3], m[3][3]],
+    ]
+}
+
+/// Convert a normalized `[0.0, 1.0]` float into an 8-bit `R8G8B8A8_UNORM` channel.
+#[inline]
+pub fn f32_to_unorm8(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u8
+}
+
+/// Convert an 8-bit `R8G8B8A8_UNORM` channel into a normalized `[0.0, 1.0]` float.
+#[inline]
+pub fn unorm8_to_f32(v: u8) -> f32 {
+    f32::from(v) / 255.0
+}
+
+/// Pack DX12 G-Buffer `SV_Target0` (`RGBA8_UNORM`: RGB = albedo, A = ambient occlusion)
+/// matching `crates/xray-render-dx12/shaders/gbuffer.hlsl:96`.
+#[inline]
+pub fn pack_gbuffer_albedo_ao(albedo: [f32; 3], occlusion: f32) -> [u8; 4] {
+    [
+        f32_to_unorm8(albedo[0]),
+        f32_to_unorm8(albedo[1]),
+        f32_to_unorm8(albedo[2]),
+        f32_to_unorm8(occlusion),
+    ]
+}
+
+/// Unpack DX12 G-Buffer `SV_Target0` into linear `(albedo, occlusion)`.
+#[inline]
+pub fn unpack_gbuffer_albedo_ao(rgba: [u8; 4]) -> ([f32; 3], f32) {
+    (
+        [
+            unorm8_to_f32(rgba[0]),
+            unorm8_to_f32(rgba[1]),
+            unorm8_to_f32(rgba[2]),
+        ],
+        unorm8_to_f32(rgba[3]),
+    )
+}
+
+/// Pack DX12 G-Buffer `SV_Target1` (`RGBA8_UNORM`: XYZ = `normal * 0.5 + 0.5`, W = roughness)
+/// matching `gbuffer.hlsl:97`.
+#[inline]
+pub fn pack_gbuffer_normal_roughness(normal: [f32; 3], roughness: f32) -> [u8; 4] {
+    let n = normalize3_or(normal, [0.0, 1.0, 0.0]);
+    [
+        f32_to_unorm8(n[0] * 0.5 + 0.5),
+        f32_to_unorm8(n[1] * 0.5 + 0.5),
+        f32_to_unorm8(n[2] * 0.5 + 0.5),
+        f32_to_unorm8(roughness),
+    ]
+}
+
+/// Unpack DX12 G-Buffer `SV_Target1` into normalized world-space `(normal, roughness)`
+/// matching `deferred_combine.hlsl:106-107`.
+#[inline]
+pub fn unpack_gbuffer_normal_roughness(rgba: [u8; 4]) -> ([f32; 3], f32) {
+    let raw = [
+        unorm8_to_f32(rgba[0]) * 2.0 - 1.0,
+        unorm8_to_f32(rgba[1]) * 2.0 - 1.0,
+        unorm8_to_f32(rgba[2]) * 2.0 - 1.0,
+    ];
+    (normalize3_or(raw, [0.0, 1.0, 0.0]), unorm8_to_f32(rgba[3]))
+}
+
+/// Pack DX12 G-Buffer `SV_Target2` (`RGBA8_UNORM`: R = metallic, G = roughness, B = specular, A = material_id)
+/// matching `gbuffer.hlsl:98`.
+#[inline]
+pub fn pack_gbuffer_material(
+    metallic: f32,
+    roughness: f32,
+    specular: f32,
+    material_id: u8,
+) -> [u8; 4] {
+    [
+        f32_to_unorm8(metallic),
+        f32_to_unorm8(roughness),
+        f32_to_unorm8(specular),
+        material_id,
+    ]
+}
+
+/// Unpack DX12 G-Buffer `SV_Target2` into `(metallic, roughness, specular, material_id)`.
+#[inline]
+pub fn unpack_gbuffer_material(rgba: [u8; 4]) -> (f32, f32, f32, u8) {
+    (
+        unorm8_to_f32(rgba[0]),
+        unorm8_to_f32(rgba[1]),
+        unorm8_to_f32(rgba[2]),
+        rgba[3],
+    )
+}
+
+/// Transform a sampled tangent-space normal (`[0, 1]` RGB) into world space using G-Buffer TBN basis
+/// (`gbuffer.hlsl:78-81`: `bitangent = cross(normal_ws, tangent_ws.xyz) * tangent_ws.w`).
+pub fn decode_tangent_space_normal(
+    normal_ws: [f32; 3],
+    tangent_ws: [f32; 4],
+    normal_sample_rgb: [f32; 3],
+) -> [f32; 3] {
+    let n = normalize3_or(normal_ws, [0.0, 1.0, 0.0]);
+    let t = normalize3_or([tangent_ws[0], tangent_ws[1], tangent_ws[2]], [1.0, 0.0, 0.0]);
+    let b_raw = cross3(n, t);
+    let b = [
+        b_raw[0] * tangent_ws[3],
+        b_raw[1] * tangent_ws[3],
+        b_raw[2] * tangent_ws[3],
+    ];
+    let nm = [
+        normal_sample_rgb[0] * 2.0 - 1.0,
+        normal_sample_rgb[1] * 2.0 - 1.0,
+        normal_sample_rgb[2] * 2.0 - 1.0,
+    ];
+    let combined = [
+        nm[0] * t[0] + nm[1] * b[0] + nm[2] * n[0],
+        nm[0] * t[1] + nm[1] * b[1] + nm[2] * n[1],
+        nm[0] * t[2] + nm[1] * b[2] + nm[2] * n[2],
+    ];
+    normalize3_or(combined, n)
+}
+
+/// Reconstruct a unit tangent-space normal from 2-channel BC5/DXT5nm `(x, y)` normalized texture samples.
+#[inline]
+pub fn decode_bc5_normal_xy(x_unorm: f32, y_unorm: f32) -> [f32; 3] {
+    let x = x_unorm * 2.0 - 1.0;
+    let y = y_unorm * 2.0 - 1.0;
+    let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+    normalize3_or([x, y, z], [0.0, 0.0, 1.0])
+}
+
+/// Decoded logical surface sample across DX12's 3 G-Buffer MRTs (`SV_Target0..=2`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GbufferMrtPixel {
+    pub albedo: [f32; 3],
+    pub occlusion: f32,
+    pub normal: [f32; 3],
+    pub metallic: f32,
+    pub roughness: f32,
+    pub specular: f32,
+    pub material_id: u8,
+}
+
+impl Default for GbufferMrtPixel {
+    fn default() -> Self {
+        Self {
+            albedo: [0.0; 3],
+            occlusion: 1.0,
+            normal: [0.0, 1.0, 0.0],
+            metallic: 0.0,
+            roughness: 0.5,
+            specular: 0.04,
+            material_id: u8::MAX,
+        }
+    }
+}
+
+/// Packed `R8G8B8A8_UNORM` pixel triplet matching DX12 G-Buffer targets (`SV_Target0..=2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GbufferMrtEncoded {
+    pub rt0_albedo_ao: [u8; 4],
+    pub rt1_normal_roughness: [u8; 4],
+    pub rt2_material: [u8; 4],
+}
+
+impl GbufferMrtPixel {
+    pub fn encode(&self) -> GbufferMrtEncoded {
+        GbufferMrtEncoded {
+            rt0_albedo_ao: pack_gbuffer_albedo_ao(self.albedo, self.occlusion),
+            rt1_normal_roughness: pack_gbuffer_normal_roughness(self.normal, self.roughness),
+            rt2_material: pack_gbuffer_material(
+                self.metallic,
+                self.roughness,
+                self.specular,
+                self.material_id,
+            ),
+        }
+    }
+
+    pub fn decode(enc: &GbufferMrtEncoded) -> Self {
+        let (albedo, occlusion) = unpack_gbuffer_albedo_ao(enc.rt0_albedo_ao);
+        let (normal, roughness_n) = unpack_gbuffer_normal_roughness(enc.rt1_normal_roughness);
+        let (metallic, roughness_m, specular, material_id) =
+            unpack_gbuffer_material(enc.rt2_material);
+        let roughness = if roughness_m > 0.0 {
+            roughness_m
+        } else {
+            roughness_n
+        };
+        Self {
+            albedo,
+            occlusion,
+            normal,
+            metallic,
+            roughness,
+            specular,
+            material_id,
+        }
+    }
+}
+
+/// 256-byte `#[repr(C, align(256))]` camera constant buffer matching DX12 `CameraConstants`
+/// (`crates/xray-render-dx12/src/geometry_abi.rs`). Matrices are column-major for HLSL column vectors.
+#[repr(C, align(256))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Dx12CameraConstants {
+    pub view: [[f32; 4]; 4],
+    pub proj: [[f32; 4]; 4],
+    pub view_proj: [[f32; 4]; 4],
+    pub cam_pos: [f32; 4],
+    pub padding: [f32; 12],
+}
+
+const _: () = assert!(std::mem::size_of::<Dx12CameraConstants>() == 256);
+const _: () = assert!(std::mem::align_of::<Dx12CameraConstants>() == 256);
+
+impl Default for Dx12CameraConstants {
+    fn default() -> Self {
+        Self {
+            view: XRAY_IDENTITY_MATRIX,
+            proj: XRAY_IDENTITY_MATRIX,
+            view_proj: XRAY_IDENTITY_MATRIX,
+            cam_pos: [0.0, 0.0, 0.0, 1.0],
+            padding: [0.0; 12],
+        }
+    }
+}
+
+impl Dx12CameraConstants {
+    /// Convert X-Ray row-vector `view` and `proj` matrices into DX12 column-major CBV layout
+    /// matching `mul(ViewProjection, float4(pos, 1.0f))`.
+    pub fn from_xray_matrices(view: &XRayMatrix, proj: &XRayMatrix, cam_pos: [f32; 3]) -> Self {
+        let vp_xray = matrix_mul_44(proj, view);
+        Self {
+            view: matrix_transpose_44(view),
+            proj: matrix_transpose_44(proj),
+            view_proj: matrix_transpose_44(&vp_xray),
+            cam_pos: [cam_pos[0], cam_pos[1], cam_pos[2], 1.0],
+            padding: [0.0; 12],
+        }
+    }
+}
+
+/// 112-byte packed DX12 depth decompression & inverse view rotation constant block for compute/pixel
+/// passes (SSAO/HDAO/SSFX/Deferred).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Dx12DepthDecompressParams {
+    /// `[2.0, -2.0, -1.0, 1.0]` mapping `[0..1]` UV to D3D `[-1..1]` NDC XY.
+    pub uv_to_ndc_scale_bias: [f32; 4],
+    /// `[1.0 / proj_00, 1.0 / proj_11, q = proj_22, q_near_neg = -q * near]`.
+    pub proj_inv_xy_q_qnear: [f32; 4],
+    /// `[near, far, is_ortho (0.0 or 1.0), m43_or_pad]`.
+    pub near_far_is_ortho_pad: [f32; 4],
+    /// Column 0..2 of inverse view rotation (`right`, `up`, `forward` in `.xyz`).
+    pub inv_view_right: [f32; 4],
+    pub inv_view_up: [f32; 4],
+    pub inv_view_forward: [f32; 4],
+    /// World camera position `[x, y, z, 1.0]`.
+    pub cam_pos: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<Dx12DepthDecompressParams>() == 112);
+
+impl Dx12DepthDecompressParams {
+    /// Construct GPU depth decompression constants from X-Ray row-vector `view`, `proj`, and camera pose.
+    pub fn from_xray_camera(
+        view: &XRayMatrix,
+        proj: &XRayMatrix,
+        cam_pos: [f32; 3],
+        near: f32,
+        far: f32,
+    ) -> Self {
+        let is_ortho = if proj[2][3].abs() <= 1e-6 { 1.0 } else { 0.0 };
+        let inv_px = if proj[0][0].abs() > 1e-9 {
+            1.0 / proj[0][0]
+        } else {
+            1.0
+        };
+        let inv_py = if proj[1][1].abs() > 1e-9 {
+            1.0 / proj[1][1]
+        } else {
+            1.0
+        };
+        Self {
+            uv_to_ndc_scale_bias: [2.0, -2.0, -1.0, 1.0],
+            proj_inv_xy_q_qnear: [inv_px, inv_py, proj[2][2], proj[3][2]],
+            near_far_is_ortho_pad: [near, far, is_ortho, 0.0],
+            inv_view_right: [view[0][0], view[1][0], view[2][0], 0.0],
+            inv_view_up: [view[0][1], view[1][1], view[2][1], 0.0],
+            inv_view_forward: [view[0][2], view[1][2], view[2][2], 0.0],
+            cam_pos: [cam_pos[0], cam_pos[1], cam_pos[2], 1.0],
+        }
+    }
+}
+
+/// Convert `[0, 1]` screen-space texture UV to DX12 clip-space NDC `[-1, 1]` (`Y` up).
+#[inline]
+pub fn uv_to_ndc_dx12(uv: [f32; 2]) -> [f32; 2] {
+    [uv[0] * 2.0 - 1.0, (1.0 - uv[1]) * 2.0 - 1.0]
+}
+
+/// Convert DX12 clip-space NDC `[-1, 1]` (`Y` up) to `[0, 1]` screen-space texture UV.
+#[inline]
+pub fn ndc_to_uv_dx12(ndc: [f32; 2]) -> [f32; 2] {
+    [ndc[0] * 0.5 + 0.5, 1.0 - (ndc[1] * 0.5 + 0.5)]
+}
+
+/// Reconstruct linear view-space depth `z` from a `[0, 1]` hardware depth value under a standard
+/// Direct3D left-handed perspective projection (`q = far / (far - near)`, `z_ndc = q - q * near / z`).
+#[inline]
+pub fn linearize_depth_perspective_lh(depth: f32, near: f32, far: f32) -> f32 {
+    let denom = far - near;
+    if denom.abs() <= 1e-6 {
+        return depth * far;
+    }
+    let q = far / denom;
+    let d = depth - q;
+    if d.abs() <= 1e-7 {
+        far
+    } else {
+        (-q * near) / d
+    }
+}
+
+/// Reconstruct view-space depth `z` from `[0, 1]` hardware depth using an X-Ray row-vector projection matrix
+/// (`proj[2][3] != 0` for perspective, `0` for orthographic).
+#[inline]
+pub fn linearize_depth_xray_proj(depth: f32, xray_proj: &XRayMatrix) -> f32 {
+    if xray_proj[2][3].abs() > 1e-6 {
+        let denom = depth - xray_proj[2][2];
+        if denom.abs() <= 1e-7 {
+            0.0
+        } else {
+            xray_proj[3][2] / denom
+        }
+    } else if xray_proj[2][2].abs() > 1e-7 {
+        (depth - xray_proj[3][2]) / xray_proj[2][2]
+    } else {
+        depth
+    }
+}
+
+/// Reconstruct view-space `[x, y, z]` using X-Ray R4's `PosDecompressParams` and `[0, 1]` texture UV.
+#[inline]
+pub fn reconstruct_view_pos_r4(
+    uv: [f32; 2],
+    linear_depth_z: f32,
+    params: &PosDecompressParams,
+) -> [f32; 3] {
+    let ht = params.pos_decompression_params[0];
+    let vt = params.pos_decompression_params[1];
+    [
+        (uv[0] * 2.0 - 1.0) * ht * linear_depth_z,
+        (uv[1] * 2.0 - 1.0) * vt * linear_depth_z,
+        linear_depth_z,
+    ]
+}
+
+/// Reconstruct view-space `[x, y, z]` from screen UV `[0, 1]`, hardware depth `[0, 1]`,
+/// and an X-Ray row-vector projection matrix (perspective or orthographic).
+#[inline]
+pub fn reconstruct_view_pos_from_depth_xray(
+    uv: [f32; 2],
+    ndc_depth: f32,
+    xray_proj: &XRayMatrix,
+) -> [f32; 3] {
+    let ndc = uv_to_ndc_dx12(uv);
+    let view_x = ndc[0]
+        / if xray_proj[0][0].abs() > 1e-6 {
+            xray_proj[0][0]
+        } else {
+            1.0
+        };
+    let view_y = ndc[1]
+        / if xray_proj[1][1].abs() > 1e-6 {
+            xray_proj[1][1]
+        } else {
+            1.0
+        };
+    let view_z = linearize_depth_xray_proj(ndc_depth, xray_proj);
+    if xray_proj[2][3].abs() > 1e-6 {
+        [view_x * view_z, view_y * view_z, view_z]
+    } else {
+        [view_x, view_y, view_z]
+    }
+}
+
+/// Reconstruct world-space `[x, y, z]` from screen UV `[0, 1]`, hardware depth `[0, 1]`,
+/// and X-Ray row-vector `view`, `proj`, and camera world position.
+#[inline]
+pub fn reconstruct_world_pos_from_depth_xray(
+    uv: [f32; 2],
+    ndc_depth: f32,
+    xray_view: &XRayMatrix,
+    xray_proj: &XRayMatrix,
+    cam_pos: [f32; 3],
+) -> [f32; 3] {
+    let pos_vs = reconstruct_view_pos_from_depth_xray(uv, ndc_depth, xray_proj);
+    // Columns of upper-left 3x3 of `xray_view` are camera basis vectors `(right, up, forward)`
+    [
+        xray_view[0][0] * pos_vs[0]
+            + xray_view[0][1] * pos_vs[1]
+            + xray_view[0][2] * pos_vs[2]
+            + cam_pos[0],
+        xray_view[1][0] * pos_vs[0]
+            + xray_view[1][1] * pos_vs[1]
+            + xray_view[1][2] * pos_vs[2]
+            + cam_pos[1],
+        xray_view[2][0] * pos_vs[0]
+            + xray_view[2][1] * pos_vs[1]
+            + xray_view[2][2] * pos_vs[2]
+            + cam_pos[2],
+    ]
+}
+
+/// Reconstruct world-space `[x, y, z]` directly from column-major [`Dx12CameraConstants`].
+#[inline]
+pub fn reconstruct_world_pos_from_dx12_camera(
+    uv: [f32; 2],
+    ndc_depth: f32,
+    cam: &Dx12CameraConstants,
+) -> [f32; 3] {
+    let xray_view = matrix_transpose_44(&cam.view);
+    let xray_proj = matrix_transpose_44(&cam.proj);
+    reconstruct_world_pos_from_depth_xray(
+        uv,
+        ndc_depth,
+        &xray_view,
+        &xray_proj,
+        [cam.cam_pos[0], cam.cam_pos[1], cam.cam_pos[2]],
+    )
+}
+
 /// Active camera frame state passed through camera effectors (`SCamEffectorInfo`, `CameraDefs.h:16-42`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CamEffectorInfo {
@@ -1035,5 +1481,76 @@ mod tests {
         xf.set_v_prev(v);
         xf.set_p_prev(p);
         assert_eq!(xf.m_wvp_prev, xf.m_wvp);
+    }
+
+    #[test]
+    fn gbuffer_mrt_codecs_and_dx12_depth_world_pos_reconstruction() {
+        let pix = GbufferMrtPixel {
+            albedo: [0.8, 0.4, 0.2],
+            occlusion: 0.9,
+            normal: normalize3_or([0.3, 0.9, -0.25], [0.0, 1.0, 0.0]),
+            metallic: 0.75,
+            roughness: 0.35,
+            specular: 0.04,
+            material_id: 42,
+        };
+        let enc = pix.encode();
+        let dec = GbufferMrtPixel::decode(&enc);
+        for k in 0..3 {
+            assert!((dec.albedo[k] - pix.albedo[k]).abs() < 1e-2);
+            assert!((dec.normal[k] - pix.normal[k]).abs() < 1.5e-2);
+        }
+        assert!((dec.occlusion - 0.9).abs() < 1e-2);
+        assert!((dec.metallic - 0.75).abs() < 1e-2);
+        assert!((dec.roughness - 0.35).abs() < 1e-2);
+        assert!((dec.specular - 0.04).abs() < 1e-2);
+        assert_eq!(dec.material_id, 42);
+
+        // Tangent space normal mapping matching gbuffer.hlsl:78-81
+        let ws_n = decode_tangent_space_normal(
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [0.5, 0.5, 1.0],
+        );
+        assert!((ws_n[1] - 1.0).abs() < 1e-5);
+        let bc5 = decode_bc5_normal_xy(0.5, 0.5);
+        assert!((bc5[2] - 1.0).abs() < 1e-5);
+
+        // Perspective world -> clip -> UV/depth -> reconstructed world roundtrip
+        let cam_pos = [12.0, 3.5, -8.0];
+        let view = matrix_build_camera_dir(cam_pos, [0.2, -0.1, 1.0], [0.0, 1.0, 0.0]);
+        let proj = matrix_build_projection(75.0f32.to_radians(), 9.0 / 16.0, 0.2, 200.0);
+        let dx_cam = Dx12CameraConstants::from_xray_matrices(&view, &proj, cam_pos);
+        assert_eq!(std::mem::size_of::<Dx12CameraConstants>(), 256);
+
+        let target_ws = [15.0, 2.0, 9.5];
+        let vp_xray = matrix_mul_44(&proj, &view);
+        let ndc = crate::ogf::matrix_transform_projected(&vp_xray, target_ws).unwrap();
+        let uv = ndc_to_uv_dx12([ndc[0], ndc[1]]);
+        let lin_z = linearize_depth_perspective_lh(ndc[2], 0.2, 200.0);
+        assert!((lin_z - crate::ogf::matrix_transform_point(&view, target_ws)[2]).abs() < 1e-3);
+
+        let rec_ws = reconstruct_world_pos_from_dx12_camera(uv, ndc[2], &dx_cam);
+        for k in 0..3 {
+            assert!((rec_ws[k] - target_ws[k]).abs() < 1e-2, "axis {k}");
+        }
+
+        let dp = Dx12DepthDecompressParams::from_xray_camera(&view, &proj, cam_pos, 0.2, 200.0);
+        assert_eq!(dp.near_far_is_ortho_pad[2], 0.0);
+        assert_eq!(std::mem::size_of::<Dx12DepthDecompressParams>(), 112);
+
+        // R4 PosDecompressParams reconstruction check
+        let r4_pd = PosDecompressParams::compute(75.0, 9.0 / 16.0, 1920, 1080, 0.02, 50.0);
+        let r4_vs = reconstruct_view_pos_r4([0.5, 0.5], 10.0, &r4_pd);
+        assert!(r4_vs[0].abs() < 1e-6 && r4_vs[1].abs() < 1e-6 && (r4_vs[2] - 10.0).abs() < 1e-6);
+
+        // Orthographic depth reconstruction
+        let ortho = matrix_build_projection_ortho(20.0, 10.0, 1.0, 21.0);
+        let o_ndc = crate::ogf::matrix_transform_projected(&ortho, [4.0, -2.5, 11.0]).unwrap();
+        let o_uv = ndc_to_uv_dx12([o_ndc[0], o_ndc[1]]);
+        let o_vs = reconstruct_view_pos_from_depth_xray(o_uv, o_ndc[2], &ortho);
+        assert!((o_vs[0] - 4.0).abs() < 1e-4);
+        assert!((o_vs[1] - (-2.5)).abs() < 1e-4);
+        assert!((o_vs[2] - 11.0).abs() < 1e-4);
     }
 }
