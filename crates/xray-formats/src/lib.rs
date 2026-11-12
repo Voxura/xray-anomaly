@@ -5,7 +5,7 @@
 //! - `camera`: X-Ray view/projection matrices, `CamEffectorInfo`, `.anm`/`.anms` & `.ppe` players + `CameraManagerState`
 //! - `cform`: `level.cform` collision database, pure-Rust AABB BVH raycast (`OPT_CULL`/`OPT_ONLYFIRST`/`OPT_ONLYNEAREST`) & SAT box queries
 //! - `chunk`: Zero-copy X-Ray Chunked File Format reader (`ID + size + payload` + `CFS_CompressMark` LZHuf)
-//! - `details`: `.dm` & `level.details` (`DETAIL_VERSION_3` / `DETAIL_VERSION_4`) flora/grass slots
+//! - `details`: `.dm` & `level.details` (`DETAIL_VERSION_3` / `DETAIL_VERSION_4`) flora/grass slots + SSFX interactive grass benders
 //! - `envelopes`: LightWave `CEnvelope` splines (`TCB`/`Hermite`/`Bezier`/`Linear`/`Step`/`Bezier2D`), `.anm` `ObjectMotion` & `.ppe` `PostprocessEffect`
 //! - `fonts`: `CGameFont` resolution rung selector (`texture_h<N>` + `[string_table] font_prefix`), UI `.ini` glyph atlases, word-wrap & DX12 glyph quad emitter
 //! - `gamemtl`: X-Ray `gamemtl.xr` physical/surface material & interaction pair library parser
@@ -13,11 +13,11 @@
 //! - `lanims`: `$game_data$/lanims.xr` keyframed `LightAnimItem` / `LightAnimLibrary` color anims
 //! - `level`: `level` & `level.geom`/`level.geomx` scene, visuals, sectors, portals, lights & `D3DVERTEXELEMENT9` VB/IB/SWIS decoders
 //! - `lighting`: Pure-Rust dynamic lights, `SMAP_Allocator`, `ComputeXFS`, spot/point accumulation matrices & `LightTrack` hemisphere/visibility cache
-//! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, LOD, tree, and skeletal mesh + bone/IK parser
+//! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, LOD, tree (`TreeWindState`), and skeletal mesh + bone/IK parser
 //! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
 //! - `particle_sim`: Pure-Rust PAPI runtime simulator, 3D Perlin noise, `ParticleGroupInstance` timeline & billboard emitter
 //! - `particles`: `particles.xr` / loose `.pe` & `.pg` PAPI bytecode systems + LTX blood wallmark configs (no binary `level.wallmarks` in Anomaly/CoP)
-//! - `postprocess`: Phase-13+ PPE noise UVs, bloom kernels/adaptation, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision, SSFX TAA & blur/SSS helpers
+//! - `postprocess`: Phase-13+ PPE noise UVs, bloom/luminance adaptation, sunshafts/combine constants, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision, SSFX TAA & blur/SSS helpers
 //! - `savegames`: Anomaly `.scop` LZO1X ALife savegame reader/writer (`GameDateTime`, spawn header, dynamic objects & 7 binary registries)
 //! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
 //! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, OMF pose evaluation & `1W`–`4W` CPU skinning
@@ -86,12 +86,13 @@ pub use details::{
     DetailHwBatchMesh, DetailHwObjectSpan, DetailHwVertex, DetailMesh, DetailMeshVertexOut,
     DetailPalette, DetailRandom, DetailSlot, DetailSlotItem, DetailSlotPart, DetailSurfaceHit,
     DetailSwingConfig, DetailSwingState, DetailSwingValue, DetailVertex, DetailVisibilityConfig,
-    DetailVisibleBatches, DetailWaveConstants, LevelDetails, DETAIL_CACHE1_COUNT,
+    DetailVisibleBatches, DetailWaveConstants, GrassBenderAnim, GrassBenderHandle, GrassBenderPool,
+    GrassBenderSlot, GrassBendersConfig, GrassBendersGpuData, LevelDetails, DETAIL_CACHE1_COUNT,
     DETAIL_DEFAULT_DENSITY, DETAIL_DEFAULT_HEIGHT, DETAIL_DEFAULT_L_AMBIENT,
     DETAIL_DEFAULT_L_ANISO, DETAIL_DEFAULT_PS_SSA_DISCARD, DETAIL_DEFAULT_RADIUS,
     DETAIL_DEFAULT_SSA_DISCARD, DETAIL_HW_QUANT, DETAIL_ID_EMPTY, DETAIL_ID_EMPTY_V3,
     DETAIL_MAX_OBJECTS, DETAIL_OBJ_IN_SLOT, DETAIL_SLOT_HALF_SIZE, DETAIL_SLOT_SIZE,
-    DETAIL_VERSION_3, DETAIL_VERSION_4, DO_NO_WAVING,
+    DETAIL_VERSION_3, DETAIL_VERSION_4, DO_NO_WAVING, GRASS_BENDERS_MAX_SLOTS,
 };
 pub use envelopes::{
     decode_q16, encode_q16, Envelope, EnvelopeBehavior, EnvelopeKey, EnvelopeShape, ObjectMotion,
@@ -148,9 +149,10 @@ pub use ogf::{
     OgfBBox, OgfBSphere, OgfBone, OgfBufferRef, OgfDesc, OgfGContainerRef, OgfHeader, OgfLodDef,
     OgfLodFacet, OgfLodVertex, OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows, OgfTextureLink,
     OgfTreeDef, OgfVertices, OgfVisualType, SlideWindow, StaticVertex, StaticVertexLayout,
-    TreeLightingColor, UnifiedSkinnedVertex, VertBoned1W, VertBoned2W, VertBoned3W, VertBoned4W,
-    XRayMatrix, LOD_IMPOSTER_QUAD_ORDER, OGF_LODDEF2_SIZE, OGF_LOD_VERTEX_SIZE,
-    OGF_TREEDEF2_SIZE, XRAY_IDENTITY_MATRIX,
+    TreeInstanceGpuConstants, TreeLightingColor, TreeWindConfig, TreeWindFrame, TreeWindState,
+    UnifiedSkinnedVertex, VertBoned1W, VertBoned2W, VertBoned3W, VertBoned4W, XRayMatrix,
+    FTREE_VISUAL_QUANT, FTREE_VISUAL_TILE, LOD_IMPOSTER_QUAD_ORDER, OGF_LODDEF2_SIZE,
+    OGF_LOD_VERTEX_SIZE, OGF_TREEDEF2_SIZE, XRAY_IDENTITY_MATRIX,
 };
 pub use omf::{
     motion_def_flags, motion_key_flags, slerp_quat_xyzw, BoneKeyframe, BoneMotionTrack,
@@ -178,16 +180,21 @@ pub use particles::{
 };
 pub use postprocess::{
     apply_st2084_pq_rgb, apply_vignette_rgb, bloom_build_4tap_uvs, bloom_filter_taps_horizontal,
-    bloom_filter_taps_vertical, calc_gauss_k7, calc_gauss_wave, effects_sun_hdr_blend_factor,
-    phase_blur_schedule, ssfx_ao_blur_schedule, ssfx_bloom_lens_blur_schedule,
-    ssfx_il_blur_schedule, ssfx_volumetric_blur_schedule, uncharted2_tonemap_curve,
-    BloomAdaptState, BloomConfig, BloomFilterGpuWeights, DofConfig, DofGpuParams,
-    GammaControlConfig, GasmaskConfig, GasmaskGpuParams, Hdr10Colorspace, Hdr10Config,
-    Hdr10GpuParams, Hdr10PassKind, Hdr10PingPongPass, Hdr10TonemapMode, Hdr10Tonemapper,
-    HeatVisionConfig, HeatVisionGpuParams, ImageCorrectionConfig, ImageCorrectionGpuParams,
-    NightVisionGen, NightVisionProfile, PostprocessNoiseState, SsfxBloomGpuParams,
-    SsfxBlurPassDesc, SsfxLightingConfig, SsfxScreenConfig, SsfxSssCandidate, SsfxSssExtSlots,
-    SsfxTaaConfig, TonemapGpuParams, TonemapParams, SSFX_SSS_EXT_MAX_SLOTS,
+    bloom_filter_taps_vertical, calc_gauss_k7, calc_gauss_wave, combine2_aa_quad_uvs,
+    combine2_shader_element, compute_combine1_params, effects_sun_hdr_blend_factor,
+    luminance_filter_quad_uvs, luminance_filter_taps, luminance_pass0_uvs, phase_blur_schedule,
+    ssfx_ao_blur_schedule, ssfx_bloom_lens_blur_schedule, ssfx_il_blur_schedule,
+    ssfx_volumetric_blur_schedule, sunshafts_schedule, sunshafts_uv_bounds,
+    uncharted2_tonemap_curve, BloomAdaptState, BloomConfig, BloomFilterGpuWeights, Combine1Config,
+    Combine1GpuParams, Combine2AaCornerUvs, Combine2Config, Combine2GpuParams, Combine2MotionState,
+    DofConfig, DofGpuParams, GammaControlConfig, GasmaskConfig, GasmaskGpuParams, Hdr10Colorspace,
+    Hdr10Config, Hdr10GpuParams, Hdr10PassKind, Hdr10PingPongPass, Hdr10TonemapMode,
+    Hdr10Tonemapper, HeatVisionConfig, HeatVisionGpuParams, ImageCorrectionConfig,
+    ImageCorrectionGpuParams, LuminanceAdaptState, LuminanceConfig, NightVisionGen,
+    NightVisionProfile, PostprocessNoiseState, SsfxBloomGpuParams, SsfxBlurPassDesc,
+    SsfxLightingConfig, SsfxScreenConfig, SsfxSssCandidate, SsfxSssExtSlots, SsfxTaaConfig,
+    SunshaftsConfig, SunshaftsPassDesc, SunshaftsPassKind, TonemapGpuParams, TonemapParams,
+    BLOOM_SIZE_X, BLOOM_SIZE_Y, SSFX_SSS_EXT_MAX_SLOTS,
 };
 pub use savegames::{
     compress_scop, decompress_scop, validate_scop_header, ActorStatDetail, ActorStatSection,

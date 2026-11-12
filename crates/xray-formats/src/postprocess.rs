@@ -1,15 +1,19 @@
-//! Pure-Rust X-Ray Phase-13 Post-Processing, Bloom, Tonemapping, Gamma LUT & HDR10 Constants
+//! Pure-Rust X-Ray Phase-13 Post-Processing, Bloom, Luminance, Combine, Tonemapping, Gamma LUT & HDR10 Constants
 //!
 //! Grounds C++ renderer and HLSL shader parameters directly from:
 //! - `src/Layers/xrRenderPC_R3/r3_rendertarget_phase_PP.cpp` (`u_calc_tc_noise`)
 //! - `src/Layers/xrRenderPC_R3/r3_rendertarget_phase_bloom.cpp` (`CalcGauss_k7`, `CalcGauss_wave`, UV/tap builders)
-//! - `src/Layers/xrRenderPC_R3/r3_rendertarget_phase_combine.cpp` (`tnmp_*`, `vignette_control`)
+//! - `src/Layers/xrRenderPC_R4/r4_rendertarget_phase_luminance.cpp` (`phase_luminance` 256->64->8->1 & `MiddleGray`)
+//! - `src/Layers/xrRender/rendertarget_phase_sunshafts.cpp` (`phase_sunshafts` 5-pass schedule)
+//! - `src/Layers/xrRenderPC_R4/r4_rendertarget_phase_combine.cpp` (`combine_1`, `combine_2`, `tnmp_*`, `vignette_control`)
 //! - `src/Layers/xrRender/xr_effgamma.cpp` (`CGammaControl::GenLUT`)
 //! - `src/Layers/xrRender/Blender_Recorder_StandartBinding.cpp` (`hdr10_parameters1..10`)
 //! - `gamedata/shaders/r3/{hdr10.h,combine_2_naa.ps,effects_sun.ps}`
 
-use crate::ogf::{matrix_transform_point, XRayMatrix};
+use crate::lighting::{compute_u_diffuse2s, GlossConfig, TEX_JITTER_SIZE};
+use crate::ogf::{matrix_mul_44, matrix_transform_point, XRayMatrix, XRAY_IDENTITY_MATRIX};
 use crate::particle_sim::ParticleRng;
+use crate::skinning::{matrix_transform_dir, normalize_vec3};
 use crate::weather::MixedEnvironment;
 
 const EPS_S: f32 = 1e-7;
@@ -1882,6 +1886,480 @@ pub fn ssfx_bloom_lens_blur_schedule(screen_w: u32, screen_h: u32) -> [SsfxBlurP
     ]
 }
 
+// ============================================================================
+// Luminance Adaptation (`r4_rendertarget_phase_luminance.cpp`, `r2_types.h`)
+// ============================================================================
+
+/// Bloom & initial luminance downsample source texture dimensions (`BLOOM_size_X/Y`, `r2_types.h:141-142`).
+pub const BLOOM_SIZE_X: u32 = 256;
+pub const BLOOM_SIZE_Y: u32 = 256;
+
+/// Eye-adaptation and middle-gray tonemap configuration (`xrRender_console.cpp:188, 206-209`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LuminanceConfig {
+    pub adaptation: f32,
+    pub middle_gray: f32,
+    pub low_lum: f32,
+    pub amount: f32,
+    pub tonemap_enabled: bool,
+}
+
+impl Default for LuminanceConfig {
+    fn default() -> Self {
+        Self {
+            adaptation: 1.0,
+            middle_gray: 1.0,
+            low_lum: 0.4,
+            amount: 0.7,
+            tonemap_enabled: true,
+        }
+    }
+}
+
+/// Build pass-0 (`256x256 -> 64x64`) 4-tap log-luminance UV bounds `(a[0..4], b[0..4])`
+/// matching `CRenderTarget::phase_luminance` (`r4_rendertarget_phase_luminance.cpp:38-49`).
+pub fn luminance_pass0_uvs(bloom_w: u32, bloom_h: u32) -> ([[f32; 2]; 4], [[f32; 2]; 4]) {
+    let w = bloom_w.max(1) as f32;
+    let h = bloom_h.max(1) as f32;
+    let one = [2.0 / w, 2.0 / h];
+    let half = [1.0 / w, 1.0 / h];
+    let a = [
+        [half[0], half[1]],
+        [half[0] + one[0], half[1]],
+        [half[0], half[1] + one[1]],
+        [half[0] + one[0], half[1] + one[1]],
+    ];
+    let b = [
+        [1.0 + a[0][0], 1.0 + a[0][1]],
+        [1.0 + a[1][0], 1.0 + a[1][1]],
+        [1.0 + a[2][0], 1.0 + a[2][1]],
+        [1.0 + a[3][0], 1.0 + a[3][1]],
+    ];
+    (a, b)
+}
+
+/// Build 16-tap filter kernel `(a[0..16], b[0..16])` for luminance pass 1 (`64 -> 8`) and pass 2 (`8 -> 1`)
+/// (`r4_rendertarget_phase_luminance.cpp:90-97, 127-134`).
+pub fn luminance_filter_taps(src_size: u32) -> ([[f32; 2]; 16], [[f32; 2]; 16]) {
+    let src = src_size.max(1) as f32;
+    let mut a = [[0.0f32; 2]; 16];
+    let mut b = [[0.0f32; 2]; 16];
+    for k in 0..16 {
+        let x = ((k * 2 + 1) % 8) as f32;
+        let y = ((k / 4) * 2 + 1) as f32;
+        a[k] = [x / src, y / src];
+        b[k] = [a[k][0] + 1.0, a[k][1] + 1.0];
+    }
+    (a, b)
+}
+
+/// Pack the 4 fullscreen quad corners `(bottom_left, top_left, bottom_right, top_right)`
+/// matching `v_filter::uv[8]` in `CRenderTarget::phase_luminance` (`r4_rendertarget_phase_luminance.cpp:100-112`).
+pub fn luminance_filter_quad_uvs(src_size: u32) -> [[[f32; 4]; 8]; 4] {
+    let (a, b) = luminance_filter_taps(src_size);
+    let mut out = [[[0.0f32; 4]; 8]; 4];
+    for t in 0..8 {
+        out[0][t] = [a[t][0], b[t][1], b[t + 8][1], a[t + 8][0]]; // left + down
+        out[1][t] = [a[t][0], a[t][1], a[t + 8][1], a[t + 8][0]]; // left + up
+        out[2][t] = [b[t][0], b[t][1], b[t + 8][1], b[t + 8][0]]; // right + down
+        out[3][t] = [b[t][0], a[t][1], a[t + 8][1], b[t + 8][0]]; // right + up
+    }
+    out
+}
+
+/// Persistent exponential eye-adaptation state (`CRenderTarget::f_luminance_adapt`, initialized `0.5`
+/// in `r4_rendertarget.cpp:930`, updated in `r4_rendertarget_phase_luminance.cpp:152-161`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LuminanceAdaptState {
+    pub f_luminance_adapt: f32,
+}
+
+impl Default for LuminanceAdaptState {
+    fn default() -> Self {
+        Self {
+            f_luminance_adapt: 0.5,
+        }
+    }
+}
+
+impl LuminanceAdaptState {
+    #[inline]
+    pub fn with_adapt(f_luminance_adapt: f32) -> Self {
+        Self { f_luminance_adapt }
+    }
+
+    /// Advance `f_luminance_adapt` and compute `MiddleGray` (`[rgb.x, rgb.y, rgb.z, f_luminance_adapt]`).
+    #[inline]
+    pub fn step_middle_gray(&mut self, dt_sec: f32, cfg: &LuminanceConfig) -> [f32; 4] {
+        let dt = if dt_sec.is_finite() && dt_sec > 0.0 {
+            dt_sec
+        } else {
+            0.0
+        };
+        let adapt_rate = if cfg.adaptation.is_finite() {
+            cfg.adaptation.max(0.0)
+        } else {
+            0.0
+        };
+        self.f_luminance_adapt = 0.9 * self.f_luminance_adapt + 0.1 * dt * adapt_rate;
+
+        let amount = if cfg.tonemap_enabled { cfg.amount } else { 0.0 };
+        let none = [1.0f32, 0.0, 1.0];
+        let full = [cfg.middle_gray, 1.0, cfg.low_lum];
+        [
+            none[0] + (full[0] - none[0]) * amount,
+            none[1] + (full[1] - none[1]) * amount,
+            none[2] + (full[2] - none[2]) * amount,
+            self.f_luminance_adapt,
+        ]
+    }
+}
+
+// ============================================================================
+// Screen-Space Sunshafts (`rendertarget_phase_sunshafts.cpp`)
+// ============================================================================
+
+/// Screen-space sunshaft console parameters (`ps_r2_ss_sunshafts_*`, `xrRender_console.cpp:289-290`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SunshaftsConfig {
+    pub length: f32,
+    pub radius: f32,
+}
+
+impl Default for SunshaftsConfig {
+    fn default() -> Self {
+        Self {
+            length: 1.0,
+            radius: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SunshaftsPassKind {
+    Mask,
+    BlurPass1,
+    BlurPass2,
+    BlurPass3,
+    Blend,
+}
+
+/// Single render pass descriptor emitted by [`sunshafts_schedule`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SunshaftsPassDesc {
+    pub kind: SunshaftsPassKind,
+    pub element_index: u8,
+    /// `Some(0)` = `rt_sunshafts_0`, `Some(1)` = `rt_sunshafts_1`, `None` = `rt_Generic`.
+    pub dst_slot: Option<u8>,
+    /// `c_sunshafts = [intensity_scaled, length, step_z, radius]`, or `None` on mask generation.
+    pub c_sunshafts: Option<[f32; 4]>,
+}
+
+/// Half-texel screen UV bounds `(p0, p1)` matching `rendertarget_phase_sunshafts.cpp:22-23`.
+#[inline]
+pub fn sunshafts_uv_bounds(screen_w: u32, screen_h: u32) -> ([f32; 2], [f32; 2]) {
+    let w = screen_w.max(1) as f32;
+    let h = screen_h.max(1) as f32;
+    ([0.5 / w, 0.5 / h], [(w + 0.5) / w, (h + 0.5) / h])
+}
+
+/// Build the 5-pass screen-space sunshafts schedule matching `CRenderTarget::phase_sunshafts`
+/// (`rendertarget_phase_sunshafts.cpp:6-200`). Returns `None` when `env_intensity <= 0.001`.
+pub fn sunshafts_schedule(
+    env_intensity: f32,
+    cfg: &SunshaftsConfig,
+) -> Option<[SunshaftsPassDesc; 5]> {
+    if !env_intensity.is_finite() || env_intensity <= 0.001 {
+        return None;
+    }
+    let px = if env_intensity < 1.0 {
+        env_intensity * 2.0
+    } else {
+        1.0
+    };
+    let py = cfg.length;
+    let pw = cfg.radius;
+    Some([
+        SunshaftsPassDesc {
+            kind: SunshaftsPassKind::Mask,
+            element_index: 0,
+            dst_slot: Some(0),
+            c_sunshafts: None,
+        },
+        SunshaftsPassDesc {
+            kind: SunshaftsPassKind::BlurPass1,
+            element_index: 1,
+            dst_slot: Some(1),
+            c_sunshafts: Some([px, py, 1.0, pw]),
+        },
+        SunshaftsPassDesc {
+            kind: SunshaftsPassKind::BlurPass2,
+            element_index: 2,
+            dst_slot: Some(0),
+            c_sunshafts: Some([px, py, 0.7, pw]),
+        },
+        SunshaftsPassDesc {
+            kind: SunshaftsPassKind::BlurPass3,
+            element_index: 3,
+            dst_slot: Some(1),
+            c_sunshafts: Some([px, py, 0.3, pw]),
+        },
+        SunshaftsPassDesc {
+            kind: SunshaftsPassKind::Blend,
+            element_index: 4,
+            dst_slot: None,
+            c_sunshafts: Some([px, py, 0.0, pw]),
+        },
+    ])
+}
+
+// ============================================================================
+// Combine-1 & Combine-2 Constants (`r4_rendertarget_phase_combine.cpp`)
+// ============================================================================
+
+/// Configuration for `combine_1` deferred lighting + ambient/SSAO composition (`r4_rendertarget_phase_combine.cpp:190-296`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Combine1Config {
+    pub sun_lumscale_amb: f32,
+    pub sun_lumscale_hemi: f32,
+    pub nv_lum_factor: f32,
+    pub fov_deg: f32,
+    pub tex_jitter_size: u32,
+    pub gloss: GlossConfig,
+}
+
+impl Default for Combine1Config {
+    fn default() -> Self {
+        Self {
+            sun_lumscale_amb: 1.0,
+            sun_lumscale_hemi: 1.0,
+            nv_lum_factor: 0.0,
+            fov_deg: 67.5,
+            tex_jitter_size: TEX_JITTER_SIZE,
+            gloss: GlossConfig::default(),
+        }
+    }
+}
+
+/// 96-byte 16B-aligned GPU constant block for `combine_1` (`r4_rendertarget_phase_combine.cpp:191-296`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Combine1GpuParams {
+    pub l_ambient: [f32; 4],
+    pub l_dynamic_color: [f32; 4],
+    pub l_dynamic_dir: [f32; 4],
+    pub env_color: [f32; 4],
+    pub fog_color: [f32; 4],
+    /// `[ssao_noise_tile_factor, ssao_kernel_size, jitter_scale_x, jitter_scale_y]`.
+    pub ssao_and_jitter: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<Combine1GpuParams>() == 96);
+
+/// Compute `combine_1` shader uniforms from `MixedEnvironment`, adapted sun light, view matrix & viewport
+/// matching `r4_rendertarget_phase_combine.cpp:190-296`.
+pub fn compute_combine1_params(
+    env: &MixedEnvironment,
+    sun_color: [f32; 3],
+    sun_dir_world: [f32; 3],
+    view: &XRayMatrix,
+    screen_w: u32,
+    screen_h: u32,
+    cfg: &Combine1Config,
+) -> Combine1GpuParams {
+    const MIN_AMB: f32 = 0.001;
+    const XRAY_EPS: f32 = 1e-5;
+
+    let amb_scale = cfg.sun_lumscale_amb + cfg.nv_lum_factor;
+    let l_ambient = [
+        (env.ambient_color[0] * 2.0).max(MIN_AMB) * amb_scale,
+        (env.ambient_color[1] * 2.0).max(MIN_AMB) * amb_scale,
+        (env.ambient_color[2] * 2.0).max(MIN_AMB) * amb_scale,
+        0.0,
+    ];
+
+    let hemi_scale = 2.0 * cfg.sun_lumscale_hemi;
+    let env_color = [
+        (env.hemi_color[0] * 2.0 + XRAY_EPS) * hemi_scale,
+        (env.hemi_color[1] * 2.0 + XRAY_EPS) * hemi_scale,
+        (env.hemi_color[2] * 2.0 + XRAY_EPS) * hemi_scale,
+        env.weight,
+    ];
+
+    let fog_color = [env.fog_color[0], env.fog_color[1], env.fog_color[2], 0.0];
+
+    let base_tan = (67.5_f32 * 0.5).to_radians().tan();
+    let cur_tan = (cfg.fov_deg.clamp(5.0, 175.0) * 0.5).to_radians().tan().max(1e-4);
+    let ssao_scale = base_tan / cur_tan;
+
+    let jitter_sz = cfg.tex_jitter_size.max(1) as f32;
+    let scale_x = screen_w.max(1) as f32 / jitter_sz;
+    let scale_y = screen_h.max(1) as f32 / jitter_sz;
+
+    let l_spec = compute_u_diffuse2s(sun_color, &cfg.gloss);
+    let l_dynamic_color = [sun_color[0], sun_color[1], sun_color[2], l_spec];
+    let dir_view = normalize_vec3(matrix_transform_dir(view, sun_dir_world));
+    let l_dynamic_dir = [dir_view[0], dir_view[1], dir_view[2], 0.0];
+
+    Combine1GpuParams {
+        l_ambient,
+        l_dynamic_color,
+        l_dynamic_dir,
+        env_color,
+        fog_color,
+        ssao_and_jitter: [2.0 * ssao_scale, 150.0 * ssao_scale, scale_x, scale_y],
+    }
+}
+
+/// Edge-AA and motion-blur settings for `combine_2` (`xrRender_console.cpp:218-221`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Combine2Config {
+    pub aa_barrier: [f32; 3],
+    pub aa_weights: [f32; 3],
+    pub aa_kernel: f32,
+    pub m_blur: f32,
+    pub aa_enabled: bool,
+    pub distort_enabled: bool,
+}
+
+impl Default for Combine2Config {
+    fn default() -> Self {
+        Self {
+            aa_barrier: [0.8, 0.1, 0.0],
+            aa_weights: [0.25, 0.25, 0.0],
+            aa_kernel: 0.5,
+            m_blur: 0.0,
+            aa_enabled: false,
+            distort_enabled: false,
+        }
+    }
+}
+
+/// Select shader pass index inside `s_combine` for `combine_2` (`r4_rendertarget_phase_combine.cpp:679-687`).
+#[inline]
+pub fn combine2_shader_element(aa_enabled: bool, distort_enabled: bool) -> u8 {
+    match (aa_enabled, distort_enabled) {
+        (true, true) => 3,
+        (true, false) => 1,
+        (false, true) => 4,
+        (false, false) => 2,
+    }
+}
+
+/// One corner of the `combine_2` neighbor-sampling `v_aa` vertex format (`r4_rendertarget_phase_combine.cpp:614-670`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Combine2AaCornerUvs {
+    pub uv0: [f32; 2],
+    pub uv1: [f32; 2],
+    pub uv2: [f32; 2],
+    pub uv3: [f32; 2],
+    pub uv4: [f32; 2],
+    pub uv5: [f32; 4],
+    pub uv6: [f32; 4],
+}
+
+/// Build `(BL, TL, BR, TR)` quad corner neighbor UVs for `combine_2` edge AA (`r4_rendertarget_phase_combine.cpp:626-670`).
+pub fn combine2_aa_quad_uvs(screen_w: u32, screen_h: u32) -> [Combine2AaCornerUvs; 4] {
+    let w = screen_w.max(1) as f32;
+    let h = screen_h.max(1) as f32;
+    let ddw = 1.0 / w;
+    let ddh = 1.0 / h;
+    let p0 = [0.5 / w, 0.5 / h];
+    let p1 = [(w + 0.5) / w, (h + 0.5) / h];
+
+    let build_corner = |u: f32, v: f32| Combine2AaCornerUvs {
+        uv0: [u, v],
+        uv1: [u - ddw, v - ddh],
+        uv2: [u + ddw, v + ddh],
+        uv3: [u + ddw, v - ddh],
+        uv4: [u - ddw, v + ddh],
+        uv5: [u - ddw, v, v, u + ddw],
+        uv6: [u, v - ddh, v + ddh, u],
+    };
+
+    [
+        build_corner(p0[0], p1[1]),
+        build_corner(p0[0], p0[1]),
+        build_corner(p1[0], p1[1]),
+        build_corner(p1[0], p0[1]),
+    ]
+}
+
+/// 192-byte GPU constant block for `combine_2` (`e_barrier`, `e_weights`, `e_kernel`, `m_blur`, `m_current`, `m_previous`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Combine2GpuParams {
+    pub e_barrier: [f32; 4],
+    pub e_weights: [f32; 4],
+    pub e_kernel: [f32; 4],
+    pub m_blur: [f32; 4],
+    pub m_current: XRayMatrix,
+    pub m_previous: XRayMatrix,
+}
+
+const _: () = assert!(std::mem::size_of::<Combine2GpuParams>() == 192);
+
+/// Persistent per-camera view-projection history tracker for `combine_2` motion blur & SSFX reprojection
+/// (`r4_rendertarget_phase_combine.cpp:85-99`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Combine2MotionState {
+    pub saved_viewproj: Option<XRayMatrix>,
+    pub saved_position: Option<[f32; 3]>,
+    pub matrix_previous: XRayMatrix,
+    pub matrix_current: XRayMatrix,
+    pub position_previous: [f32; 3],
+}
+
+impl Default for Combine2MotionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Combine2MotionState {
+    pub fn new() -> Self {
+        Self {
+            saved_viewproj: None,
+            saved_position: None,
+            matrix_previous: XRAY_IDENTITY_MATRIX,
+            matrix_current: XRAY_IDENTITY_MATRIX,
+            position_previous: [0.0; 3],
+        }
+    }
+
+    /// Update motion-blur reprojection matrices (unless `is_second_viewport_frame`, matching
+    /// `!Device.m_SecondViewport.IsSVPFrame()`) and build `Combine2GpuParams`.
+    pub fn step_and_gpu_params(
+        &mut self,
+        camera_pos: [f32; 3],
+        inv_view: &XRayMatrix,
+        proj: &XRayMatrix,
+        full_transform: &XRayMatrix,
+        is_second_viewport_frame: bool,
+        cfg: &Combine2Config,
+    ) -> Combine2GpuParams {
+        if !is_second_viewport_frame {
+            self.position_previous = self.saved_position.unwrap_or(camera_pos);
+            self.saved_position = Some(camera_pos);
+
+            let prev_vp = self.saved_viewproj.unwrap_or(*full_transform);
+            self.matrix_previous = matrix_mul_44(&prev_vp, inv_view);
+            self.matrix_current = *proj;
+            self.saved_viewproj = Some(*full_transform);
+        }
+
+        let mb_scale = (cfg.m_blur * 0.5) / 12.0;
+        Combine2GpuParams {
+            e_barrier: [cfg.aa_barrier[0], cfg.aa_barrier[1], cfg.aa_barrier[2], 0.0],
+            e_weights: [cfg.aa_weights[0], cfg.aa_weights[1], cfg.aa_weights[2], 0.0],
+            e_kernel: [cfg.aa_kernel, cfg.aa_kernel, cfg.aa_kernel, 0.0],
+            m_blur: [mb_scale, -mb_scale, 0.0, 0.0],
+            m_current: self.matrix_current,
+            m_previous: self.matrix_previous,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2177,5 +2655,119 @@ mod tests {
 
         let lighting_cfg = SsfxLightingConfig::default();
         assert_eq!(lighting_cfg.il_quality, 32);
+    }
+
+    #[test]
+    fn luminance_sunshafts_and_combine_constants() {
+        let (p0_a, p0_b) = luminance_pass0_uvs(BLOOM_SIZE_X, BLOOM_SIZE_Y);
+        assert!((p0_a[0][0] - 1.0 / 256.0).abs() < 1e-6);
+        assert!((p0_a[3][0] - 3.0 / 256.0).abs() < 1e-6);
+        assert!((p0_b[0][1] - (1.0 + 1.0 / 256.0)).abs() < 1e-6);
+
+        let quad = luminance_filter_quad_uvs(64);
+        assert!((quad[0][0][0] - 1.0 / 64.0).abs() < 1e-6);
+        assert!((quad[0][0][1] - (1.0 + 1.0 / 64.0)).abs() < 1e-6);
+        assert!((quad[3][7][3] - (1.0 + 7.0 / 64.0)).abs() < 1e-6);
+
+        let mut lum = LuminanceAdaptState::default();
+        assert_eq!(lum.f_luminance_adapt, 0.5);
+        let mg = lum.step_middle_gray(0.1, &LuminanceConfig::default());
+        assert!((mg[0] - 1.0).abs() < 1e-6);
+        assert!((mg[1] - 0.7).abs() < 1e-6);
+        assert!((mg[2] - (0.3 + 0.7 * 0.4)).abs() < 1e-5);
+        assert!((mg[3] - (0.9 * 0.5 + 0.01)).abs() < 1e-6);
+
+        assert!(sunshafts_schedule(0.0005, &SunshaftsConfig::default()).is_none());
+        let sched = sunshafts_schedule(0.4, &SunshaftsConfig::default()).unwrap();
+        assert_eq!(sched[0].dst_slot, Some(0));
+        assert!(sched[0].c_sunshafts.is_none());
+        assert_eq!(sched[1].c_sunshafts, Some([0.8, 1.0, 1.0, 1.0]));
+        assert_eq!(sched[2].c_sunshafts, Some([0.8, 1.0, 0.7, 1.0]));
+        assert_eq!(sched[3].c_sunshafts, Some([0.8, 1.0, 0.3, 1.0]));
+        assert_eq!(sched[4].dst_slot, None);
+        assert_eq!(sched[4].c_sunshafts, Some([0.8, 1.0, 0.0, 1.0]));
+
+        let (ss_p0, ss_p1) = sunshafts_uv_bounds(1920, 1080);
+        assert!((ss_p0[0] - 0.5 / 1920.0).abs() < 1e-7);
+        assert!((ss_p1[1] - 1080.5 / 1080.0).abs() < 1e-6);
+
+        let desc = crate::weather::EnvDescriptor {
+            ambient_color: [0.1, 0.2, 0.3],
+            hemi_color: [0.4, 0.5, 0.6, 1.0],
+            fog_color: [0.7, 0.8, 0.9],
+            ..crate::weather::EnvDescriptor::default()
+        };
+        let mdf = crate::shaders_xr::EnvModAccum {
+            total_power: 0.0,
+            active_flags: 0,
+            far_plane: 0.0,
+            fog_color: [0.0; 3],
+            fog_density: 0.0,
+            ambient: [0.0; 3],
+            sky_color: [0.0; 3],
+            hemi_color: [0.0; 3],
+        };
+        let env = crate::weather::lerp_descriptors(
+            &desc,
+            &desc,
+            0.25,
+            &mdf,
+            1.0,
+            &crate::weather::EnvBoost::default(),
+            0.0,
+            0.0,
+        );
+        let c1 = compute_combine1_params(
+            &env,
+            [1.0, 0.8, 0.6],
+            [0.0, -1.0, 0.0],
+            &XRAY_IDENTITY_MATRIX,
+            1920,
+            1080,
+            &Combine1Config::default(),
+        );
+        assert!((c1.l_ambient[0] - 0.2).abs() < 1e-5);
+        assert!((c1.env_color[0] - (0.8 + 1e-5) * 2.0).abs() < 1e-5);
+        assert_eq!(c1.env_color[3], 0.25);
+        assert_eq!(c1.fog_color, [0.7, 0.8, 0.9, 0.0]);
+        assert!((c1.ssao_and_jitter[0] - 2.0).abs() < 1e-5);
+        assert!((c1.ssao_and_jitter[1] - 150.0).abs() < 1e-4);
+        assert!((c1.ssao_and_jitter[2] - 30.0).abs() < 1e-5);
+
+        assert_eq!(combine2_shader_element(true, true), 3);
+        assert_eq!(combine2_shader_element(true, false), 1);
+        assert_eq!(combine2_shader_element(false, true), 4);
+        assert_eq!(combine2_shader_element(false, false), 2);
+        let aa_uvs = combine2_aa_quad_uvs(1000, 500);
+        assert!((aa_uvs[1].uv1[0] - (0.5 / 1000.0 - 1.0 / 1000.0)).abs() < 1e-7);
+
+        let mut mstate = Combine2MotionState::new();
+        let proj = crate::camera::matrix_build_projection(
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.2,
+            100.0,
+        );
+        let view = crate::camera::matrix_build_camera([1.0, 2.0, 3.0], [1.0, 2.0, 4.0], [0.0, 1.0, 0.0]);
+        let full = matrix_mul_44(&proj, &view);
+        let inv_view = crate::ogf::matrix_invert_43(&view).unwrap();
+        let c2 = mstate.step_and_gpu_params(
+            [1.0, 2.0, 3.0],
+            &inv_view,
+            &proj,
+            &full,
+            false,
+            &Combine2Config {
+                m_blur: 0.6,
+                ..Combine2Config::default()
+            },
+        );
+        assert!((c2.m_blur[0] - 0.025).abs() < 1e-6);
+        assert!((c2.m_blur[1] + 0.025).abs() < 1e-6);
+        for r in 0..4 {
+            for c in 0..4 {
+                assert!((c2.m_previous[r][c] - c2.m_current[r][c]).abs() < 1e-5);
+            }
+        }
     }
 }

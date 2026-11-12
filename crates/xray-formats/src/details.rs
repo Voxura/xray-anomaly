@@ -13,6 +13,8 @@ use crate::ogf::{
     matrix_mul_43, matrix_rotate_y, matrix_scale, matrix_transform_point,
     vector_generate_orthonormal_basis, OgfBBox, XRayMatrix,
 };
+use crate::particle_sim::ParticleRng;
+use crate::weather::PerlinNoise1D;
 use xray_core::LtxDocument;
 use xray_core::ltx_loader::OwnedLtxDocument;
 
@@ -1943,6 +1945,563 @@ impl DetailCacheGrid {
     }
 }
 
+// ============================================================================
+// SSFX Interactive Grass Benders (`IGame_Persistent.h/.cpp`, `device.cpp`, `FTreeVisual.cpp`)
+// ============================================================================
+
+/// Total GPU constant slots for interactive grass benders (slot `0` = player, `1..16` = NPCs/shots/anomalies).
+pub const GRASS_BENDERS_MAX_SLOTS: usize = 16;
+
+/// Interactive grass bender animation mode (`IGame_Persistent::GrassBenders_Anim`, `IGame_Persistent.h:71-79`).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GrassBenderAnim {
+    Explosion = 0,
+    #[default]
+    Default = 1,
+    Wavy = 2,
+    Suck = 3,
+    Blow = 4,
+    Pulse = 5,
+}
+
+/// Per-entity tracking handle passed into [`GrassBenderPool::update_character`] (`data_idx`, `data_frame`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GrassBenderHandle {
+    pub slot: u8,
+    pub next_check_frame: u32,
+}
+
+/// Interactive grass configuration matching `ps_ssfx_grass_interactive` & `ps_ssfx_int_grass_params_1/2`
+/// (`xrRender_console.cpp:484-486`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GrassBendersConfig {
+    /// `ps_ssfx_grass_interactive.x > 0`
+    pub player_enabled: bool,
+    /// `ps_ssfx_grass_interactive.y` (clamped to `0..=15` so `1 + max_benders <= 16`).
+    pub max_benders: usize,
+    /// `ps_ssfx_grass_interactive.z` (squared XZ distance limit from camera).
+    pub max_distance_sq: f32,
+    /// `ps_ssfx_int_grass_params_1` (`benders_setup`).
+    pub params_1: [f32; 4],
+    /// `ps_ssfx_int_grass_params_2`.
+    pub params_2: [f32; 4],
+}
+
+impl Default for GrassBendersConfig {
+    fn default() -> Self {
+        Self {
+            player_enabled: false,
+            max_benders: 0,
+            max_distance_sq: 2000.0,
+            params_1: [1.0, 1.0, 1.0, 25.0],
+            params_2: [1.0, 5.0, 1.0, 1.0],
+        }
+    }
+}
+
+impl GrassBendersConfig {
+    #[inline]
+    pub fn clamped_max_benders(&self) -> usize {
+        self.max_benders.min(GRASS_BENDERS_MAX_SLOTS - 1)
+    }
+}
+
+/// State for one interactive grass bender slot (`IGame_Persistent::grass_data`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GrassBenderSlot {
+    pub id: u16,
+    pub anim: GrassBenderAnim,
+    pub pos: [f32; 3],
+    pub dir: [f32; 3],
+    pub radius: f32,
+    pub radius_curr: f32,
+    pub str: f32,
+    pub str_target: f32,
+    pub time: f32,
+    pub fade: f32,
+    pub speed: f32,
+    pub prev_pos: [f32; 4],
+    pub prev_dir: [f32; 4],
+}
+
+impl Default for GrassBenderSlot {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            anim: GrassBenderAnim::Default,
+            pos: [0.0; 3],
+            dir: [0.0, -99.0, 0.0],
+            radius: 0.0,
+            radius_curr: 0.0,
+            str: 0.0,
+            str_target: 0.0,
+            time: 0.0,
+            fade: 0.0,
+            speed: 0.0,
+            prev_pos: [0.0; 4],
+            prev_dir: [0.0, -99.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// GPU constant payload packed identically to `FTreeVisual.cpp:191-242` (`benders_pos`, `benders_prevpos`, `benders_setup`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GrassBendersGpuData {
+    /// Active bender slot count `_min(16, max_benders + 1)` when `max_benders > 0`, else `0`.
+    pub active_count: usize,
+    pub benders_setup: [f32; 4],
+    /// `[0..16]` = `[pos.x, pos.y, pos.z, radius_curr]`, `[16..32]` = `[dir.x, dir.y, dir.z, str]`.
+    pub benders_pos: [[f32; 4]; 32],
+    /// Previous frame `[0..16]` positions+radii and `[16..32]` directions+strengths.
+    pub benders_prevpos: [[f32; 4]; 32],
+}
+
+impl Default for GrassBendersGpuData {
+    fn default() -> Self {
+        Self {
+            active_count: 0,
+            benders_setup: [1.0, 1.0, 1.0, 25.0],
+            benders_pos: [[0.0; 4]; 32],
+            benders_prevpos: [[0.0; 4]; 32],
+        }
+    }
+}
+
+/// Interactive grass bender simulator & GPU constant packer (`IGame_Persistent::GrassBenders*` & `device.cpp:459-468`).
+#[derive(Debug, Clone)]
+pub struct GrassBenderPool {
+    pub alloc_index: u8,
+    pub slots: [GrassBenderSlot; GRASS_BENDERS_MAX_SLOTS],
+    perlin: PerlinNoise1D,
+    rng: ParticleRng,
+}
+
+impl Default for GrassBenderPool {
+    fn default() -> Self {
+        Self::new(0x1357)
+    }
+}
+
+impl GrassBenderPool {
+    /// Construct a new bender pool matching `IGame_Persistent::IGame_Persistent` (`octaves = 2`, `freq = 1.0`, `amp = 0.66666`).
+    pub fn new(seed: u32) -> Self {
+        Self {
+            alloc_index: 0,
+            slots: [GrassBenderSlot::default(); GRASS_BENDERS_MAX_SLOTS],
+            perlin: PerlinNoise1D::new(seed & 0xFFFF, 2, 1.0, 0.66666),
+            rng: ParticleRng::new(u64::from(seed).max(1)),
+        }
+    }
+
+    #[inline]
+    fn rand_i(&mut self, min_inclusive: u32, max_exclusive: u32) -> u32 {
+        let span = max_exclusive.saturating_sub(min_inclusive).max(1) as usize;
+        min_inclusive + (self.rng.range_usize(span) as u32)
+    }
+
+    /// Assign parameters into slot `idx` (`GrassBendersSet`, `IGame_Persistent.cpp:618-635`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_slot(
+        &mut self,
+        idx: usize,
+        id: u16,
+        position: [f32; 3],
+        dir: [f32; 3],
+        fade: f32,
+        speed: f32,
+        intensity: f32,
+        radius: f32,
+        anim: GrassBenderAnim,
+        reset_time: bool,
+    ) {
+        if idx >= GRASS_BENDERS_MAX_SLOTS {
+            return;
+        }
+        let s = &mut self.slots[idx];
+        s.anim = anim;
+        s.pos = position;
+        s.id = id;
+        s.radius = radius;
+        s.str = intensity;
+        s.fade = fade;
+        s.speed = speed;
+        s.dir = dir;
+        if reset_time {
+            s.radius_curr = 0.01;
+            s.time = 0.0;
+        }
+    }
+
+    /// Reset one slot (`GrassBendersReset`, `IGame_Persistent.cpp:611-616`).
+    pub fn reset_slot(&mut self, idx: usize) {
+        if idx >= GRASS_BENDERS_MAX_SLOTS {
+            return;
+        }
+        self.set_slot(
+            idx,
+            0,
+            [0.0; 3],
+            [0.0, -99.0, 0.0],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            GrassBenderAnim::Default,
+            true,
+        );
+        self.slots[idx].str_target = 0.0;
+    }
+
+    /// Reset and unlink by handle (`GrassBendersRemoveByIndex`, `IGame_Persistent.cpp:594-601`).
+    pub fn remove_by_handle(&mut self, handle: &mut GrassBenderHandle) {
+        if handle.slot != 0 {
+            self.reset_slot(handle.slot as usize);
+            handle.slot = 0;
+        }
+    }
+
+    /// Reset any active benders owned by `id` (`GrassBendersRemoveById`, `IGame_Persistent.cpp:603-609`).
+    pub fn remove_by_id(&mut self, id: u16, cfg: &GrassBendersConfig) {
+        let limit = cfg.clamped_max_benders();
+        for idx in 1..=limit {
+            if self.slots[idx].id == id {
+                self.reset_slot(idx);
+            }
+        }
+    }
+
+    /// Update or claim a slot for a moving entity (`GrassBendersUpdate`, `IGame_Persistent.cpp:350-421`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_character(
+        &mut self,
+        id: u16,
+        handle: &mut GrassBenderHandle,
+        frame: u32,
+        position: [f32; 3],
+        camera_pos: [f32; 3],
+        frustum: &ClipFrustum,
+        init_radius: f32,
+        init_str: f32,
+        check_distance: bool,
+        cfg: &GrassBendersConfig,
+    ) {
+        let limit = cfg.clamped_max_benders();
+        if limit < 1 || id == 0 {
+            return;
+        }
+
+        if handle.slot != 0 {
+            let slot_idx = handle.slot as usize;
+            if slot_idx >= GRASS_BENDERS_MAX_SLOTS || self.slots[slot_idx].id != id {
+                handle.slot = 0;
+                handle.next_check_frame = frame.saturating_add(self.rand_i(10, 35));
+            } else {
+                self.slots[slot_idx].pos = position;
+            }
+        }
+
+        if frame < handle.next_check_frame {
+            return;
+        }
+        handle.next_check_frame = frame.saturating_add(self.rand_i(10, 35));
+
+        if check_distance {
+            let dx = position[0] - camera_pos[0];
+            let dz = position[2] - camera_pos[2];
+            if dx * dx + dz * dz > cfg.max_distance_sq {
+                self.remove_by_handle(handle);
+                return;
+            }
+        }
+
+        let rad = if handle.slot == 0 {
+            1.0
+        } else {
+            (self.slots[handle.slot as usize].radius_curr + 0.5).max(1.0)
+        };
+        if !frustum.test_sphere(position, rad) {
+            self.remove_by_handle(handle);
+            return;
+        }
+
+        if handle.slot == 0 {
+            let idx = (self.alloc_index as usize) + 1;
+            if idx < GRASS_BENDERS_MAX_SLOTS && self.slots[idx].id == 0 {
+                handle.slot = idx as u8;
+                self.set_slot(
+                    idx,
+                    id,
+                    position,
+                    [0.0, -99.0, 0.0],
+                    0.0,
+                    0.0,
+                    0.0,
+                    init_radius,
+                    GrassBenderAnim::Default,
+                    true,
+                );
+                self.slots[idx].str_target = init_str;
+                self.slots[idx].radius_curr = init_radius;
+            }
+            self.alloc_index = if idx < limit { idx as u8 } else { 0 };
+        } else {
+            handle.next_check_frame = handle.next_check_frame.saturating_add(60);
+            self.slots[handle.slot as usize].pos = position;
+        }
+    }
+
+    /// Trigger an explosion shockwave bender (`GrassBendersAddExplosion`, `IGame_Persistent.cpp:423-439`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_explosion(
+        &mut self,
+        id: u16,
+        position: [f32; 3],
+        dir: [f32; 3],
+        fade: f32,
+        speed: f32,
+        intensity: f32,
+        radius: f32,
+        cfg: &GrassBendersConfig,
+    ) {
+        let limit = cfg.clamped_max_benders();
+        if limit < 1 {
+            return;
+        }
+        let exp_id = id.wrapping_add(99).max(1);
+        for idx in 1..=limit {
+            if self.slots[idx].anim != GrassBenderAnim::Explosion {
+                self.set_slot(
+                    idx,
+                    exp_id,
+                    position,
+                    dir,
+                    fade,
+                    speed,
+                    intensity,
+                    radius,
+                    GrassBenderAnim::Explosion,
+                    true,
+                );
+                self.slots[idx].str_target = intensity;
+                break;
+            }
+        }
+    }
+
+    /// Add or accumulate a muzzle/impact shot bender (`GrassBendersAddShot`, `IGame_Persistent.cpp:441-479`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_shot(
+        &mut self,
+        id: u16,
+        position: [f32; 3],
+        camera_pos: [f32; 3],
+        dir: [f32; 3],
+        fade: f32,
+        speed: f32,
+        intensity: f32,
+        radius: f32,
+        cfg: &GrassBendersConfig,
+    ) {
+        let limit = cfg.clamped_max_benders();
+        if limit < 1 || intensity <= 0.0 || id == 0 {
+            return;
+        }
+        let dx = position[0] - camera_pos[0];
+        let dz = position[2] - camera_pos[2];
+        if dx * dx + dz * dz > cfg.max_distance_sq {
+            return;
+        }
+
+        let mut add_at: Option<usize> = None;
+        for idx in 1..=limit {
+            if self.slots[idx].id == id {
+                let current_str = self.slots[idx].str;
+                self.set_slot(
+                    idx,
+                    id,
+                    position,
+                    dir,
+                    fade,
+                    speed,
+                    current_str,
+                    radius,
+                    GrassBenderAnim::Explosion,
+                    false,
+                );
+                self.slots[idx].str_target += intensity;
+                add_at = None;
+                break;
+            } else if add_at.is_none() && self.slots[idx].radius == 0.0 {
+                add_at = Some(idx);
+            }
+        }
+
+        if let Some(idx) = add_at {
+            self.set_slot(
+                idx,
+                id,
+                position,
+                dir,
+                fade,
+                speed,
+                0.001,
+                radius,
+                GrassBenderAnim::Explosion,
+                true,
+            );
+            self.slots[idx].str_target = intensity;
+        }
+    }
+
+    /// Advance all active grass bender animations by `dt_sec` (`GrassBendersUpdateAnimations`, `IGame_Persistent.cpp:481-592`).
+    pub fn update_animations(&mut self, dt_sec: f32, cfg: &GrassBendersConfig) {
+        let dt = if dt_sec.is_finite() && dt_sec > 0.0 {
+            dt_sec
+        } else {
+            0.0
+        };
+        let limit = cfg.clamped_max_benders();
+        for idx in 1..=limit {
+            if self.slots[idx].id == 0 {
+                continue;
+            }
+            match self.slots[idx].anim {
+                GrassBenderAnim::Explosion => {
+                    let s = &mut self.slots[idx];
+                    s.time += dt * s.speed;
+                    s.radius_curr = s.radius * s.time.min(1.0);
+                    s.str_target = s.str_target.min(1.0);
+
+                    let diff = (s.str - s.str_target).abs().max(0.1);
+                    if s.str_target <= s.str {
+                        s.str -= dt * s.fade * diff;
+                    } else {
+                        s.str += dt * s.speed * diff;
+                        if s.str >= s.str_target {
+                            s.str_target = 0.0;
+                        }
+                    }
+
+                    if s.str < 0.0 {
+                        self.reset_slot(idx);
+                    }
+                }
+                GrassBenderAnim::Wavy => {
+                    let s = &mut self.slots[idx];
+                    s.time += dt * 1.5 * s.speed;
+                    let curve = s.time.sin();
+                    s.str = curve * (curve * 1.4).cos() * 1.8 * s.str_target;
+                }
+                GrassBenderAnim::Suck => {
+                    self.slots[idx].time += dt * self.slots[idx].speed;
+                    let t = self.slots[idx].time;
+                    let curve = -(self.perlin.get_continuous(t) + 0.5).clamp(0.0, 1.0);
+                    self.slots[idx].str = curve * self.slots[idx].str_target;
+                }
+                GrassBenderAnim::Blow => {
+                    self.slots[idx].time += dt * 1.2 * self.slots[idx].speed;
+                    let t = self.slots[idx].time;
+                    let curve = (self.perlin.get_continuous(t) + 1.0).clamp(0.0, 2.0) * 0.25;
+                    self.slots[idx].str = curve * self.slots[idx].str_target;
+                }
+                GrassBenderAnim::Pulse => {
+                    let s = &mut self.slots[idx];
+                    s.time += dt * s.speed;
+                    s.radius_curr = s.radius * s.time.min(1.0);
+                    if s.radius_curr >= s.radius {
+                        s.str = step_grass_bender_value(s.str, 0.0, s.speed * 0.6, true, dt);
+                    }
+                    if s.str <= 0.0 {
+                        s.str = s.str_target;
+                        s.radius_curr = 0.0;
+                        s.time = 0.0;
+                    }
+                }
+                GrassBenderAnim::Default => {
+                    let s = &mut self.slots[idx];
+                    s.str = step_grass_bender_value(s.str, s.str_target, 2.0, true, dt);
+                }
+            }
+        }
+    }
+
+    /// Snapshot current bender positions/strengths into `prev_pos`/`prev_dir` (`device.cpp:459-468`).
+    pub fn snapshot_prev_frame(&mut self, camera_pos: [f32; 3], cfg: &GrassBendersConfig) {
+        self.slots[0].prev_pos = [camera_pos[0], camera_pos[1], camera_pos[2], -1.0];
+        self.slots[0].prev_dir = [0.0, -99.0, 0.0, 1.0];
+        let limit = cfg.clamped_max_benders();
+        for idx in 1..=limit {
+            let s = &mut self.slots[idx];
+            s.prev_pos = [s.pos[0], s.pos[1], s.pos[2], s.radius_curr];
+            s.prev_dir = [s.dir[0], s.dir[1], s.dir[2], s.str];
+        }
+    }
+
+    /// Pack GPU constant arrays `(benders_pos, benders_prevpos, benders_setup)` matching `FTreeVisual.cpp:188-242`.
+    pub fn pack_gpu_data(
+        &self,
+        camera_pos: [f32; 3],
+        cfg: &GrassBendersConfig,
+    ) -> GrassBendersGpuData {
+        if cfg.max_benders == 0 {
+            return GrassBendersGpuData {
+                active_count: 0,
+                benders_setup: cfg.params_1,
+                ..GrassBendersGpuData::default()
+            };
+        }
+
+        let limit = cfg.clamped_max_benders();
+        let active_count = (limit + 1).min(GRASS_BENDERS_MAX_SLOTS);
+        let mut out = GrassBendersGpuData {
+            active_count,
+            benders_setup: cfg.params_1,
+            benders_pos: [[0.0; 4]; 32],
+            benders_prevpos: [[0.0; 4]; 32],
+        };
+
+        out.benders_pos[0] = if cfg.player_enabled {
+            [camera_pos[0], camera_pos[1], camera_pos[2], -1.0]
+        } else {
+            [0.0; 4]
+        };
+        out.benders_pos[16] = [0.0, -99.0, 0.0, 1.0];
+
+        out.benders_prevpos[0] = self.slots[0].prev_pos;
+        out.benders_prevpos[16] = self.slots[0].prev_dir;
+
+        for idx in 1..active_count {
+            let s = &self.slots[idx];
+            out.benders_pos[idx] = [s.pos[0], s.pos[1], s.pos[2], s.radius_curr];
+            out.benders_pos[idx + 16] = [s.dir[0], s.dir[1], s.dir[2], s.str];
+            out.benders_prevpos[idx] = s.prev_pos;
+            out.benders_prevpos[idx + 16] = s.prev_dir;
+        }
+
+        out
+    }
+}
+
+#[inline]
+fn step_grass_bender_value(
+    current: f32,
+    go_to: f32,
+    intensity: f32,
+    use_easing: bool,
+    dt: f32,
+) -> f32 {
+    let diff = (current - go_to).abs();
+    let step = dt * intensity * if use_easing { diff.min(0.5) } else { 1.0 };
+    if diff - step <= 0.0 {
+        go_to
+    } else if current < go_to {
+        current + step
+    } else {
+        current - step
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2416,5 +2975,150 @@ swing_fast_speed = 3.5
         grid.update_cache_with_cform(&details, 3, -2, [6.0, 1.0, -4.0], 4, &cfg, &bvh, &cform, Some(&gmlib));
         assert!(grid.validate_coords());
         assert_eq!(grid.center(), (3, -2));
+    }
+
+    #[test]
+    fn test_ssfx_grass_bender_pool_lifecycle_animations_and_gpu_pack() {
+        use crate::hom::frustum_planes;
+        use crate::ogf::matrix_mul_44;
+
+        let mut pool = GrassBenderPool::new(77);
+        let cfg = GrassBendersConfig {
+            player_enabled: true,
+            max_benders: 4,
+            max_distance_sq: 100.0,
+            ..GrassBendersConfig::default()
+        };
+
+        let cam_pos = [0.0, 1.5, -5.0];
+        let view = crate::camera::matrix_build_camera(cam_pos, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let proj =
+            crate::camera::matrix_build_projection(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 50.0);
+        let full = matrix_mul_44(&proj, &view);
+        let frustum =
+            ClipFrustum::from_view_proj(&full, frustum_planes::LRTB | frustum_planes::FAR);
+
+        // Claim character slot 1 in front of camera
+        let mut handle = GrassBenderHandle::default();
+        pool.update_character(
+            42,
+            &mut handle,
+            0,
+            [0.0, 0.0, 0.0],
+            cam_pos,
+            &frustum,
+            1.25,
+            0.8,
+            true,
+            &cfg,
+        );
+        assert_eq!(handle.slot, 1);
+        assert_eq!(pool.slots[1].id, 42);
+        assert_eq!(pool.slots[1].radius_curr, 1.25);
+
+        // Explosion scans `1..=limit` for first non-Explosion slot, overtaking Default slot 1
+        pool.add_explosion(10, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 2.0, 4.0, 0.9, 3.0, &cfg);
+        assert_eq!(pool.slots[1].id, 109);
+        assert_eq!(pool.slots[1].anim, GrassBenderAnim::Explosion);
+
+        // Character detects its old slot was overtaken, resets handle, then re-claims slot 2
+        let check_evicted = handle.next_check_frame;
+        pool.update_character(
+            42,
+            &mut handle,
+            check_evicted,
+            [0.0, 0.0, 0.0],
+            cam_pos,
+            &frustum,
+            1.25,
+            0.8,
+            true,
+            &cfg,
+        );
+        assert_eq!(handle.slot, 0);
+        let check_reclaim = handle.next_check_frame;
+        pool.update_character(
+            42,
+            &mut handle,
+            check_reclaim,
+            [0.0, 0.0, 0.0],
+            cam_pos,
+            &frustum,
+            1.25,
+            0.8,
+            true,
+            &cfg,
+        );
+        assert_eq!(handle.slot, 2);
+        assert_eq!(pool.slots[2].id, 42);
+
+        // Add shot twice with same id -> claims slot 3 and accumulates target intensity
+        pool.add_shot(55, [2.0, 0.0, 0.0], cam_pos, [1.0, 0.0, 0.0], 1.5, 5.0, 0.4, 2.0, &cfg);
+        assert_eq!(pool.slots[3].id, 55);
+        pool.add_shot(55, [2.0, 0.0, 0.0], cam_pos, [1.0, 0.0, 0.0], 1.5, 5.0, 0.3, 2.0, &cfg);
+        assert!((pool.slots[3].str_target - 0.7).abs() < 1e-6);
+
+        // Perlin Suck animation in slot 4 remains finite & non-positive
+        pool.set_slot(
+            4,
+            88,
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            1.0,
+            2.0,
+            0.0,
+            1.5,
+            GrassBenderAnim::Suck,
+            true,
+        );
+        pool.slots[4].str_target = 1.0;
+
+        // Snapshot previous frame, advance animations, and pack GPU constant buffers
+        pool.snapshot_prev_frame(cam_pos, &cfg);
+        pool.update_animations(0.1, &cfg);
+        assert!((pool.slots[1].radius_curr - 3.0 * 0.4).abs() < 1e-5);
+        assert!(pool.slots[2].str > 0.0 && pool.slots[2].str <= 0.8);
+        assert!(pool.slots[4].str <= 0.0 && pool.slots[4].str >= -1.0);
+
+        let gpu = pool.pack_gpu_data(cam_pos, &cfg);
+        assert_eq!(gpu.active_count, 5);
+        assert_eq!(gpu.benders_pos[0], [0.0, 1.5, -5.0, -1.0]);
+        assert_eq!(gpu.benders_pos[16], [0.0, -99.0, 0.0, 1.0]);
+        assert_eq!(gpu.benders_prevpos[0], [0.0, 1.5, -5.0, -1.0]);
+        assert!((gpu.benders_pos[1][3] - 1.2).abs() < 1e-5);
+        assert_eq!(gpu.benders_prevpos[2][3], 1.25);
+
+        // Distance eviction cleans character's slot 2
+        let check_far = handle.next_check_frame;
+        pool.update_character(
+            42,
+            &mut handle,
+            check_far,
+            [50.0, 0.0, 0.0],
+            cam_pos,
+            &frustum,
+            1.25,
+            0.8,
+            true,
+            &cfg,
+        );
+        assert_eq!(handle.slot, 0);
+        assert_eq!(pool.slots[2].id, 0);
+
+        // Verify Wavy, Blow, and Pulse animation variants advance and reset cleanly
+        let mut anim_pool = GrassBenderPool::new(12);
+        anim_pool.set_slot(1, 1, [0.0; 3], [0.0, 1.0, 0.0], 1.0, 1.0, 0.0, 1.0, GrassBenderAnim::Wavy, true);
+        anim_pool.slots[1].str_target = 0.5;
+        anim_pool.set_slot(2, 2, [0.0; 3], [0.0, 1.0, 0.0], 1.0, 1.0, 0.0, 1.0, GrassBenderAnim::Blow, true);
+        anim_pool.slots[2].str_target = 0.8;
+        anim_pool.set_slot(3, 3, [0.0; 3], [0.0, 1.0, 0.0], 1.0, 2.0, 0.6, 1.0, GrassBenderAnim::Pulse, true);
+        anim_pool.slots[3].str_target = 0.6;
+        anim_pool.update_animations(0.25, &cfg);
+        assert!(anim_pool.slots[1].str.is_finite() && anim_pool.slots[1].str > 0.0);
+        assert!(anim_pool.slots[2].str >= 0.0 && anim_pool.slots[2].str <= 0.4 + 1e-6);
+        assert!((anim_pool.slots[3].radius_curr - 0.5).abs() < 1e-5);
+        anim_pool.update_animations(0.5, &cfg);
+        anim_pool.update_animations(1.0, &cfg);
+        assert!(anim_pool.slots[3].str >= 0.0 && anim_pool.slots[3].str.is_finite());
     }
 }

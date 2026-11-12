@@ -1955,6 +1955,195 @@ fn parse_skeleton_if_present(reader: &ChunkReader<'_>) -> Result<Option<OgfSkele
     }))
 }
 
+// ============================================================================
+// Tree Foliage Wind & Lighting Constants (`FTreeVisual.h/.cpp`)
+// ============================================================================
+
+/// Fixed-point vertex quantization tile and divisor for `OGF_TREEDEF2` meshes
+/// (`FTreeVisual_tile = 16`, `FTreeVisual_quant = 2048` in `FTreeVisual.h:67-68`).
+pub const FTREE_VISUAL_TILE: u32 = 16;
+pub const FTREE_VISUAL_QUANT: u32 = 32768 / FTREE_VISUAL_TILE;
+
+/// Console defaults for tree foliage wind sway and lighting scale/bias
+/// (`ps_r__Tree_*` in `xrRender_console.cpp:132-136`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TreeWindConfig {
+    pub w_rot: f32,
+    pub w_speed: f32,
+    pub w_amp: f32,
+    pub wave: [f32; 3],
+    pub sbc: f32,
+}
+
+impl Default for TreeWindConfig {
+    fn default() -> Self {
+        Self {
+            w_rot: 10.0,
+            w_speed: 1.0,
+            w_amp: 0.005,
+            wave: [0.1, 0.01, 0.11],
+            sbc: 1.5,
+        }
+    }
+}
+
+/// One frame's computed wind direction/amplitude & vertex-wave vector (`FTreeVisual_setup` in `FTreeVisual.cpp:110-149`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TreeWindFrame {
+    pub scale: f32,
+    pub wave: [f32; 4],
+    pub wind: [f32; 4],
+}
+
+impl Default for TreeWindFrame {
+    fn default() -> Self {
+        Self {
+            scale: 1.0 / FTREE_VISUAL_QUANT as f32,
+            wave: [0.0; 4],
+            wind: [0.0; 4],
+        }
+    }
+}
+
+/// Per-instance tree draw constant block (`FTreeVisual::Render`, `FTreeVisual.cpp:161-185`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TreeInstanceGpuConstants {
+    pub m_xform: XRayMatrix,
+    pub m_xform_v: XRayMatrix,
+    pub consts: [f32; 4],
+    pub wave: [f32; 4],
+    pub wind: [f32; 4],
+    pub prev_wave: [f32; 4],
+    pub prev_wind: [f32; 4],
+    pub c_scale: [f32; 4],
+    pub c_bias: [f32; 4],
+    pub c_sun: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<TreeInstanceGpuConstants>() == 256);
+
+/// Persistent per-frame tree wind tracker preserving `(curr, prev)` across `dwFrame` changes
+/// (`FTreeVisual.cpp:151-185`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TreeWindState {
+    initialized: bool,
+    pub frame: u64,
+    pub curr: TreeWindFrame,
+    pub prev: TreeWindFrame,
+}
+
+impl Default for TreeWindState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TreeWindState {
+    pub fn new() -> Self {
+        Self {
+            initialized: false,
+            frame: 0,
+            curr: TreeWindFrame::default(),
+            prev: TreeWindFrame::default(),
+        }
+    }
+
+    /// Update shared per-frame tree wind/wave vectors when `frame` advances.
+    ///
+    /// Uses `TREE_WIND_EFFECT` (`env_tree_amplitude_intensity`, falling back to `cfg.w_amp` if `None`).
+    pub fn step(
+        &mut self,
+        frame: u64,
+        time_global_sec: f32,
+        env_tree_amplitude_intensity: Option<f32>,
+        cfg: &TreeWindConfig,
+    ) -> (&TreeWindFrame, &TreeWindFrame) {
+        if !self.initialized || self.frame != frame {
+            let next_curr = compute_tree_wind_frame(
+                time_global_sec,
+                env_tree_amplitude_intensity.unwrap_or(cfg.w_amp),
+                cfg,
+            );
+            if self.initialized {
+                self.prev = self.curr;
+            } else {
+                self.prev = next_curr;
+                self.initialized = true;
+            }
+            self.curr = next_curr;
+            self.frame = frame;
+        }
+        (&self.curr, &self.prev)
+    }
+
+    /// Build GPU shader constants for a single [`OgfTreeDef`] tree visual (`FTreeVisual::Render`).
+    pub fn instance_constants(
+        &self,
+        tree: &OgfTreeDef,
+        view: &XRayMatrix,
+        cfg: &TreeWindConfig,
+    ) -> TreeInstanceGpuConstants {
+        let s = cfg.sbc * 1.3333;
+        let m_xform_v = matrix_mul_43(view, &tree.xform);
+        TreeInstanceGpuConstants {
+            m_xform: tree.xform,
+            m_xform_v,
+            consts: [self.curr.scale, self.curr.scale, 0.0, 0.0],
+            wave: self.curr.wave,
+            wind: self.curr.wind,
+            prev_wave: self.prev.wave,
+            prev_wind: self.prev.wind,
+            c_scale: [
+                s * tree.c_scale.rgb[0],
+                s * tree.c_scale.rgb[1],
+                s * tree.c_scale.rgb[2],
+                s * tree.c_scale.hemi,
+            ],
+            c_bias: [
+                s * tree.c_bias.rgb[0],
+                s * tree.c_bias.rgb[1],
+                s * tree.c_bias.rgb[2],
+                s * tree.c_bias.hemi,
+            ],
+            c_sun: [s * tree.c_scale.sun, s * tree.c_bias.sun, 0.0, 0.0],
+        }
+    }
+}
+
+fn compute_tree_wind_frame(
+    time_global_sec: f32,
+    wind_amp: f32,
+    cfg: &TreeWindConfig,
+) -> TreeWindFrame {
+    let w_rot = if cfg.w_rot.abs() > 1e-4 {
+        cfg.w_rot
+    } else {
+        10.0
+    };
+    let t = if time_global_sec.is_finite() {
+        time_global_sec
+    } else {
+        0.0
+    };
+    let tm_rot = std::f32::consts::TAU * t / w_rot;
+    let sx = tm_rot.sin();
+    let cz = tm_rot.cos();
+    let len = (sx * sx + cz * cz).sqrt().max(1e-6);
+    let amp = if wind_amp.is_finite() { wind_amp } else { 0.0 };
+
+    TreeWindFrame {
+        scale: 1.0 / FTREE_VISUAL_QUANT as f32,
+        wave: [
+            cfg.wave[0] / std::f32::consts::TAU,
+            cfg.wave[1] / std::f32::consts::TAU,
+            cfg.wave[2] / std::f32::consts::TAU,
+            (t * cfg.w_speed) / std::f32::consts::TAU,
+        ],
+        wind: [sx / len * amp, 0.0, cz / len * amp, 0.0],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2505,5 +2694,50 @@ mod tests {
         assert!(bs.is_pickable());
         bs.flags |= bone_shape_flags::SF_NO_PICKABLE;
         assert!(!bs.is_pickable());
+    }
+
+    #[test]
+    fn test_tree_wind_state_and_instance_constants() {
+        let cfg = TreeWindConfig::default();
+        let mut wind_state = TreeWindState::new();
+        let (c0, p0) = wind_state.step(1, 2.5, Some(0.4), &cfg);
+        assert_eq!(c0, p0);
+        assert!((c0.scale - 1.0 / 2048.0).abs() < 1e-7);
+        // tm_rot = 2*pi * 2.5 / 10 = pi/2 => sin=1, cos=0 => wind.x = 0.4, wind.z = 0
+        assert!((c0.wind[0] - 0.4).abs() < 1e-5);
+        assert!(c0.wind[2].abs() < 1e-5);
+        assert!((c0.wave[3] - 2.5 / std::f32::consts::TAU).abs() < 1e-6);
+
+        // Same frame id keeps previous snapshot untouched; advancing shifts curr -> prev
+        let prev_saved = *c0;
+        let (c1_same, p1_same) = wind_state.step(1, 99.0, Some(1.0), &cfg);
+        assert_eq!(*c1_same, prev_saved);
+        assert_eq!(*p1_same, prev_saved);
+
+        let (c2, p2) = wind_state.step(2, 5.0, Some(0.4), &cfg);
+        assert_eq!(*p2, prev_saved);
+        assert!((c2.wind[2] + 0.4).abs() < 1e-5);
+
+        let tree = OgfTreeDef {
+            xform: matrix_set_xyz_translate([0.0; 3], [10.0, 2.0, -5.0]),
+            c_scale: TreeLightingColor {
+                rgb: [1.0, 0.8, 0.6],
+                hemi: 0.5,
+                sun: 0.4,
+            },
+            c_bias: TreeLightingColor {
+                rgb: [0.1, 0.2, 0.3],
+                hemi: 0.05,
+                sun: 0.02,
+            },
+        };
+        let view = matrix_set_xyz_translate([0.0; 3], [0.0, 0.0, 3.0]);
+        let gpu = wind_state.instance_constants(&tree, &view, &cfg);
+        let s = 1.5 * 1.3333;
+        assert!((gpu.c_scale[0] - s).abs() < 1e-5);
+        assert!((gpu.c_bias[3] - s * 0.05).abs() < 1e-6);
+        assert!((gpu.c_sun[0] - s * 0.4).abs() < 1e-5);
+        assert!((gpu.c_sun[1] - s * 0.02).abs() < 1e-6);
+        assert_eq!(gpu.m_xform_v[3], [10.0, 2.0, -2.0, 1.0]);
     }
 }
