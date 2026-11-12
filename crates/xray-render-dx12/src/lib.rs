@@ -58,7 +58,7 @@ pub use postprocess::{
     TonemapParams,
 };
 pub use rain::{GpuRainDrop, RainManager, RainPushConstants, RainRenderer};
-pub use shadow::DirectionalShadowMap;
+pub use shadow::{CascadedShadowAtlas, DirectionalShadowMap};
 pub use sky::{SkyPushConstants, SkyRenderer};
 pub use ui_canvas::{GlyphQuad, GpuUiQuad, UiCanvas, UiCanvasPipeline, UiPushConstants};
 pub use wallmarks::{

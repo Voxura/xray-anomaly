@@ -1091,6 +1091,9 @@ impl Dx12Renderer {
             shadow_map_idx: shadow_map_idx.map(|s| s.0).unwrap_or(u32::MAX),
             num_lights,
             screen_res_inv: [1.0 / self.width as f32, 1.0 / self.height as f32],
+            csm_active: 0,
+            volumetric_active: 0,
+            _pad: [0, 0],
         };
 
         let hdr_rtv = targets.hdr_rtv();
@@ -1107,6 +1110,71 @@ impl Dx12Renderer {
             &self.bindless_heap,
             &push,
             light_params,
+            None,
+            hdr_rtv,
+            width,
+            height,
+        )?;
+
+        let targets = self.gbuffer.as_ref().unwrap().targets.as_ref().unwrap();
+        targets.end_combine_pass(cmd);
+
+        Ok(hdr_srv)
+    }
+
+    /// Execute deferred lighting combine pass with 3-split Cascaded Shadow Maps (CSM) and SSFX Volumetrics
+    pub fn execute_deferred_combine_csm(
+        &mut self,
+        light_params: &crate::deferred::GpuLightParams,
+        csm_atlas: &crate::shadow::CascadedShadowAtlas,
+        num_lights: u32,
+        volumetric_active: bool,
+    ) -> WinResult<crate::bindless::DescriptorIndex> {
+        self.ensure_gbuffer()?;
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let camera_va = self
+            .geometry
+            .camera_gpu_va()
+            .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        let lt_va = self.geometry.lights_gpu_va(&self.device_ctx.device)?;
+
+        let gbuffer = self.gbuffer.as_mut().unwrap();
+        let targets = gbuffer.targets.as_ref().unwrap();
+
+        targets.begin_combine_pass(cmd);
+        targets.clear_hdr(cmd);
+
+        let push = crate::deferred::PushCombineConstants {
+            gbuffer_albedo_idx: targets.albedo_srv.0,
+            gbuffer_normal_idx: targets.normal_srv.0,
+            gbuffer_material_idx: targets.material_srv.0,
+            gbuffer_depth_idx: targets.depth_srv.0,
+            shadow_map_idx: csm_atlas.srv_index.0,
+            num_lights,
+            screen_res_inv: [1.0 / self.width as f32, 1.0 / self.height as f32],
+            csm_active: 1,
+            volumetric_active: if volumetric_active { 1 } else { 0 },
+            _pad: [0, 0],
+        };
+
+        let hdr_rtv = targets.hdr_rtv();
+        let width = self.width;
+        let height = self.height;
+        let hdr_srv = targets.hdr_srv;
+
+        let combine = gbuffer.combine_pipeline.as_mut().unwrap();
+        combine.render(
+            &self.device_ctx.device,
+            cmd,
+            camera_va,
+            lt_va,
+            &self.bindless_heap,
+            &push,
+            light_params,
+            Some(csm_atlas.gpu_uniforms_va),
             hdr_rtv,
             width,
             height,

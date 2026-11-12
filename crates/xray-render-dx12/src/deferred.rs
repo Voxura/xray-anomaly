@@ -153,9 +153,12 @@ pub struct PushCombineConstants {
     pub shadow_map_idx: u32,
     pub num_lights: u32,
     pub screen_res_inv: [f32; 2],
+    pub csm_active: u32,
+    pub volumetric_active: u32,
+    pub _pad: [u32; 2],
 }
 
-const _: () = assert!(std::mem::size_of::<PushCombineConstants>() == 32);
+const _: () = assert!(std::mem::size_of::<PushCombineConstants>() == 48);
 
 impl Default for PushCombineConstants {
     fn default() -> Self {
@@ -167,6 +170,9 @@ impl Default for PushCombineConstants {
             shadow_map_idx: u32::MAX,
             num_lights: 0,
             screen_res_inv: [0.0, 0.0],
+            csm_active: 0,
+            volumetric_active: 0,
+            _pad: [0, 0],
         }
     }
 }
@@ -816,6 +822,7 @@ pub struct DeferredCombinePipeline {
     pub root: ID3D12RootSignature,
     pub pso: ID3D12PipelineState,
     light_params_buffer: Option<ID3D12Resource>,
+    dummy_csm_buffer: Option<ID3D12Resource>,
 }
 
 impl DeferredCombinePipeline {
@@ -873,7 +880,16 @@ impl DeferredCombinePipeline {
             pDescriptorRanges: &srv_range,
         };
 
-        let parameters = [push, cam, light_params, lights, textures];
+        // Param 5: CSM Split Uniforms CBV (b3)
+        let mut csm_cbv = D3D12_ROOT_PARAMETER::default();
+        csm_cbv.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        csm_cbv.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        csm_cbv.Anonymous.Descriptor = D3D12_ROOT_DESCRIPTOR {
+            ShaderRegister: 3,
+            RegisterSpace: 0,
+        };
+
+        let parameters = [push, cam, light_params, lights, textures, csm_cbv];
 
         let samplers = [
             D3D12_STATIC_SAMPLER_DESC {
@@ -1032,6 +1048,7 @@ impl DeferredCombinePipeline {
             root,
             pso,
             light_params_buffer: None,
+            dummy_csm_buffer: None,
         })
     }
 
@@ -1045,6 +1062,7 @@ impl DeferredCombinePipeline {
         bindless_heap: &ID3D12DescriptorHeap,
         push: &PushCombineConstants,
         light_params: &GpuLightParams,
+        csm_uniforms_va: Option<u64>,
         hdr_rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
         width: u32,
         height: u32,
@@ -1083,6 +1101,40 @@ impl DeferredCombinePipeline {
             self.light_params_buffer = Some(res.ok_or_else(failure)?);
         }
 
+        if self.dummy_csm_buffer.is_none() {
+            let heap_props = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                CreationNodeMask: 1,
+                VisibleNodeMask: 1,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 512,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut res = None;
+            unsafe {
+                device.CreateCommittedResource(
+                    &heap_props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut res,
+                )?;
+            }
+            self.dummy_csm_buffer = Some(res.ok_or_else(failure)?);
+        }
+
         let lpb = self.light_params_buffer.as_ref().unwrap();
         unsafe {
             let mut mapped = std::ptr::null_mut();
@@ -1096,6 +1148,11 @@ impl DeferredCombinePipeline {
         }
 
         let light_params_va = unsafe { lpb.GetGPUVirtualAddress() };
+        let csm_va = if let Some(va) = csm_uniforms_va {
+            va
+        } else {
+            unsafe { self.dummy_csm_buffer.as_ref().unwrap().GetGPUVirtualAddress() }
+        };
 
         unsafe {
             cmd.SetPipelineState(&self.pso);
@@ -1116,6 +1173,7 @@ impl DeferredCombinePipeline {
                 4,
                 bindless_heap.GetGPUDescriptorHandleForHeapStart(),
             );
+            cmd.SetGraphicsRootConstantBufferView(5, csm_va);
 
             cmd.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: 0.0,
