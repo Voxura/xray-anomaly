@@ -19,7 +19,12 @@ use std::f32::consts::{FRAC_PI_2, PI};
 use xray_core::LtxDocument;
 use xray_core::ltx_loader::OwnedLtxDocument;
 
+use crate::camera::matrix_build_camera;
+use crate::cform::{CformBvh, CformModel};
 use crate::chunk::{ByteCursor, ChunkReader, ChunkWriter, FormatError};
+use crate::hom::{frustum_planes, ClipFrustum};
+use crate::lanims::pack_argb;
+use crate::ogf::{matrix_mul_43, matrix_rotate_z, matrix_scale, matrix_transform_point, XRayMatrix};
 
 pub const PS_VERSION: u16 = 0x0001;
 pub const PED_VERSION: u16 = 0x0001;
@@ -1685,6 +1690,520 @@ pub struct WallmarkVertex {
     pub uv: [f32; 2],
 }
 
+pub const WALLMARK_RANGE_STATIC: f32 = 100.0;
+pub const WALLMARK_RANGE_SKELETON: f32 = 50.0;
+pub const WALLMARK_DEFAULT_TTL: f32 = 50.0;
+pub const WALLMARK_SHIFT_PP: f32 = 0.0001;
+pub const WALLMARK_SHIFT_V: f32 = 0.0001;
+pub const WALLMARK_COS_88_DEG: f32 = 0.034899;
+pub const WALLMARK_DUPLICATE_TOLERANCE: f32 = 0.02;
+const WALLMARK_PACK_EPS: f32 = 1e-5;
+
+/// Parameters controlling static wallmark decal projection (`CWallmarksEngine::AddStaticWallmark`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticWallmarkConfig {
+    pub shader: String,
+    pub texture: String,
+    /// Decal half-extent in meters (`sz`).
+    pub size: f32,
+    /// Lifetime in seconds: `0.0` uses `WALLMARK_DEFAULT_TTL * 15.0` (750s), `< 0.0` is infinite (`-1.0`).
+    pub ttl: f32,
+    /// Random or explicit decal roll around contact normal in degrees.
+    pub rotation_deg: f32,
+    /// Creation timestamp (`Device.fTimeGlobal`).
+    pub time_now: f32,
+    /// Skip `WALLMARK_RANGE_STATIC` (100m) distance cull when `true`.
+    pub ignore_range_opt: bool,
+    /// Optional camera world position for distance optimization culling.
+    pub camera_pos: Option<[f32; 3]>,
+    /// Skip triangles with `CformTriangle::suppress_wm == true`.
+    pub respect_suppress_wm: bool,
+}
+
+impl Default for StaticWallmarkConfig {
+    fn default() -> Self {
+        Self {
+            shader: "effects\\wallmark".to_string(),
+            texture: String::new(),
+            size: 0.25,
+            ttl: 0.0,
+            rotation_deg: 0.0,
+            time_now: 0.0,
+            ignore_range_opt: false,
+            camera_pos: None,
+            respect_suppress_wm: true,
+        }
+    }
+}
+
+/// Weld triangle vertex positions within `eps` matching `CDB::Collector::add_face_packed_D`.
+pub fn pack_triangle_vertices(
+    tris: &[([f32; 3], [f32; 3], [f32; 3])],
+    eps: f32,
+) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+    let tol = eps.max(1e-6);
+    let cell_size = tol * 4.0;
+    let inv_cell = 1.0 / cell_size;
+    let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::with_capacity(tris.len() * 2);
+    let mut verts: Vec<[f32; 3]> = Vec::with_capacity(tris.len() * 2);
+    let mut out_tris = Vec::with_capacity(tris.len());
+
+    let mut intern = |p: [f32; 3]| -> u32 {
+        let cx = (p[0] * inv_cell).floor() as i64;
+        let cy = (p[1] * inv_cell).floor() as i64;
+        let cz = (p[2] * inv_cell).floor() as i64;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if let Some(bucket) = grid.get(&(cx + dx, cy + dy, cz + dz)) {
+                        for &idx in bucket {
+                            let q = verts[idx as usize];
+                            if (q[0] - p[0]).abs() <= tol
+                                && (q[1] - p[1]).abs() <= tol
+                                && (q[2] - p[2]).abs() <= tol
+                            {
+                                return idx;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let idx = verts.len() as u32;
+        verts.push(p);
+        grid.entry((cx, cy, cz)).or_default().push(idx);
+        idx
+    };
+
+    for &(p0, p1, p2) in tris {
+        out_tris.push([intern(p0), intern(p1), intern(p2)]);
+    }
+    (verts, out_tris)
+}
+
+/// Build per-triangle edge adjacency matching `CDB::Collector::calc_adjacency` (`xrCDB_Collector.cpp`).
+pub fn calc_triangle_adjacency(tris: &[[u32; 3]]) -> Vec<[Option<u32>; 3]> {
+    #[derive(Clone, Copy)]
+    struct EdgeRec {
+        v0: u32,
+        v1: u32,
+        face_id: u32,
+        edge_id: u8,
+    }
+
+    let mut edges = Vec::with_capacity(tris.len() * 3);
+    for (face_idx, &tri) in tris.iter().enumerate() {
+        let face_id = face_idx as u32;
+        for e in 0..3 {
+            let a = tri[e];
+            let b = tri[(e + 1) % 3];
+            let (v0, v1) = if a <= b { (a, b) } else { (b, a) };
+            edges.push(EdgeRec {
+                v0,
+                v1,
+                face_id,
+                edge_id: e as u8,
+            });
+        }
+    }
+
+    edges.sort_unstable_by(|a, b| {
+        a.v0.cmp(&b.v0)
+            .then_with(|| a.v1.cmp(&b.v1))
+            .then_with(|| a.face_id.cmp(&b.face_id))
+    });
+
+    let mut adj = vec![[None; 3]; tris.len()];
+    for pair in edges.windows(2) {
+        let e0 = pair[0];
+        let e1 = pair[1];
+        if e0.v0 == e1.v0 && e0.v1 == e1.v1 && e0.face_id != e1.face_id {
+            adj[e0.face_id as usize][e0.edge_id as usize] = Some(e1.face_id);
+            adj[e1.face_id as usize][e1.edge_id as usize] = Some(e0.face_id);
+        }
+    }
+    adj
+}
+
+/// Build the orthographic decal projection matrix matching `CWallmarksEngine::BuildMatrix`
+/// + Z-rotation (`WallmarksEngine.cpp:193-206, 244-247`).
+pub fn build_wallmark_view_matrix(
+    normal: [f32; 3],
+    size: f32,
+    contact_point: [f32; 3],
+    rotation_deg: f32,
+) -> XRayMatrix {
+    let n = vec3_normalize_safe(normal);
+    let n = if vec3_len(n) <= 1e-6 {
+        [0.0, 0.0, 1.0]
+    } else {
+        n
+    };
+    let inv_sz = 1.0 / size.max(1e-4);
+    let at = vec3_sub(contact_point, n);
+    let y = if n[1].abs() > 0.99 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let right = vec3_cross(y, n);
+    let up = vec3_cross(n, right);
+
+    let mut m_view = matrix_build_camera(contact_point, at, up);
+    m_view = matrix_mul_43(&matrix_scale(inv_sz, inv_sz, inv_sz), &m_view);
+    if rotation_deg.abs() > 1e-6 {
+        m_view = matrix_mul_43(&matrix_rotate_z(rotation_deg.to_radians()), &m_view);
+    }
+    m_view
+}
+
+#[inline]
+fn tri_mknormal(p0: [f32; 3], p1: [f32; 3], p2: [f32; 3]) -> [f32; 3] {
+    let e0 = vec3_sub(p1, p0);
+    let e1 = vec3_sub(p2, p1);
+    vec3_normalize_safe(vec3_cross(e0, e1))
+}
+
+fn project_packed_wallmark(
+    verts: &[[f32; 3]],
+    tris: &[[u32; 3]],
+    seed_tri_idx: usize,
+    contact_point: [f32; 3],
+    cfg: &StaticWallmarkConfig,
+) -> Option<StaticWallmarkRecord> {
+    if cfg.size <= 1e-4 || seed_tri_idx >= tris.len() {
+        return None;
+    }
+    if !cfg.ignore_range_opt
+        && let Some(cam) = cfg.camera_pos
+    {
+        let d = vec3_sub(contact_point, cam);
+        if vec3_dot(d, d) > WALLMARK_RANGE_STATIC * WALLMARK_RANGE_STATIC {
+            return None;
+        }
+    }
+
+    let seed = tris[seed_tri_idx];
+    let sml_normal = tri_mknormal(
+        verts[seed[0] as usize],
+        verts[seed[1] as usize],
+        verts[seed[2] as usize],
+    );
+    if vec3_len(sml_normal) <= 1e-6 {
+        return None;
+    }
+
+    let m_view = build_wallmark_view_matrix(sml_normal, cfg.size, contact_point, cfg.rotation_deg);
+    let clipper = ClipFrustum::from_view_proj(&m_view, frustum_planes::LRTB);
+    let adj = calc_triangle_adjacency(tris);
+
+    let mut visited = vec![false; tris.len()];
+    let mut stack = Vec::with_capacity(32);
+    stack.push(seed_tri_idx);
+    let mut out_verts = Vec::with_capacity(24);
+    let base_color = pack_argb(0, 128, 128, 128);
+
+    while let Some(t) = stack.pop() {
+        if visited[t] {
+            continue;
+        }
+        visited[t] = true;
+
+        let tri = tris[t];
+        let poly = [
+            verts[tri[0] as usize],
+            verts[tri[1] as usize],
+            verts[tri[2] as usize],
+        ];
+        if let Some(clipped) = clipper.clip_poly(&poly) {
+            let p0 = clipped[0];
+            let uv0 = matrix_transform_point(&m_view, p0);
+            let v0 = WallmarkVertex {
+                position: p0,
+                color: base_color,
+                uv: [(1.0 + uv0[0]) * 0.5, (1.0 - uv0[1]) * 0.5],
+            };
+
+            let p1 = clipped[1];
+            let uv1 = matrix_transform_point(&m_view, p1);
+            let mut v1 = WallmarkVertex {
+                position: p1,
+                color: base_color,
+                uv: [(1.0 + uv1[0]) * 0.5, (1.0 - uv1[1]) * 0.5],
+            };
+
+            for &pi in &clipped[2..] {
+                let uvi = matrix_transform_point(&m_view, pi);
+                let v2 = WallmarkVertex {
+                    position: pi,
+                    color: base_color,
+                    uv: [(1.0 + uvi[0]) * 0.5, (1.0 - uvi[1]) * 0.5],
+                };
+                out_verts.push(v0);
+                out_verts.push(v1);
+                out_verts.push(v2);
+                v1 = v2;
+            }
+
+            for adj_idx in adj[t].into_iter().flatten() {
+                let idx = adj_idx as usize;
+                if visited[idx] {
+                    continue;
+                }
+                let nt = tris[idx];
+                let test_normal = tri_mknormal(
+                    verts[nt[0] as usize],
+                    verts[nt[1] as usize],
+                    verts[nt[2] as usize],
+                );
+                if vec3_dot(test_normal, sml_normal) >= WALLMARK_COS_88_DEG {
+                    stack.push(idx);
+                }
+            }
+        }
+    }
+
+    if out_verts.len() < 3 {
+        return None;
+    }
+
+    let mut bmin = out_verts[0].position;
+    let mut bmax = out_verts[0].position;
+    for v in &out_verts[1..] {
+        for axis in 0..3 {
+            bmin[axis] = bmin[axis].min(v.position[axis]);
+            bmax[axis] = bmax[axis].max(v.position[axis]);
+        }
+    }
+    let bounds_center = [
+        (bmin[0] + bmax[0]) * 0.5,
+        (bmin[1] + bmax[1]) * 0.5,
+        (bmin[2] + bmax[2]) * 0.5,
+    ];
+    let half_diag = vec3_sub(bmax, bounds_center);
+    let bounds_radius = vec3_len(half_diag);
+    let time_end = if cfg.ttl < 0.0 {
+        -1.0
+    } else if cfg.ttl == 0.0 {
+        WALLMARK_DEFAULT_TTL * 15.0
+    } else {
+        cfg.ttl
+    };
+
+    Some(StaticWallmarkRecord {
+        bounds_center,
+        bounds_radius,
+        shader: cfg.shader.clone(),
+        texture: cfg.texture.clone(),
+        time_start: cfg.time_now,
+        time_end,
+        vertices: out_verts,
+    })
+}
+
+/// Project a static decal polygon onto an arbitrary triangle list starting from `seed_tri_index`.
+pub fn project_static_wallmark_from_tris(
+    tris: &[([f32; 3], [f32; 3], [f32; 3])],
+    seed_tri_index: usize,
+    contact_point: [f32; 3],
+    cfg: &StaticWallmarkConfig,
+) -> Option<StaticWallmarkRecord> {
+    if seed_tri_index >= tris.len() {
+        return None;
+    }
+    let (verts, packed_tris) = pack_triangle_vertices(tris, WALLMARK_PACK_EPS);
+    project_packed_wallmark(&verts, &packed_tris, seed_tri_index, contact_point, cfg)
+}
+
+/// Project a static decal polygon against a `level.cform` BVH (`CWallmarksEngine::AddWallmark_internal`).
+pub fn project_static_wallmark_on_cform(
+    model: &CformModel,
+    bvh: &CformBvh<'_>,
+    seed_tri_index: usize,
+    contact_point: [f32; 3],
+    cfg: &StaticWallmarkConfig,
+) -> Option<StaticWallmarkRecord> {
+    let seed_tri = model.triangles.get(seed_tri_index)?;
+    if cfg.respect_suppress_wm && seed_tri.suppress_wm {
+        return None;
+    }
+    if cfg.size <= 1e-4 {
+        return None;
+    }
+    if !cfg.ignore_range_opt
+        && let Some(cam) = cfg.camera_pos
+    {
+        let d = vec3_sub(contact_point, cam);
+        if vec3_dot(d, d) > WALLMARK_RANGE_STATIC * WALLMARK_RANGE_STATIC {
+            return None;
+        }
+    }
+
+    let half_q = cfg.size * 2.5;
+    let hits = bvh.box_query(contact_point, [half_q, half_q, half_q], true, false);
+    if hits.is_empty() {
+        return None;
+    }
+
+    let mut raw_tris = Vec::with_capacity(hits.len() + 1);
+    raw_tris.push((
+        model.vertices[seed_tri.verts[0] as usize],
+        model.vertices[seed_tri.verts[1] as usize],
+        model.vertices[seed_tri.verts[2] as usize],
+    ));
+    for h in hits {
+        if h.tri_index == seed_tri_index {
+            continue;
+        }
+        if cfg.respect_suppress_wm && model.triangles[h.tri_index].suppress_wm {
+            continue;
+        }
+        raw_tris.push((h.verts[0], h.verts[1], h.verts[2]));
+    }
+
+    let (verts, packed_tris) = pack_triangle_vertices(&raw_tris, WALLMARK_PACK_EPS);
+    project_packed_wallmark(&verts, &packed_tris, 0, contact_point, cfg)
+}
+
+/// Flattened static wallmark render batch grouped by `(shader, texture)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticWallmarkBatch {
+    pub shader: String,
+    pub texture: String,
+    pub vertices: Vec<WallmarkVertex>,
+}
+
+/// Active static decal pool managing slots, duplicate merge, TTL expiry, and frustum/SSA emission.
+#[derive(Debug, Clone, Default)]
+pub struct StaticWallmarkPool {
+    items: Vec<StaticWallmarkRecord>,
+}
+
+impl StaticWallmarkPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    #[inline]
+    pub fn items(&self) -> &[StaticWallmarkRecord] {
+        &self.items
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    /// Add or replace an overlapping wallmark within `0.02m` (`WallmarksEngine.cpp:280-298`).
+    pub fn add(&mut self, record: StaticWallmarkRecord) {
+        for existing in &mut self.items {
+            if existing.shader == record.shader
+                && existing.texture == record.texture
+                && (existing.bounds_center[0] - record.bounds_center[0]).abs()
+                    < WALLMARK_DUPLICATE_TOLERANCE
+                && (existing.bounds_center[1] - record.bounds_center[1]).abs()
+                    < WALLMARK_DUPLICATE_TOLERANCE
+                && (existing.bounds_center[2] - record.bounds_center[2]).abs()
+                    < WALLMARK_DUPLICATE_TOLERANCE
+            {
+                *existing = record;
+                return;
+            }
+        }
+        self.items.push(record);
+    }
+
+    /// Remove finite-lifetime wallmarks whose age ratio reached `1.0`, returning count pruned.
+    pub fn prune_expired(&mut self, time_now: f32) -> usize {
+        let before = self.items.len();
+        self.items.retain(|wm| {
+            if wm.time_end < 0.0 {
+                return true;
+            }
+            let w = (time_now - wm.time_start) / wm.time_end.max(1e-6);
+            w < 1.0
+        });
+        before - self.items.len()
+    }
+
+    /// Frustum + SSA cull (`ssa >= ssa_discard / 4`), prune expired decals, and emit vertex batches
+    /// matching `CWallmarksEngine::Render` (`WallmarksEngine.cpp:407-456`).
+    ///
+    /// `ssa_discard` is the normalized `r_ssaDISCARD` threshold (`ps_r__ssaDISCARD^2 / g_fSCREEN`,
+    /// e.g. via [`crate::details::compute_r_ssa_discard`]).
+    pub fn collect_visible_batches(
+        &mut self,
+        time_now: f32,
+        camera_pos: [f32; 3],
+        frustum: &ClipFrustum,
+        ssa_discard: f32,
+    ) -> Vec<StaticWallmarkBatch> {
+        let ssa_clip = ssa_discard * 0.25;
+        let mut batches: Vec<StaticWallmarkBatch> = Vec::new();
+        let mut idx = 0usize;
+
+        while idx < self.items.len() {
+            let wm = &self.items[idx];
+            if frustum.test_sphere(wm.bounds_center, wm.bounds_radius) {
+                let d = vec3_sub(camera_pos, wm.bounds_center);
+                let dist_sq = vec3_dot(d, d).max(1e-6);
+                let ssa = (wm.bounds_radius * wm.bounds_radius) / dist_sq;
+                if ssa >= ssa_clip {
+                    let a = if wm.time_end < 0.0 {
+                        0.0
+                    } else {
+                        ((time_now - wm.time_start) / wm.time_end.max(1e-6)).clamp(0.0, 1.0)
+                    };
+                    let a_c = ((a * 255.0).floor() as i32).clamp(0, 255) as u8;
+                    let color = pack_argb(a_c, 128, 128, 128);
+
+                    let batch_idx = if let Some(pos) = batches
+                        .iter()
+                        .position(|b| b.shader == wm.shader && b.texture == wm.texture)
+                    {
+                        pos
+                    } else {
+                        batches.push(StaticWallmarkBatch {
+                            shader: wm.shader.clone(),
+                            texture: wm.texture.clone(),
+                            vertices: Vec::with_capacity(wm.vertices.len()),
+                        });
+                        batches.len() - 1
+                    };
+                    let out = &mut batches[batch_idx].vertices;
+                    for v in &wm.vertices {
+                        out.push(WallmarkVertex {
+                            position: v.position,
+                            color,
+                            uv: v.uv,
+                        });
+                    }
+                }
+            }
+
+            if wm.time_end >= 0.0 {
+                let w = (time_now - wm.time_start) / wm.time_end.max(1e-6);
+                if w >= 1.0 {
+                    self.items.swap_remove(idx);
+                    continue;
+                }
+            }
+            idx += 1;
+        }
+
+        batches
+    }
+}
+
 // ============================================================================
 // Internal .pe EParticleAction -> CompiledParticleAction Compiler
 // ============================================================================
@@ -2454,5 +2973,125 @@ blood_drop_size = 0.1
         assert_eq!(cfg.wallmarks.textures, vec!["wm\\wm_blood_1", "wm\\wm_blood_2"]);
         assert_eq!(cfg.blood_drops.textures, vec!["wm\\wm_blood_drop_1"]);
         assert!((cfg.nominal_hit - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_static_wallmark_projection_cform_adjacency_crease_and_pool() {
+        use crate::camera::{matrix_build_camera, matrix_build_projection};
+        use crate::cform::CformTriangle;
+        use crate::ogf::matrix_mul_44;
+
+        // Build a 4-triangle mesh sharing vertices:
+        // - Tri 0 & 1 form a front wall on z = 0 facing -Z (normal = [0, 0, -1]) across x=[-1..1], y=[-1..1]
+        //   Wait: (p1-p0)x(p2-p1) for p0=(-1,-1,0), p1=(-1,1,0), p2=(1,1,0) => (0,2,0)x(2,0,0) = (0,0,-4) -> [0,0,-1].
+        // - Tri 2 is a perpendicular side wall at x=1 turning +Z (normal = [1, 0, 0]): dot([1,0,0], [0,0,-1]) = 0 < 0.034899 (90 deg crease!)
+        // - Tri 3 shares top edge y=1 with Tri 1 & 0, tilted slightly (same plane / small 15 deg tilt), marked suppress_wm=true when on cform.
+        let model = CformModel::from_parts(
+            vec![
+                [-1.0, -1.0, 0.0], // 0
+                [-1.0, 1.0, 0.0],  // 1
+                [1.0, 1.0, 0.0],   // 2
+                [1.0, -1.0, 0.0],  // 3
+                [1.0, -1.0, 2.0],  // 4
+                [1.0, 1.0, 2.0],   // 5
+                [-1.0, 2.0, 0.25], // 6
+                [1.0, 2.0, 0.25],  // 7
+            ],
+            vec![
+                CformTriangle {
+                    verts: [0, 1, 2],
+                    material: 0,
+                    suppress_shadows: false,
+                    suppress_wm: false,
+                    sector: 0,
+                },
+                CformTriangle {
+                    verts: [0, 2, 3],
+                    material: 0,
+                    suppress_shadows: false,
+                    suppress_wm: false,
+                    sector: 0,
+                },
+                // 90 deg crease wall sharing edge (3, 2)
+                CformTriangle {
+                    verts: [3, 2, 5],
+                    material: 0,
+                    suppress_shadows: false,
+                    suppress_wm: false,
+                    sector: 0,
+                },
+                // Top lip sharing edge (1, 2) with suppress_wm = true
+                CformTriangle {
+                    verts: [1, 6, 7],
+                    material: 0,
+                    suppress_shadows: false,
+                    suppress_wm: true,
+                    sector: 0,
+                },
+            ],
+        )
+        .unwrap();
+        let bvh = model.build_bvh();
+
+        // Project a 0.5m radius decal at (0.0, 0.0, 0.0) across the diagonal shared by Tri 0 & Tri 1
+        let mut cfg = StaticWallmarkConfig {
+            shader: "effects\\wallmark".to_string(),
+            texture: "wm\\wm_bullet".to_string(),
+            size: 0.5,
+            ttl: 10.0,
+            rotation_deg: 0.0,
+            time_now: 2.0,
+            ignore_range_opt: false,
+            camera_pos: Some([0.0, 0.0, -5.0]),
+            respect_suppress_wm: true,
+        };
+        let wm = project_static_wallmark_on_cform(&model, &bvh, 0, [0.0, 0.0, 0.0], &cfg).unwrap();
+        assert!(wm.vertices.len() >= 6);
+        assert_eq!(wm.vertices.len() % 3, 0);
+        // Every projected vertex stays on z = 0 wall (90 deg side wall & suppress_wm excluded) and within [-0.5, 0.5]
+        for v in &wm.vertices {
+            assert!(v.position[2].abs() < 1e-4, "vertex leaked off front wall: {:?}", v.position);
+            assert!(v.position[0] >= -0.501 && v.position[0] <= 0.501);
+            assert!(v.position[1] >= -0.501 && v.position[1] <= 0.501);
+            assert!(v.uv[0] >= -1e-4 && v.uv[0] <= 1.0 + 1e-4);
+            assert!(v.uv[1] >= -1e-4 && v.uv[1] <= 1.0 + 1e-4);
+        }
+        assert!((wm.bounds_center[0]).abs() < 1e-4);
+        assert!((wm.bounds_center[1]).abs() < 1e-4);
+
+        // Seed triangle with suppress_wm=true must produce None
+        assert!(project_static_wallmark_on_cform(&model, &bvh, 3, [0.0, 1.5, 0.1], &cfg).is_none());
+
+        // Range culling (>100m away) returns None unless ignore_range_opt = true
+        cfg.camera_pos = Some([0.0, 0.0, -200.0]);
+        assert!(project_static_wallmark_on_cform(&model, &bvh, 0, [0.0, 0.0, 0.0], &cfg).is_none());
+        cfg.ignore_range_opt = true;
+        assert!(project_static_wallmark_on_cform(&model, &bvh, 0, [0.0, 0.0, 0.0], &cfg).is_some());
+
+        // Pool duplicate replacement (< 0.02m) + visibility emission + TTL expiry
+        let mut pool = StaticWallmarkPool::new();
+        pool.add(wm.clone());
+        assert_eq!(pool.len(), 1);
+        let mut replacement = wm.clone();
+        replacement.bounds_center[0] += 0.005;
+        replacement.time_start = 4.0;
+        pool.add(replacement);
+        assert_eq!(pool.len(), 1);
+
+        let view = matrix_build_camera([0.0, 0.0, -4.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let proj = matrix_build_projection(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 50.0);
+        let full = matrix_mul_44(&proj, &view);
+        let frustum = ClipFrustum::from_view_proj(&full, frustum_planes::LRTB | frustum_planes::FAR);
+
+        // At t=9.0, elapsed = 5.0 / 10.0 = 0.5 -> alpha ~ 127
+        let batches = pool.collect_visible_batches(9.0, [0.0, 0.0, -4.0], &frustum, 0.01);
+        assert_eq!(batches.len(), 1);
+        let a_byte = (batches[0].vertices[0].color >> 24) & 0xFF;
+        assert!((126..=128).contains(&a_byte), "expected ~127 alpha, got {a_byte}");
+
+        // At t=15.0, elapsed = 11.0 / 10.0 >= 1.0 -> rendered on frame of death & pruned
+        let batches_end = pool.collect_visible_batches(15.0, [0.0, 0.0, -4.0], &frustum, 0.01);
+        assert_eq!(batches_end.len(), 1);
+        assert_eq!(pool.len(), 0);
     }
 }

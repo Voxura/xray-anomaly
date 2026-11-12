@@ -113,13 +113,13 @@ pub mod fvf_flags {
     pub const XRAY_STATIC_FVF_STANDARD: u32 = D3DFVF_XYZ | D3DFVF_NORMAL | 0x0100;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct OgfBBox {
     pub min: [f32; 3],
     pub max: [f32; 3],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct OgfBSphere {
     pub center: [f32; 3],
     pub radius: f32,
@@ -740,6 +740,17 @@ pub const XRAY_IDENTITY_MATRIX: XRayMatrix = [
     [0.0, 0.0, 0.0, 1.0],
 ];
 
+/// Compute `Fmatrix::rotateX(angle)` matching `src/xrCore/_matrix.h:348-361`.
+pub fn matrix_rotate_x(angle: f32) -> XRayMatrix {
+    let (sina, cosa) = angle.sin_cos();
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, cosa, sina, 0.0],
+        [0.0, -sina, cosa, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
 /// Compute `Fmatrix::rotateY(angle)` matching `src/xrCore/_matrix.h:363-376`.
 ///
 /// Matches X-Ray's left-handed row-vector basis (`i = (cos, 0, -sin)`, `k = (sin, 0, cos)`),
@@ -752,6 +763,56 @@ pub fn matrix_rotate_y(angle: f32) -> XRayMatrix {
         [sina, 0.0, cosa, 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ]
+}
+
+/// Compute `Fmatrix::rotateZ(angle)` matching `src/xrCore/_matrix.h:378-391`.
+pub fn matrix_rotate_z(angle: f32) -> XRayMatrix {
+    let (sina, cosa) = angle.sin_cos();
+    [
+        [cosa, sina, 0.0, 0.0],
+        [-sina, cosa, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+/// Compute `Fmatrix::scale(x, y, z)` matching `src/xrCore/_matrix.h:334-341`.
+#[inline]
+pub fn matrix_scale(x: f32, y: f32, z: f32) -> XRayMatrix {
+    [
+        [x, 0.0, 0.0, 0.0],
+        [0.0, y, 0.0, 0.0],
+        [0.0, 0.0, z, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+/// Compute `(up, right)` orthonormal vectors perpendicular to `dir` matching
+/// `Fvector::generate_orthonormal_basis` (`src/xrCore/_vector3d.h:653-675`).
+pub fn vector_generate_orthonormal_basis(dir: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let up = if dir[0].abs() >= dir[1].abs() {
+        let denom = (dir[0] * dir[0] + dir[2] * dir[2]).sqrt();
+        if denom > 1e-6 {
+            let inv = 1.0 / denom;
+            [-dir[2] * inv, 0.0, dir[0] * inv]
+        } else {
+            [0.0, 0.0, 1.0]
+        }
+    } else {
+        let denom = (dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        if denom > 1e-6 {
+            let inv = 1.0 / denom;
+            [0.0, dir[2] * inv, -dir[1] * inv]
+        } else {
+            [0.0, 1.0, 0.0]
+        }
+    };
+    let right = [
+        up[1] * dir[2] - up[2] * dir[1],
+        up[2] * dir[0] - up[0] * dir[2],
+        up[0] * dir[1] - up[1] * dir[0],
+    ];
+    (up, right)
 }
 
 /// Compute `Fmatrix::setHPB(h, p, b)` matching `_matrix.h:852-876`.
@@ -793,6 +854,22 @@ pub fn matrix_set_xyzi_translate(xyz: [f32; 3], t: [f32; 3]) -> XRayMatrix {
     m[3][1] = t[1];
     m[3][2] = t[2];
     m
+}
+
+/// Compute `Fmatrix::mul(A, B)` (full 4x4 row-vector product, `_matrix.h:116-139`).
+///
+/// Transforms row vector by `b` first, then by `a` (`v * (b * a)`).
+pub fn matrix_mul_44(a: &XRayMatrix, b: &XRayMatrix) -> XRayMatrix {
+    let mut r = XRAY_IDENTITY_MATRIX;
+    for row in 0..4 {
+        for col in 0..4 {
+            r[row][col] = a[0][col] * b[row][0]
+                + a[1][col] * b[row][1]
+                + a[2][col] * b[row][2]
+                + a[3][col] * b[row][3];
+        }
+    }
+    r
 }
 
 /// Compute `Fmatrix::mul_43(A, B)` (`_matrix.h:142-165`).
@@ -2186,5 +2263,34 @@ mod tests {
         assert!((ndc[1] + 0.5).abs() < 1e-5);
         assert!(ndc[2] > 0.0 && ndc[2] < 1.0);
         assert!(matrix_transform_projected(&proj, [0.0, 0.0, 0.0]).is_none());
+
+        let rx = matrix_rotate_x(std::f32::consts::FRAC_PI_2);
+        let vy = matrix_transform_point(&rx, [0.0, 1.0, 0.0]);
+        assert!((vy[1] - 0.0).abs() < 1e-6);
+        assert!((vy[2] - 1.0).abs() < 1e-6);
+
+        let rz = matrix_rotate_z(std::f32::consts::FRAC_PI_2);
+        let vx_z = matrix_transform_point(&rz, [1.0, 0.0, 0.0]);
+        assert!((vx_z[0] - 0.0).abs() < 1e-6);
+        assert!((vx_z[1] - 1.0).abs() < 1e-6);
+
+        let ms = matrix_scale(2.0, 3.0, 4.0);
+        assert_eq!(matrix_transform_point(&ms, [1.0, 2.0, -1.0]), [2.0, 6.0, -4.0]);
+
+        let (up, right) = vector_generate_orthonormal_basis([0.0, 1.0, 0.0]);
+        let dot_ju = up[0] * 0.0 + up[1] * 1.0 + up[2] * 0.0;
+        let dot_jr = right[0] * 0.0 + right[1] * 1.0 + right[2] * 0.0;
+        let dot_ur = up[0] * right[0] + up[1] * right[1] + up[2] * right[2];
+        assert!(dot_ju.abs() < 1e-6 && dot_jr.abs() < 1e-6 && dot_ur.abs() < 1e-6);
+
+        let view = crate::camera::matrix_build_camera(
+            [0.0, 0.0, -5.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        );
+        let full = matrix_mul_44(&proj, &view);
+        let origin_ndc = matrix_transform_projected(&full, [0.0, 0.0, 0.0]).unwrap();
+        assert!(origin_ndc[0].abs() < 1e-6 && origin_ndc[1].abs() < 1e-6);
+        assert!(origin_ndc[2] > 0.0 && origin_ndc[2] < 1.0);
     }
 }

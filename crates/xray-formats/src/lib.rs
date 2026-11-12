@@ -68,13 +68,22 @@ pub use camera::{
     PostprocessPlayer,
 };
 pub use cform::{
-    ray_options, BoxQueryHit, CformBvh, CformHeader, CformModel, CformTriangle, RaycastHit,
-    RaycastOptions, CFORM_CURRENT_VERSION,
+    ray_options, ray_triangle_test, BoxQueryHit, CformBvh, CformHeader, CformModel, CformTriangle,
+    RaycastHit, RaycastOptions, CFORM_CURRENT_VERSION,
 };
 pub use chunk::{ByteCursor, ChunkEntry, ChunkIter, ChunkReader, ChunkWriter, FormatError};
 pub use details::{
-    DetailHeader, DetailMesh, DetailMeshVertexOut, DetailPalette, DetailSlot, DetailVertex,
-    LevelDetails, DETAIL_ID_EMPTY, DETAIL_ID_EMPTY_V3, DETAIL_SLOT_HALF_SIZE, DETAIL_SLOT_SIZE,
+    compute_r_ssa_discard, detail_bwdithermap, detail_hash2, detail_interpolate,
+    detail_interpolate_and_dither, quantize_detail_coord, DetailCacheGrid, DetailCacheLevel1,
+    DetailCacheSlotState, DetailDecompressConfig, DetailGpuInstanceData, DetailHeader,
+    DetailHwBatchMesh, DetailHwObjectSpan, DetailHwVertex, DetailMesh, DetailMeshVertexOut,
+    DetailPalette, DetailRandom, DetailSlot, DetailSlotItem, DetailSlotPart, DetailSurfaceHit,
+    DetailSwingConfig, DetailSwingState, DetailSwingValue, DetailVertex, DetailVisibilityConfig,
+    DetailVisibleBatches, DetailWaveConstants, LevelDetails, DETAIL_CACHE1_COUNT,
+    DETAIL_DEFAULT_DENSITY, DETAIL_DEFAULT_HEIGHT, DETAIL_DEFAULT_L_AMBIENT,
+    DETAIL_DEFAULT_L_ANISO, DETAIL_DEFAULT_PS_SSA_DISCARD, DETAIL_DEFAULT_RADIUS,
+    DETAIL_DEFAULT_SSA_DISCARD, DETAIL_HW_QUANT, DETAIL_ID_EMPTY, DETAIL_ID_EMPTY_V3,
+    DETAIL_MAX_OBJECTS, DETAIL_OBJ_IN_SLOT, DETAIL_SLOT_HALF_SIZE, DETAIL_SLOT_SIZE,
     DETAIL_VERSION_3, DETAIL_VERSION_4, DO_NO_WAVING,
 };
 pub use envelopes::{
@@ -113,9 +122,10 @@ pub use level::{
     VertexDeclarator, VertexElement9, BUILD_LIGHT_RECORD_SIZE, LEVEL_GLOW_RECORD_SIZE,
 };
 pub use ogf::{
-    fvf_flags, matrix_forward_dir, matrix_invert_43, matrix_mul_43, matrix_rotate_y,
-    matrix_set_hpb, matrix_set_xyz_translate, matrix_set_xyzi_translate, matrix_transform_point,
-    matrix_transform_projected, ogf_chunks, skel_vert_type, BoneIkData, BoneIkSection,
+    fvf_flags, matrix_forward_dir, matrix_invert_43, matrix_mul_43, matrix_mul_44, matrix_rotate_x,
+    matrix_rotate_y, matrix_rotate_z, matrix_scale, matrix_set_hpb, matrix_set_xyz_translate,
+    matrix_set_xyzi_translate, matrix_transform_point, matrix_transform_projected, ogf_chunks,
+    skel_vert_type, vector_generate_orthonormal_basis, BoneIkData, BoneIkSection,
     BonePoseMatrices, BoneShape, BoneShapeType, LodImposterSample, OgfBBox, OgfBSphere, OgfBone,
     OgfBufferRef, OgfDesc, OgfGContainerRef, OgfHeader, OgfLodDef, OgfLodFacet, OgfLodVertex,
     OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows, OgfTextureLink, OgfTreeDef, OgfVertices,
@@ -136,12 +146,16 @@ pub use particle_sim::{
     ParticleStepEvents, PerlinNoise3,
 };
 pub use particles::{
-    encode_compiled_action_list, papi_flags, parse_compiled_action_list, ped_chunks, ped_flags,
-    pg_effect_flags, pgd_chunks, ps_chunks, BloodWallmarksConfig, CompiledParticleAction,
+    build_wallmark_view_matrix, calc_triangle_adjacency, encode_compiled_action_list,
+    pack_triangle_vertices, papi_flags, parse_compiled_action_list, ped_chunks, ped_flags,
+    pg_effect_flags, pgd_chunks, project_static_wallmark_from_tris,
+    project_static_wallmark_on_cform, ps_chunks, BloodWallmarksConfig, CompiledParticleAction,
     GroupEffectItem, ParticleActionKind, ParticleCollisionParams, ParticleDomain,
     ParticleDomainType, ParticleEffectDef, ParticleGroupDef, ParticleSpriteFrame, ParticlesLibrary,
-    StaticWallmarkRecord, WallmarkSlotConfig, WallmarkVertex, PARTICLE_DOMAIN_BINARY_SIZE,
-    PED_VERSION, PGD_VERSION, PS_VERSION,
+    StaticWallmarkBatch, StaticWallmarkConfig, StaticWallmarkPool, StaticWallmarkRecord,
+    WallmarkSlotConfig, WallmarkVertex, PARTICLE_DOMAIN_BINARY_SIZE, PED_VERSION, PGD_VERSION,
+    PS_VERSION, WALLMARK_COS_88_DEG, WALLMARK_DEFAULT_TTL, WALLMARK_DUPLICATE_TOLERANCE,
+    WALLMARK_RANGE_SKELETON, WALLMARK_RANGE_STATIC, WALLMARK_SHIFT_PP, WALLMARK_SHIFT_V,
 };
 pub use savegames::{
     compress_scop, decompress_scop, validate_scop_header, ActorStatDetail, ActorStatSection,

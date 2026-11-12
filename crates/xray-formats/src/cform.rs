@@ -653,6 +653,19 @@ fn ray_aabb_hit(origin: [f32; 3], dir: [f32; 3], bmin: [f32; 3], bmax: [f32; 3],
     true
 }
 
+/// Public Möller–Trumbore ray-triangle test matching `CDB::TestRayTri` (`xrCDB_ray.cpp:275-318`).
+#[inline]
+pub fn ray_triangle_test(
+    origin: [f32; 3],
+    dir: [f32; 3],
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    cull_backfaces: bool,
+) -> Option<(f32, f32, f32)> {
+    ray_triangle_xray(origin, dir, p0, p1, p2, cull_backfaces)
+}
+
 /// Möller–Trumbore ray-triangle test matching `xrCDB_ray.cpp:275-318`.
 #[inline]
 fn ray_triangle_xray(

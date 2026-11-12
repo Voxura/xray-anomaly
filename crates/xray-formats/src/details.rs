@@ -5,8 +5,16 @@
 //! Supports both legacy `DETAIL_VERSION_3` (16-byte slots, 6-bit IDs) and Anomaly
 //! `DETAIL_VERSION_4` (20-byte slots, 14-bit object IDs).
 
+use crate::cform::{ray_triangle_test, CformBvh, CformModel};
 use crate::chunk::{ByteCursor, ChunkReader, FormatError};
-use crate::ogf::{matrix_transform_point, OgfBBox, XRayMatrix};
+use crate::gamemtl::{gamemtl_flags, GameMaterialLibrary};
+use crate::hom::{ClipFrustum, OccRasterizer};
+use crate::ogf::{
+    matrix_mul_43, matrix_rotate_y, matrix_scale, matrix_transform_point,
+    vector_generate_orthonormal_basis, OgfBBox, XRayMatrix,
+};
+use xray_core::LtxDocument;
+use xray_core::ltx_loader::OwnedLtxDocument;
 
 pub const DETAIL_VERSION_3: u32 = 3;
 pub const DETAIL_VERSION_4: u32 = 4;
@@ -15,6 +23,36 @@ pub const DETAIL_SLOT_HALF_SIZE: f32 = 1.0;
 pub const DETAIL_ID_EMPTY_V3: u16 = 0x003F;
 pub const DETAIL_ID_EMPTY: u16 = 0x3FFF;
 pub const DO_NO_WAVING: u32 = 0x0001;
+pub const DETAIL_CACHE1_COUNT: usize = 4;
+pub const DETAIL_OBJ_IN_SLOT: usize = 4;
+pub const DETAIL_MAX_OBJECTS: usize = 16383;
+pub const DETAIL_DEFAULT_RADIUS: u32 = 49;
+pub const DETAIL_HW_QUANT: f32 = 16384.0;
+pub const DETAIL_DEFAULT_L_AMBIENT: f32 = 0.9;
+pub const DETAIL_DEFAULT_L_ANISO: f32 = 0.25;
+pub const DETAIL_DEFAULT_DENSITY: f32 = 0.6;
+pub const DETAIL_DEFAULT_HEIGHT: f32 = 1.0;
+/// Console CVar default `ps_r__ssaDISCARD = 3.5f` (`xrRender_console.cpp:146`).
+pub const DETAIL_DEFAULT_PS_SSA_DISCARD: f32 = 3.5;
+/// Normalized `r_ssaDISCARD = (3.5^2) / (1920 * 1080)` (`r2_R_calculate.cpp:20`).
+pub const DETAIL_DEFAULT_SSA_DISCARD: f32 = (3.5 * 3.5) / (1920.0 * 1080.0);
+
+/// Compute normalized `r_ssaDISCARD` matching `CRender::Calculate` (`r2_R_calculate.cpp:18-20`).
+#[inline]
+pub fn compute_r_ssa_discard(
+    viewport_width: u32,
+    viewport_height: u32,
+    fov_deg: f32,
+    r_lod: f32,
+    ps_ssa_discard: f32,
+) -> f32 {
+    let fov_factor = (90.0 / fov_deg.max(1.0)).powi(2);
+    let g_f_screen = (viewport_width.max(1) as f32)
+        * (viewport_height.max(1) as f32)
+        * fov_factor
+        * (1e-5 + r_lod.max(0.0));
+    (ps_ssa_discard * ps_ssa_discard) / g_f_screen.max(1.0)
+}
 
 /// `CDetail::fvfVertexIn` (20 bytes per vertex).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -518,6 +556,1391 @@ impl LevelDetails {
             ],
         })
     }
+
+    /// Snap world `(x, z)` to `CDetailManager::MT_CALC` cache grid center `(s_x, s_z)`
+    /// (`iFloor(EYE / dm_slot_size + 0.5)` in `DetailManager.cpp:477-478`).
+    #[inline]
+    pub fn world_to_cache_center(world_x: f32, world_z: f32) -> (i32, i32) {
+        (
+            (world_x / DETAIL_SLOT_SIZE + 0.5).floor() as i32,
+            (world_z / DETAIL_SLOT_SIZE + 0.5).floor() as i32,
+        )
+    }
+}
+
+// ============================================================================
+// Pure-Rust CDetailManager Runtime: Swing, Dither, HW Batches, Cache & Culling
+// ============================================================================
+
+/// Grass wind oscillation profile (`CDetailManager::SSwingValue` in `DetailManager.h:158-166`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailSwingValue {
+    pub rot1: f32,
+    pub rot2: f32,
+    pub amp1: f32,
+    pub amp2: f32,
+    pub speed: f32,
+}
+
+impl DetailSwingValue {
+    #[inline]
+    pub fn lerp(self, other: Self, factor: f32) -> Self {
+        let fi = 1.0 - factor;
+        Self {
+            amp1: fi * self.amp1 + factor * other.amp1,
+            amp2: fi * self.amp2 + factor * other.amp2,
+            rot1: fi * self.rot1 + factor * other.rot1,
+            rot2: fi * self.rot2 + factor * other.rot2,
+            speed: fi * self.speed + factor * other.speed,
+        }
+    }
+}
+
+/// `[details]` LTX swing preset pair (`swing_desc[2]` in `DetailManager.cpp:244-254`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailSwingConfig {
+    pub normal: DetailSwingValue,
+    pub fast: DetailSwingValue,
+}
+
+impl Default for DetailSwingConfig {
+    fn default() -> Self {
+        Self {
+            normal: DetailSwingValue {
+                rot1: 10.0,
+                rot2: 5.0,
+                amp1: 0.005,
+                amp2: 0.002,
+                speed: 1.0,
+            },
+            fast: DetailSwingValue {
+                rot1: 3.0,
+                rot2: 1.5,
+                amp1: 0.03,
+                amp2: 0.015,
+                speed: 3.0,
+            },
+        }
+    }
+}
+
+impl DetailSwingConfig {
+    pub fn from_ltx_str(ltx_text: &str) -> Self {
+        let doc = LtxDocument::parse(ltx_text);
+        Self::from_ltx_lookup(|k| doc.read_str("details", k).and_then(|s| s.parse::<f32>().ok()))
+    }
+
+    pub fn from_ltx_doc(doc: &OwnedLtxDocument) -> Self {
+        Self::from_ltx_lookup(|k| doc.read_str("details", k).and_then(|s| s.parse::<f32>().ok()))
+    }
+
+    fn from_ltx_lookup(mut f: impl FnMut(&str) -> Option<f32>) -> Self {
+        let def = Self::default();
+        Self {
+            normal: DetailSwingValue {
+                amp1: f("swing_normal_amp1").unwrap_or(def.normal.amp1),
+                amp2: f("swing_normal_amp2").unwrap_or(def.normal.amp2),
+                rot1: f("swing_normal_rot1").unwrap_or(def.normal.rot1),
+                rot2: f("swing_normal_rot2").unwrap_or(def.normal.rot2),
+                speed: f("swing_normal_speed").unwrap_or(def.normal.speed),
+            },
+            fast: DetailSwingValue {
+                amp1: f("swing_fast_amp1").unwrap_or(def.fast.amp1),
+                amp2: f("swing_fast_amp2").unwrap_or(def.fast.amp2),
+                rot1: f("swing_fast_rot1").unwrap_or(def.fast.rot1),
+                rot2: f("swing_fast_rot2").unwrap_or(def.fast.rot2),
+                speed: f("swing_fast_speed").unwrap_or(def.fast.speed),
+            },
+        }
+    }
+}
+
+/// GPU shader wave/wind constants matching `dx10DetailManager_VS.cpp:95-124`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailWaveConstants {
+    pub consts: [f32; 4],
+    pub wave0: [f32; 4],
+    pub wave1: [f32; 4],
+    pub dir1: [f32; 4],
+    pub dir2: [f32; 4],
+    pub prev_wave0: [f32; 4],
+    pub prev_wave1: [f32; 4],
+    pub prev_dir1: [f32; 4],
+    pub prev_dir2: [f32; 4],
+    pub still_consts: [f32; 4],
+}
+
+/// Time accumulator for grass wind animation (`CDetailManager::hw_Render`, `dx10DetailManager_VS.cpp:70-135`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DetailSwingState {
+    pub time_rot_1: f32,
+    pub time_rot_2: f32,
+    pub time_pos: f32,
+    pub prev_time_pos: f32,
+    pub prev_dir1: [f32; 4],
+    pub prev_dir2: [f32; 4],
+}
+
+impl DetailSwingState {
+    pub fn step(
+        &mut self,
+        dt_sec: f32,
+        wind_strength_factor: f32,
+        cfg: &DetailSwingConfig,
+        l_aniso: f32,
+        l_ambient: f32,
+    ) -> DetailWaveConstants {
+        let dt = if !dt_sec.is_finite() || !(0.0..=1.0).contains(&dt_sec) {
+            0.03
+        } else {
+            dt_sec
+        };
+        let swing = cfg.normal.lerp(cfg.fast, wind_strength_factor);
+        let rot1 = if swing.rot1.abs() > 1e-5 { swing.rot1 } else { 1.0 };
+        let rot2 = if swing.rot2.abs() > 1e-5 { swing.rot2 } else { 1.0 };
+
+        self.time_rot_1 += std::f32::consts::TAU * dt / rot1;
+        self.time_rot_2 += std::f32::consts::TAU * dt / rot2;
+        self.time_pos += dt * swing.speed;
+
+        // X-Ray normalizes `(sin(t), 0, cos(t), 0)` before scaling by `amp` (magnitude stays 1).
+        let (s1, c1) = self.time_rot_1.sin_cos();
+        let (s2, c2) = self.time_rot_2.sin_cos();
+        let dir1 = [s1 * swing.amp1, 0.0, c1 * swing.amp1, 0.0];
+        let dir2 = [s2 * swing.amp2, 0.0, c2 * swing.amp2, 0.0];
+
+        let inv_tau = 1.0 / std::f32::consts::TAU;
+        let inv_quant = 1.0 / DETAIL_HW_QUANT;
+        let out = DetailWaveConstants {
+            consts: [inv_quant, inv_quant, l_aniso, l_ambient],
+            wave0: [
+                (1.0 / 5.0) * inv_tau,
+                (1.0 / 7.0) * inv_tau,
+                (1.0 / 3.0) * inv_tau,
+                self.time_pos * inv_tau,
+            ],
+            wave1: [
+                (1.0 / 3.0) * inv_tau,
+                (1.0 / 7.0) * inv_tau,
+                (1.0 / 5.0) * inv_tau,
+                self.time_pos * inv_tau,
+            ],
+            dir1,
+            dir2,
+            prev_wave0: [
+                (1.0 / 5.0) * inv_tau,
+                (1.0 / 7.0) * inv_tau,
+                (1.0 / 3.0) * inv_tau,
+                self.prev_time_pos * inv_tau,
+            ],
+            prev_wave1: [
+                (1.0 / 3.0) * inv_tau,
+                (1.0 / 7.0) * inv_tau,
+                (1.0 / 5.0) * inv_tau,
+                self.prev_time_pos * inv_tau,
+            ],
+            prev_dir1: self.prev_dir1,
+            prev_dir2: self.prev_dir2,
+            still_consts: [inv_quant, inv_quant, inv_quant, 1.0],
+        };
+
+        self.prev_time_pos = self.time_pos;
+        self.prev_dir1 = dir1;
+        self.prev_dir2 = dir2;
+        out
+    }
+}
+
+/// Ordered 16x16 Bayer-style dither table (`bwdithermap` in `DetailManager.cpp:28-59`).
+pub fn detail_bwdithermap(levels: i32) -> [[i32; 16]; 16] {
+    const MAGIC_4X4: [[i32; 4]; 4] = [
+        [0, 14, 3, 13],
+        [11, 5, 8, 6],
+        [12, 2, 15, 1],
+        [7, 9, 4, 10],
+    ];
+    let denom = (levels.max(2) - 1) as f64;
+    let n = 255.0_f64 / denom;
+    let magicfact = (n - 1.0) / 16.0;
+    let mut out = [[0i32; 16]; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            for k in 0..4 {
+                for l in 0..4 {
+                    let v = 0.5
+                        + (MAGIC_4X4[i][j] as f64) * magicfact
+                        + ((MAGIC_4X4[k][l] as f64) / 16.0) * magicfact;
+                    out[4 * k + i][4 * l + j] = v as i32;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Bilinear corner density interpolation matching `Interpolate` in `DetailManager_Decompress.cpp:14-31`.
+#[inline]
+pub fn detail_interpolate(base: &[f32; 4], x: u32, y: u32, size: u32) -> f32 {
+    if size == 0 {
+        return base[0];
+    }
+    let f = size as f32;
+    let fx = (x as f32) / f;
+    let ifx = 1.0 - fx;
+    let fy = (y as f32) / f;
+    let ify = 1.0 - fy;
+
+    let c01 = base[0] * ifx + base[1] * fx;
+    let c23 = base[2] * ifx + base[3] * fx;
+    let c02 = base[0] * ify + base[2] * fy;
+    let c13 = base[1] * ify + base[3] * fy;
+
+    let cx = ify * c01 + fy * c23;
+    let cy = ifx * c02 + fx * c13;
+    (cx + cy) * 0.5
+}
+
+/// Bilinear corner density interpolation + 16x16 threshold test (`InterpolateAndDither`, `DetailManager_Decompress.cpp:33-43`).
+#[inline]
+pub fn detail_interpolate_and_dither(
+    alpha255: &[f32; 4],
+    x: u32,
+    y: u32,
+    sx: u32,
+    sy: u32,
+    size: u32,
+    dither: &[[i32; 16]; 16],
+) -> bool {
+    let max_idx = size.saturating_sub(1);
+    let cx = x.min(max_idx);
+    let cy = y.min(max_idx);
+    let c = (detail_interpolate(alpha255, cx, cy, size.max(1)) + 0.5).floor() as i32;
+    let clamped = c.clamp(0, 255);
+    let row = ((cy + sy) % 16) as usize;
+    let col = ((cx + sx) % 16) as usize;
+    clamped > dither[col][row]
+}
+
+/// Quantize a detail UV or normalized height coordinate into signed 16-bit (`QC(v)`, `dx10DetailManager_VS.cpp:14-40`).
+#[inline]
+pub fn quantize_detail_coord(v: f32) -> i16 {
+    (v * DETAIL_HW_QUANT).floor().clamp(-32768.0, 32767.0) as i16
+}
+
+/// Packed hardware-instanced detail vertex (`struct vertHW`, 20 bytes in `dx10DetailManager_VS.cpp:26-32`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+pub struct DetailHwVertex {
+    pub position: [f32; 3],
+    pub u_q: i16,
+    pub v_q: i16,
+    pub t_q: i16,
+    pub mid: i16,
+}
+
+/// Per-object batch slice in a `DetailHwBatchMesh` (`hw_Load_Geom`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailHwObjectSpan {
+    pub vertex_offset: u32,
+    pub index_offset: u32,
+    pub vertex_count_per_instance: u32,
+    pub index_count_per_instance: u32,
+}
+
+/// Replicated static vertex/index buffer for hardware detail batching (`CDetailManager::hw_Load_Geom`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailHwBatchMesh {
+    pub batch_size: u32,
+    pub vertices: Vec<DetailHwVertex>,
+    pub indices: Vec<u16>,
+    pub object_spans: Vec<DetailHwObjectSpan>,
+}
+
+/// Packed constant-buffer per-instance record matching `dx10DetailManager_VS.cpp:305-320`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailGpuInstanceData {
+    /// 3x4 transposed scale/rotation/translation matrix (`rows[0..3]`) + `(sun, sun, sun, hemi)` (`rows[3]`).
+    pub rows: [[f32; 4]; 4],
+    /// Terrain normal `.xyz` + dissolve alpha `.w` (`exdata` buffer).
+    pub ex_data: [f32; 4],
+}
+
+impl DetailMesh {
+    /// Build a replicated `batch_size`-instanced vertex/index buffer for hardware detail batching
+    /// (`CDetailManager::hw_Load_Geom` in `dx10DetailManager_VS.cpp` / `DetailManager_VS.cpp`).
+    ///
+    /// Returns `None` if `batch_size == 0` or replicated vertex indices per object would overflow `u16`.
+    pub fn build_hw_batches(objects: &[DetailMesh], batch_size: u32) -> Option<DetailHwBatchMesh> {
+        let batch_size = batch_size.clamp(1, 64);
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut object_spans = Vec::with_capacity(objects.len());
+
+        for obj in objects {
+            let v_count = u32::try_from(obj.vertices.len()).ok()?;
+            let i_count = u32::try_from(obj.indices.len()).ok()?;
+            let batch_verts = v_count.checked_mul(batch_size)?;
+            if batch_verts > u32::from(u16::MAX) + 1 {
+                return None;
+            }
+            let vertex_offset = u32::try_from(vertices.len()).ok()?;
+            let index_offset = u32::try_from(indices.len()).ok()?;
+
+            let y_span = if let Some(bb) = obj.bbox() {
+                let d = bb.max[1] - bb.min[1];
+                if d.abs() > 1e-6 {
+                    d
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            };
+
+            for batch in 0..batch_size {
+                let mid = (batch * 4) as i16;
+                for v in &obj.vertices {
+                    vertices.push(DetailHwVertex {
+                        position: v.position,
+                        u_q: quantize_detail_coord(v.u),
+                        v_q: quantize_detail_coord(v.v),
+                        t_q: quantize_detail_coord(v.position[1] / y_span),
+                        mid,
+                    });
+                }
+            }
+
+            let mut base_off: u16 = 0;
+            for batch in 0..batch_size {
+                for &idx in &obj.indices {
+                    indices.push(idx.checked_add(base_off)?);
+                }
+                if batch + 1 < batch_size {
+                    base_off = base_off.checked_add(u16::try_from(v_count).ok()?)?;
+                }
+            }
+
+            object_spans.push(DetailHwObjectSpan {
+                vertex_offset,
+                index_offset,
+                vertex_count_per_instance: v_count,
+                index_count_per_instance: i_count,
+            });
+        }
+
+        Some(DetailHwBatchMesh {
+            batch_size,
+            vertices,
+            indices,
+            object_spans,
+        })
+    }
+}
+
+/// Deterministic X-Ray MSVCRT-LCG PRNG matching `CRandom` (`src/xrCore/_random.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailRandom {
+    holdrand: i32,
+}
+
+impl DetailRandom {
+    #[inline]
+    pub fn new(seed: i32) -> Self {
+        Self { holdrand: seed }
+    }
+
+    #[inline]
+    pub fn rand_i(&mut self) -> i32 {
+        self.holdrand = self
+            .holdrand
+            .wrapping_mul(214_013)
+            .wrapping_add(2_531_011);
+        (self.holdrand >> 16) & 0x7FFF
+    }
+
+    #[inline]
+    pub fn rand_i_max(&mut self, max: i32) -> i32 {
+        if max <= 0 {
+            0
+        } else {
+            self.rand_i() % max
+        }
+    }
+
+    #[inline]
+    pub fn rand_f(&mut self) -> f32 {
+        (self.rand_i() as f32) / 32767.0
+    }
+
+    #[inline]
+    pub fn rand_f_range(&mut self, min: f32, max: f32) -> f32 {
+        min + self.rand_f() * (max - min)
+    }
+
+    #[inline]
+    pub fn rand_fs(&mut self, range: f32) -> f32 {
+        self.rand_f_range(-range, range)
+    }
+}
+
+/// Exact 64-bit spatial slot seed hash (`hash2` in `DetailManager_Decompress.cpp:74-79`).
+#[inline]
+pub fn detail_hash2(sx: i32, sz: i32) -> u32 {
+    let a = ((sx as u32 as u64) << 32) | (sz as u32 as u64);
+    let r = a
+        .wrapping_mul(9_199_940_308_585_234_877)
+        .wrapping_add(9_199_940_308_585_234_877);
+    (r >> 32) as u32
+}
+
+/// Slot decompression parameters matching `DetailManager_Decompress.cpp` & `xrRender_console.cpp`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailDecompressConfig {
+    pub density: f32,
+    pub detail_height: f32,
+    pub terrain_grass_align: bool,
+    pub terrain_grass_slope: f32,
+    pub no_random: bool,
+    pub use_vs: bool,
+}
+
+impl Default for DetailDecompressConfig {
+    fn default() -> Self {
+        Self {
+            density: DETAIL_DEFAULT_DENSITY,
+            detail_height: DETAIL_DEFAULT_HEIGHT,
+            terrain_grass_align: false,
+            terrain_grass_slope: 1.0,
+            no_random: false,
+            use_vs: true,
+        }
+    }
+}
+
+/// Per-frame visibility & SSA culling configuration (`CDetailManager::UpdateVisibleM`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailVisibilityConfig {
+    pub ssa_discard: f32,
+    pub no_scale: bool,
+    pub fade_distance: f32,
+    pub light_position: Option<[f32; 3]>,
+}
+
+impl Default for DetailVisibilityConfig {
+    fn default() -> Self {
+        Self {
+            ssa_discard: DETAIL_DEFAULT_SSA_DISCARD,
+            no_scale: false,
+            fade_distance: 99999.0,
+            light_position: None,
+        }
+    }
+}
+
+/// Single decompressed grass/detail instance (`CDetailManager::SlotItem` in `DetailManager.h:73-90`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailSlotItem {
+    pub scale: f32,
+    pub scale_calculated: f32,
+    pub xform: XRayMatrix,
+    pub vis_id: u8,
+    pub c_hemi: f32,
+    pub c_sun: f32,
+    pub c_rgb: [f32; 3],
+    pub distance_sq: f32,
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub alpha: f32,
+    pub alpha_target: f32,
+}
+
+impl DetailSlotItem {
+    /// Pack matrix and lighting row for GPU instancing (`dx10DetailManager_VS.cpp:305-320`).
+    pub fn to_gpu_instance(&self, effective_scale: f32) -> DetailGpuInstanceData {
+        let m = &self.xform;
+        DetailGpuInstanceData {
+            rows: [
+                [
+                    m[0][0] * effective_scale,
+                    m[1][0] * effective_scale,
+                    m[2][0] * effective_scale,
+                    m[3][0],
+                ],
+                [
+                    m[0][1] * effective_scale,
+                    m[1][1] * effective_scale,
+                    m[2][1] * effective_scale,
+                    m[3][1],
+                ],
+                [
+                    m[0][2] * effective_scale,
+                    m[1][2] * effective_scale,
+                    m[2][2] * effective_scale,
+                    m[3][2],
+                ],
+                [self.c_sun, self.c_sun, self.c_sun, self.c_hemi],
+            ],
+            ex_data: [self.normal[0], self.normal[1], self.normal[2], self.alpha],
+        }
+    }
+}
+
+/// One of 4 prototype buckets in a decompressed slot (`CDetailManager::SlotPart`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailSlotPart {
+    pub object_id: u16,
+    pub items: Vec<DetailSlotItem>,
+}
+
+impl Default for DetailSlotPart {
+    fn default() -> Self {
+        Self {
+            object_id: DETAIL_ID_EMPTY,
+            items: Vec::new(),
+        }
+    }
+}
+
+/// Decompressed detail cache cell (`CDetailManager::Slot` in `DetailManager.h:112-135`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailCacheSlotState {
+    pub sx: i32,
+    pub sz: i32,
+    pub empty: bool,
+    pub pending: bool,
+    pub hidden: bool,
+    pub next_eval_frame: u32,
+    pub bbox: OgfBBox,
+    pub sphere_center: [f32; 3],
+    pub sphere_radius: f32,
+    pub parts: [DetailSlotPart; DETAIL_OBJ_IN_SLOT],
+}
+
+impl Default for DetailCacheSlotState {
+    fn default() -> Self {
+        Self {
+            sx: 0,
+            sz: 0,
+            empty: true,
+            pending: false,
+            hidden: false,
+            next_eval_frame: 0,
+            bbox: OgfBBox::default(),
+            sphere_center: [0.0; 3],
+            sphere_radius: 0.0,
+            parts: [
+                DetailSlotPart::default(),
+                DetailSlotPart::default(),
+                DetailSlotPart::default(),
+                DetailSlotPart::default(),
+            ],
+        }
+    }
+}
+
+/// 4x4 coarse hierarchical visibility cell (`CDetailManager::CacheSlot1`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailCacheLevel1 {
+    pub empty: bool,
+    pub bbox: OgfBBox,
+    pub sphere_center: [f32; 3],
+    pub sphere_radius: f32,
+}
+
+impl Default for DetailCacheLevel1 {
+    fn default() -> Self {
+        Self {
+            empty: true,
+            bbox: OgfBBox::default(),
+            sphere_center: [0.0; 3],
+            sphere_radius: 0.0,
+        }
+    }
+}
+
+/// Terrain intersection sample returned to `DetailCacheGrid` slot decompression.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailSurfaceHit {
+    pub height_y: f32,
+    pub normal: [f32; 3],
+}
+
+/// Per-frame culled detail instances partitioned by wave bucket (`0=still`, `1=wave1`, `2=wave2`) and object ID.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DetailVisibleBatches {
+    pub still: Vec<Vec<DetailSlotItem>>,
+    pub wave1: Vec<Vec<DetailSlotItem>>,
+    pub wave2: Vec<Vec<DetailSlotItem>>,
+}
+
+/// Pure-Rust sliding spatial cache & visibility culler (`CDetailManager` runtime).
+#[derive(Debug, Clone)]
+pub struct DetailCacheGrid {
+    dm_size: usize,
+    dm_cache1_line: usize,
+    dm_cache_line: usize,
+    dm_fade: f32,
+    cache_cx: i32,
+    cache_cz: i32,
+    dither: [[i32; 16]; 16],
+    slots: Vec<DetailCacheSlotState>,
+    level1: Vec<DetailCacheLevel1>,
+    pending_indices: Vec<usize>,
+    wave_rng: DetailRandom,
+    object_bounds_radius: Vec<f32>,
+}
+
+fn bbox_to_sphere(bb: &OgfBBox) -> ([f32; 3], f32) {
+    let center = [
+        (bb.min[0] + bb.max[0]) * 0.5,
+        (bb.min[1] + bb.max[1]) * 0.5,
+        (bb.min[2] + bb.max[2]) * 0.5,
+    ];
+    let dx = bb.max[0] - center[0];
+    let dy = bb.max[1] - center[1];
+    let dz = bb.max[2] - center[2];
+    (center, (dx * dx + dy * dy + dz * dz).sqrt())
+}
+
+impl DetailCacheGrid {
+    /// Initialize cache grid around `(0, 0)` matching `CDetailManager::cache_Initialize`.
+    pub fn new(details: &LevelDetails, detail_radius: u32) -> Self {
+        let dm_size = (((detail_radius.max(4) as f32) / 4.0).floor() as usize * 2).max(2);
+        let dm_cache1_line = (dm_size * 2) / DETAIL_CACHE1_COUNT;
+        let dm_cache_line = dm_size + 1 + dm_size;
+        let dm_fade = (2 * dm_size) as f32 - 0.5;
+        let cache_size = dm_cache_line * dm_cache_line;
+
+        let mut object_bounds_radius = Vec::with_capacity(details.objects.len());
+        for obj in &details.objects {
+            let r = obj.bounding_sphere().map(|(_, rad)| rad).unwrap_or(0.5);
+            object_bounds_radius.push(r);
+        }
+
+        let mut grid = Self {
+            dm_size,
+            dm_cache1_line,
+            dm_cache_line,
+            dm_fade,
+            cache_cx: 0,
+            cache_cz: 0,
+            dither: detail_bwdithermap(2),
+            slots: vec![DetailCacheSlotState::default(); cache_size],
+            level1: vec![DetailCacheLevel1::default(); dm_cache1_line * dm_cache1_line],
+            pending_indices: Vec::with_capacity(cache_size),
+            wave_rng: DetailRandom::new(0x1234_5678),
+            object_bounds_radius,
+        };
+
+        for gz in 0..dm_cache_line {
+            for gx in 0..dm_cache_line {
+                let idx = gz * dm_cache_line + gx;
+                grid.assign_task(details, gx, gz, idx);
+            }
+        }
+        grid.rebuild_level1_bounds();
+        grid
+    }
+
+    #[inline]
+    pub fn dm_size(&self) -> usize {
+        self.dm_size
+    }
+
+    #[inline]
+    pub fn cache_line(&self) -> usize {
+        self.dm_cache_line
+    }
+
+    #[inline]
+    pub fn cache_size(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[inline]
+    pub fn cache1_line(&self) -> usize {
+        self.dm_cache1_line
+    }
+
+    #[inline]
+    pub fn fade_distance_slots(&self) -> f32 {
+        self.dm_fade
+    }
+
+    #[inline]
+    pub fn center(&self) -> (i32, i32) {
+        (self.cache_cx, self.cache_cz)
+    }
+
+    #[inline]
+    pub fn pending_count(&self) -> usize {
+        self.pending_indices.len()
+    }
+
+    #[inline]
+    pub fn cg2w_x(&self, gx: usize) -> i32 {
+        self.cache_cx - (self.dm_size as i32) + (gx as i32)
+    }
+
+    #[inline]
+    pub fn cg2w_z(&self, gz: usize) -> i32 {
+        self.cache_cz - (self.dm_size as i32) + (self.dm_cache_line as i32 - 1 - gz as i32)
+    }
+
+    #[inline]
+    pub fn w2cg_x(&self, sx: i32) -> isize {
+        (sx - self.cache_cx + self.dm_size as i32) as isize
+    }
+
+    #[inline]
+    pub fn w2cg_z(&self, sz: i32) -> isize {
+        (self.cache_cz - self.dm_size as i32 + (self.dm_cache_line as i32 - 1 - sz)) as isize
+    }
+
+    #[inline]
+    pub fn slot_at_grid(&self, gx: usize, gz: usize) -> Option<&DetailCacheSlotState> {
+        if gx < self.dm_cache_line && gz < self.dm_cache_line {
+            self.slots.get(gz * self.dm_cache_line + gx)
+        } else {
+            None
+        }
+    }
+
+    /// Relative slot lookup matching `CDetailManager::cache_Query`.
+    pub fn query_slot_rel(&self, rel_x: i32, rel_z: i32) -> Option<&DetailCacheSlotState> {
+        let gx = self.w2cg_x(rel_x + self.cache_cx);
+        let gz = self.w2cg_z(rel_z + self.cache_cz);
+        if gx >= 0 && gz >= 0 {
+            self.slot_at_grid(gx as usize, gz as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Verify every grid slot matches `(cg2w_x(gx), cg2w_z(gz))` (`CDetailManager::cache_Validate`).
+    pub fn validate_coords(&self) -> bool {
+        for gz in 0..self.dm_cache_line {
+            for gx in 0..self.dm_cache_line {
+                let s = &self.slots[gz * self.dm_cache_line + gx];
+                if s.sx != self.cg2w_x(gx) || s.sz != self.cg2w_z(gz) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn assign_task(&mut self, details: &LevelDetails, gx: usize, gz: usize, idx: usize) {
+        let sx = self.cg2w_x(gx);
+        let sz = self.cg2w_z(gz);
+        let ds = details.query_slot(sx, sz).copied().unwrap_or_default();
+
+        let slot = &mut self.slots[idx];
+        let was_pending = slot.pending;
+        slot.sx = sx;
+        slot.sz = sz;
+        slot.empty = ds.is_empty();
+        slot.pending = true;
+        slot.hidden = false;
+        slot.next_eval_frame = 0;
+
+        let x0 = (sx as f32) * DETAIL_SLOT_SIZE;
+        let z0 = (sz as f32) * DETAIL_SLOT_SIZE;
+        let y0 = ds.y_base_meters();
+        let eps_l = 0.001_f32;
+        slot.bbox = OgfBBox {
+            min: [x0 - eps_l, y0 - eps_l, z0 - eps_l],
+            max: [
+                x0 + DETAIL_SLOT_SIZE + eps_l,
+                y0 + ds.y_height_meters() + eps_l,
+                z0 + DETAIL_SLOT_SIZE + eps_l,
+            ],
+        };
+        let (sc, sr) = bbox_to_sphere(&slot.bbox);
+        slot.sphere_center = sc;
+        slot.sphere_radius = sr;
+
+        for (i, part) in slot.parts.iter_mut().enumerate() {
+            part.object_id = ds.ids[i];
+            part.items.clear();
+        }
+
+        if !was_pending {
+            self.pending_indices.push(idx);
+        }
+    }
+
+    fn rebuild_level1_bounds(&mut self) {
+        let l1 = self.dm_cache1_line;
+        for mz1 in 0..l1 {
+            for mx1 in 0..l1 {
+                let mut empty = true;
+                let mut bmin = [f32::INFINITY; 3];
+                let mut bmax = [f32::NEG_INFINITY; 3];
+                for z in 0..DETAIL_CACHE1_COUNT {
+                    for x in 0..DETAIL_CACHE1_COUNT {
+                        let gx = mx1 * DETAIL_CACHE1_COUNT + x;
+                        let gz = mz1 * DETAIL_CACHE1_COUNT + z;
+                        let s = &self.slots[gz * self.dm_cache_line + gx];
+                        for a in 0..3 {
+                            bmin[a] = bmin[a].min(s.bbox.min[a]);
+                            bmax[a] = bmax[a].max(s.bbox.max[a]);
+                        }
+                        if !s.empty {
+                            empty = false;
+                        }
+                    }
+                }
+                let bb = if bmin[0].is_finite() {
+                    OgfBBox { min: bmin, max: bmax }
+                } else {
+                    OgfBBox::default()
+                };
+                let (center, radius) = bbox_to_sphere(&bb);
+                self.level1[mz1 * l1 + mx1] = DetailCacheLevel1 {
+                    empty,
+                    bbox: bb,
+                    sphere_center: center,
+                    sphere_radius: radius,
+                };
+            }
+        }
+    }
+
+    fn shift_grid(&mut self, details: &LevelDetails, target_cx: i32, target_cz: i32) -> bool {
+        let moved = self.cache_cx != target_cx || self.cache_cz != target_cz;
+        let line = self.dm_cache_line;
+
+        while self.cache_cx != target_cx {
+            if target_cx > self.cache_cx {
+                self.cache_cx += 1;
+                for gz in 0..line {
+                    let row = gz * line;
+                    self.slots[row..row + line].rotate_left(1);
+                    self.assign_task(details, line - 1, gz, row + line - 1);
+                }
+            } else {
+                self.cache_cx -= 1;
+                for gz in 0..line {
+                    let row = gz * line;
+                    self.slots[row..row + line].rotate_right(1);
+                    self.assign_task(details, 0, gz, row);
+                }
+            }
+        }
+
+        while self.cache_cz != target_cz {
+            if target_cz > self.cache_cz {
+                self.cache_cz += 1;
+                for gx in 0..line {
+                    let saved = self.slots[(line - 1) * line + gx].clone();
+                    for gz in (1..line).rev() {
+                        self.slots[gz * line + gx] = self.slots[(gz - 1) * line + gx].clone();
+                    }
+                    self.slots[gx] = saved;
+                    self.assign_task(details, gx, 0, gx);
+                }
+            } else {
+                self.cache_cz -= 1;
+                for gx in 0..line {
+                    let saved = self.slots[gx].clone();
+                    for gz in 1..line {
+                        self.slots[(gz - 1) * line + gx] = self.slots[gz * line + gx].clone();
+                    }
+                    self.slots[(line - 1) * line + gx] = saved;
+                    self.assign_task(details, gx, line - 1, (line - 1) * line + gx);
+                }
+            }
+        }
+
+        if moved {
+            self.pending_indices.clear();
+            for (idx, s) in self.slots.iter().enumerate() {
+                if s.pending {
+                    self.pending_indices.push(idx);
+                }
+            }
+        }
+        moved
+    }
+
+    /// Shift the sliding grid to `(target_cx, target_cz)` and decompress up to `decompress_limit`
+    /// nearest pending slots via `sampler` (`cache_Update` + `cache_Decompress`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_cache_with_sampler<F>(
+        &mut self,
+        details: &LevelDetails,
+        target_cx: i32,
+        target_cz: i32,
+        camera_pos: [f32; 3],
+        decompress_limit: usize,
+        cfg: &DetailDecompressConfig,
+        mut sampler: F,
+    ) where
+        F: FnMut(f32, f32, &OgfBBox) -> Option<DetailSurfaceHit>,
+    {
+        let need_mega_update = self.shift_grid(details, target_cx, target_cz);
+
+        let full_unpack = self.pending_indices.len() == self.slots.len();
+        let limit = if full_unpack {
+            self.slots.len()
+        } else {
+            decompress_limit
+        };
+
+        for _ in 0..limit {
+            if self.pending_indices.is_empty() {
+                break;
+            }
+            let best_pos = if full_unpack {
+                self.pending_indices.len() - 1
+            } else {
+                let mut best_i = 0;
+                let mut best_dist = f32::INFINITY;
+                for (pos, &slot_idx) in self.pending_indices.iter().enumerate() {
+                    let s = &self.slots[slot_idx];
+                    let dx = camera_pos[0] - s.sphere_center[0];
+                    let dy = camera_pos[1] - s.sphere_center[1];
+                    let dz = camera_pos[2] - s.sphere_center[2];
+                    let d = dx * dx + dy * dy + dz * dz;
+                    if d < best_dist {
+                        best_dist = d;
+                        best_i = pos;
+                    }
+                }
+                best_i
+            };
+
+            let slot_idx = self.pending_indices.swap_remove(best_pos);
+            self.decompress_slot_at(details, slot_idx, cfg, &mut sampler);
+        }
+
+        if need_mega_update || full_unpack {
+            self.rebuild_level1_bounds();
+        }
+    }
+
+    /// Convenience wrapper of `update_cache_with_sampler` using a `CformBvh` (`DetailManager_Decompress.cpp:102-240`),
+    /// skipping passable triangles (`gamemtl_flags::FL_PASSABLE`) when `mtl_lib` is supplied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_cache_with_cform(
+        &mut self,
+        details: &LevelDetails,
+        target_cx: i32,
+        target_cz: i32,
+        camera_pos: [f32; 3],
+        decompress_limit: usize,
+        cfg: &DetailDecompressConfig,
+        bvh: &CformBvh<'_>,
+        model: &CformModel,
+        mtl_lib: Option<&GameMaterialLibrary>,
+    ) {
+        self.update_cache_with_sampler(
+            details,
+            target_cx,
+            target_cz,
+            camera_pos,
+            decompress_limit,
+            cfg,
+            |px, pz, slot_box| {
+                let center = [
+                    (slot_box.min[0] + slot_box.max[0]) * 0.5,
+                    (slot_box.min[1] + slot_box.max[1]) * 0.5,
+                    (slot_box.min[2] + slot_box.max[2]) * 0.5,
+                ];
+                let half = [
+                    (slot_box.max[0] - slot_box.min[0]) * 0.5,
+                    (slot_box.max[1] - slot_box.min[1]) * 0.5,
+                    (slot_box.max[2] - slot_box.min[2]) * 0.5,
+                ];
+                let hits = bvh.box_query(center, half, true, false);
+                if hits.is_empty() {
+                    return None;
+                }
+                let origin = [px, slot_box.max[1], pz];
+                let dir = [0.0_f32, -1.0, 0.0];
+                let mut best_y = slot_box.min[1] - 5.0;
+                let mut best_normal = None;
+
+                for h in hits {
+                    if let Some(lib) = mtl_lib
+                        && let Some(mtl) = model.triangle_material(h.tri_index, lib)
+                        && mtl.has_flag(gamemtl_flags::FL_PASSABLE)
+                    {
+                        continue;
+                    }
+                    let [p0, p1, p2] = h.verts;
+                    if let Some((range, _, _)) = ray_triangle_test(origin, dir, p0, p1, p2, true)
+                        && range >= 0.0
+                    {
+                        let y_test = origin[1] - range;
+                        if y_test > best_y {
+                            best_y = y_test;
+                            let e0 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+                            let e1 = [p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]];
+                            let n = [
+                                e0[1] * e1[2] - e0[2] * e1[1],
+                                e0[2] * e1[0] - e0[0] * e1[2],
+                                e0[0] * e1[1] - e0[1] * e1[0],
+                            ];
+                            let len_sq = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+                            let norm = if len_sq > 1e-12 {
+                                let inv = 1.0 / len_sq.sqrt();
+                                [n[0] * inv, n[1] * inv, n[2] * inv]
+                            } else {
+                                [0.0, 1.0, 0.0]
+                            };
+                            best_normal = Some(norm);
+                        }
+                    }
+                }
+
+                best_normal.map(|normal| DetailSurfaceHit {
+                    height_y: best_y,
+                    normal,
+                })
+            },
+        );
+    }
+
+    fn decompress_slot_at<F>(
+        &mut self,
+        details: &LevelDetails,
+        slot_idx: usize,
+        cfg: &DetailDecompressConfig,
+        sampler: &mut F,
+    ) where
+        F: FnMut(f32, f32, &OgfBBox) -> Option<DetailSurfaceHit>,
+    {
+        let (sx, sz, empty, slot_box) = {
+            let s = &mut self.slots[slot_idx];
+            s.pending = false;
+            if s.empty {
+                return;
+            }
+            (s.sx, s.sz, s.empty, s.bbox)
+        };
+        if empty {
+            return;
+        }
+
+        let ds = match details.query_slot(sx, sz) {
+            Some(ds) if !ds.is_empty() => *ds,
+            _ => return,
+        };
+
+        let mut alpha255 = [[0.0_f32; 4]; DETAIL_OBJ_IN_SLOT];
+        for (dst, pal) in alpha255.iter_mut().zip(ds.palette.iter()) {
+            dst[0] = 255.0 * f32::from(pal.a0) / 15.0;
+            dst[1] = 255.0 * f32::from(pal.a1) / 15.0;
+            dst[2] = 255.0 * f32::from(pal.a2) / 15.0;
+            dst[3] = 255.0 * f32::from(pal.a3) / 15.0;
+        }
+
+        let density = cfg.density.max(0.05);
+        let jitter = density / 1.7;
+        let d_size = ((DETAIL_SLOT_SIZE / density).ceil() as u32).max(1);
+        let seed = (0x1207_1980u32 ^ detail_hash2(sx, sz)) as i32;
+        let mut r_selection = DetailRandom::new(seed);
+        let mut r_jitter = DetailRandom::new(seed);
+        let mut r_yaw = DetailRandom::new(seed);
+        let mut r_scale = DetailRandom::new(seed);
+
+        let min_x = (sx as f32) * DETAIL_SLOT_SIZE;
+        let min_z = (sz as f32) * DETAIL_SLOT_SIZE;
+        let min_y = ds.y_base_meters();
+        let c_hemi = ds.hemi_light();
+        let c_sun = ds.dir_light();
+        let c_rgb = ds.rgb_light();
+
+        let mut bmin = [f32::INFINITY; 3];
+        let mut bmax = [f32::NEG_INFINITY; 3];
+        let mut any_bounds = false;
+        let mut out_parts: [Vec<DetailSlotItem>; DETAIL_OBJ_IN_SLOT] =
+            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+
+        for z in 0..=d_size {
+            for x in 0..=d_size {
+                let (shift_x, shift_z) = if cfg.no_random {
+                    (8u32, 8u32)
+                } else {
+                    (
+                        r_jitter.rand_i_max(16) as u32,
+                        r_jitter.rand_i_max(16) as u32,
+                    )
+                };
+
+                let mut selected = [0usize; DETAIL_OBJ_IN_SLOT];
+                let mut sel_len = 0usize;
+                for (slot_part, alpha_row) in alpha255.iter().enumerate() {
+                    if ds.ids[slot_part] != DETAIL_ID_EMPTY
+                        && (cfg.no_random
+                            || detail_interpolate_and_dither(
+                                alpha_row,
+                                x,
+                                z,
+                                shift_x,
+                                shift_z,
+                                d_size,
+                                &self.dither,
+                            ))
+                    {
+                        selected[sel_len] = slot_part;
+                        sel_len += 1;
+                    }
+                }
+
+                if sel_len == 0 {
+                    continue;
+                }
+                let bucket_idx = if cfg.no_random || sel_len == 1 {
+                    selected[0]
+                } else {
+                    selected[r_selection.rand_i_max(sel_len as i32) as usize]
+                };
+
+                let obj_id = ds.ids[bucket_idx];
+                let Some(dobj) = details.objects.get(obj_id as usize) else {
+                    continue;
+                };
+
+                let rx = ((x as f32) / (d_size as f32)) * DETAIL_SLOT_SIZE + min_x;
+                let rz = ((z as f32) / (d_size as f32)) * DETAIL_SLOT_SIZE + min_z;
+                let (px, pz) = if cfg.no_random {
+                    (rx, rz)
+                } else {
+                    (rx + r_jitter.rand_fs(jitter), rz + r_jitter.rand_fs(jitter))
+                };
+
+                let slope_thresh =
+                    -(1.0 - r_scale.rand_f_range(cfg.terrain_grass_slope * 0.8, cfg.terrain_grass_slope));
+                let Some(hit) = sampler(px, pz, &slot_box) else {
+                    continue;
+                };
+                if -hit.normal[1] > slope_thresh || hit.height_y < min_y {
+                    continue;
+                }
+
+                let mut scale = if cfg.no_random {
+                    (dobj.min_scale * 0.5 + dobj.max_scale * 0.9) * 0.5
+                } else {
+                    r_scale.rand_f_range(dobj.min_scale * 0.5, dobj.max_scale * 0.9)
+                };
+                scale *= cfg.detail_height;
+
+                let yaw = if cfg.no_random {
+                    0.0
+                } else {
+                    r_yaw.rand_f_range(0.0, std::f32::consts::TAU)
+                };
+                let mut m_rot_y = matrix_rotate_y(yaw);
+                if cfg.terrain_grass_align {
+                    let (axis_i, axis_k) = vector_generate_orthonormal_basis(hit.normal);
+                    let aligned = [
+                        [axis_i[0], axis_i[1], axis_i[2], 0.0],
+                        [hit.normal[0], hit.normal[1], hit.normal[2], 0.0],
+                        [axis_k[0], axis_k[1], axis_k[2], 0.0],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ];
+                    // C++ `Item.mRotY.mulB_43(CurrMatrix)` computes `mul_43(aligned, CurrMatrix)`:
+                    // first local yaw (`m_rot_y`), then terrain normal alignment (`aligned`).
+                    m_rot_y = matrix_mul_43(&aligned, &m_rot_y);
+                }
+                m_rot_y[3][0] = px;
+                m_rot_y[3][1] = hit.height_y;
+                m_rot_y[3][2] = pz;
+
+                let m_xform = matrix_mul_43(&m_rot_y, &matrix_scale(scale, scale, scale));
+                if let Some(obj_bb) = dobj.bbox() {
+                    let corners = [
+                        [obj_bb.min[0], obj_bb.min[1], obj_bb.min[2]],
+                        [obj_bb.min[0], obj_bb.min[1], obj_bb.max[2]],
+                        [obj_bb.max[0], obj_bb.min[1], obj_bb.max[2]],
+                        [obj_bb.max[0], obj_bb.min[1], obj_bb.min[2]],
+                        [obj_bb.min[0], obj_bb.max[1], obj_bb.min[2]],
+                        [obj_bb.min[0], obj_bb.max[1], obj_bb.max[2]],
+                        [obj_bb.max[0], obj_bb.max[1], obj_bb.max[2]],
+                        [obj_bb.max[0], obj_bb.max[1], obj_bb.min[2]],
+                    ];
+                    for c in corners {
+                        let tc = matrix_transform_point(&m_xform, c);
+                        for a in 0..3 {
+                            bmin[a] = bmin[a].min(tc[a]);
+                            bmax[a] = bmax[a].max(tc[a]);
+                        }
+                        any_bounds = true;
+                    }
+                }
+
+                let vis_id = if cfg.no_random || !cfg.use_vs || dobj.no_waving() {
+                    0
+                } else if self.wave_rng.rand_i_max(3) == 0 {
+                    2
+                } else {
+                    1
+                };
+
+                out_parts[bucket_idx].push(DetailSlotItem {
+                    scale,
+                    scale_calculated: scale,
+                    xform: m_rot_y,
+                    vis_id,
+                    c_hemi,
+                    c_sun,
+                    c_rgb,
+                    distance_sq: 0.0,
+                    position: [px, hit.height_y, pz],
+                    normal: hit.normal,
+                    alpha: 1.0,
+                    alpha_target: 1.0,
+                });
+            }
+        }
+
+        let slot = &mut self.slots[slot_idx];
+        for (i, items) in out_parts.into_iter().enumerate() {
+            slot.parts[i].object_id = ds.ids[i];
+            slot.parts[i].items = items;
+        }
+        if any_bounds {
+            let real_bb = OgfBBox { min: bmin, max: bmax };
+            let (sc, sr) = bbox_to_sphere(&real_bb);
+            slot.bbox = real_bb;
+            slot.sphere_center = sc;
+            slot.sphere_radius = sr;
+        }
+    }
+
+    /// Frustum, optional HOM occlusion, fade, and SSA culling (`CDetailManager::UpdateVisibleM`).
+    pub fn collect_visible(
+        &mut self,
+        camera_pos: [f32; 3],
+        frustum: &ClipFrustum,
+        hom: Option<&OccRasterizer>,
+        full_transform: &XRayMatrix,
+        frame: u32,
+        cfg: &DetailVisibilityConfig,
+    ) -> DetailVisibleBatches {
+        let obj_count = self.object_bounds_radius.len();
+        let mut out = DetailVisibleBatches {
+            still: vec![Vec::new(); obj_count],
+            wave1: vec![Vec::new(); obj_count],
+            wave2: vec![Vec::new(); obj_count],
+        };
+
+        let fade_limit = self.dm_fade * self.dm_fade;
+        let fade_start = 1.0_f32;
+        let fade_range = (fade_limit - fade_start).max(1e-4);
+        let r_ssa_cheap = 16.0 * cfg.ssa_discard;
+        let l1 = self.dm_cache1_line;
+        let line = self.dm_cache_line;
+
+        for mz1 in 0..l1 {
+            for mx1 in 0..l1 {
+                let ms = &self.level1[mz1 * l1 + mx1];
+                if ms.empty || !frustum.test_sphere(ms.sphere_center, ms.sphere_radius) {
+                    continue;
+                }
+
+                for z in 0..DETAIL_CACHE1_COUNT {
+                    for x in 0..DETAIL_CACHE1_COUNT {
+                        let gx = mx1 * DETAIL_CACHE1_COUNT + x;
+                        let gz = mz1 * DETAIL_CACHE1_COUNT + z;
+                        let slot = &mut self.slots[gz * line + gx];
+                        if slot.empty
+                            || !frustum.test_sphere(slot.sphere_center, slot.sphere_radius)
+                        {
+                            continue;
+                        }
+                        if let Some(occ) = hom
+                            && !occ.test_aabb(&slot.bbox, full_transform, camera_pos)
+                        {
+                            continue;
+                        }
+
+                        let dx = camera_pos[0] - slot.sphere_center[0];
+                        let dy = camera_pos[1] - slot.sphere_center[1];
+                        let dz = camera_pos[2] - slot.sphere_center[2];
+                        let dist_sq = dx * dx + dy * dy + dz * dz;
+                        if dist_sq > fade_limit {
+                            slot.hidden = true;
+                            continue;
+                        }
+
+                        if frame > slot.next_eval_frame {
+                            slot.next_eval_frame =
+                                frame.saturating_add(15 + (self.wave_rng.rand_i_max(15) as u32));
+                        }
+
+                        let alpha = if dist_sq < fade_start {
+                            0.0
+                        } else {
+                            (dist_sq - fade_start) / fade_range
+                        };
+                        let alpha_i = (1.0 - alpha).max(0.0);
+                        let dist_sq_rcp = 1.0 / dist_sq.max(1e-6);
+
+                        for part in &mut slot.parts {
+                            let obj_idx = part.object_id as usize;
+                            if part.object_id == DETAIL_ID_EMPTY || obj_idx >= obj_count {
+                                continue;
+                            }
+                            let r = self.object_bounds_radius[obj_idx];
+                            let rq_drcp = r * r * dist_sq_rcp;
+
+                            for item in &mut part.items {
+                                let mut scale = if cfg.no_scale {
+                                    item.scale
+                                } else {
+                                    item.scale * alpha_i
+                                };
+                                item.scale_calculated = scale;
+
+                                let ssa = if cfg.no_scale {
+                                    scale
+                                } else {
+                                    scale * scale * rq_drcp
+                                };
+                                if ssa < cfg.ssa_discard {
+                                    item.alpha_target = 0.0;
+                                    continue;
+                                }
+
+                                if let Some(lpos) = cfg.light_position {
+                                    let ldx = item.position[0] - lpos[0];
+                                    let ldz = item.position[2] - lpos[2];
+                                    scale *= 1.0 - (ldx * ldx + ldz * ldz) * 0.005;
+                                } else if dist_sq > cfg.fade_distance {
+                                    scale *= 1.0 - (dist_sq - cfg.fade_distance).abs() * 0.005;
+                                }
+                                if scale <= 0.0 {
+                                    continue;
+                                }
+
+                                if slot.hidden {
+                                    item.alpha = 0.0;
+                                    slot.hidden = false;
+                                }
+                                item.alpha_target = 1.0;
+                                item.distance_sq = dist_sq;
+
+                                let vis_id = if ssa > r_ssa_cheap { item.vis_id } else { 0 };
+                                let mut copied = *item;
+                                copied.scale_calculated = scale;
+                                match vis_id {
+                                    1 => out.wave1[obj_idx].push(copied),
+                                    2 => out.wave2[obj_idx].push(copied),
+                                    _ => out.still[obj_idx].push(copied),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        out
+    }
 }
 
 #[cfg(test)]
@@ -691,5 +2114,307 @@ mod tests {
         assert!((verts[1].uv[0] - 0.6).abs() < 1e-6);
         assert!((verts[1].uv[1] - 0.5).abs() < 1e-6);
         assert!(dm.transfer(&xf, color, 0.0, 0.0, u16::MAX).is_none());
+    }
+
+    #[test]
+    fn test_detail_swing_config_and_step() {
+        let ltx = r#"
+[details]
+swing_normal_amp1 = 0.01
+swing_normal_amp2 = 0.004
+swing_normal_rot1 = 8.0
+swing_normal_rot2 = 4.0
+swing_normal_speed = 1.5
+swing_fast_amp1 = 0.05
+swing_fast_amp2 = 0.02
+swing_fast_rot1 = 2.0
+swing_fast_rot2 = 1.0
+swing_fast_speed = 3.5
+"#;
+        let cfg = DetailSwingConfig::from_ltx_str(ltx);
+        assert!((cfg.normal.amp1 - 0.01).abs() < 1e-6);
+        assert!((cfg.fast.speed - 3.5).abs() < 1e-6);
+
+        let mut state = DetailSwingState::default();
+        let w1 = state.step(0.05, 0.5, &cfg, 0.3, 0.85);
+        let expected_amp1 = 0.5 * (0.01 + 0.05);
+        let expected_amp2 = 0.5 * (0.004 + 0.02);
+        let len1 = (w1.dir1[0] * w1.dir1[0] + w1.dir1[2] * w1.dir1[2]).sqrt();
+        let len2 = (w1.dir2[0] * w1.dir2[0] + w1.dir2[2] * w1.dir2[2]).sqrt();
+        assert!((len1 - expected_amp1).abs() < 1e-6);
+        assert!((len2 - expected_amp2).abs() < 1e-6);
+        assert!((w1.consts[0] - 1.0 / DETAIL_HW_QUANT).abs() < 1e-8);
+        assert!((w1.consts[2] - 0.3).abs() < 1e-6);
+        assert!((w1.consts[3] - 0.85).abs() < 1e-6);
+
+        let w2 = state.step(0.05, 0.5, &cfg, 0.3, 0.85);
+        assert_eq!(w2.prev_dir1, w1.dir1);
+        assert_eq!(w2.prev_dir2, w1.dir2);
+        assert!((w2.prev_wave0[3] - w1.wave0[3]).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_detail_dither_hw_batches_and_gpu_instance() {
+        let dither = detail_bwdithermap(2);
+        let min_v = dither.iter().flatten().copied().min().unwrap();
+        let max_v = dither.iter().flatten().copied().max().unwrap();
+        assert_eq!(min_v, 0);
+        // `bwdithermap(2)` yields max value `floor(0.5 + 15 * 15.875 + (15/16) * 15.875) == 253`
+        assert_eq!(max_v, 253);
+
+        let r_ssa = compute_r_ssa_discard(1920, 1080, 90.0, 1.0, DETAIL_DEFAULT_PS_SSA_DISCARD);
+        assert!((r_ssa - DETAIL_DEFAULT_SSA_DISCARD).abs() < 1e-7);
+
+        let corners = [0.0_f32, 255.0, 255.0, 255.0];
+        assert!((detail_interpolate(&corners, 0, 0, 4) - 0.0).abs() < 1e-6);
+        assert!((detail_interpolate(&corners, 4, 4, 4) - 255.0).abs() < 1e-6);
+        assert!(!detail_interpolate_and_dither(&[0.0; 4], 1, 1, 2, 3, 4, &dither));
+        assert!(detail_interpolate_and_dither(&[255.0; 4], 1, 1, 2, 3, 4, &dither));
+
+        let dm0 = DetailMesh::parse_dm(&build_dm_bytes("details\\blend", "detail\\g0", 0)).unwrap();
+        let dm1 = DetailMesh::parse_dm(&build_dm_bytes("details\\still", "detail\\g1", DO_NO_WAVING))
+            .unwrap();
+        let hw = DetailMesh::build_hw_batches(&[dm0, dm1], 4).unwrap();
+        assert_eq!(hw.batch_size, 4);
+        assert_eq!(hw.vertices.len(), 24);
+        assert_eq!(hw.indices.len(), 24);
+        assert_eq!(hw.vertices[0].mid, 0);
+        assert_eq!(hw.vertices[3].mid, 4);
+        assert_eq!(hw.vertices[6].mid, 8);
+        assert_eq!(hw.vertices[9].mid, 12);
+        assert_eq!(hw.object_spans[0].vertex_offset, 0);
+        assert_eq!(hw.object_spans[1].vertex_offset, 12);
+        assert_eq!(hw.object_spans[1].index_offset, 12);
+
+        let item = DetailSlotItem {
+            scale: 1.0,
+            scale_calculated: 0.75,
+            xform: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [4.0, 5.0, 6.0, 1.0],
+            ],
+            vis_id: 1,
+            c_hemi: 0.5,
+            c_sun: 0.8,
+            c_rgb: [0.0; 3],
+            distance_sq: 10.0,
+            position: [4.0, 5.0, 6.0],
+            normal: [0.0, 1.0, 0.0],
+            alpha: 0.9,
+            alpha_target: 1.0,
+        };
+        let gpu = item.to_gpu_instance(item.scale_calculated);
+        assert_eq!(gpu.rows[0], [0.75, 0.0, 0.0, 4.0]);
+        assert_eq!(gpu.rows[1], [0.0, 0.75, 0.0, 5.0]);
+        assert_eq!(gpu.rows[2], [0.0, 0.0, 0.75, 6.0]);
+        assert_eq!(gpu.rows[3], [0.8, 0.8, 0.8, 0.5]);
+        assert_eq!(gpu.ex_data, [0.0, 1.0, 0.0, 0.9]);
+    }
+
+    #[test]
+    fn test_detail_cache_grid_cform_alignment_shift_and_visibility() {
+        use crate::gamemtl::{gamemtl_chunks, gamemtl_root_chunks, GameMaterialLibrary};
+        use crate::hom::{frustum_planes, OccRasterizer};
+        use crate::ogf::matrix_mul_44;
+
+        // Build LevelDetails covering slot (0,0) with an object mesh
+        let dm0 = DetailMesh::parse_dm(&build_dm_bytes("details\\blend", "detail\\g0", 0)).unwrap();
+        let mut s = DetailSlot {
+            ids: [0, DETAIL_ID_EMPTY, DETAIL_ID_EMPTY, DETAIL_ID_EMPTY],
+            c_dir: 15,
+            c_hemi: 10,
+            y_base: 0,
+            y_height: 0,
+            c_r: 8,
+            c_g: 8,
+            c_b: 8,
+            palette: [
+                DetailPalette { a0: 15, a1: 15, a2: 15, a3: 15 },
+                DetailPalette::default(),
+                DetailPalette::default(),
+                DetailPalette::default(),
+            ],
+        };
+        s.pack_y(0.0, 5.0);
+        let details = LevelDetails {
+            header: DetailHeader {
+                version: DETAIL_VERSION_4,
+                object_count: 1,
+                offs_x: 0,
+                offs_z: 0,
+                size_x: 1,
+                size_z: 1,
+            },
+            objects: vec![dm0],
+            slots: vec![s],
+        };
+
+        // Gamemtl library: idx 0 solid, idx 1 FL_PASSABLE
+        let make_mtl = |id: u32, name: &str, flags: u32| {
+            let mut mw = ChunkWriter::new();
+            let mut main = id.to_le_bytes().to_vec();
+            main.extend_from_slice(name.as_bytes());
+            main.push(0);
+            mw.write_chunk(gamemtl_chunks::GAMEMTL_CHUNK_MAIN, &main);
+            mw.write_chunk(gamemtl_chunks::GAMEMTL_CHUNK_FLAGS, &flags.to_le_bytes());
+            mw.write_chunk(gamemtl_chunks::GAMEMTL_CHUNK_PHYSICS, &[0u8; 20]);
+            mw.write_chunk(gamemtl_chunks::GAMEMTL_CHUNK_FACTORS, &[0u8; 16]);
+            mw.into_bytes()
+        };
+        let mut mtls = ChunkWriter::new();
+        mtls.write_chunk(0, &make_mtl(0, "ground", gamemtl_flags::FL_SHOOTABLE));
+        mtls.write_chunk(1, &make_mtl(1, "bush", gamemtl_flags::FL_PASSABLE));
+        let mut root = ChunkWriter::new();
+        root.write_chunk(gamemtl_root_chunks::GAMEMTLS_CHUNK_VERSION, &1u16.to_le_bytes());
+        root.write_chunk(gamemtl_root_chunks::GAMEMTLS_CHUNK_AUTOINC, &[0u8; 8]);
+        root.write_chunk(gamemtl_root_chunks::GAMEMTLS_CHUNK_MTLS, &mtls.into_bytes());
+        let gmlib = GameMaterialLibrary::parse(&root.into_bytes()).unwrap();
+
+        // Sloped solid floor quad (slope y = 0.5 + 0.5*x) plus higher passable cover quad at y = 4.0
+        // Note: downward ray (0,-1,0) hits p0=(0,0.5,0), p1=(0,0.5,2), p2=(2,1.5,0) with +Y-up normal.
+        let cform = CformModel::from_parts(
+            vec![
+                [-0.5, 0.25, -0.5],
+                [-0.5, 0.25, 2.5],
+                [2.5, 1.75, 2.5],
+                [2.5, 1.75, -0.5],
+                // Passable overhead quad at y=4.0
+                [-0.5, 4.0, -0.5],
+                [-0.5, 4.0, 2.5],
+                [2.5, 4.0, 2.5],
+                [2.5, 4.0, -0.5],
+            ],
+            vec![
+                crate::cform::CformTriangle {
+                    verts: [0, 1, 2],
+                    material: 0,
+                    suppress_shadows: false,
+                    suppress_wm: false,
+                    sector: 0,
+                },
+                crate::cform::CformTriangle {
+                    verts: [0, 2, 3],
+                    material: 0,
+                    suppress_shadows: false,
+                    suppress_wm: false,
+                    sector: 0,
+                },
+                crate::cform::CformTriangle {
+                    verts: [4, 5, 6],
+                    material: 1,
+                    suppress_shadows: false,
+                    suppress_wm: false,
+                    sector: 0,
+                },
+                crate::cform::CformTriangle {
+                    verts: [4, 6, 7],
+                    material: 1,
+                    suppress_shadows: false,
+                    suppress_wm: false,
+                    sector: 0,
+                },
+            ],
+        )
+        .unwrap();
+        let bvh = cform.build_bvh();
+
+        let mut grid = DetailCacheGrid::new(&details, 8);
+        assert!(grid.validate_coords());
+        assert_eq!(LevelDetails::world_to_cache_center(1.2, -0.8), (1, 0));
+
+        let cfg = DetailDecompressConfig {
+            density: 0.6,
+            detail_height: 1.0,
+            terrain_grass_align: true,
+            terrain_grass_slope: 1.0,
+            no_random: false,
+            use_vs: true,
+        };
+        grid.update_cache_with_cform(
+            &details,
+            0,
+            0,
+            [1.0, 1.5, -3.0],
+            grid.cache_size(),
+            &cfg,
+            &bvh,
+            &cform,
+            Some(&gmlib),
+        );
+        assert_eq!(grid.pending_count(), 0);
+
+        let slot = grid.query_slot_rel(0, 0).unwrap();
+        assert!(!slot.empty);
+        let expected_items = slot.parts[0].items.len();
+        assert!(expected_items > 0);
+        for item in &slot.parts[0].items {
+            // Must land on sloped terrain (y ~ 0.5 + 0.5*x), NOT on y=4.0 passable roof
+            assert!(item.position[1] < 2.0, "expected terrain height, got {}", item.position[1]);
+            let expected_y = 0.5 + 0.5 * item.position[0];
+            assert!((item.position[1] - expected_y).abs() < 1e-4);
+            // Aligned row 1 (m.j) must equal terrain normal (-1/sqrt(5), 2/sqrt(5), 0)
+            let inv_sqrt5 = 1.0 / 5.0_f32.sqrt();
+            assert!((item.normal[0] + inv_sqrt5).abs() < 1e-4);
+            assert!((item.normal[1] - 2.0 * inv_sqrt5).abs() < 1e-4);
+            assert!((item.xform[1][0] - item.normal[0]).abs() < 1e-5);
+            assert!((item.xform[1][1] - item.normal[1]).abs() < 1e-5);
+            assert!((item.xform[1][2] - item.normal[2]).abs() < 1e-5);
+        }
+
+        // Collect visible from front camera -> should emit items
+        let cam_pos = [1.0, 1.5, -3.0];
+        let view = crate::camera::matrix_build_camera(cam_pos, [1.0, 1.0, 1.0], [0.0, 1.0, 0.0]);
+        let proj = crate::camera::matrix_build_projection(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 50.0);
+        let full = matrix_mul_44(&proj, &view);
+        let frustum = ClipFrustum::from_view_proj(&full, frustum_planes::LRTB | frustum_planes::FAR);
+
+        let vis = grid.collect_visible(cam_pos, &frustum, None, &full, 1, &DetailVisibilityConfig::default());
+        let total_vis = vis.still[0].len() + vis.wave1[0].len() + vis.wave2[0].len();
+        assert_eq!(total_vis, expected_items);
+
+        // Camera looking away -> frustum culls all
+        let back_view = crate::camera::matrix_build_camera(cam_pos, [1.0, 1.0, -10.0], [0.0, 1.0, 0.0]);
+        let back_full = matrix_mul_44(&proj, &back_view);
+        let back_frustum =
+            ClipFrustum::from_view_proj(&back_full, frustum_planes::LRTB | frustum_planes::FAR);
+        let vis_back = grid.collect_visible(
+            cam_pos,
+            &back_frustum,
+            None,
+            &back_full,
+            2,
+            &DetailVisibilityConfig::default(),
+        );
+        assert_eq!(
+            vis_back.still[0].len() + vis_back.wave1[0].len() + vis_back.wave2[0].len(),
+            0
+        );
+
+        // HOM occlusion wall directly between cam_pos and slot -> hides all
+        let wall_mesh = crate::hom::HomMesh::from_raw_triangles(&[
+            ([-5.0, -5.0, -1.0], [-5.0, 5.0, -1.0], [5.0, 5.0, -1.0], 1),
+            ([-5.0, -5.0, -1.0], [5.0, 5.0, -1.0], [5.0, -5.0, -1.0], 1),
+        ]);
+        let mut occ = OccRasterizer::new();
+        occ.render_mesh(&wall_mesh, &full, cam_pos);
+        let vis_hom = grid.collect_visible(
+            cam_pos,
+            &frustum,
+            Some(&occ),
+            &full,
+            3,
+            &DetailVisibilityConfig::default(),
+        );
+        assert_eq!(
+            vis_hom.still[0].len() + vis_hom.wave1[0].len() + vis_hom.wave2[0].len(),
+            0
+        );
+
+        // Shift grid far away -> validate_coords still exact
+        grid.update_cache_with_cform(&details, 3, -2, [6.0, 1.0, -4.0], 4, &cfg, &bvh, &cform, Some(&gmlib));
+        assert!(grid.validate_coords());
+        assert_eq!(grid.center(), (3, -2));
     }
 }
