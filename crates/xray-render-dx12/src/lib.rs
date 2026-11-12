@@ -4,8 +4,13 @@
 //! Implements Shader Model 6.6 bindless descriptor indexing, an automated Render Graph DAG pass
 //! compiler with resource barrier scheduling, and multi-threaded command list recording.
 
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::manual_div_ceil)]
+
 pub mod allocators;
 pub mod bindless;
+pub mod clouds;
 pub mod deferred;
 pub mod device;
 pub mod ffi;
@@ -17,6 +22,7 @@ pub mod heaps;
 pub mod lighting;
 pub mod particle;
 pub mod pipeline;
+pub mod rain;
 pub mod renderer;
 pub mod shaders;
 pub mod shadow;
@@ -25,10 +31,12 @@ pub mod swapchain;
 pub mod texture;
 pub mod ui_canvas;
 
+pub use clouds::{CloudRenderer, CloudSimulation, CloudsPushConstants};
 pub use geometry::PushDrawConstants;
 pub use geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
 pub use lighting::{DynamicLight, GpuLight, LightManager, LightType};
 pub use particle::{GpuParticleInstance, ParticleSystemRenderer};
+pub use rain::{GpuRainDrop, RainManager, RainPushConstants, RainRenderer};
 pub use shadow::DirectionalShadowMap;
 pub use sky::{SkyPushConstants, SkyRenderer};
 pub use ui_canvas::{GlyphQuad, GpuUiQuad, UiCanvas, UiCanvasPipeline, UiPushConstants};

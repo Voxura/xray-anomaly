@@ -67,6 +67,9 @@ pub struct Dx12Renderer {
     pub shadow_map: Option<crate::shadow::DirectionalShadowMap>,
     pub particle_renderer: Option<crate::particle::ParticleSystemRenderer>,
     pub sky_renderer: Option<crate::sky::SkyRenderer>,
+    pub clouds_renderer: Option<crate::clouds::CloudRenderer>,
+    pub rain_renderer: Option<crate::rain::RainRenderer>,
+    pub rain_manager: Option<crate::rain::RainManager>,
     pub ui_canvas_pipeline: Option<crate::ui_canvas::UiCanvasPipeline>,
     pub ui_canvas: crate::ui_canvas::UiCanvas,
     pub(crate) geometry: GeometryState,
@@ -128,6 +131,9 @@ impl Dx12Renderer {
             shadow_map: None,
             particle_renderer: None,
             sky_renderer: None,
+            clouds_renderer: None,
+            rain_renderer: None,
+            rain_manager: None,
             ui_canvas_pipeline: None,
             ui_canvas: crate::ui_canvas::UiCanvas::default(),
             geometry: GeometryState::default(),
@@ -662,6 +668,108 @@ impl Dx12Renderer {
             cmd,
             camera_va,
             &self.bindless_heap,
+            push,
+            rtv,
+            Some(dsv),
+            self.width,
+            self.height,
+        );
+        Ok(())
+    }
+
+    /// Record a draw call rendering the dual-layer scrolling clouds dome
+    pub fn draw_clouds(&mut self, push: &crate::clouds::CloudsPushConstants) -> WinResult<()> {
+        if self.clouds_renderer.is_none() {
+            self.clouds_renderer = Some(crate::clouds::CloudRenderer::new(&self.device_ctx.device)?);
+        }
+        let clouds = self.clouds_renderer.as_ref().unwrap();
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let camera_va = self
+            .geometry
+            .camera_gpu_va()
+            .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
+
+        clouds.render(
+            cmd,
+            camera_va,
+            &self.bindless_heap,
+            push,
+            rtv,
+            Some(dsv),
+            self.width,
+            self.height,
+        );
+        Ok(())
+    }
+
+    /// Advance rain simulation state around camera volume
+    pub fn step_rain(
+        &mut self,
+        cam_pos: [f32; 3],
+        wind_direction: f32,
+        wind_velocity: f32,
+        rain_density: f32,
+        dt: f32,
+    ) {
+        if self.rain_manager.is_none() {
+            self.rain_manager = Some(crate::rain::RainManager::new(crate::rain::DEFAULT_MAX_RAIN_DROPS));
+        }
+        let rain_mgr = self.rain_manager.as_mut().unwrap();
+        rain_mgr.step(cam_pos, wind_direction, wind_velocity, rain_density, dt);
+    }
+
+    /// Access mutable reference to rain manager
+    pub fn rain_manager_mut(&mut self) -> &mut crate::rain::RainManager {
+        if self.rain_manager.is_none() {
+            self.rain_manager = Some(crate::rain::RainManager::new(crate::rain::DEFAULT_MAX_RAIN_DROPS));
+        }
+        self.rain_manager.as_mut().unwrap()
+    }
+
+    /// Record a draw call rendering instanced rain streaks
+    pub fn draw_rain(&mut self, push: &crate::rain::RainPushConstants) -> WinResult<()> {
+        if self.rain_renderer.is_none() {
+            self.rain_renderer = Some(crate::rain::RainRenderer::new(&self.device_ctx.device)?);
+        }
+        if self.rain_manager.is_none() {
+            self.rain_manager = Some(crate::rain::RainManager::new(crate::rain::DEFAULT_MAX_RAIN_DROPS));
+        }
+        let num_drops = self.rain_manager.as_ref().unwrap().active_count();
+        if num_drops == 0 {
+            return Ok(());
+        }
+        let raindrops_va = self.rain_manager.as_mut().unwrap().upload(&self.device_ctx.device)?;
+        let rain = self.rain_renderer.as_ref().unwrap();
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let camera_va = self
+            .geometry
+            .camera_gpu_va()
+            .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
+
+        rain.render(
+            cmd,
+            camera_va,
+            &self.bindless_heap,
+            raindrops_va,
+            num_drops,
             push,
             rtv,
             Some(dsv),
