@@ -76,6 +76,7 @@ pub struct Dx12Renderer {
     pub detail_manager: Option<crate::details::DetailManager>,
     pub postprocess_renderer: Option<crate::postprocess::PostprocessRenderer>,
     pub postprocess_manager: Option<crate::postprocess::PostprocessManager>,
+    pub gbuffer: Option<crate::deferred::GBufferManager>,
     pub ui_canvas_pipeline: Option<crate::ui_canvas::UiCanvasPipeline>,
     pub ui_canvas: crate::ui_canvas::UiCanvas,
     pub(crate) geometry: GeometryState,
@@ -146,6 +147,7 @@ impl Dx12Renderer {
             detail_manager: None,
             postprocess_renderer: None,
             postprocess_manager: None,
+            gbuffer: None,
             ui_canvas_pipeline: None,
             ui_canvas: crate::ui_canvas::UiCanvas::default(),
             geometry: GeometryState::default(),
@@ -960,6 +962,160 @@ impl Dx12Renderer {
             self.height,
         );
         Ok(())
+    }
+
+    /// Ensure G-Buffer targets and pipelines are initialized for current window dimensions
+    pub fn ensure_gbuffer(&mut self) -> WinResult<()> {
+        if self.gbuffer.is_none() {
+            self.gbuffer = Some(crate::deferred::GBufferManager::new());
+        }
+        let gbuffer = self.gbuffer.as_mut().unwrap();
+        gbuffer.ensure_initialized(
+            &self.device_ctx.device,
+            self.width,
+            self.height,
+            &mut self.bindless_allocator,
+            &self.bindless_heap,
+            self.srv_descriptor_size,
+        )
+    }
+
+    /// Access mutable reference to G-Buffer manager
+    pub fn gbuffer_manager_mut(&mut self) -> WinResult<&mut crate::deferred::GBufferManager> {
+        self.ensure_gbuffer()?;
+        Ok(self.gbuffer.as_mut().unwrap())
+    }
+
+    /// Begin G-Buffer MRT rasterization pass
+    pub fn begin_gbuffer_pass(&mut self) -> WinResult<()> {
+        self.ensure_gbuffer()?;
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let gbuffer = self.gbuffer.as_ref().unwrap();
+        let targets = gbuffer.targets.as_ref().unwrap();
+
+        targets.begin_gbuffer_pass(cmd);
+        targets.clear_gbuffer(cmd);
+        Ok(())
+    }
+
+    /// Draw a mesh into the 3 G-Buffer MRTs (Albedo, Normal, Material) and Depth
+    pub fn draw_gbuffer_mesh(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        albedo_index: Option<crate::bindless::DescriptorIndex>,
+        normal_index: Option<crate::bindless::DescriptorIndex>,
+        material_index: Option<crate::bindless::DescriptorIndex>,
+        transform_index: u32,
+    ) -> WinResult<()> {
+        self.ensure_gbuffer()?;
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let gbuffer = self.gbuffer.as_ref().unwrap();
+        let pipeline = gbuffer.mesh_pipeline.as_ref().unwrap();
+        let targets = gbuffer.targets.as_ref().unwrap();
+
+        let rtvs = targets.gbuffer_rtvs();
+        let dsv = targets.dsv_handle();
+
+        let push = crate::geometry::PushDrawConstants {
+            albedo_index: albedo_index.map(|i| i.0).unwrap_or(u32::MAX),
+            normal_index: normal_index.map(|i| i.0).unwrap_or(u32::MAX),
+            material_index: material_index.map(|i| i.0).unwrap_or(u32::MAX),
+            transform_index,
+            ..Default::default()
+        };
+
+        self.geometry.draw_gbuffer(
+            &self.device_ctx.device,
+            cmd,
+            &pipeline.pso,
+            &pipeline.root,
+            &self.bindless_heap,
+            &rtvs,
+            dsv,
+            self.width,
+            self.height,
+            handle,
+            &push,
+        )
+    }
+
+    /// Complete G-Buffer MRT rasterization pass
+    pub fn end_gbuffer_pass(&mut self) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        if let Some(gbuffer) = self.gbuffer.as_ref() {
+            if let Some(targets) = gbuffer.targets.as_ref() {
+                targets.end_gbuffer_pass(cmd);
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute the deferred lighting combine pass into the HDR accumulation target and return its bindless SRV
+    pub fn execute_deferred_combine(
+        &mut self,
+        light_params: &crate::deferred::GpuLightParams,
+        shadow_map_idx: Option<crate::bindless::DescriptorIndex>,
+        num_lights: u32,
+    ) -> WinResult<crate::bindless::DescriptorIndex> {
+        self.ensure_gbuffer()?;
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let camera_va = self
+            .geometry
+            .camera_gpu_va()
+            .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        let lt_va = self.geometry.lights_gpu_va(&self.device_ctx.device)?;
+
+        let gbuffer = self.gbuffer.as_mut().unwrap();
+        let targets = gbuffer.targets.as_ref().unwrap();
+
+        targets.begin_combine_pass(cmd);
+        targets.clear_hdr(cmd);
+
+        let push = crate::deferred::PushCombineConstants {
+            gbuffer_albedo_idx: targets.albedo_srv.0,
+            gbuffer_normal_idx: targets.normal_srv.0,
+            gbuffer_material_idx: targets.material_srv.0,
+            gbuffer_depth_idx: targets.depth_srv.0,
+            shadow_map_idx: shadow_map_idx.map(|s| s.0).unwrap_or(u32::MAX),
+            num_lights,
+            screen_res_inv: [1.0 / self.width as f32, 1.0 / self.height as f32],
+        };
+
+        let hdr_rtv = targets.hdr_rtv();
+        let width = self.width;
+        let height = self.height;
+        let hdr_srv = targets.hdr_srv;
+
+        let combine = gbuffer.combine_pipeline.as_mut().unwrap();
+        combine.render(
+            &self.device_ctx.device,
+            cmd,
+            camera_va,
+            lt_va,
+            &self.bindless_heap,
+            &push,
+            light_params,
+            hdr_rtv,
+            width,
+            height,
+        )?;
+
+        let targets = self.gbuffer.as_ref().unwrap().targets.as_ref().unwrap();
+        targets.end_combine_pass(cmd);
+
+        Ok(hdr_srv)
     }
 
     /// Begin the directional sunlight shadow map rendering pass

@@ -41,6 +41,10 @@ pub mod ui_canvas;
 pub mod wallmarks;
 
 pub use clouds::{CloudRenderer, CloudSimulation, CloudsPushConstants};
+pub use deferred::{
+    DeferredCombinePipeline, DeferredPipeline, GBufferManager, GBufferMeshPipeline,
+    GBufferResources, GBufferTargets, GpuLightParams, PushCombineConstants,
+};
 pub use details::{
     DetailManager, DetailPushConstants, DetailRenderer, GpuDetailInstance, GpuDetailVertex,
 };

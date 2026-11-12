@@ -245,3 +245,67 @@ float4 ps_main(PSInput input) : SV_Target0
     }
     return float4(base_color, 1.0);
 }
+
+struct GBufferOutput
+{
+    float4 albedo   : SV_Target0; // RGB: Albedo, A: Material Flag / AO
+    float4 normal   : SV_Target1; // XYZ: Encoded Normal [0..1], W: Roughness
+    float4 material : SV_Target2; // R: Metallic, G: Roughness, B: Specular, A: 1.0
+};
+
+GBufferOutput ps_gbuffer(PSInput input)
+{
+    GBufferOutput output;
+
+    // Decode normal
+    float3 world_normal = normalize(input.normal);
+    if (normal_index != 0xFFFFFFFF)
+    {
+        float4 n_tex = g_textures[NonUniformResourceIndex(normal_index)].Sample(g_sampler, input.uv);
+        float2 xy;
+        if (n_tex.a > 0.0 && n_tex.b < 0.1)
+        {
+            xy = float2(n_tex.a, n_tex.g) * 2.0 - 1.0;
+        }
+        else
+        {
+            xy = n_tex.rg * 2.0 - 1.0;
+        }
+        float z = sqrt(max(0.0, 1.0 - dot(xy, xy)));
+        float3 tangent_normal = float3(xy, z);
+        if (n_tex.b >= 0.1)
+        {
+            tangent_normal = n_tex.rgb * 2.0 - 1.0;
+        }
+
+        float3 N = world_normal;
+        float3 T = normalize(input.tangent - N * dot(input.tangent, N));
+        float3 B = cross(N, T);
+        float3x3 tbn = float3x3(T, B, N);
+        world_normal = normalize(mul(tangent_normal, tbn));
+    }
+
+    // Decode albedo
+    float4 albedo = float4(1.0, 1.0, 1.0, 1.0);
+    if (albedo_index != 0xFFFFFFFF)
+    {
+        albedo = g_textures[NonUniformResourceIndex(albedo_index)].Sample(g_sampler, input.uv);
+    }
+
+    // Material properties
+    float roughness = 0.5;
+    float metallic = 0.0;
+    float specular = 0.5;
+    if (material_index != 0xFFFFFFFF)
+    {
+        float4 mat = g_textures[NonUniformResourceIndex(material_index)].Sample(g_sampler, input.uv);
+        roughness = mat.g;
+        metallic = mat.r;
+        specular = mat.b;
+    }
+
+    output.albedo = albedo;
+    output.normal = float4(world_normal * 0.5 + 0.5, roughness);
+    output.material = float4(metallic, roughness, specular, 1.0);
+    return output;
+}

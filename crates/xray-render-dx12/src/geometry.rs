@@ -514,6 +514,17 @@ impl GeometryState {
         Ok(())
     }
 
+    /// Retrieve GPU virtual address for dynamic lights buffer (or default dummy buffer)
+    pub fn lights_gpu_va(&mut self, device: &ID3D12Device) -> WinResult<u64> {
+        if self.default_lights.is_none() {
+            let dummy = [0u8; 64];
+            self.default_lights = Some(UploadBuffer::new(device, &dummy)?);
+        }
+        let default_lt = self.default_lights.as_ref().unwrap();
+        let lt_buf = self.lights.as_ref().unwrap_or(default_lt);
+        unsafe { Ok(lt_buf.0.GetGPUVirtualAddress()) }
+    }
+
     /// Caller validates frame, mesh and camera before recording any commands.
     pub fn draw(
         &mut self,
@@ -772,6 +783,94 @@ impl GeometryState {
                 bottom: height as i32,
             }]);
             cmd.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+            cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmd.IASetVertexBuffers(0, Some(&[mesh.vertex_view]));
+            cmd.IASetIndexBuffer(Some(&mesh.index_view));
+            cmd.DrawIndexedInstanced(mesh.index_count, 1, 0, 0, 0);
+        }
+        Ok(())
+    }
+
+    /// Record a G-Buffer MRT draw call (writes Albedo, Normal, Material, Depth)
+    pub fn draw_gbuffer(
+        &mut self,
+        device: &ID3D12Device,
+        cmd: &ID3D12GraphicsCommandList,
+        gbuffer_pso: &ID3D12PipelineState,
+        gbuffer_root: &ID3D12RootSignature,
+        srv_heap: &ID3D12DescriptorHeap,
+        rtvs: &[D3D12_CPU_DESCRIPTOR_HANDLE; 3],
+        dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        width: u32,
+        height: u32,
+        handle: MeshHandle,
+        push_constants: &PushDrawConstants,
+    ) -> WinResult<()> {
+        let mesh = self.meshes.get(handle).unwrap();
+        let camera = self.camera.as_ref().unwrap();
+
+        if self.default_transform.is_none() {
+            let identity: [[[f32; 4]; 4]; 1] = [[
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]];
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    identity.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(&identity),
+                )
+            };
+            self.default_transform = Some(UploadBuffer::new(device, bytes)?);
+        }
+        let default_tf = self.default_transform.as_ref().unwrap();
+        let tf_buf = self.transforms.as_ref().unwrap_or(default_tf);
+
+        if self.default_lights.is_none() {
+            let dummy = [0u8; 64];
+            self.default_lights = Some(UploadBuffer::new(device, &dummy)?);
+        }
+        let default_lt = self.default_lights.as_ref().unwrap();
+        let lt_buf = self.lights.as_ref().unwrap_or(default_lt);
+
+        self.recording_resources.extend([
+            mesh.vertices.0.clone(),
+            mesh.indices.0.clone(),
+            camera.0.clone(),
+            tf_buf.0.clone(),
+            lt_buf.0.clone(),
+        ]);
+        unsafe {
+            cmd.SetPipelineState(gbuffer_pso);
+            cmd.SetGraphicsRootSignature(gbuffer_root);
+            cmd.SetDescriptorHeaps(&[Some(srv_heap.clone())]);
+            cmd.SetGraphicsRootConstantBufferView(0, camera.0.GetGPUVirtualAddress());
+            cmd.SetGraphicsRootDescriptorTable(
+                1,
+                srv_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            cmd.SetGraphicsRoot32BitConstants(
+                2,
+                8,
+                (push_constants as *const PushDrawConstants).cast(),
+                0,
+            );
+            cmd.SetGraphicsRootShaderResourceView(3, tf_buf.0.GetGPUVirtualAddress());
+            cmd.SetGraphicsRootShaderResourceView(4, lt_buf.0.GetGPUVirtualAddress());
+            cmd.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: width as f32,
+                Height: height as f32,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+            cmd.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            }]);
+            cmd.OMSetRenderTargets(3, Some(rtvs.as_ptr()), false, Some(&dsv));
             cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             cmd.IASetVertexBuffers(0, Some(&[mesh.vertex_view]));
             cmd.IASetIndexBuffer(Some(&mesh.index_view));
