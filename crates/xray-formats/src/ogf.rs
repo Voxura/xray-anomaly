@@ -855,6 +855,23 @@ pub fn matrix_transform_point(m: &XRayMatrix, p: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// Transform and perspective-divide a 3D point by a 4x4 projection/view-proj matrix
+/// (`Fmatrix::transform(Fvector&, const Fvector&)` in `src/xrCore/_matrix.h:815-821`).
+///
+/// Returns `None` if clip `w` is near zero (`<= 1e-6` in magnitude) or non-finite.
+pub fn matrix_transform_projected(m: &XRayMatrix, p: [f32; 3]) -> Option<[f32; 3]> {
+    let w = p[0] * m[0][3] + p[1] * m[1][3] + p[2] * m[2][3] + m[3][3];
+    if w.abs() <= 1e-6 || !w.is_finite() {
+        return None;
+    }
+    let iw = 1.0 / w;
+    Some([
+        (p[0] * m[0][0] + p[1] * m[1][0] + p[2] * m[2][0] + m[3][0]) * iw,
+        (p[0] * m[0][1] + p[1] * m[1][1] + p[2] * m[2][1] + m[3][1]) * iw,
+        (p[0] * m[0][2] + p[1] * m[1][2] + p[2] * m[2][2] + m[3][2]) * iw,
+    ])
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BonePoseMatrices {
     pub local_bind: XRayMatrix,
@@ -2157,5 +2174,17 @@ mod tests {
         assert!((vz[0] - 1.0).abs() < 1e-6);
         assert!((vz[1] + 1.0).abs() < 1e-6);
         assert!((vz[2] - 0.0).abs() < 1e-6);
+
+        let proj = crate::camera::matrix_build_projection(
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            1.0,
+            100.0,
+        );
+        let ndc = matrix_transform_projected(&proj, [2.0, -2.0, 4.0]).unwrap();
+        assert!((ndc[0] - 0.5).abs() < 1e-5);
+        assert!((ndc[1] + 0.5).abs() < 1e-5);
+        assert!(ndc[2] > 0.0 && ndc[2] < 1.0);
+        assert!(matrix_transform_projected(&proj, [0.0, 0.0, 0.0]).is_none());
     }
 }

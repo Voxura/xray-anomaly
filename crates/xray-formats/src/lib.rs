@@ -73,9 +73,9 @@ pub use cform::{
 };
 pub use chunk::{ByteCursor, ChunkEntry, ChunkIter, ChunkReader, ChunkWriter, FormatError};
 pub use details::{
-    DetailHeader, DetailMesh, DetailPalette, DetailSlot, DetailVertex, LevelDetails,
-    DETAIL_ID_EMPTY, DETAIL_ID_EMPTY_V3, DETAIL_SLOT_HALF_SIZE, DETAIL_SLOT_SIZE, DETAIL_VERSION_3,
-    DETAIL_VERSION_4, DO_NO_WAVING,
+    DetailHeader, DetailMesh, DetailMeshVertexOut, DetailPalette, DetailSlot, DetailVertex,
+    LevelDetails, DETAIL_ID_EMPTY, DETAIL_ID_EMPTY_V3, DETAIL_SLOT_HALF_SIZE, DETAIL_SLOT_SIZE,
+    DETAIL_VERSION_3, DETAIL_VERSION_4, DO_NO_WAVING,
 };
 pub use envelopes::{
     decode_q16, encode_q16, Envelope, EnvelopeBehavior, EnvelopeKey, EnvelopeShape, ObjectMotion,
@@ -115,13 +115,14 @@ pub use level::{
 pub use ogf::{
     fvf_flags, matrix_forward_dir, matrix_invert_43, matrix_mul_43, matrix_rotate_y,
     matrix_set_hpb, matrix_set_xyz_translate, matrix_set_xyzi_translate, matrix_transform_point,
-    ogf_chunks, skel_vert_type, BoneIkData, BoneIkSection, BonePoseMatrices, BoneShape,
-    BoneShapeType, LodImposterSample, OgfBBox, OgfBSphere, OgfBone, OgfBufferRef, OgfDesc,
-    OgfGContainerRef, OgfHeader, OgfLodDef, OgfLodFacet, OgfLodVertex, OgfModel, OgfObb,
-    OgfSkeleton, OgfSlideWindows, OgfTextureLink, OgfTreeDef, OgfVertices, OgfVisualType,
-    SlideWindow, StaticVertex, StaticVertexLayout, TreeLightingColor, UnifiedSkinnedVertex,
-    VertBoned1W, VertBoned2W, VertBoned3W, VertBoned4W, XRayMatrix, LOD_IMPOSTER_QUAD_ORDER,
-    OGF_LODDEF2_SIZE, OGF_LOD_VERTEX_SIZE, OGF_TREEDEF2_SIZE, XRAY_IDENTITY_MATRIX,
+    matrix_transform_projected, ogf_chunks, skel_vert_type, BoneIkData, BoneIkSection,
+    BonePoseMatrices, BoneShape, BoneShapeType, LodImposterSample, OgfBBox, OgfBSphere, OgfBone,
+    OgfBufferRef, OgfDesc, OgfGContainerRef, OgfHeader, OgfLodDef, OgfLodFacet, OgfLodVertex,
+    OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows, OgfTextureLink, OgfTreeDef, OgfVertices,
+    OgfVisualType, SlideWindow, StaticVertex, StaticVertexLayout, TreeLightingColor,
+    UnifiedSkinnedVertex, VertBoned1W, VertBoned2W, VertBoned3W, VertBoned4W, XRayMatrix,
+    LOD_IMPOSTER_QUAD_ORDER, OGF_LODDEF2_SIZE, OGF_LOD_VERTEX_SIZE, OGF_TREEDEF2_SIZE,
+    XRAY_IDENTITY_MATRIX,
 };
 pub use omf::{
     motion_def_flags, motion_key_flags, slerp_quat_xyzw, BoneKeyframe, BoneMotionTrack,
@@ -220,16 +221,24 @@ pub use vfs_bridge::{
     VfsLtxProvider, VfsXmlProvider,
 };
 pub use weather::{
-    calculate_dynamic_sun_dir, dir_from_hp, lerp_descriptors, normalize_time, parse_hhmmss_seconds,
-    parse_ltx_str, skybox_hbox_mesh, time_diff, time_weight, EnvAmbientDef, EnvAmbientEffectDef,
-    EnvBoost, EnvDescriptor, EnvGlobalParams, EnvSoundChannelDef, LensFlareDef, LensFlareElement,
-    MixedEnvironment, SkyboxVertex, SunPositionsConfig, ThunderboltCollectionDef,
-    ThunderboltDescDef, ThunderboltFlareDef, WeatherCycle, WeatherLibrary, WindAnimState,
+    append_quad_indices, calculate_dynamic_sun_dir, clouds_hemi_mesh, dir_from_hp, hp_from_dir,
+    lerp_descriptors, normalize_time, parse_hhmmss_seconds, parse_ltx_str, skybox_hbox_mesh,
+    time_diff, time_weight, CloudsDomeVertex, EnvAmbientDef, EnvAmbientEffectDef, EnvBoost,
+    EnvDescriptor, EnvGlobalParams, EnvLitVertex, EnvSoundChannelDef, LensFlareDef,
+    LensFlareDrawQuad, LensFlareElement, LensFlareFrameOutput, LensFlarePlayState,
+    LensFlareQuadKind, LensFlareState, MixedEnvironment, PerlinNoise1D, RainDropItem,
+    RainEffectConfig, RainEffectState, RainFrameOutput, RainSplashInstance, RainSplashParticle,
+    SkyboxVertex, SunPositionsConfig, ThunderboltBoltDraw, ThunderboltCollectionDef,
+    ThunderboltDescDef, ThunderboltEffectState, ThunderboltFlareDef, ThunderboltFrameOutput,
+    ThunderboltGradientQuad, ThunderboltPlayState, WeatherCycle, WeatherLibrary, WindAnimState,
     CLOUDS_HEMI_INDICES, CLOUDS_HEMI_INDEX_COUNT, CLOUDS_HEMI_POSITIONS,
-    CLOUDS_HEMI_TRIANGLE_COUNT, CLOUDS_HEMI_VERTEX_COUNT, DAY_LENGTH, RAIN_CPU_SOURCE_RADIUS,
-    RAIN_DROP_LENGTH, RAIN_DROP_MAX_ANGLE_RAD, RAIN_DROP_SPEED_MAX, RAIN_DROP_SPEED_MIN,
-    RAIN_DROP_WIDTH, RAIN_MAX_DESIRED_ITEMS, RAIN_MAX_DISTANCE, RAIN_SINK_OFFSET,
-    RAIN_SOURCE_OFFSET, RAIN_SOURCE_RADIUS, SKYBOX_HBOX_INDEX_COUNT, SKYBOX_HBOX_INDICES,
+    CLOUDS_HEMI_TRIANGLE_COUNT, CLOUDS_HEMI_VERTEX_COUNT, DAY_LENGTH, LENS_FLARE_BLEND_DEC_SPEED,
+    LENS_FLARE_BLEND_INC_SPEED, LENS_FLARE_MAX_RAYS, LENS_FLARE_RAY_DELTAS,
+    LENS_FLARE_RAY_MAX_DIST, LENS_FLARE_RAY_SCALE, QUAD_INDEX_PATTERN, RAIN_CPU_SOURCE_RADIUS,
+    RAIN_DROP_ANGLE_RAD, RAIN_DROP_LENGTH, RAIN_DROP_MAX_ANGLE_RAD, RAIN_DROP_SPEED_MAX,
+    RAIN_DROP_SPEED_MIN, RAIN_DROP_WIDTH, RAIN_MAX_DESIRED_ITEMS, RAIN_MAX_DISTANCE,
+    RAIN_MAX_PARTICLES, RAIN_SINK_OFFSET, RAIN_SOURCE_OFFSET, RAIN_SOURCE_RADIUS,
+    RAIN_SPLASH_TIME_SEC, RAIN_STREAK_UVS, SKYBOX_HBOX_INDEX_COUNT, SKYBOX_HBOX_INDICES,
     SKYBOX_HBOX_POSITIONS, SKYBOX_HBOX_TEXCOORDS, SKYBOX_HBOX_TRIANGLE_COUNT,
     SKYBOX_HBOX_VERTEX_COUNT, WFX_TRANS_TIME,
 };

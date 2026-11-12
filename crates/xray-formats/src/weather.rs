@@ -15,8 +15,15 @@ use std::collections::BTreeMap;
 use xray_core::ltx_loader::OwnedLtxDocument;
 
 use crate::chunk::FormatError;
-use crate::ogf::{matrix_mul_43, matrix_rotate_y, XRayMatrix, XRAY_IDENTITY_MATRIX};
+use crate::details::{DetailMesh, DetailMeshVertexOut};
+use crate::lanims::{unpack_argb_f32, LightAnimItem, LightAnimLibrary};
+use crate::ogf::{
+    matrix_mul_43, matrix_rotate_y, matrix_set_xyzi_translate, matrix_transform_point,
+    matrix_transform_projected, XRayMatrix, XRAY_IDENTITY_MATRIX,
+};
+use crate::particle_sim::ParticleRng;
 use crate::shaders_xr::{env_mod_flags, EnvModAccum, LevelEnvModifiers};
+use crate::skinning::{matrix_transform_dir, normalize_vec3};
 use crate::thm::texture_stem_to_dds_vpath;
 
 pub const DAY_LENGTH: f32 = 86_400.0;
@@ -220,7 +227,7 @@ pub const CLOUDS_HEMI_INDICES: [u16; CLOUDS_HEMI_INDEX_COUNT] = [
     77, 76, 75, 79, 30, 77, 90, 75, 90, 79, 75, 90, 80, 79,
 ];
 
-/// Rain emitter & streak geometry constants (`Rain.cpp:20-32`, `dxRainRender.cpp:7-18`).
+/// Rain emitter & streak geometry constants (`Rain.cpp:20-35`, `dxRainRender.cpp:7-22`).
 pub const RAIN_MAX_DESIRED_ITEMS: u32 = 2500;
 pub const RAIN_SOURCE_RADIUS: f32 = 15.0;
 pub const RAIN_CPU_SOURCE_RADIUS: f32 = 12.5;
@@ -229,9 +236,66 @@ pub const RAIN_MAX_DISTANCE: f32 = RAIN_SOURCE_OFFSET * 1.5;
 pub const RAIN_SINK_OFFSET: f32 = -(RAIN_MAX_DISTANCE - RAIN_SOURCE_OFFSET);
 pub const RAIN_DROP_LENGTH: f32 = 5.0;
 pub const RAIN_DROP_WIDTH: f32 = 0.30;
+pub const RAIN_DROP_ANGLE_RAD: f32 = 15.0 * (std::f32::consts::PI / 180.0);
 pub const RAIN_DROP_MAX_ANGLE_RAD: f32 = 35.0 * (std::f32::consts::PI / 180.0);
 pub const RAIN_DROP_SPEED_MIN: f32 = 40.0;
 pub const RAIN_DROP_SPEED_MAX: f32 = 80.0;
+pub const RAIN_MAX_PARTICLES: usize = 1000;
+pub const RAIN_SPLASH_TIME_SEC: f32 = 0.3;
+
+/// Standard 6-index pattern emitted per quad (`CBackend::CreateQuadIB`, `R_Backend.cpp:42-48`).
+pub const QUAD_INDEX_PATTERN: [u16; 6] = [0, 1, 2, 3, 2, 1];
+
+/// Append one quad's 6 `QuadIB` indices anchored at `vertex_base`.
+#[inline]
+pub fn append_quad_indices(indices: &mut Vec<u16>, vertex_base: u16) {
+    indices.extend(QUAD_INDEX_PATTERN.map(|o| vertex_base + o));
+}
+
+/// Shared lit billboard vertex (`FVF::F_LIT`: position, linear RGBA color, UV).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnvLitVertex {
+    pub pos: [f32; 3],
+    pub color_rgba: [f32; 4],
+    pub uv: [f32; 2],
+}
+
+/// Alternating UV patterns used by `dxRainRender::Render` streaks (`dxRainRender.cpp:213-216`).
+pub const RAIN_STREAK_UVS: [[[f32; 2]; 4]; 2] = [
+    [[0.0, 1.0], [0.0, 0.0], [1.0, 1.0], [1.0, 0.0]],
+    [[1.0, 0.0], [1.0, 1.0], [0.0, 0.0], [0.0, 1.0]],
+];
+
+/// Unpacked `v_clouds` dome vertex (`dxEnvironmentRender.cpp:79-91`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CloudsDomeVertex {
+    pub pos: [f32; 3],
+    pub wind_rgba: [f32; 4],
+    pub color_rgba: [f32; 4],
+}
+
+/// Construct the 91-vertex / 480-index clouds dome mesh tinted for `env`
+/// (`dxEnvironmentRender.cpp:374-387`).
+pub fn clouds_hemi_mesh(
+    env: &MixedEnvironment,
+) -> (
+    [CloudsDomeVertex; CLOUDS_HEMI_VERTEX_COUNT],
+    [u16; CLOUDS_HEMI_INDEX_COUNT],
+) {
+    let wind_rgba = env.clouds_wind_rgba();
+    let color_rgba = env.clouds_color_rgba();
+    let mut verts = [CloudsDomeVertex {
+        pos: [0.0; 3],
+        wind_rgba: [0.0; 4],
+        color_rgba: [0.0; 4],
+    }; CLOUDS_HEMI_VERTEX_COUNT];
+    for (slot, pos) in verts.iter_mut().zip(CLOUDS_HEMI_POSITIONS.iter()) {
+        slot.pos = *pos;
+        slot.wind_rgba = wind_rgba;
+        slot.color_rgba = color_rgba;
+    }
+    (verts, CLOUDS_HEMI_INDICES)
+}
 
 /// Accumulating wind animation state (`CEnvironment::wind_anim`, `Environment.cpp:617-628`).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -261,6 +325,138 @@ impl WindAnimState {
         self.anim[1] += vel * ws * dt_sec;
         self.anim[2] += (vel * 1.33).clamp(0.0, 1.0) * dt_sec;
         self.anim[3] += dt_sec;
+    }
+
+    /// Dual-layer scrolling UV offsets `((u0, v0), (u1, v1))` derived from elapsed `anim[3]`
+    /// along X-Ray's cloud wind basis (`PI_DIV_4` & `3*PI_DIV_8`, `dxEnvironmentRender.cpp:370-371`).
+    #[inline]
+    pub fn clouds_uv_scroll(&self, layer0_speed: f32, layer1_speed: f32) -> ([f32; 2], [f32; 2]) {
+        let wd0 = dir_from_hp(std::f32::consts::FRAC_PI_4, 0.0);
+        let wd1 = dir_from_hp(
+            std::f32::consts::FRAC_PI_4 + std::f32::consts::FRAC_PI_8,
+            0.0,
+        );
+        let t = self.anim[3];
+        (
+            [wd0[0] * t * layer0_speed, wd0[2] * t * layer0_speed],
+            [wd1[0] * t * layer1_speed, wd1[2] * t * layer1_speed],
+        )
+    }
+}
+
+// ============================================================================
+// 1D Perlin Noise (`src/xrEngine/perlin.cpp`)
+// ============================================================================
+
+const PERLIN_1D_SAMPLE_SIZE: usize = 256;
+
+/// Classic 1D Perlin noise matching `CPerlinNoise1D` (`perlin.h`, `perlin.cpp:29-111`).
+#[derive(Debug, Clone)]
+pub struct PerlinNoise1D {
+    octaves: usize,
+    frequency: f32,
+    amplitude: f32,
+    perm: Vec<usize>,
+    g1: Vec<f32>,
+    prev_continuous_time: f32,
+    times: Vec<f32>,
+}
+
+impl PerlinNoise1D {
+    pub fn new(seed: u32, octaves: usize, frequency: f32, amplitude: f32) -> Self {
+        let b = PERLIN_1D_SAMPLE_SIZE;
+        let mut perm = vec![0usize; b + b + 2];
+        let mut g1 = vec![0.0f32; b + b + 2];
+
+        let mut lcg_state: u32 = seed;
+        let mut msvcrt_rand = || -> usize {
+            lcg_state = lcg_state.wrapping_mul(214_013).wrapping_add(2_531_011);
+            ((lcg_state >> 16) & 0x7FFF) as usize
+        };
+
+        for i in 0..b {
+            perm[i] = i;
+            let r = (msvcrt_rand() % (b + b)) as i32 - (b as i32);
+            g1[i] = (r as f32) / (b as f32);
+        }
+        for i in (1..b).rev() {
+            let j = msvcrt_rand() % b;
+            perm.swap(i, j);
+        }
+        for i in 0..(b + 2) {
+            perm[b + i] = perm[i];
+            g1[b + i] = g1[i];
+        }
+
+        Self {
+            octaves,
+            frequency,
+            amplitude,
+            perm,
+            g1,
+            prev_continuous_time: 0.0,
+            times: vec![0.0; octaves],
+        }
+    }
+
+    pub fn set_params(&mut self, octaves: usize, frequency: f32, amplitude: f32) {
+        self.octaves = octaves;
+        self.frequency = frequency;
+        self.amplitude = amplitude;
+        self.times.resize(octaves, 0.0);
+    }
+
+    fn noise1d(&self, arg: f32) -> f32 {
+        let t = (arg as f64) + 4096.0;
+        let t_floor = t.floor();
+        let b0 = (t_floor as i64).rem_euclid(PERLIN_1D_SAMPLE_SIZE as i64) as usize;
+        let b1 = (b0 + 1) & (PERLIN_1D_SAMPLE_SIZE - 1);
+        let rx0 = (t - t_floor) as f32;
+        let rx1 = rx0 - 1.0;
+        let sx = rx0 * rx0 * (3.0 - 2.0 * rx0);
+        let u = rx0 * self.g1[self.perm[b0]];
+        let v = rx1 * self.g1[self.perm[b1]];
+        u + sx * (v - u)
+    }
+
+    /// Evaluate multi-octave 1D noise at absolute coordinate `v` (`CPerlinNoise1D::Get`).
+    pub fn get(&self, v: f32) -> f32 {
+        if !v.is_finite() || self.octaves == 0 {
+            return 0.0;
+        }
+        let mut result = 0.0;
+        let mut amp = self.amplitude;
+        let mut coord = v * self.frequency;
+        for _ in 0..self.octaves {
+            result += self.noise1d(coord) * amp;
+            coord *= 2.0;
+            amp *= 0.5;
+        }
+        result
+    }
+
+    /// Evaluate smooth delta-accumulated 1D noise (`CPerlinNoise1D::GetContinious`).
+    pub fn get_continuous(&mut self, v: f32) -> f32 {
+        if !v.is_finite() || self.octaves == 0 {
+            return 0.0;
+        }
+        let mut dv = v;
+        if self.prev_continuous_time != 0.0 {
+            dv -= self.prev_continuous_time;
+        }
+        self.prev_continuous_time = v;
+
+        let mut result = 0.0;
+        let mut amp = self.amplitude;
+        dv *= self.frequency;
+        for i in 0..self.octaves {
+            let next_t = self.times[i] + dv;
+            self.times[i] = next_t;
+            result += self.noise1d(next_t) * amp;
+            dv *= 2.0;
+            amp *= 0.5;
+        }
+        result
     }
 }
 
@@ -1688,6 +1884,1482 @@ impl WeatherLibrary {
     }
 }
 
+// ============================================================================
+// Pure-Rust Runtime Simulators: Rain, Thunderbolt & LensFlare
+// ============================================================================
+
+#[inline]
+fn rng_range(rng: &mut ParticleRng, lo: f32, hi: f32) -> f32 {
+    lo + (hi - lo) * rng.unit_f32()
+}
+
+#[inline]
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+#[inline]
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn random_dir_cone(rng: &mut ParticleRng, cone_axis: [f32; 3], cone_angle: f32) -> [f32; 3] {
+    let cos_theta = (rng.unit_f32() * std::f32::consts::PI).cos();
+    let phi = rng.unit_f32() * std::f32::consts::TAU;
+    let r = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+    let (sa, ca) = phi.sin_cos();
+    let rnd = [r * ca, r * sa, cos_theta];
+    let scale = rng.unit_f32() * cone_angle.tan();
+    normalize_vec3([
+        cone_axis[0] + rnd[0] * scale,
+        cone_axis[1] + rnd[1] * scale,
+        cone_axis[2] + rnd[2] * scale,
+    ])
+}
+
+/// Extract X-Ray yaw/heading `h` and pitch `p` (radians) from direction vector (`_vector3::getHP`).
+#[inline]
+pub fn hp_from_dir(v: [f32; 3]) -> (f32, f32) {
+    let eps = 1e-5_f32;
+    let x = v[0];
+    let y = v[1];
+    let z = v[2];
+    if x.abs() < eps && z.abs() < eps {
+        let p = if y.abs() >= eps {
+            if y > 0.0 {
+                std::f32::consts::FRAC_PI_2
+            } else {
+                -std::f32::consts::FRAC_PI_2
+            }
+        } else {
+            0.0
+        };
+        (0.0, p)
+    } else {
+        let h = if z.abs() < eps {
+            if x > 0.0 {
+                -std::f32::consts::FRAC_PI_2
+            } else {
+                std::f32::consts::FRAC_PI_2
+            }
+        } else if z < 0.0 {
+            -(x / z).atan() + std::f32::consts::PI
+        } else {
+            -(x / z).atan()
+        };
+        let hyp = (x * x + z * z).sqrt();
+        let p = if hyp.abs() < eps {
+            if y > 0.0 {
+                std::f32::consts::FRAC_PI_2
+            } else {
+                -std::f32::consts::FRAC_PI_2
+            }
+        } else {
+            (y / hyp).atan()
+        };
+        (h, p)
+    }
+}
+
+/// Configuration for `RainEffectState` (`Rain.cpp` / `dxRainRender.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RainEffectConfig {
+    pub max_particles: u32,
+    pub source_radius: f32,
+    pub source_offset: f32,
+    pub max_distance: f32,
+    pub sink_offset: f32,
+    pub drop_length: f32,
+    pub drop_width: f32,
+    pub drop_speed_scale: f32,
+    pub drop_angle_rad: f32,
+    pub drop_max_angle_rad: f32,
+    pub drop_speed_min: f32,
+    pub drop_speed_max: f32,
+    pub max_splashes: usize,
+    pub splash_lifetime_sec: f32,
+}
+
+impl Default for RainEffectConfig {
+    fn default() -> Self {
+        Self {
+            max_particles: RAIN_MAX_DESIRED_ITEMS,
+            source_radius: RAIN_SOURCE_RADIUS,
+            source_offset: RAIN_SOURCE_OFFSET,
+            max_distance: RAIN_MAX_DISTANCE,
+            sink_offset: RAIN_SINK_OFFSET,
+            drop_length: RAIN_DROP_LENGTH,
+            drop_width: RAIN_DROP_WIDTH,
+            drop_speed_scale: 1.0,
+            drop_angle_rad: RAIN_DROP_ANGLE_RAD,
+            drop_max_angle_rad: RAIN_DROP_MAX_ANGLE_RAD,
+            drop_speed_min: RAIN_DROP_SPEED_MIN,
+            drop_speed_max: RAIN_DROP_SPEED_MAX,
+            max_splashes: RAIN_MAX_PARTICLES,
+            splash_lifetime_sec: RAIN_SPLASH_TIME_SEC,
+        }
+    }
+}
+
+/// Single active rain streak particle (`CEffect_Rain::Item`, `Rain.h:25-39`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RainDropItem {
+    pub pos: [f32; 3],
+    pub pos_hit: [f32; 3],
+    pub dir: [f32; 3],
+    pub speed: f32,
+    pub life_remaining_sec: f32,
+    pub hit_remaining_sec: f32,
+    pub hit_pending: bool,
+    pub uv_set: u8,
+}
+
+impl RainDropItem {
+    #[inline]
+    pub fn invalidate(&mut self) {
+        self.life_remaining_sec = -1.0;
+    }
+}
+
+/// Active rain impact splash state (`CEffect_Rain::Particle`, `Rain.h:41-47`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RainSplashParticle {
+    pub xform: XRayMatrix,
+    pub bounds_center: [f32; 3],
+    pub bounds_radius: f32,
+    pub time_remaining_sec: f32,
+}
+
+/// Per-frame splash draw instance scaled by remaining life (`dxRainRender.cpp:293-295`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RainSplashInstance {
+    pub xform: XRayMatrix,
+    pub color_rgba: [f32; 4],
+    pub bounds_center: [f32; 3],
+    pub bounds_radius: f32,
+}
+
+/// Output emitted by `RainEffectState::step_with_raycast`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RainFrameOutput {
+    pub active: bool,
+    pub desired_items: u32,
+    pub active_items: u32,
+    pub audio_volume: f32,
+    pub rain_hemi: f32,
+    pub rain_color_rgba: [f32; 4],
+    /// Contiguous groups of 4 vertices per streak quad, indexed by `QUAD_INDEX_PATTERN`.
+    pub streak_vertices: Vec<EnvLitVertex>,
+    pub splashes: Vec<RainSplashInstance>,
+}
+
+/// Pure-Rust CPU rain streak & splash simulator (`CEffect_Rain` + `dxRainRender`).
+#[derive(Debug, Clone)]
+pub struct RainEffectState {
+    pub config: RainEffectConfig,
+    pub items: Vec<RainDropItem>,
+    pub splashes: Vec<RainSplashParticle>,
+    pub current_items: usize,
+    pub audio_active: bool,
+    pub audio_volume: f32,
+    pub rain_hemi: f32,
+    hemi_factor: f32,
+    time_sec: f32,
+    perlin: PerlinNoise1D,
+    rng: ParticleRng,
+}
+
+impl Default for RainEffectState {
+    fn default() -> Self {
+        Self::new(1, RainEffectConfig::default())
+    }
+}
+
+impl RainEffectState {
+    pub fn new(seed: u64, config: RainEffectConfig) -> Self {
+        Self {
+            config,
+            items: Vec::new(),
+            splashes: Vec::new(),
+            current_items: 0,
+            audio_active: false,
+            audio_volume: 0.0,
+            rain_hemi: 0.0,
+            hemi_factor: 0.0,
+            time_sec: 0.0,
+            perlin: PerlinNoise1D::new((seed & 0xFFFF) as u32, 2, 1.0, 0.66666),
+            rng: ParticleRng::new(seed),
+        }
+    }
+
+    /// Reset all active drops, splashes, and audio volume (`CEffect_Rain::InvalidateState`).
+    pub fn invalidate_state(&mut self) {
+        self.audio_active = false;
+        self.audio_volume = 0.0;
+        self.current_items = 0;
+        self.items.clear();
+        self.splashes.clear();
+    }
+
+    /// Compute wind-gust-perturbed horizontal spawn offset & fall axis (`CEffect_Rain::Prepare`, `Rain.cpp:81-105`).
+    pub fn prepare_axis_and_offset(
+        &mut self,
+        wind_vel_01: f32,
+        wind_dir_rad: f32,
+    ) -> ([f32; 2], [f32; 3]) {
+        let wind_gust = self.perlin.get_continuous(self.time_sec * 0.3) * 2.0;
+        let wind_velocity = (wind_vel_01 + wind_gust).clamp(0.0, 1.0);
+        let pitch = self.config.drop_max_angle_rad * wind_velocity;
+        let axis = dir_from_hp(wind_dir_rad, pitch - std::f32::consts::FRAC_PI_2);
+
+        let denom = (std::f32::consts::FRAC_PI_2 - pitch).sin();
+        let dist = if denom.abs() > 1e-5 {
+            pitch.sin() * self.config.source_offset / denom
+        } else {
+            0.0
+        };
+        let fix_north = wind_dir_rad - std::f32::consts::FRAC_PI_2;
+        ([dist * fix_north.cos(), dist * fix_north.sin()], axis)
+    }
+
+    fn renew_item(&mut self, item: &mut RainDropItem, height: f32, b_hit: bool) {
+        item.uv_set = (self.rng.next_u64() & 1) as u8;
+        let travel_sec = if item.speed > 1e-5 {
+            height.max(0.0) / item.speed
+        } else {
+            0.0
+        };
+        if b_hit {
+            item.life_remaining_sec = travel_sec;
+            item.hit_remaining_sec = travel_sec;
+            item.hit_pending = true;
+            item.pos_hit = [
+                item.pos[0] + item.dir[0] * height,
+                item.pos[1] + item.dir[1] * height,
+                item.pos[2] + item.dir[2] * height,
+            ];
+        } else {
+            item.life_remaining_sec = travel_sec;
+            item.hit_remaining_sec = 2.0 * travel_sec;
+            item.hit_pending = false;
+            item.pos_hit = item.pos;
+        }
+    }
+
+    fn born_item<F>(
+        &mut self,
+        env: &MixedEnvironment,
+        camera_pos: [f32; 3],
+        camera_dir: [f32; 3],
+        ray_pick: &mut F,
+    ) -> RainDropItem
+    where
+        F: FnMut([f32; 3], [f32; 3], f32) -> Option<f32>,
+    {
+        let wind_dir = -env.wind_direction;
+        let wind_vel = (env.wind_velocity * 0.001).clamp(0.0, 1.0);
+        let (rain_offset, rain_axis) = self.prepare_axis_and_offset(wind_vel, wind_dir);
+
+        let r = self.config.source_radius * 0.5;
+        let rx = rng_range(&mut self.rng, -r, r);
+        let rz = rng_range(&mut self.rng, -r, r);
+
+        let final_view = [
+            camera_pos[0] + camera_dir[0] * 5.0,
+            camera_pos[1] + camera_dir[1] * 5.0,
+            camera_pos[2] + camera_dir[2] * 5.0,
+        ];
+        let angle =
+            rng_range(&mut self.rng, -self.config.drop_angle_rad, self.config.drop_angle_rad)
+                * (1.5 - wind_vel);
+        let dir = random_dir_cone(&mut self.rng, rain_axis, angle);
+        let pos = [
+            rain_offset[0] + final_view[0] + rx,
+            self.config.source_offset + camera_pos[1],
+            rain_offset[1] + final_view[2] + rz,
+        ];
+        let speed = rng_range(&mut self.rng, self.config.drop_speed_min, self.config.drop_speed_max)
+            * self.config.drop_speed_scale
+            * (wind_vel * 1.5).clamp(0.5, 1.0);
+
+        let mut item = RainDropItem {
+            pos,
+            pos_hit: pos,
+            dir,
+            speed,
+            life_remaining_sec: 0.0,
+            hit_remaining_sec: 0.0,
+            hit_pending: false,
+            uv_set: 0,
+        };
+        if let Some(hit_dist) = ray_pick(pos, dir, self.config.max_distance) {
+            let clamped = hit_dist.clamp(0.0, self.config.max_distance);
+            self.renew_item(&mut item, clamped, true);
+        } else {
+            self.renew_item(&mut item, self.config.max_distance, false);
+        }
+        item
+    }
+
+    fn spawn_splash(&mut self, pos: [f32; 3], splash_bounds: Option<([f32; 3], f32)>) {
+        if (self.rng.next_u64() & 1) != 0 {
+            return;
+        }
+        if self.splashes.len() >= self.config.max_splashes {
+            return;
+        }
+        let Some((b_center, b_radius)) = splash_bounds else {
+            return;
+        };
+        let mut xform = matrix_rotate_y(rng_range(&mut self.rng, 0.0, std::f32::consts::TAU));
+        xform[3][0] = pos[0];
+        xform[3][1] = pos[1];
+        xform[3][2] = pos[2];
+        xform[3][3] = 1.0;
+        let world_center = matrix_transform_point(&xform, b_center);
+        self.splashes.push(RainSplashParticle {
+            xform,
+            bounds_center: world_center,
+            bounds_radius: b_radius,
+            time_remaining_sec: self.config.splash_lifetime_sec,
+        });
+    }
+
+    fn update_audio(
+        &mut self,
+        dt_sec: f32,
+        rain_density: f32,
+        wind_velocity: f32,
+        hemi_luminance: f32,
+    ) {
+        let wind_vel = (wind_velocity * 0.001).clamp(0.0, 1.0)
+            * if rain_density > 0.0 { 1.0 } else { 0.0 };
+        let factor = rain_density * 0.5 + wind_vel * 0.5;
+        let t = dt_sec.clamp(0.001, 1.0);
+        let hemi = hemi_luminance.max(0.0);
+        self.hemi_factor = self.hemi_factor * (1.0 - t) + hemi * t;
+        self.rain_hemi = hemi;
+
+        if factor < 1e-5 {
+            self.audio_active = false;
+            self.audio_volume = 0.0;
+        } else {
+            self.audio_active = true;
+            self.audio_volume = (factor * self.hemi_factor).clamp(0.1, 1.0);
+        }
+    }
+
+    /// Advance rain particles, cylinder wrapping, raycast hits, splashes, audio, and streak
+    /// billboards for one frame (`Rain.cpp:177-480`, `dxRainRender.cpp:60-335`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_raycast<F>(
+        &mut self,
+        dt_sec: f32,
+        env: &MixedEnvironment,
+        camera_pos: [f32; 3],
+        camera_dir: [f32; 3],
+        splash_bounds: Option<([f32; 3], f32)>,
+        hemi_luminance: f32,
+        mut ray_pick: F,
+    ) -> RainFrameOutput
+    where
+        F: FnMut([f32; 3], [f32; 3], f32) -> Option<f32>,
+    {
+        let dt = if dt_sec.is_finite() && dt_sec > 0.0 {
+            dt_sec
+        } else {
+            0.0
+        };
+        self.time_sec += dt;
+        self.update_audio(dt, env.rain_density, env.wind_velocity, hemi_luminance);
+
+        let rain_color_rgba = env.rain_color_rgba();
+        let factor = env.rain_density;
+        if factor < 1e-5 {
+            return RainFrameOutput {
+                active: false,
+                desired_items: 0,
+                active_items: 0,
+                audio_volume: self.audio_volume,
+                rain_hemi: self.rain_hemi,
+                rain_color_rgba,
+                streak_vertices: Vec::new(),
+                splashes: Vec::new(),
+            };
+        }
+
+        let desired_items = env.rain_desired_count(self.config.max_particles) as usize;
+        if self.current_items < desired_items {
+            self.current_items = desired_items;
+        }
+        while self.items.len() < self.current_items {
+            let item = self.born_item(env, camera_pos, camera_dir, &mut ray_pick);
+            self.items.push(item);
+        }
+
+        let wrap_radius_sq = (self.config.source_radius * 1.5).powi(2);
+        let upper_y = camera_pos[1] + self.config.source_offset;
+        let factor_visual = factor * 0.5 + 0.5;
+        let mut streak_vertices = Vec::with_capacity(self.current_items * 4);
+
+        let mut i = 0usize;
+        while i < self.current_items {
+            let mut hit_pos_to_spawn = None;
+            let mut needs_born = false;
+
+            {
+                let one = &mut self.items[i];
+                if one.hit_pending && one.hit_remaining_sec < 0.0 {
+                    one.hit_pending = false;
+                    hit_pos_to_spawn = Some(one.pos_hit);
+                    if self.current_items > desired_items {
+                        self.current_items -= 1;
+                    }
+                }
+                if one.life_remaining_sec < 0.0 {
+                    needs_born = true;
+                    if self.current_items > desired_items {
+                        self.current_items -= 1;
+                    }
+                }
+            }
+
+            if let Some(hit_p) = hit_pos_to_spawn {
+                self.spawn_splash(hit_p, splash_bounds);
+            }
+            if needs_born {
+                self.items[i] = self.born_item(env, camera_pos, camera_dir, &mut ray_pick);
+                if i >= self.current_items {
+                    break;
+                }
+            }
+
+            let mut wrap_query: Option<(usize, [f32; 3], [f32; 3], f32)> = None;
+            {
+                let one = &mut self.items[i];
+                let step_len = one.speed * dt;
+                one.pos[0] += one.dir[0] * step_len;
+                one.pos[1] += one.dir[1] * step_len;
+                one.pos[2] += one.dir[2] * step_len;
+                one.life_remaining_sec -= dt;
+                one.hit_remaining_sec -= dt;
+
+                let wx = one.pos[0] - camera_pos[0];
+                let wz = one.pos[2] - camera_pos[2];
+                let wlen_sq = wx * wx + wz * wz;
+                if wlen_sq > wrap_radius_sq {
+                    if (one.pos[1] - camera_pos[1]) < self.config.sink_offset {
+                        one.invalidate();
+                    } else {
+                        let wlen = wlen_sq.sqrt();
+                        let inv_wlen = 1.0 / wlen;
+                        let shift = wlen + self.config.source_radius;
+                        one.pos[0] -= (wx * inv_wlen) * shift;
+                        one.pos[2] -= (wz * inv_wlen) * shift;
+
+                        // Plane at y = upper_y with normal = (0, -1, 0), ray -one.dir:
+                        let denom = one.dir[1];
+                        if denom.abs() > 1e-5 {
+                            let t_plane = (one.pos[1] - upper_y) / denom;
+                            if t_plane >= 0.0 {
+                                let src_p = [
+                                    one.pos[0] - one.dir[0] * t_plane,
+                                    one.pos[1] - one.dir[1] * t_plane,
+                                    one.pos[2] - one.dir[2] * t_plane,
+                                ];
+                                wrap_query = Some((i, src_p, one.dir, t_plane));
+                            } else {
+                                one.invalidate();
+                            }
+                        } else {
+                            one.invalidate();
+                        }
+                    }
+                }
+            }
+
+            if let Some((idx, src_p, dir, dist_to_plane)) = wrap_query {
+                if let Some(hit_h) = ray_pick(src_p, dir, self.config.max_distance) {
+                    if hit_h <= dist_to_plane {
+                        self.items[idx].invalidate();
+                    } else {
+                        let mut item = self.items[idx];
+                        self.renew_item(&mut item, hit_h - dist_to_plane, true);
+                        self.items[idx] = item;
+                    }
+                } else if self.config.max_distance > dist_to_plane {
+                    let mut item = self.items[idx];
+                    self.renew_item(&mut item, self.config.max_distance - dist_to_plane, false);
+                    self.items[idx] = item;
+                } else {
+                    self.items[idx].invalidate();
+                }
+            }
+
+            let one = &self.items[i];
+            let pos_head = one.pos;
+            let trail_len = self.config.drop_length * factor_visual;
+            let pos_trail = [
+                pos_head[0] - one.dir[0] * trail_len,
+                pos_head[1] - one.dir[1] * trail_len,
+                pos_head[2] - one.dir[2] * trail_len,
+            ];
+            let delta = [
+                pos_head[0] - pos_trail[0],
+                pos_head[1] - pos_trail[1],
+                pos_head[2] - pos_trail[2],
+            ];
+            let line_d = normalize_vec3(delta);
+            let mid = [
+                pos_trail[0] + delta[0] * 0.5,
+                pos_trail[1] + delta[1] * 0.5,
+                pos_trail[2] + delta[2] * 0.5,
+            ];
+            let cam_dir = normalize_vec3([
+                mid[0] - camera_pos[0],
+                mid[1] - camera_pos[1],
+                mid[2] - camera_pos[2],
+            ]);
+            let line_top = cross3(cam_dir, line_d);
+            let w = self.config.drop_width;
+            let uvs = RAIN_STREAK_UVS[(one.uv_set & 1) as usize];
+
+            streak_vertices.push(EnvLitVertex {
+                pos: [
+                    pos_trail[0] - line_top[0] * w,
+                    pos_trail[1] - line_top[1] * w,
+                    pos_trail[2] - line_top[2] * w,
+                ],
+                color_rgba: rain_color_rgba,
+                uv: uvs[0],
+            });
+            streak_vertices.push(EnvLitVertex {
+                pos: [
+                    pos_trail[0] + line_top[0] * w,
+                    pos_trail[1] + line_top[1] * w,
+                    pos_trail[2] + line_top[2] * w,
+                ],
+                color_rgba: rain_color_rgba,
+                uv: uvs[1],
+            });
+            streak_vertices.push(EnvLitVertex {
+                pos: [
+                    pos_head[0] - line_top[0] * w,
+                    pos_head[1] - line_top[1] * w,
+                    pos_head[2] - line_top[2] * w,
+                ],
+                color_rgba: rain_color_rgba,
+                uv: uvs[2],
+            });
+            streak_vertices.push(EnvLitVertex {
+                pos: [
+                    pos_head[0] + line_top[0] * w,
+                    pos_head[1] + line_top[1] * w,
+                    pos_head[2] + line_top[2] * w,
+                ],
+                color_rgba: rain_color_rgba,
+                uv: uvs[3],
+            });
+
+            i += 1;
+        }
+
+        // Advance active splashes (`dxRainRender.cpp:275-321`)
+        let life_denom = self.config.splash_lifetime_sec.max(1e-5);
+        let mut splashes_out = Vec::with_capacity(self.splashes.len());
+        self.splashes.retain_mut(|p| {
+            p.time_remaining_sec -= dt;
+            if p.time_remaining_sec < 0.0 {
+                return false;
+            }
+            let s = (p.time_remaining_sec / life_denom).clamp(0.0, 1.0);
+            let m_scale = [
+                [s, 0.0, 0.0, 0.0],
+                [0.0, s, 0.0, 0.0],
+                [0.0, 0.0, s, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ];
+            splashes_out.push(RainSplashInstance {
+                xform: matrix_mul_43(&p.xform, &m_scale),
+                color_rgba: rain_color_rgba,
+                bounds_center: p.bounds_center,
+                bounds_radius: p.bounds_radius,
+            });
+            true
+        });
+
+        RainFrameOutput {
+            active: true,
+            desired_items: desired_items as u32,
+            active_items: self.current_items as u32,
+            audio_volume: self.audio_volume,
+            rain_hemi: self.rain_hemi,
+            rain_color_rgba,
+            streak_vertices,
+            splashes: splashes_out,
+        }
+    }
+
+    /// Convenience wrapper of `step_with_raycast` without level collision raycasts.
+    pub fn step_no_collision(
+        &mut self,
+        dt_sec: f32,
+        env: &MixedEnvironment,
+        camera_pos: [f32; 3],
+        camera_dir: [f32; 3],
+        hemi_luminance: f32,
+    ) -> RainFrameOutput {
+        self.step_with_raycast(
+            dt_sec,
+            env,
+            camera_pos,
+            camera_dir,
+            None,
+            hemi_luminance,
+            |_, _, _| None,
+        )
+    }
+
+    /// Transform a `.dm` splash mesh across all active splash instances (`dxRainRender.cpp:298`),
+    /// stopping cleanly before exceeding `u16::MAX` vertex indices.
+    pub fn emit_splash_mesh(
+        dm: &DetailMesh,
+        output: &RainFrameOutput,
+    ) -> (Vec<DetailMeshVertexOut>, Vec<u16>) {
+        let mut verts = Vec::with_capacity(output.splashes.len() * dm.vertices.len());
+        let mut indices = Vec::with_capacity(output.splashes.len() * dm.indices.len());
+        for inst in &output.splashes {
+            let Ok(base) = u16::try_from(verts.len()) else {
+                break;
+            };
+            let Some((v, idx)) = dm.transfer(&inst.xform, inst.color_rgba, 0.0, 0.0, base) else {
+                break;
+            };
+            verts.extend(v);
+            indices.extend(idx);
+        }
+        (verts, indices)
+    }
+}
+
+/// Playback state of `ThunderboltEffectState` (`CEffect_Thunderbolt::EState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThunderboltPlayState {
+    #[default]
+    Idle,
+    Working,
+}
+
+/// Camera-facing top/center flare quad emitted for an active lightning bolt (`dxThunderboltRender.cpp:61-98`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThunderboltGradientQuad {
+    pub flare: ThunderboltFlareDef,
+    pub vertices: [EnvLitVertex; 4],
+}
+
+/// Active lightning strike mesh & flare draw payload (`dxThunderboltRender::Render`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThunderboltBoltDraw {
+    pub lightning_model: String,
+    pub xform: XRayMatrix,
+    pub color_rgba: [f32; 4],
+    pub dv: f32,
+    pub center: [f32; 3],
+    pub size: f32,
+    pub top_gradient: ThunderboltGradientQuad,
+    pub center_gradient: ThunderboltGradientQuad,
+}
+
+/// Per-frame output from `ThunderboltEffectState::step_with_raycast`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ThunderboltFrameOutput {
+    pub active: bool,
+    pub lightning_phase: f32,
+    pub flash_color: [f32; 3],
+    pub current_direction: [f32; 3],
+    pub triggered_sound: Option<String>,
+    pub triggered_sound_pos: [f32; 3],
+    pub triggered_distance: f32,
+    pub bolt_draw: Option<ThunderboltBoltDraw>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ThunderboltFlashSnapshot {
+    applied: bool,
+    base_sky: [f32; 3],
+    base_sun: [f32; 3],
+    base_fog: [f32; 3],
+    base_sun_dir: [f32; 3],
+    flash_sky: [f32; 3],
+    flash_sun: [f32; 3],
+    flash_fog: [f32; 3],
+    flash_sun_dir: [f32; 3],
+}
+
+/// Pure-Rust lightning bolt scheduler & atmospheric flash simulator
+/// (`CEffect_Thunderbolt` + `dxThunderboltRender`).
+#[derive(Debug, Clone)]
+pub struct ThunderboltEffectState {
+    pub state: ThunderboltPlayState,
+    pub enabled: bool,
+    pub current_desc: Option<ThunderboltDescDef>,
+    pub current_xform: XRayMatrix,
+    pub current_direction: [f32; 3],
+    pub lightning_center: [f32; 3],
+    pub lightning_size: f32,
+    pub lightning_phase: f32,
+    pub life_time: f32,
+    pub current_time: f32,
+    pub time_global: f32,
+    pub next_lightning_time: f32,
+    flash_snapshot: ThunderboltFlashSnapshot,
+    rng: ParticleRng,
+}
+
+impl Default for ThunderboltEffectState {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+impl ThunderboltEffectState {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            state: ThunderboltPlayState::Idle,
+            enabled: false,
+            current_desc: None,
+            current_xform: XRAY_IDENTITY_MATRIX,
+            current_direction: [0.0, -1.0, 0.0],
+            lightning_center: [0.0; 3],
+            lightning_size: 0.0,
+            lightning_phase: 0.0,
+            life_time: 0.0,
+            current_time: 0.0,
+            time_global: 0.0,
+            next_lightning_time: 0.0,
+            flash_snapshot: ThunderboltFlashSnapshot::default(),
+            rng: ParticleRng::new(seed),
+        }
+    }
+
+    /// Restore un-flashed sky/sun/fog values on `env` if unchanged since the previous flash
+    /// (`thunderbolt.cpp:201-205, 272-279`).
+    pub fn undo_flash(&mut self, env: &mut MixedEnvironment) {
+        if self.flash_snapshot.applied {
+            if env.sky_color == self.flash_snapshot.flash_sky {
+                env.sky_color = self.flash_snapshot.base_sky;
+            }
+            if env.sun_color == self.flash_snapshot.flash_sun {
+                env.sun_color = self.flash_snapshot.base_sun;
+            }
+            if env.fog_color == self.flash_snapshot.flash_fog {
+                env.fog_color = self.flash_snapshot.base_fog;
+            }
+            if env.sun_dir == self.flash_snapshot.flash_sun_dir {
+                env.sun_dir = self.flash_snapshot.base_sun_dir;
+            }
+            self.flash_snapshot.applied = false;
+        }
+    }
+
+    /// Apply atmospheric lightning flash color/direction modulation onto `env`
+    /// (`thunderbolt.cpp:307-333`).
+    pub fn apply_flash(
+        &mut self,
+        env: &mut MixedEnvironment,
+        global_params: &EnvGlobalParams,
+        output: &ThunderboltFrameOutput,
+    ) {
+        self.flash_snapshot.applied = false;
+        if !output.active {
+            return;
+        }
+        self.flash_snapshot.base_sky = env.sky_color;
+        self.flash_snapshot.base_sun = env.sun_color;
+        self.flash_snapshot.base_fog = env.fog_color;
+        self.flash_snapshot.base_sun_dir = env.sun_dir;
+
+        for (c, f) in env.sky_color.iter_mut().zip(output.flash_color.iter()) {
+            *c = (*c + f * global_params.sky_color).clamp(0.0, 1.0);
+        }
+        for (c, f) in env.sun_color.iter_mut().zip(output.flash_color.iter()) {
+            *c += f * global_params.sun_color;
+        }
+        for (c, f) in env.fog_color.iter_mut().zip(output.flash_color.iter()) {
+            *c += f * global_params.fog_color;
+        }
+        if output.current_direction[1] < 0.0 {
+            env.sun_dir = output.current_direction;
+        }
+
+        self.flash_snapshot.flash_sky = env.sky_color;
+        self.flash_snapshot.flash_sun = env.sun_color;
+        self.flash_snapshot.flash_fog = env.fog_color;
+        self.flash_snapshot.flash_sun_dir = env.sun_dir;
+        self.flash_snapshot.applied = true;
+    }
+
+    /// Transform `dm` (`lightning_model`) with `draw.xform` and animated UV shift `(0.0, draw.dv)`.
+    pub fn emit_bolt_mesh(
+        dm: &DetailMesh,
+        draw: &ThunderboltBoltDraw,
+    ) -> Option<(Vec<DetailMeshVertexOut>, Vec<u16>)> {
+        dm.transfer(&draw.xform, draw.color_rgba, 0.0, draw.dv, 0)
+    }
+
+    fn build_gradient_quad(
+        pos: [f32; 3],
+        flare: &ThunderboltFlareDef,
+        lightning_size: f32,
+        lightning_phase: f32,
+        camera_right: [f32; 3],
+        camera_top: [f32; 3],
+    ) -> ThunderboltGradientQuad {
+        let c_val = (flare.opacity * lightning_phase).clamp(0.0, 1.0);
+        let color_rgba = [c_val, c_val, c_val, c_val];
+        let sx = [
+            camera_right[0] * (flare.radius[0] * lightning_size),
+            camera_right[1] * (flare.radius[0] * lightning_size),
+            camera_right[2] * (flare.radius[0] * lightning_size),
+        ];
+        let sy = [
+            camera_top[0] * (-flare.radius[1] * lightning_size),
+            camera_top[1] * (-flare.radius[1] * lightning_size),
+            camera_top[2] * (-flare.radius[1] * lightning_size),
+        ];
+        let vtx = |sign_x: f32, sign_y: f32, u: f32, v: f32| EnvLitVertex {
+            pos: [
+                pos[0] + sign_x * sx[0] + sign_y * sy[0],
+                pos[1] + sign_x * sx[1] + sign_y * sy[1],
+                pos[2] + sign_x * sx[2] + sign_y * sy[2],
+            ],
+            color_rgba,
+            uv: [u, v],
+        };
+        ThunderboltGradientQuad {
+            flare: flare.clone(),
+            vertices: [
+                vtx(1.0, -1.0, 0.0, 0.0),
+                vtx(1.0, 1.0, 0.0, 1.0),
+                vtx(-1.0, -1.0, 1.0, 0.0),
+                vtx(-1.0, 1.0, 1.0, 1.0),
+            ],
+        }
+    }
+
+    /// Advance lightning scheduling, active bolt animation, and draw payload
+    /// (`CEffect_Thunderbolt::OnFrame`, `Bolt`, `RayPick`, `dxThunderboltRender::Render`).
+    ///
+    /// Note: in `SThunderboltDesc::load` (`thunderbolt.cpp:67`), C++ overrides `color_anim.fps = frame_count as f32`
+    /// so sampling `color_anim` at `current_time / life_time` sweeps the full timeline over `[0, 1)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_raycast<F>(
+        &mut self,
+        dt_sec: f32,
+        env: &MixedEnvironment,
+        global_params: &EnvGlobalParams,
+        weather_lib: &WeatherLibrary,
+        light_anims: Option<&LightAnimLibrary>,
+        camera_pos: [f32; 3],
+        camera_right: [f32; 3],
+        camera_top: [f32; 3],
+        mut ray_pick: F,
+    ) -> ThunderboltFrameOutput
+    where
+        F: FnMut([f32; 3], [f32; 3], f32) -> Option<f32>,
+    {
+        let dt = if dt_sec.is_finite() && dt_sec > 0.0 {
+            dt_sec
+        } else {
+            0.0
+        };
+        self.time_global += dt;
+
+        let mut output = ThunderboltFrameOutput::default();
+        let collection_id = env.active_thunderbolt_id.as_str();
+        let period = env.bolt_period;
+        let duration = env.bolt_duration;
+        let now_enabled = !collection_id.is_empty();
+
+        if self.enabled != now_enabled {
+            self.enabled = now_enabled;
+            self.next_lightning_time =
+                self.time_global + period + rng_range(&mut self.rng, -period * 0.5, period * 0.5);
+        } else if self.enabled
+            && self.time_global > self.next_lightning_time
+            && self.state == ThunderboltPlayState::Idle
+            && let Some(coll) = weather_lib.thunderbolt_collections.get(collection_id)
+            && !coll.thunderbolts.is_empty()
+        {
+            let pick_idx = self.rng.range_usize(coll.thunderbolts.len());
+            let desc_id = &coll.thunderbolts[pick_idx];
+            if let Some(desc) = weather_lib.thunderbolts.get(desc_id).cloned() {
+                self.state = ThunderboltPlayState::Working;
+                self.life_time =
+                    duration + rng_range(&mut self.rng, -duration * 0.5, duration * 0.5);
+                self.life_time = self.life_time.max(1e-4);
+                self.current_time = 0.0;
+
+                let (sun_h, _) = hp_from_dir(env.sun_dir);
+                let alt = global_params.altitude_rad;
+                let lng = rng_range(
+                    &mut self.rng,
+                    sun_h - global_params.delta_longitude_rad + std::f32::consts::PI,
+                    sun_h + global_params.delta_longitude_rad + std::f32::consts::PI,
+                );
+                let min_d = env.far_plane * global_params.min_dist_factor;
+                let max_d = env.far_plane * 0.95;
+                let dist = rng_range(&mut self.rng, min_d.min(max_d), max_d.max(min_d));
+                self.current_direction = dir_from_hp(lng, alt);
+                let pos = [
+                    camera_pos[0] + self.current_direction[0] * dist,
+                    camera_pos[1] + self.current_direction[1] * dist,
+                    camera_pos[2] + self.current_direction[2] * dist,
+                ];
+
+                let dev = [
+                    rng_range(&mut self.rng, -global_params.tilt_rad, global_params.tilt_rad),
+                    rng_range(&mut self.rng, 0.0, std::f32::consts::TAU),
+                    rng_range(&mut self.rng, -global_params.tilt_rad, global_params.tilt_rad),
+                ];
+                let mut xf = matrix_set_xyzi_translate(dev, [0.0, 0.0, 0.0]);
+                let light_dir = matrix_transform_dir(&xf, [0.0, -1.0, 0.0]);
+
+                let mut size = env.far_plane * 2.0;
+                if let Some(hit) = ray_pick(pos, light_dir, size) {
+                    size = hit.clamp(0.0, size);
+                } else if light_dir[1].abs() > 1e-5 {
+                    // Plane y = 0 with normal (0, -1, 0): dist = pos.y / -light_dir.y
+                    let plane_dist = -pos[1] / light_dir[1];
+                    if plane_dist >= 0.0 && plane_dist <= size {
+                        size = plane_dist;
+                    }
+                }
+                self.lightning_size = size;
+                self.lightning_center = [
+                    pos[0] + light_dir[0] * (size * 0.5),
+                    pos[1] + light_dir[1] * (size * 0.5),
+                    pos[2] + light_dir[2] * (size * 0.5),
+                ];
+
+                let mut scale_m = XRAY_IDENTITY_MATRIX;
+                scale_m[0][0] = size;
+                scale_m[1][1] = size;
+                scale_m[2][2] = size;
+                xf[3][0] = pos[0];
+                xf[3][1] = pos[1];
+                xf[3][2] = pos[2];
+                self.current_xform = matrix_mul_43(&xf, &scale_m);
+
+                if self.rng.unit_f32() < global_params.second_probability {
+                    self.next_lightning_time = self.time_global + duration + 1e-5;
+                } else {
+                    self.next_lightning_time = self.time_global
+                        + period
+                        + rng_range(&mut self.rng, -period * 0.3, period * 0.3);
+                    output.triggered_sound = desc.sound.clone();
+                    output.triggered_sound_pos = pos;
+                    output.triggered_distance = dist;
+                }
+
+                self.current_direction = [
+                    -self.current_direction[0],
+                    -self.current_direction[1],
+                    -self.current_direction[2],
+                ];
+                self.current_desc = Some(desc);
+            }
+        }
+
+        if self.state == ThunderboltPlayState::Working {
+            if self.current_time > self.life_time {
+                self.state = ThunderboltPlayState::Idle;
+                return output;
+            }
+            self.current_time += dt;
+            let norm_t = if self.life_time > 1e-5 {
+                self.current_time / self.life_time
+            } else {
+                0.0
+            };
+            self.lightning_phase = (1.5 * norm_t).clamp(0.0, 1.0);
+
+            let desc = match &self.current_desc {
+                Some(d) => d,
+                None => {
+                    self.state = ThunderboltPlayState::Idle;
+                    return output;
+                }
+            };
+
+            let flash_rgb = if let Some(lib) = light_anims {
+                if let Some(anim) = lib.find_item(&desc.color_anim).or_else(|| lib.find_item_ci(&desc.color_anim)) {
+                    let mut normalized_anim = LightAnimItem {
+                        fps: anim.frame_count.max(1) as f32,
+                        ..anim.clone()
+                    };
+                    let (argb, _) = normalized_anim.calculate_rgb(norm_t);
+                    normalized_anim.fps = anim.fps;
+                    let rgba = unpack_argb_f32(argb);
+                    [
+                        rgba[0].clamp(0.0, 1.0),
+                        rgba[1].clamp(0.0, 1.0),
+                        rgba[2].clamp(0.0, 1.0),
+                    ]
+                } else {
+                    [1.0, 1.0, 1.0]
+                }
+            } else {
+                [1.0, 1.0, 1.0]
+            };
+
+            let dv = if self.lightning_phase > 0.5 {
+                ((self.rng.next_u64() & 1) as f32) * 0.5
+            } else {
+                self.lightning_phase * 0.5
+            };
+
+            let top_pos = [
+                self.current_xform[3][0],
+                self.current_xform[3][1],
+                self.current_xform[3][2],
+            ];
+            let top_gradient = Self::build_gradient_quad(
+                top_pos,
+                &desc.gradient_top,
+                self.lightning_size,
+                self.lightning_phase,
+                camera_right,
+                camera_top,
+            );
+            // Note: GSC `dxThunderboltRender.cpp:82` copy-pasted `m_GradientTop->fOpacity`; we evaluate
+            // `gradient_center.opacity` cleanly for `center_gradient`.
+            let center_gradient = Self::build_gradient_quad(
+                self.lightning_center,
+                &desc.gradient_center,
+                self.lightning_size,
+                self.lightning_phase,
+                camera_right,
+                camera_top,
+            );
+
+            output.active = true;
+            output.lightning_phase = self.lightning_phase;
+            output.flash_color = flash_rgb;
+            output.current_direction = self.current_direction;
+            output.bolt_draw = Some(ThunderboltBoltDraw {
+                lightning_model: desc.lightning_model.clone(),
+                xform: self.current_xform,
+                color_rgba: [1.0, 1.0, 1.0, 1.0],
+                dv,
+                center: self.lightning_center,
+                size: self.lightning_size,
+                top_gradient,
+                center_gradient,
+            });
+        }
+
+        output
+    }
+}
+
+/// Constants matching `xr_efflensflare.cpp` (`BLEND_INC_SPEED`, `BLEND_DEC_SPEED`, `MAX_RAYS`, `RayDeltas`).
+pub const LENS_FLARE_BLEND_INC_SPEED: f32 = 8.0;
+pub const LENS_FLARE_BLEND_DEC_SPEED: f32 = 4.0;
+pub const LENS_FLARE_MAX_RAYS: usize = 5;
+pub const LENS_FLARE_RAY_DELTAS: [[f32; 2]; LENS_FLARE_MAX_RAYS] =
+    [[0.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, -1.0], [0.0, 1.0]];
+pub const LENS_FLARE_RAY_SCALE: f32 = 0.02;
+pub const LENS_FLARE_RAY_MAX_DIST: f32 = 1000.0;
+
+#[inline]
+fn blend_lerp(cur: &mut f32, tgt: f32, speed: f32, dt: f32) {
+    let diff = tgt - *cur;
+    let diff_a = diff.abs();
+    if diff_a < 1e-5 {
+        return;
+    }
+    let mot = (speed * dt).min(diff_a);
+    *cur += (diff / diff_a) * mot;
+}
+
+/// Lens flare crossfade state (`CLensFlare::LFState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LensFlarePlayState {
+    #[default]
+    None,
+    Idle,
+    Hide,
+    Show,
+}
+
+/// Type of billboard emitted by `LensFlareState` (`dxLensFlareRender::Render`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LensFlareQuadKind {
+    Source,
+    Flare(usize),
+    Gradient,
+}
+
+/// Single ordered lens flare billboard quad (`QuadIB` vertex layout).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LensFlareDrawQuad {
+    pub kind: LensFlareQuadKind,
+    pub shader: String,
+    pub texture: String,
+    pub vertices: [EnvLitVertex; 4],
+}
+
+/// Per-frame output from `LensFlareState::step_with_raycast`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LensFlareFrameOutput {
+    pub render_active: bool,
+    pub state_blend: f32,
+    pub visibility_blend: f32,
+    pub gradient_value: f32,
+    pub sun_world_pos: [f32; 3],
+    pub quads: Vec<LensFlareDrawQuad>,
+}
+
+/// Pure-Rust sun disc, lens flare & halo gradient runtime (`CLensFlare` + `dxLensFlareRender`).
+#[derive(Debug, Clone, Default)]
+pub struct LensFlareState {
+    pub state: LensFlarePlayState,
+    pub current_id: String,
+    pub state_blend: f32,
+    pub f_blend: f32,
+    pub f_gradient_value: f32,
+}
+
+impl LensFlareState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn build_flare_quad(
+        kind: LensFlareQuadKind,
+        shader: &str,
+        texture: &str,
+        center: [f32; 3],
+        sx: [f32; 3],
+        sy: [f32; 3],
+        color_rgba: [f32; 4],
+    ) -> LensFlareDrawQuad {
+        let vtx = |sign_x: f32, sign_y: f32, u: f32, v: f32| EnvLitVertex {
+            pos: [
+                center[0] + sign_x * sx[0] + sign_y * sy[0],
+                center[1] + sign_x * sx[1] + sign_y * sy[1],
+                center[2] + sign_x * sx[2] + sign_y * sy[2],
+            ],
+            color_rgba,
+            uv: [u, v],
+        };
+        LensFlareDrawQuad {
+            kind,
+            shader: shader.to_string(),
+            texture: texture.to_string(),
+            vertices: [
+                vtx(1.0, -1.0, 0.0, 0.0),
+                vtx(1.0, 1.0, 0.0, 1.0),
+                vtx(-1.0, -1.0, 1.0, 0.0),
+                vtx(-1.0, 1.0, 1.0, 1.0),
+            ],
+        }
+    }
+
+    /// Update lens flare transitions, 5-ray occlusion sampling, screen-space gradient attenuation,
+    /// and ordered quad emission (`xr_efflensflare.cpp:270-513`, `dxLensFlareRender.cpp:30-144`).
+    ///
+    /// `ray_transmittance(origin, ray_dir, max_dist)` should return `0.0` when occluded, `1.0` when
+    /// unobstructed, or `(0..1)` for partially transparent materials.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_raycast<F>(
+        &mut self,
+        dt_sec: f32,
+        time_factor: f32,
+        paused: bool,
+        env: &MixedEnvironment,
+        weather_lib: &WeatherLibrary,
+        camera_pos: [f32; 3],
+        camera_right: [f32; 3],
+        camera_top: [f32; 3],
+        camera_dir: [f32; 3],
+        full_transform: Option<&XRayMatrix>,
+        draw_flags: (bool, bool, bool),
+        mut ray_transmittance: F,
+    ) -> LensFlareFrameOutput
+    where
+        F: FnMut([f32; 3], [f32; 3], f32) -> f32,
+    {
+        let dt = if dt_sec.is_finite() && dt_sec > 0.0 {
+            dt_sec
+        } else {
+            0.0
+        };
+        let tf = if time_factor.is_finite() && time_factor >= 0.0 {
+            time_factor
+        } else {
+            1.0
+        };
+
+        let next_id = if env.active_sun_id.is_empty()
+            || !weather_lib.lens_flares.contains_key(&env.active_sun_id)
+        {
+            ""
+        } else {
+            env.active_sun_id.as_str()
+        };
+
+        match self.state {
+            LensFlarePlayState::None => {
+                self.state = LensFlarePlayState::Show;
+                self.current_id = next_id.to_string();
+            }
+            LensFlarePlayState::Idle => {
+                if next_id != self.current_id {
+                    self.state = LensFlarePlayState::Hide;
+                }
+            }
+            LensFlarePlayState::Show => {
+                if let Some(cur) = weather_lib.lens_flares.get(&self.current_id) {
+                    self.state_blend += cur.blend_rise_speed * dt * tf;
+                } else {
+                    self.state_blend = 1.0 + 1e-4;
+                }
+                if self.state_blend >= 1.0 || paused {
+                    self.state_blend = 1.0;
+                    self.state = LensFlarePlayState::Idle;
+                }
+            }
+            LensFlarePlayState::Hide => {
+                if let Some(cur) = weather_lib.lens_flares.get(&self.current_id) {
+                    self.state_blend -= cur.blend_down_speed * dt * tf;
+                } else {
+                    self.state_blend = -1e-4;
+                }
+                if self.state_blend <= 0.0 || paused {
+                    self.state = LensFlarePlayState::Show;
+                    self.current_id = next_id.to_string();
+                    self.state_blend = weather_lib
+                        .lens_flares
+                        .get(&self.current_id)
+                        .map(|d| d.blend_rise_speed * dt * tf)
+                        .unwrap_or(0.0);
+                }
+            }
+        }
+        self.state_blend = self.state_blend.clamp(0.0, 1.0);
+
+        let light_mag_sq = env.sun_color[0] * env.sun_color[0]
+            + env.sun_color[1] * env.sun_color[1]
+            + env.sun_color[2] * env.sun_color[2];
+        let Some(desc) = weather_lib.lens_flares.get(&self.current_id) else {
+            return LensFlareFrameOutput::default();
+        };
+        if light_mag_sq <= 0.0 {
+            return LensFlareFrameOutput::default();
+        }
+
+        let v_sun_dir = [-env.sun_dir[0], -env.sun_dir[1], -env.sun_dir[2]];
+        let vec_dir = normalize_vec3(camera_dir);
+        let vec_sun_norm = normalize_vec3(v_sun_dir);
+        let f_dot = dot3(vec_sun_norm, vec_dir);
+        if f_dot <= 0.01 {
+            return LensFlareFrameOutput {
+                render_active: false,
+                state_blend: self.state_blend,
+                visibility_blend: self.f_blend,
+                gradient_value: self.f_gradient_value,
+                sun_world_pos: [0.0; 3],
+                quads: Vec::new(),
+            };
+        }
+
+        let f_distance = env.far_plane * 0.75;
+        let vec_center = [
+            camera_pos[0] + vec_dir[0] * f_distance,
+            camera_pos[1] + vec_dir[1] * f_distance,
+            camera_pos[2] + vec_dir[2] * f_distance,
+        ];
+        let sun_dist = f_distance / f_dot;
+        let vec_light = [
+            camera_pos[0] + vec_sun_norm[0] * sun_dist,
+            camera_pos[1] + vec_sun_norm[1] * sun_dist,
+            camera_pos[2] + vec_sun_norm[2] * sun_dist,
+        ];
+        let vec_axis = [
+            vec_light[0] - vec_center[0],
+            vec_light[1] - vec_center[1],
+            vec_light[2] - vec_center[2],
+        ];
+        let vec_x = normalize_vec3(camera_right);
+        let vec_y = cross3(vec_x, vec_dir);
+        let _ = camera_top; // orthonormal screen basis derived from right x dir per xr_efflensflare.cpp:376
+
+        let vec_sx = [
+            vec_x[0] * LENS_FLARE_RAY_SCALE,
+            vec_x[1] * LENS_FLARE_RAY_SCALE,
+            vec_x[2] * LENS_FLARE_RAY_SCALE,
+        ];
+        let vec_sy = [
+            vec_y[0] * LENS_FLARE_RAY_SCALE,
+            vec_y[1] * LENS_FLARE_RAY_SCALE,
+            vec_y[2] * LENS_FLARE_RAY_SCALE,
+        ];
+
+        let mut f_vis_result = 0.0f32;
+        for delta in &LENS_FLARE_RAY_DELTAS {
+            let ray_d = [
+                v_sun_dir[0] + vec_sx[0] * delta[0] + vec_sy[0] * delta[1],
+                v_sun_dir[1] + vec_sx[1] * delta[0] + vec_sy[1] * delta[1],
+                v_sun_dir[2] + vec_sx[2] * delta[0] + vec_sy[2] * delta[1],
+            ];
+            f_vis_result +=
+                ray_transmittance(camera_pos, ray_d, LENS_FLARE_RAY_MAX_DIST).clamp(0.0, 1.0);
+        }
+        f_vis_result *= 1.0 / (LENS_FLARE_MAX_RAYS as f32);
+
+        blend_lerp(&mut self.f_blend, f_vis_result, LENS_FLARE_BLEND_DEC_SPEED, dt);
+        self.f_blend = self.f_blend.clamp(0.0, 1.0);
+
+        if desc.has_gradient {
+            let (kx, ky, in_range) = if let Some(ft) = full_transform {
+                if let Some(mut scr) = matrix_transform_projected(ft, vec_light) {
+                    scr[1] *= -1.0;
+                    let sun_blend = 0.5f32;
+                    let sun_max = 2.5f32;
+                    let ax = scr[0].abs();
+                    let ay = scr[1].abs();
+                    if ax > sun_max || ay > sun_max {
+                        (0.0, 0.0, false)
+                    } else {
+                        let kx = if ax > sun_blend {
+                            (sun_max - ax) / (sun_max - sun_blend)
+                        } else {
+                            1.0
+                        };
+                        let ky = if ay > sun_blend {
+                            (sun_max - ay) / (sun_max - sun_blend)
+                        } else {
+                            1.0
+                        };
+                        (kx, ky, true)
+                    }
+                } else {
+                    (0.0, 0.0, false)
+                }
+            } else {
+                (1.0, 1.0, true)
+            };
+            if in_range {
+                let op = self.state_blend * desc.gradient_opacity;
+                self.f_gradient_value = kx * ky * op * self.f_blend;
+            } else {
+                self.f_gradient_value = 0.0;
+            }
+        }
+
+        let (draw_sun, draw_flares, draw_gradient) = draw_flags;
+        let mut quads = Vec::new();
+        let dw_light = [env.sun_color[0], env.sun_color[1], env.sun_color[2], 1.0];
+
+        if draw_sun && desc.has_source {
+            let r = desc.source_radius * f_distance;
+            let sx = [vec_x[0] * r, vec_x[1] * r, vec_x[2] * r];
+            let sy = [vec_y[0] * r, vec_y[1] * r, vec_y[2] * r];
+            let mut color = if desc.source_ignore_color {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                dw_light
+            };
+            color[3] *= self.state_blend;
+            quads.push(Self::build_flare_quad(
+                LensFlareQuadKind::Source,
+                &desc.source_shader,
+                &desc.source_texture,
+                vec_light,
+                sx,
+                sy,
+                color,
+            ));
+        }
+
+        if self.f_blend >= 1e-5 {
+            if draw_flares && desc.has_flares {
+                let axis_sq = dot3(vec_axis, vec_axis);
+                let vec_dx = if axis_sq > 1e-12 {
+                    let inv = 1.0 / axis_sq.sqrt();
+                    [vec_axis[0] * inv, vec_axis[1] * inv, vec_axis[2] * inv]
+                } else {
+                    vec_x
+                };
+                let vec_dy = cross3(vec_dx, vec_dir);
+                for (idx, flare) in desc.flares.iter().enumerate() {
+                    let center = [
+                        vec_center[0] + vec_axis[0] * flare.position,
+                        vec_center[1] + vec_axis[1] * flare.position,
+                        vec_center[2] + vec_axis[2] * flare.position,
+                    ];
+                    let r = flare.radius * f_distance;
+                    let sx = [vec_dx[0] * r, vec_dx[1] * r, vec_dx[2] * r];
+                    let sy = [vec_dy[0] * r, vec_dy[1] * r, vec_dy[2] * r];
+                    let cl = flare.opacity * self.f_blend * self.state_blend;
+                    let color = [
+                        dw_light[0] * cl,
+                        dw_light[1] * cl,
+                        dw_light[2] * cl,
+                        dw_light[3] * cl,
+                    ];
+                    quads.push(Self::build_flare_quad(
+                        LensFlareQuadKind::Flare(idx),
+                        &flare.shader,
+                        &flare.texture,
+                        center,
+                        sx,
+                        sy,
+                        color,
+                    ));
+                }
+            }
+
+            if draw_gradient && self.f_gradient_value >= 1e-5 && desc.has_gradient {
+                let r = desc.gradient_radius * self.f_gradient_value * f_distance;
+                let sx = [vec_x[0] * r, vec_x[1] * r, vec_x[2] * r];
+                let sy = [vec_y[0] * r, vec_y[1] * r, vec_y[2] * r];
+                let cl = self.f_gradient_value * self.state_blend;
+                let color = [
+                    dw_light[0] * cl,
+                    dw_light[1] * cl,
+                    dw_light[2] * cl,
+                    dw_light[3] * cl,
+                ];
+                quads.push(Self::build_flare_quad(
+                    LensFlareQuadKind::Gradient,
+                    &desc.gradient_shader,
+                    &desc.gradient_texture,
+                    vec_light,
+                    sx,
+                    sy,
+                    color,
+                ));
+            }
+        }
+
+        LensFlareFrameOutput {
+            render_active: true,
+            state_blend: self.state_blend,
+            visibility_blend: self.f_blend,
+            gradient_value: self.f_gradient_value,
+            sun_world_pos: vec_light,
+            quads,
+        }
+    }
+}
+
 /// Parse an `[...]` LTX string into an `OwnedLtxDocument` cleanly without external files.
 pub fn parse_ltx_str(text: &str) -> OwnedLtxDocument {
     use xray_core::ltx_loader::LoadedLtxSource;
@@ -1995,5 +3667,266 @@ sun_color = 1.0, 0.8, 0.6
         assert!((wind.anim[0] - 0.0).abs() < 1e-5);
         assert!((wind.anim[1] - 0.2).abs() < 1e-5);
         assert!((wind.anim[3] - 0.5).abs() < 1e-5);
+        let (uv0, uv1) = wind.clouds_uv_scroll(0.1, 0.2);
+        assert!((uv0[0].hypot(uv0[1]) - 0.05).abs() < 1e-5);
+        assert!((uv1[0].hypot(uv1[1]) - 0.1).abs() < 1e-5);
+
+        let (cloud_verts, cloud_idx) = clouds_hemi_mesh(&mixed);
+        assert_eq!(cloud_verts.len(), CLOUDS_HEMI_VERTEX_COUNT);
+        assert_eq!(cloud_idx.len(), CLOUDS_HEMI_INDEX_COUNT);
+        assert_eq!(cloud_verts[0].color_rgba, mixed.clouds_color_rgba());
+    }
+
+    #[test]
+    fn test_perlin_1d_and_rain_effect_simulator() {
+        let p_a = PerlinNoise1D::new(42, 2, 1.0, 0.66666);
+        let p_b = PerlinNoise1D::new(42, 2, 1.0, 0.66666);
+        assert!((p_a.get(1.37) - p_b.get(1.37)).abs() < 1e-7);
+
+        let mut p_c = PerlinNoise1D::new(42, 2, 1.0, 0.66666);
+        let c1 = p_c.get_continuous(0.3);
+        let c2 = p_c.get_continuous(0.6);
+        assert!(c1.is_finite() && c2.is_finite() && (c1 - c2).abs() > 1e-6);
+
+        let cycle_doc = parse_ltx_str(
+            r#"
+[00:00:00]
+rain_density = 0.5
+rain_color = 0.4, 0.5, 0.6
+wind_velocity = 400.0
+wind_direction = 45.0
+"#,
+        );
+        let cycle = WeatherCycle::from_ltx("w_rain", &cycle_doc).unwrap();
+        let (a, b, w) = cycle.select_at(0.0).unwrap();
+        let env = lerp_descriptors(
+            a,
+            b,
+            w,
+            &EnvModAccum {
+                total_power: 0.0,
+                active_flags: 0,
+                far_plane: 0.0,
+                fog_color: [0.0; 3],
+                fog_density: 0.0,
+                ambient: [0.0; 3],
+                sky_color: [0.0; 3],
+                hemi_color: [0.0; 3],
+            },
+            1.0,
+            &EnvBoost::default(),
+            0.0,
+            1.0,
+        );
+
+        let cfg = RainEffectConfig {
+            max_particles: 20,
+            splash_lifetime_sec: 0.3,
+            ..RainEffectConfig::default()
+        };
+        let mut rain = RainEffectState::new(7, cfg);
+        let cam_pos = [0.0, 2.0, 0.0];
+        let cam_dir = [0.0, 0.0, 1.0];
+
+        // Force frequent ground hits so splash lifecycle triggers deterministically
+        let mut out = RainFrameOutput::default();
+        for _ in 0..8 {
+            out = rain.step_with_raycast(
+                0.08,
+                &env,
+                cam_pos,
+                cam_dir,
+                Some(([0.0, 0.0, 0.0], 0.2)),
+                0.8,
+                |_, _, _| Some(1.0),
+            );
+        }
+        assert!(out.active);
+        assert_eq!(out.desired_items, 10);
+        assert!(out.active_items >= 10);
+        assert_eq!(out.streak_vertices.len(), (out.active_items as usize) * 4);
+        assert!(out.audio_volume >= 0.1 && out.audio_volume <= 1.0);
+        assert!(!out.splashes.is_empty());
+
+        let mut dry = env.clone();
+        dry.rain_density = 0.0;
+        let dry_out = rain.step_no_collision(0.1, &dry, cam_pos, cam_dir, 0.8);
+        assert!(!dry_out.active);
+        assert_eq!(dry_out.audio_volume, 0.0);
+        assert!(dry_out.streak_vertices.is_empty());
+    }
+
+    #[test]
+    fn test_thunderbolt_and_lens_flare_step() {
+        let mut lib = WeatherLibrary::default();
+        lib.parse_thunderbolts(&parse_ltx_str(
+            r#"
+[tb_0]
+gradient_top_shader = effects\flare
+gradient_top_texture = fx\fx_thunder_top
+gradient_top_radius = 0.05, 0.05
+gradient_top_opacity = 0.7
+gradient_center_shader = effects\flare
+gradient_center_texture = fx\fx_thunder_center
+gradient_center_radius = 0.04, 0.04
+gradient_center_opacity = 0.6
+color_anim = tb_flash
+lightning_model = dm\lightning.dm
+sound = nature\thunder1
+"#,
+        ));
+        lib.parse_thunderbolt_collections(&parse_ltx_str("[tb_coll]\ntb_0 =\n"));
+        lib.parse_suns(&parse_ltx_str(
+            r#"
+[sun_clear]
+sun = true
+sun_shader = effects\sun
+sun_texture = fx\fx_sun
+sun_radius = 0.06
+sun_ignore_color = false
+flares = true
+flare_shader = effects\flare
+flare_textures = fx\fx_flare1, fx\fx_flare2
+flare_radius = 0.1, 0.2
+flare_opacity = 0.5, 0.3
+flare_position = 0.4, 0.8
+gradient = true
+gradient_shader = effects\flare
+gradient_texture = fx\fx_grad
+gradient_radius = 0.4
+gradient_opacity = 0.6
+blend_rise_time = 0.5
+blend_down_time = 0.5
+"#,
+        ));
+
+        let mut anim = LightAnimItem::new("tb_flash");
+        anim.frame_count = 4;
+        anim.keys.clear();
+        anim.insert_key(0, crate::lanims::pack_argb(0xFF, 0xFF, 0xFF, 0xFF))
+            .unwrap();
+        anim.insert_key(4, crate::lanims::pack_argb(0xFF, 0x20, 0x20, 0x40))
+            .unwrap();
+        let mut anim_lib = LightAnimLibrary::default();
+        anim_lib.append_item(anim).unwrap();
+
+        let desc_doc = parse_ltx_str(
+            r#"
+[00:00:00]
+sky_color = 0.2, 0.2, 0.3
+sun_color = 0.8, 0.7, 0.6
+fog_color = 0.1, 0.1, 0.2
+far_plane = 400.0
+thunderbolt_collection = tb_coll
+thunderbolt_period = 0.2
+thunderbolt_duration = 0.6
+sun = sun_clear
+"#,
+        );
+        let cycle = WeatherCycle::from_ltx("w_tb", &desc_doc).unwrap();
+        let (a, b, w) = cycle.select_at(0.0).unwrap();
+        let mut mixed = lerp_descriptors(
+            a,
+            b,
+            w,
+            &EnvModAccum {
+                total_power: 0.0,
+                active_flags: 0,
+                far_plane: 0.0,
+                fog_color: [0.0; 3],
+                fog_density: 0.0,
+                ambient: [0.0; 3],
+                sky_color: [0.0; 3],
+                hemi_color: [0.0; 3],
+            },
+            1.0,
+            &EnvBoost::default(),
+            0.0,
+            1.0,
+        );
+        mixed.sun_dir = normalize_vec3([0.0, -0.5, -1.0]);
+
+        let gp = EnvGlobalParams::default();
+        let mut tb = ThunderboltEffectState::new(9);
+        let mut active_out = None;
+        for _ in 0..20 {
+            let out = tb.step_with_raycast(
+                0.05,
+                &mixed,
+                &gp,
+                &lib,
+                Some(&anim_lib),
+                [0.0, 2.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                |_, _, _| Some(120.0),
+            );
+            if out.active {
+                tb.apply_flash(&mut mixed, &gp, &out);
+                active_out = Some(out);
+                break;
+            }
+        }
+        let tb_out = active_out.expect("thunderbolt should fire within period");
+        assert!(tb_out.bolt_draw.is_some());
+        assert!(mixed.sky_color[0] > 0.2);
+        tb.undo_flash(&mut mixed);
+        assert!((mixed.sky_color[0] - 0.2).abs() < 1e-5);
+
+        // Lens flare looking straight toward the sun (-sun_dir = +0.5Y, +Z normalized)
+        mixed.sun_dir = normalize_vec3([0.0, -0.2, -1.0]);
+        let mut lf = LensFlareState::new();
+        let proj = crate::camera::matrix_build_projection(
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.2,
+            500.0,
+        );
+        let view = crate::camera::matrix_build_camera_dir(
+            [0.0, 2.0, 0.0],
+            [0.0, 0.2, 1.0],
+            [0.0, 1.0, 0.0],
+        );
+        let full_xf = matrix_mul_43(&proj, &view);
+        let mut lf_out = LensFlareFrameOutput::default();
+        for _ in 0..10 {
+            lf_out = lf.step_with_raycast(
+                0.1,
+                1.0,
+                false,
+                &mixed,
+                &lib,
+                [0.0, 2.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                normalize_vec3([0.0, 0.2, 1.0]),
+                Some(&full_xf),
+                (true, true, true),
+                |_, _, _| 1.0,
+            );
+        }
+        assert!(lf_out.render_active);
+        assert!(lf_out.state_blend > 0.9);
+        assert!(lf_out.visibility_blend > 0.5);
+        assert!(lf_out.quads.len() >= 3);
+        assert_eq!(lf_out.quads[0].kind, LensFlareQuadKind::Source);
+
+        // Looking away from sun disables flare rendering
+        let away = lf.step_with_raycast(
+            0.1,
+            1.0,
+            false,
+            &mixed,
+            &lib,
+            [0.0, 2.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, -1.0],
+            Some(&full_xf),
+            (true, true, true),
+            |_, _, _| 1.0,
+        );
+        assert!(!away.render_active);
+        assert!(away.quads.is_empty());
     }
 }

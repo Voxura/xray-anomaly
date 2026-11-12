@@ -6,7 +6,7 @@
 //! `DETAIL_VERSION_4` (20-byte slots, 14-bit object IDs).
 
 use crate::chunk::{ByteCursor, ChunkReader, FormatError};
-use crate::ogf::OgfBBox;
+use crate::ogf::{matrix_transform_point, OgfBBox, XRayMatrix};
 
 pub const DETAIL_VERSION_3: u32 = 3;
 pub const DETAIL_VERSION_4: u32 = 4;
@@ -22,6 +22,14 @@ pub struct DetailVertex {
     pub position: [f32; 3],
     pub u: f32,
     pub v: f32,
+}
+
+/// Transformed detail vertex emitted by `DetailMesh::transfer` (`CDetail::fvfVertexOut`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailMeshVertexOut {
+    pub position: [f32; 3],
+    pub color_rgba: [f32; 4],
+    pub uv: [f32; 2],
 }
 
 /// Individual grass/flora mesh loaded from `.dm` or `level.details` chunk 1 (`CDetail`).
@@ -112,6 +120,52 @@ impl DetailMesh {
             }
         }
         Some(OgfBBox { min, max })
+    }
+
+    /// Bounding sphere `(center, radius)` derived from `bbox()` via `Fbox::getsphere`
+    /// (`DetailModel.cpp:118`, `_fbox.h:247-252`).
+    pub fn bounding_sphere(&self) -> Option<([f32; 3], f32)> {
+        let bb = self.bbox()?;
+        let center = [
+            (bb.min[0] + bb.max[0]) * 0.5,
+            (bb.min[1] + bb.max[1]) * 0.5,
+            (bb.min[2] + bb.max[2]) * 0.5,
+        ];
+        let dx = bb.max[0] - center[0];
+        let dy = bb.max[1] - center[1];
+        let dz = bb.max[2] - center[2];
+        Some((center, (dx * dx + dy * dy + dz * dz).sqrt()))
+    }
+
+    /// Transform vertices by `xform`, tint with `color_rgba`, offset UVs by `(du, dv)`, and shift
+    /// indices by `index_offset` (`CDetail::transfer` in `DetailModel.cpp:24-80`).
+    ///
+    /// Returns `None` if adding `index_offset` would overflow `u16`.
+    pub fn transfer(
+        &self,
+        xform: &XRayMatrix,
+        color_rgba: [f32; 4],
+        du: f32,
+        dv: f32,
+        index_offset: u16,
+    ) -> Option<(Vec<DetailMeshVertexOut>, Vec<u16>)> {
+        let max_idx = usize::from(index_offset).checked_add(self.vertices.len())?;
+        if max_idx > usize::from(u16::MAX) + 1 {
+            return None;
+        }
+        let mut out_verts = Vec::with_capacity(self.vertices.len());
+        for v in &self.vertices {
+            out_verts.push(DetailMeshVertexOut {
+                position: matrix_transform_point(xform, v.position),
+                color_rgba,
+                uv: [v.u + du, v.v + dv],
+            });
+        }
+        let mut out_indices = Vec::with_capacity(self.indices.len());
+        for &idx in &self.indices {
+            out_indices.push(idx.checked_add(index_offset)?);
+        }
+        Some((out_verts, out_indices))
     }
 }
 
@@ -612,5 +666,30 @@ mod tests {
         assert!((slot.y_height_meters() - 2.5).abs() < 1e-4);
         assert_eq!((slot.c_dir, slot.c_hemi, slot.c_r, slot.c_g, slot.c_b), (8, 4, 15, 7, 2));
         assert_eq!(slot.palette[0], DetailPalette { a0: 1, a1: 4, a2: 8, a3: 15 });
+    }
+
+    #[test]
+    fn test_dm_bounding_sphere_and_transfer() {
+        let dm_bytes = build_dm_bytes("details\\blend", "detail\\rain", 0);
+        let dm = DetailMesh::parse_dm(&dm_bytes).unwrap();
+        let (center, radius) = dm.bounding_sphere().unwrap();
+        assert!((center[0] - 0.2).abs() < 1e-6);
+        assert!((center[1] - 0.25).abs() < 1e-6);
+        assert!((radius - (0.2_f32 * 0.2 + 0.25 * 0.25).sqrt()).abs() < 1e-5);
+
+        let mut xf = crate::ogf::matrix_rotate_y(std::f32::consts::FRAC_PI_2);
+        xf[3][0] = 10.0;
+        xf[3][1] = 2.0;
+        xf[3][2] = -3.0;
+        let color = [0.2, 0.4, 0.6, 0.8];
+        let (verts, idx) = dm.transfer(&xf, color, 0.1, 0.5, 100).unwrap();
+        assert_eq!(verts.len(), 3);
+        assert_eq!(idx, vec![100, 101, 102]);
+        assert!((verts[2].position[0] - 10.0).abs() < 1e-5);
+        assert!((verts[2].position[2] + 3.4).abs() < 1e-5);
+        assert_eq!(verts[1].color_rgba, color);
+        assert!((verts[1].uv[0] - 0.6).abs() < 1e-6);
+        assert!((verts[1].uv[1] - 0.5).abs() < 1e-6);
+        assert!(dm.transfer(&xf, color, 0.0, 0.0, u16::MAX).is_none());
     }
 }
