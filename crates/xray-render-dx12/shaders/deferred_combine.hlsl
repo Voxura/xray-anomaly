@@ -1,7 +1,7 @@
-// Phase 14 & 15: Modern Deferred Combine & Lighting Pass Shader with Cascaded Shadow Maps (CSM)
+// Phase 14: Modern Deferred Combine & Lighting Pass Shader
 // Renders via procedural full-screen triangle from SV_VertexID (0..2)
-// Reconstructs world position from depth, evaluates direct sunlight with 3-split CSM shadow atlas,
-// dynamic point/spot lights from structured buffer, SSFX volumetric light shafts, and ambient lighting into an HDR target.
+// Reconstructs world position from depth, evaluates direct sunlight with shadow mapping,
+// dynamic point/spot lights from structured buffer, and ambient lighting into an HDR intermediate target.
 
 struct PushCombineConstants
 {
@@ -120,54 +120,41 @@ float sample_csm_cascade(Texture2D shadow_tex, uint cascade_idx, float3 world_po
 
 float evaluate_csm_shadow(Texture2D shadow_tex, float3 world_pos)
 {
-    float view_dist = length(world_pos - cam_pos.xyz);
+    float dist = length(world_pos - cam_pos.xyz);
     float split0 = csm_split_distances_and_blend.x;
     float split1 = csm_split_distances_and_blend.y;
     float split2 = csm_split_distances_and_blend.z;
-    float blend_frac = csm_split_distances_and_blend.w;
+    float blend_fraction = csm_split_distances_and_blend.w;
 
-    if (view_dist >= split2)
+    if (dist < split0)
     {
-        return 1.0; // Outside shadow range
-    }
-
-    uint primary_idx = 0;
-    int next_idx = -1;
-    float primary_split = split0;
-
-    if (view_dist < split0)
-    {
-        primary_idx = 0;
-        next_idx = 1;
-        primary_split = split0;
-    }
-    else if (view_dist < split1)
-    {
-        primary_idx = 1;
-        next_idx = 2;
-        primary_split = split1;
-    }
-    else
-    {
-        primary_idx = 2;
-        next_idx = -1;
-        primary_split = split2;
-    }
-
-    float shadow = sample_csm_cascade(shadow_tex, primary_idx, world_pos);
-
-    if (next_idx >= 0)
-    {
-        float blend_start = primary_split * (1.0 - blend_frac);
-        if (view_dist > blend_start)
+        float s0 = sample_csm_cascade(shadow_tex, 0, world_pos);
+        float blend_range = split0 * blend_fraction;
+        if (dist > (split0 - blend_range))
         {
-            float blend_t = saturate((view_dist - blend_start) / max(primary_split * blend_frac, 1e-4));
-            float next_shadow = sample_csm_cascade(shadow_tex, (uint)next_idx, world_pos);
-            shadow = lerp(shadow, next_shadow, blend_t);
+            float s1 = sample_csm_cascade(shadow_tex, 1, world_pos);
+            float t = (dist - (split0 - blend_range)) / max(blend_range, 1e-4);
+            return lerp(s0, s1, t);
         }
+        return s0;
     }
-
-    return shadow;
+    else if (dist < split1)
+    {
+        float s1 = sample_csm_cascade(shadow_tex, 1, world_pos);
+        float blend_range = (split1 - split0) * blend_fraction;
+        if (dist > (split1 - blend_range))
+        {
+            float s2 = sample_csm_cascade(shadow_tex, 2, world_pos);
+            float t = (dist - (split1 - blend_range)) / max(blend_range, 1e-4);
+            return lerp(s1, s2, t);
+        }
+        return s1;
+    }
+    else if (dist < split2)
+    {
+        return sample_csm_cascade(shadow_tex, 2, world_pos);
+    }
+    return 1.0;
 }
 
 float4 ps_deferred_combine(VSOutput input) : SV_Target0
@@ -197,7 +184,7 @@ float4 ps_deferred_combine(VSOutput input) : SV_Target0
     // World position reconstruction from depth
     float2 ndc_xy = float2(input.uv.x * 2.0 - 1.0, (1.0 - input.uv.y) * 2.0 - 1.0);
     float4 clip_pos = float4(ndc_xy, depth, 1.0);
-
+    
     float view_x = clip_pos.x / max(proj[0][0], 1e-6);
     float view_y = clip_pos.y / max(proj[1][1], 1e-6);
 
@@ -243,52 +230,49 @@ float4 ps_deferred_combine(VSOutput input) : SV_Target0
         }
     }
 
-    // Direct Sunlight Lighting
+    // Direct sun diffuse and Blinn-Phong specular
     float3 V = normalize(cam_pos.xyz - world_pos);
     float3 H = normalize(L + V);
     float n_dot_h = saturate(dot(normal, H));
-    float spec_power = max((1.0 - roughness) * 64.0, 1.0);
-    float specular = pow(n_dot_h, spec_power) * specular_intensity;
+    float spec_power = (1.0 - roughness) * 64.0 + 1.0;
+    float spec_factor = pow(n_dot_h, spec_power) * n_dot_l;
 
-    float3 diffuse_color = albedo_sample.rgb * (1.0 - metallic);
-    float3 sun_illumination = (diffuse_color * n_dot_l + specular) * SunColor.rgb * shadow_factor;
+    float3 sun_diffuse = albedo_sample.rgb * SunColor.rgb * (n_dot_l * shadow_factor);
+    float3 sun_specular = SunColor.rgb * (spec_factor * shadow_factor * (0.04 * (1.0 - metallic) + albedo_sample.rgb * metallic));
 
-    // Ambient Lighting
-    float3 ambient_illumination = albedo_sample.rgb * AmbientColor.rgb;
-
-    // Accumulate Dynamic Lights from Structured Buffer
+    // Dynamic lights evaluation from structured buffer
     float3 dynamic_light_accum = float3(0.0, 0.0, 0.0);
-    for (uint i = 0; i < cb_combine.num_lights; i++)
+    uint num_lights = min(cb_combine.num_lights, 64);
+    for (uint i = 0; i < num_lights; ++i)
     {
         GpuLightData light = load_light(i);
         float3 to_light = light.position - world_pos;
         float dist = length(to_light);
-
-        if (dist >= light.range || dist < 1e-4)
-            continue;
-
-        float3 light_dir = to_light / dist;
-        float n_dot_ldir = saturate(dot(normal, light_dir));
-        if (n_dot_ldir <= 0.0)
-            continue;
-
-        // Quadratic Distance Attenuation
-        float norm_dist = dist / light.range;
-        float atten = saturate(1.0 - norm_dist * norm_dist);
-        atten = (atten * atten) / (1.0 + light.attenuation.y * dist * dist);
-
-        // Spot Light Cone Attenuation
-        if (light.light_type == 1) // Spot light
+        if (dist < light.range && dist > 0.0001)
         {
-            float cos_angle = dot(-light_dir, normalize(light.direction));
-            float spot_effect = saturate((cos_angle - light.spot_params.y) / max(light.spot_params.x - light.spot_params.y, 1e-4));
-            atten *= spot_effect;
-        }
+            float3 light_dir = to_light / dist;
+            float light_ndotl = saturate(dot(normal, light_dir));
+            if (light_ndotl > 0.0)
+            {
+                float att_dist = saturate(1.0 - dist / light.range);
+                float att = att_dist * att_dist;
 
-        float3 light_h = normalize(light_dir + V);
-        float light_spec = pow(saturate(dot(normal, light_h)), spec_power) * specular_intensity;
-        dynamic_light_accum += (diffuse_color * n_dot_ldir + light_spec) * light.color.rgb * atten;
+                if (light.light_type == 1) // SPOT
+                {
+                    float spot_cos = dot(-light_dir, normalize(light.direction));
+                    float spot_factor = saturate((spot_cos - light.spot_params.y) / max(0.0001, light.spot_params.x - light.spot_params.y));
+                    att *= spot_factor;
+                }
+
+                float3 light_h = normalize(light_dir + V);
+                float light_spec = pow(saturate(dot(normal, light_h)), spec_power);
+                dynamic_light_accum += (light.color.rgb * light.color.a) * (light_ndotl * att + light_spec * att * 0.5);
+            }
+        }
     }
+
+    // Ambient Lighting
+    float3 ambient = AmbientColor.rgb * albedo_sample.rgb;
 
     // SSFX Volumetric Light Shafts
     float3 volumetric_shafts = float3(0.0, 0.0, 0.0);
@@ -320,8 +304,6 @@ float4 ps_deferred_combine(VSOutput input) : SV_Target0
         }
     }
 
-    // Total Lighting Composition
-    float3 final_color = sun_illumination + ambient_illumination + dynamic_light_accum + volumetric_shafts;
-
-    return float4(final_color, 1.0);
+    float3 final_hdr = sun_diffuse + sun_specular + albedo_sample.rgb * dynamic_light_accum + ambient + volumetric_shafts;
+    return float4(final_hdr, 1.0);
 }
