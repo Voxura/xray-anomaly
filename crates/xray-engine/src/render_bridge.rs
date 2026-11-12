@@ -32,6 +32,7 @@ use crate::ui_inventory::{InventoryManager, UiFontResource};
 use crate::ui_pda::PdaManager;
 use crate::world_loader::{LoadedDynamicModel, LoadedWorld};
 use xray_formats::details::{LevelDetails, DETAIL_ID_EMPTY, DETAIL_SLOT_SIZE};
+use xray_formats::hom::{frustum_planes, ClipFrustum};
 use xray_formats::ogf::{
     matrix_set_xyz_translate, vector_generate_orthonormal_basis, OgfModel, OgfVisualType,
     StaticVertex, XRAY_IDENTITY_MATRIX,
@@ -84,9 +85,9 @@ pub struct RenderBridgeConfig {
 impl Default for RenderBridgeConfig {
     fn default() -> Self {
         Self {
-            csm_tile_size: 1024,
+            csm_tile_size: 512,
             csm_blend_band: 0.1,
-            volumetric_shafts: true,
+            volumetric_shafts: false,
             tonemap_mode: 0,
             bloom_factor: 0.25,
             render_details: true,
@@ -422,6 +423,8 @@ impl RenderBridge {
     fn prepare_dynamic_draws(
         &mut self,
         renderer: &mut Dx12Renderer,
+        cam_pos: [f32; 3],
+        frustum: &ClipFrustum,
         world: Option<&LoadedWorld>,
         alife: Option<&AlifeManager>,
         vfs: Option<&VirtualFileSystem>,
@@ -434,9 +437,17 @@ impl RenderBridge {
             return Ok(draws);
         };
 
+        const MAX_ENT_VIS_DIST_SQ: f32 = 280.0 * 280.0;
+
         // Online NPCs / dynamic objects / actors (excluding first-person host actor)
         for ent in alife.entities.values() {
             if !ent.online || ent.role == EntityRole::LocalHostActor {
+                continue;
+            }
+            if distance_sq(cam_pos, ent.position) > MAX_ENT_VIS_DIST_SQ {
+                continue;
+            }
+            if !frustum.test_sphere(ent.position, 2.5) {
                 continue;
             }
             let xf = matrix_set_xyz_translate(ent.angle, ent.position);
@@ -461,6 +472,12 @@ impl RenderBridge {
 
         // Connected co-op peers (`RemotePeerAvatar`)
         for peer in alife.remote_peers.values() {
+            if distance_sq(cam_pos, peer.position) > MAX_ENT_VIS_DIST_SQ {
+                continue;
+            }
+            if !frustum.test_sphere(peer.position, 2.5) {
+                continue;
+            }
             let xf = matrix_set_xyz_translate([peer.pitch, peer.yaw, 0.0], peer.position);
             let tf_idx = matrices.len() as u32;
             matrices.push(xf);
@@ -583,13 +600,33 @@ impl RenderBridge {
         let cam_constants = camera.to_render_constants();
         renderer.update_camera(&cam_constants)?;
 
-        let dynamic_draws = self.prepare_dynamic_draws(renderer, world, alife, vfs)?;
+        let frustum = ClipFrustum::from_view_proj_dx(&cam_constants.view_proj, frustum_planes::ALL);
+        const MAX_VIS_DIST: f32 = 280.0;
+
+        let dynamic_draws = self.prepare_dynamic_draws(
+            renderer,
+            camera.position,
+            &frustum,
+            world,
+            alife,
+            vfs,
+        )?;
 
         // ---------------------------------------------------------------------
         // Stage (a): Early-Z Depth Prepass -> primes swapchain DSV for sky/FX occlusion
         // ---------------------------------------------------------------------
         renderer.clear_backbuffer([0.04, 0.05, 0.08, 1.0]);
         for mesh in &self.world_meshes {
+            if mesh.bsphere_radius > 1e-4 {
+                if distance_sq(camera.position, mesh.bsphere_center)
+                    > (MAX_VIS_DIST + mesh.bsphere_radius).powi(2)
+                {
+                    continue;
+                }
+                if !frustum.test_sphere(mesh.bsphere_center, mesh.bsphere_radius) {
+                    continue;
+                }
+            }
             let handle = mesh.fastpath_handle.unwrap_or(mesh.mesh_handle);
             renderer.draw_depth_prepass(handle, u32::MAX)?;
             stats.early_z_draws += 1;
@@ -606,6 +643,16 @@ impl RenderBridge {
         // ---------------------------------------------------------------------
         renderer.begin_gbuffer_pass()?;
         for mesh in &self.world_meshes {
+            if mesh.bsphere_radius > 1e-4 {
+                if distance_sq(camera.position, mesh.bsphere_center)
+                    > (MAX_VIS_DIST + mesh.bsphere_radius).powi(2)
+                {
+                    continue;
+                }
+                if !frustum.test_sphere(mesh.bsphere_center, mesh.bsphere_radius) {
+                    continue;
+                }
+            }
             renderer.draw_gbuffer_mesh(
                 mesh.mesh_handle,
                 Some(mesh.albedo_tex),

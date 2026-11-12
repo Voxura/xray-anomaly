@@ -220,13 +220,22 @@ impl EngineRuntime {
     /// Attach an ALife simulation manager and synchronize camera, physics, inventory & weather initial state.
     pub fn attach_alife(&mut self, alife: AlifeManager) {
         self.inventory.actor_stats = alife.actor_stats.clone();
-        if let Some(actor) = alife.host_actor() {
-            self.camera.position = actor.position;
-            self.camera.pitch = actor.angle[0];
-            self.camera.yaw = actor.angle[1];
-            self.physics.sync_from_eye(self.camera.position);
-            self.inventory.actor_stats.health = actor.health.clamp(0.0, 1.0);
-        }
+        let (pos, angles, hp) = if let Some(actor) = alife.host_actor()
+            && actor.position != [0.0, 0.0, 0.0]
+        {
+            (actor.position, [actor.angle[0], actor.angle[1]], actor.health)
+        } else {
+            (
+                alife.actor_stats.position,
+                [alife.actor_stats.angles[0], alife.actor_stats.angles[1]],
+                alife.actor_stats.health,
+            )
+        };
+        self.camera.position = pos;
+        self.camera.pitch = angles[0];
+        self.camera.yaw = angles[1];
+        self.physics.sync_from_eye(self.camera.position);
+        self.inventory.actor_stats.health = hp.clamp(0.0, 1.0);
         self.hud.health = self.inventory.actor_stats.health.clamp(0.0, 1.0);
         self.hud.stamina = self.inventory.actor_stats.stamina.clamp(0.0, 1.0);
         if let Some(world) = &mut self.world {

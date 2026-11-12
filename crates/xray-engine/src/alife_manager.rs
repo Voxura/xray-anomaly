@@ -284,7 +284,7 @@ impl AlifeManager {
 
     /// Insert or replace an entity while maintaining `host_actor_id`, `story_id_index`, and `next_dynamic_id`.
     pub fn insert_entity(&mut self, entity: LiveAlifeEntity) {
-        if matches!(entity.role, EntityRole::LocalHostActor) {
+        if matches!(entity.role, EntityRole::LocalHostActor) || entity.id == 0 {
             self.host_actor_id = Some(entity.id);
         }
         if entity.story_id != INVALID_STORY_ID {
