@@ -23,6 +23,37 @@ cbuffer cb_draw : register(b1)
 Texture2D g_textures[] : register(t0);
 SamplerState g_sampler : register(s0);
 ByteAddressBuffer g_transforms : register(t0, space1);
+ByteAddressBuffer g_lights : register(t1, space1);
+
+struct GpuLightData
+{
+    float3 position;
+    float range;
+    float4 color;
+    float3 direction;
+    uint light_type;
+    float2 spot_params; // cos_inner, cos_outer
+    float2 attenuation;
+};
+
+GpuLightData load_light(uint index)
+{
+    uint offset = index * 64;
+    uint4 w0 = g_lights.Load4(offset);
+    uint4 w1 = g_lights.Load4(offset + 16);
+    uint4 w2 = g_lights.Load4(offset + 32);
+    uint4 w3 = g_lights.Load4(offset + 48);
+
+    GpuLightData l;
+    l.position = asfloat(w0.xyz);
+    l.range = asfloat(w0.w);
+    l.color = asfloat(w1);
+    l.direction = asfloat(w2.xyz);
+    l.light_type = w2.w;
+    l.spot_params = asfloat(w3.xy);
+    l.attenuation = asfloat(w3.zw);
+    return l;
+}
 
 float4x4 load_transform(uint index)
 {
@@ -160,12 +191,46 @@ float4 ps_main(PSInput input) : SV_Target0
 
     float diff = saturate(dot(world_normal, sun_dir));
 
+    // Dynamic point and spot light accumulation
+    float3 dynamic_light_accum = float3(0.0, 0.0, 0.0);
+    uint num_lights = (custom_param2 != 0xFFFFFFFF) ? min(custom_param2, 32u) : 0u;
+    for (uint li = 0; li < num_lights; ++li)
+    {
+        GpuLightData light = load_light(li);
+        float3 to_light = light.position - input.world_pos.xyz;
+        float dist = length(to_light);
+        if (dist < light.range && dist > 0.0001)
+        {
+            float3 L = to_light / dist;
+            float n_dot_l = saturate(dot(world_normal, L));
+            if (n_dot_l > 0.0)
+            {
+                float att_dist = saturate(1.0 - dist / light.range);
+                float att = att_dist * att_dist;
+
+                if (light.light_type == 1) // SPOT
+                {
+                    float spot_cos = dot(-L, normalize(light.direction));
+                    float spot_factor = saturate((spot_cos - light.spot_params.y) / max(0.0001, light.spot_params.x - light.spot_params.y));
+                    att *= spot_factor;
+                }
+
+                float3 V = normalize(cam_pos.xyz - input.world_pos.xyz);
+                float3 H = normalize(L + V);
+                float spec = pow(saturate(dot(world_normal, H)), 32.0);
+
+                dynamic_light_accum += (light.color.rgb * light.color.a) * (n_dot_l * att + spec * att * 0.5);
+            }
+        }
+    }
+
     if (albedo_index != 0xFFFFFFFF)
     {
         float4 albedo = g_textures[NonUniformResourceIndex(albedo_index)].Sample(g_sampler, input.uv);
-        if (normal_index != 0xFFFFFFFF || custom_param0 != 0xFFFFFFFF)
+        if (normal_index != 0xFFFFFFFF || custom_param0 != 0xFFFFFFFF || num_lights > 0)
         {
-            float3 lit = albedo.rgb * (0.2 + 0.8 * diff * shadow_factor);
+            float3 sun_lit = albedo.rgb * (0.2 + 0.8 * diff * shadow_factor);
+            float3 lit = sun_lit + albedo.rgb * dynamic_light_accum;
             return float4(lit, albedo.a);
         }
         return albedo;
@@ -173,9 +238,10 @@ float4 ps_main(PSInput input) : SV_Target0
 
     // Normal visualization fallback (perturbed if normal map bound, geometric otherwise)
     float3 base_color = abs(world_normal);
-    if (custom_param0 != 0xFFFFFFFF)
+    if (custom_param0 != 0xFFFFFFFF || num_lights > 0)
     {
-        return float4(base_color * (0.25 + 0.75 * diff * shadow_factor), 1.0);
+        float3 sun_lit = base_color * (0.25 + 0.75 * diff * shadow_factor);
+        return float4(sun_lit + base_color * dynamic_light_accum, 1.0);
     }
     return float4(base_color, 1.0);
 }

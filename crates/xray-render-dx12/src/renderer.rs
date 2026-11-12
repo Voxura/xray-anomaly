@@ -593,6 +593,48 @@ impl Dx12Renderer {
         }
     }
 
+    /// Update dynamic light structured buffer
+    pub fn update_lights(&mut self, lights: &[crate::lighting::GpuLight]) -> WinResult<()> {
+        self.geometry.update_lights(&self.device_ctx.device, lights)
+    }
+
+    /// Record a draw call with dynamic point/spot lights evaluated
+    pub fn draw_mesh_with_lights(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        albedo_index: Option<crate::bindless::DescriptorIndex>,
+        transform_index: u32,
+        num_lights: u32,
+    ) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
+        let push_constants = crate::geometry::PushDrawConstants {
+            albedo_index: albedo_index.map(|i| i.0).unwrap_or(u32::MAX),
+            transform_index,
+            custom_param2: num_lights,
+            ..Default::default()
+        };
+        self.geometry.draw(
+            &self.device_ctx.device,
+            cmd,
+            rtv,
+            Some(dsv),
+            self.width,
+            self.height,
+            handle,
+            Some(&self.bindless_heap),
+            Some(&push_constants),
+        )
+    }
+
     /// Begin the directional sunlight shadow map rendering pass
     pub fn begin_shadow_pass(&mut self) -> WinResult<()> {
         let cmd = match self.current_cmd_list.as_ref() {

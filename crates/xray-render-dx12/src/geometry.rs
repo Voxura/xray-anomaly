@@ -18,7 +18,6 @@ struct UploadBuffer(ID3D12Resource);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
 pub struct PushDrawConstants {
     pub albedo_index: u32,
     pub normal_index: u32,
@@ -151,7 +150,14 @@ impl GeometryPipeline {
             ShaderRegister: 0,
             RegisterSpace: 1,
         };
-        let parameters = [camera, textures, push, transforms];
+        let mut lights = D3D12_ROOT_PARAMETER::default();
+        lights.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        lights.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        lights.Anonymous.Descriptor = D3D12_ROOT_DESCRIPTOR {
+            ShaderRegister: 1,
+            RegisterSpace: 1,
+        };
+        let parameters = [camera, textures, push, transforms, lights];
         // The contract permits clamp/wrap; choose linear wrap on all axes.
         let sampler = D3D12_STATIC_SAMPLER_DESC {
             Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -167,7 +173,7 @@ impl GeometryPipeline {
             ..Default::default()
         };
         let root_desc = D3D12_ROOT_SIGNATURE_DESC {
-            NumParameters: 4,
+            NumParameters: parameters.len() as u32,
             pParameters: parameters.as_ptr(),
             NumStaticSamplers: 1,
             pStaticSamplers: &sampler,
@@ -410,6 +416,8 @@ pub(crate) struct GeometryState {
     camera: Option<UploadBuffer>,
     transforms: Option<UploadBuffer>,
     default_transform: Option<UploadBuffer>,
+    lights: Option<UploadBuffer>,
+    default_lights: Option<UploadBuffer>,
     pipeline: Option<GeometryPipeline>,
     recording_resources: Vec<ID3D12Resource>,
     submitted_resources: Vec<(u64, Vec<ID3D12Resource>)>,
@@ -495,6 +503,17 @@ impl GeometryState {
         Ok(())
     }
 
+    /// Update dynamic light structured buffer
+    pub fn update_lights(
+        &mut self,
+        device: &ID3D12Device,
+        lights: &[crate::lighting::GpuLight],
+    ) -> WinResult<()> {
+        let bytes = crate::lighting::GpuLight::as_bytes(lights);
+        self.lights = Some(UploadBuffer::new(device, bytes)?);
+        Ok(())
+    }
+
     /// Caller validates frame, mesh and camera before recording any commands.
     pub fn draw(
         &mut self,
@@ -536,12 +555,20 @@ impl GeometryState {
         let default_tf = self.default_transform.as_ref().unwrap();
         let tf_buf = self.transforms.as_ref().unwrap_or(default_tf);
 
+        if self.default_lights.is_none() {
+            let dummy = [0u8; 64];
+            self.default_lights = Some(UploadBuffer::new(device, &dummy)?);
+        }
+        let default_lt = self.default_lights.as_ref().unwrap();
+        let lt_buf = self.lights.as_ref().unwrap_or(default_lt);
+
         // Clone BEFORE command recording so CPU destruction cannot invalidate a draw.
         self.recording_resources.extend([
             mesh.vertices.0.clone(),
             mesh.indices.0.clone(),
             camera.0.clone(),
             tf_buf.0.clone(),
+            lt_buf.0.clone(),
         ]);
         unsafe {
             cmd.SetPipelineState(&pipeline.pso);
@@ -559,6 +586,7 @@ impl GeometryState {
                 0,
             );
             cmd.SetGraphicsRootShaderResourceView(3, tf_buf.0.GetGPUVirtualAddress());
+            cmd.SetGraphicsRootShaderResourceView(4, lt_buf.0.GetGPUVirtualAddress());
             cmd.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: width as f32,
                 Height: height as f32,
@@ -700,11 +728,19 @@ impl GeometryState {
         let default_tf = self.default_transform.as_ref().unwrap();
         let tf_buf = self.transforms.as_ref().unwrap_or(default_tf);
 
+        if self.default_lights.is_none() {
+            let dummy = [0u8; 64];
+            self.default_lights = Some(UploadBuffer::new(device, &dummy)?);
+        }
+        let default_lt = self.default_lights.as_ref().unwrap();
+        let lt_buf = self.lights.as_ref().unwrap_or(default_lt);
+
         self.recording_resources.extend([
             mesh.vertices.0.clone(),
             mesh.indices.0.clone(),
             camera.0.clone(),
             tf_buf.0.clone(),
+            lt_buf.0.clone(),
         ]);
         unsafe {
             cmd.SetPipelineState(&pipeline.equal_depth_pso);
@@ -722,6 +758,7 @@ impl GeometryState {
                 0,
             );
             cmd.SetGraphicsRootShaderResourceView(3, tf_buf.0.GetGPUVirtualAddress());
+            cmd.SetGraphicsRootShaderResourceView(4, lt_buf.0.GetGPUVirtualAddress());
             cmd.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: width as f32,
                 Height: height as f32,

@@ -14,6 +14,7 @@ pub mod geometry;
 pub mod geometry_abi;
 mod geometry_ffi;
 pub mod heaps;
+pub mod lighting;
 pub mod particle;
 pub mod pipeline;
 pub mod renderer;
@@ -25,6 +26,7 @@ pub mod ui_canvas;
 
 pub use geometry::PushDrawConstants;
 pub use geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
+pub use lighting::{DynamicLight, GpuLight, LightManager, LightType};
 pub use particle::{GpuParticleInstance, ParticleSystemRenderer};
 pub use shadow::DirectionalShadowMap;
 pub use ui_canvas::{GlyphQuad, GpuUiQuad, UiCanvas, UiCanvasPipeline, UiPushConstants};
