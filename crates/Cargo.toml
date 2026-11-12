@@ -5,5 +5,6 @@ members = [
     "xray-vfs",
     "xray-formats",
     "xray-render-dx12",
+    "xray-net",
 ]
 resolver = "2"

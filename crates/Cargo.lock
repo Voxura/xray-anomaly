@@ -168,6 +168,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "xray-net"
+version = "0.1.0"
+dependencies = [
+ "xray-core",
+]
+
+[[package]]
 name = "xray-render-dx12"
 version = "0.1.0"
 dependencies = [

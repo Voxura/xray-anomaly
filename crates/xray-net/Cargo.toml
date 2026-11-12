@@ -1,0 +1,10 @@
+[package]
+name = "xray-net"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xray-core = { path = "../xray-core" }
+
+[dev-dependencies]
+xray-core = { path = "../xray-core" }
