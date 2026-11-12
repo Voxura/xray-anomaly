@@ -16,6 +16,7 @@
 //! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
 //! - `particle_sim`: Pure-Rust PAPI runtime simulator, 3D Perlin noise, `ParticleGroupInstance` timeline & billboard emitter
 //! - `particles`: `particles.xr` / loose `.pe` & `.pg` PAPI bytecode systems + LTX blood wallmark configs (no binary `level.wallmarks` in Anomaly/CoP)
+//! - `postprocess`: Phase-13 PPE noise UVs, Gaussian bloom kernels/adaptation, Uncharted2 tonemap, display gamma LUT & HDR10 parameters
 //! - `savegames`: Anomaly `.scop` LZO1X ALife savegame reader/writer (`GameDateTime`, spawn header, dynamic objects & 7 binary registries)
 //! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
 //! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, OMF pose evaluation & `1W`–`4W` CPU skinning
@@ -43,6 +44,7 @@ pub mod ogf;
 pub mod omf;
 pub mod particle_sim;
 pub mod particles;
+pub mod postprocess;
 pub mod savegames;
 pub mod shaders_xr;
 pub mod skinning;
@@ -158,6 +160,14 @@ pub use particles::{
     WallmarkSlotConfig, WallmarkVertex, PARTICLE_DOMAIN_BINARY_SIZE, PED_VERSION, PGD_VERSION,
     PS_VERSION, WALLMARK_COS_88_DEG, WALLMARK_DEFAULT_TTL, WALLMARK_DUPLICATE_TOLERANCE,
     WALLMARK_RANGE_SKELETON, WALLMARK_RANGE_STATIC, WALLMARK_SHIFT_PP, WALLMARK_SHIFT_V,
+};
+pub use postprocess::{
+    apply_st2084_pq_rgb, apply_vignette_rgb, bloom_build_4tap_uvs, bloom_filter_taps_horizontal,
+    bloom_filter_taps_vertical, calc_gauss_k7, calc_gauss_wave, effects_sun_hdr_blend_factor,
+    uncharted2_tonemap_curve, BloomAdaptState, BloomConfig, BloomFilterGpuWeights,
+    GammaControlConfig, Hdr10Colorspace, Hdr10Config, Hdr10GpuParams, Hdr10TonemapMode,
+    Hdr10Tonemapper, ImageCorrectionConfig, ImageCorrectionGpuParams, PostprocessNoiseState,
+    SsfxBloomGpuParams, TonemapGpuParams, TonemapParams,
 };
 pub use savegames::{
     compress_scop, decompress_scop, validate_scop_header, ActorStatDetail, ActorStatSection,
