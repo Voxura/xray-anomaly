@@ -181,6 +181,13 @@ impl EngineWindow {
         self.state.is_closed.load(Ordering::SeqCst)
     }
 
+    /// Enqueue a synthetic window event into the pending queue (useful for automated runtime tests).
+    pub fn push_synthetic_event(&self, event: WindowEvent) {
+        if let Ok(mut events) = self.state.events.lock() {
+            events.push(event);
+        }
+    }
+
     /// Pump Windows event queue and dispatch to `EngineInput`
     pub fn poll_events(&mut self, input: &mut EngineInput) -> bool {
         if self.is_closed() {

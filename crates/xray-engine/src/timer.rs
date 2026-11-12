@@ -76,6 +76,12 @@ impl EngineTimer {
         clamped_dt
     }
 
+    /// Shift `prev_time` backward so the next `tick()` observes `dt_sec` elapsed cleanly in deterministic tests.
+    pub fn simulate_elapsed(&mut self, dt_sec: f32) {
+        let ticks = (f64::from(dt_sec.max(0.0)) * self.frequency as f64) as i64;
+        self.prev_time = self.prev_time.saturating_sub(ticks);
+    }
+
     /// Run fixed-timestep updates (e.g. 60Hz physics/network step)
     pub fn step_fixed<F: FnMut(f32)>(&mut self, fixed_dt: f32, mut update_fn: F) {
         let max_steps = 4; // Prevent spiral of death

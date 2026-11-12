@@ -16,6 +16,7 @@ use xray_formats::ai_graph::{LevelCrossTable, LevelGraph};
 use xray_formats::cform::{CformBvh, CformModel, RaycastHit};
 use xray_formats::chunk::FormatError;
 use xray_formats::details::LevelDetails;
+use xray_formats::gamemtl::GameMaterialLibrary;
 use xray_formats::hom::{frustum_planes, ClipFrustum, OccRasterizer, HomMesh};
 use xray_formats::level::{
     LevelData, LevelGeometry, LevelShaderRef, PortalTraversalOptions, PortalTraversalResult,
@@ -24,18 +25,21 @@ use xray_formats::level::{
 use xray_formats::ogf::{matrix_mul_44, OgfBBox, OgfBSphere, OgfModel, OgfTextureLink, OgfVisualType, XRayMatrix};
 use xray_formats::scop::ScopWeatherState;
 use xray_formats::shaders_xr::{LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles};
+use xray_formats::sound_env::{LevelStaticSounds, SoundOcclusionMesh};
 use xray_formats::spawns::{LevelGameData, LevelSpawnData};
 use xray_formats::thm::ResolvedTextureLinks;
 use xray_formats::vfs_bridge::{
     load_cform_from_vfs, load_details_from_vfs, load_env_mods_from_vfs, load_fog_volumes_from_vfs,
-    load_hom_from_vfs, load_level_ai_from_vfs, load_level_from_vfs, load_level_game_from_vfs,
-    load_level_gct_from_vfs, load_level_geometry_from_vfs, load_level_spawn_from_vfs,
-    load_ogf_from_vfs, load_ps_static_from_vfs, load_weather_library_from_vfs,
-    resolve_ogf_texture_links, AssetLoadError,
+    load_gamemtl_from_vfs, load_hom_from_vfs, load_level_ai_from_vfs, load_level_from_vfs,
+    load_level_game_from_vfs, load_level_gct_from_vfs, load_level_geometry_from_vfs,
+    load_level_spawn_from_vfs, load_ogf_from_vfs, load_ps_static_from_vfs, load_som_from_vfs,
+    load_static_sounds_from_vfs, load_weather_library_from_vfs, resolve_ogf_texture_links,
+    AssetLoadError,
 };
 use xray_formats::weather::{
-    normalize_time, EnvBoost, MixedEnvironment, RainEffectState, RainFrameOutput,
-    ThunderboltEffectState, WeatherLibrary, WetnessState, WindAnimState, DEFAULT_WETNESS_MULTIPLIERS,
+    normalize_time, EnvBoost, EnvGlobalParams, MixedEnvironment, RainEffectState, RainFrameOutput,
+    ThunderboltEffectState, ThunderboltFrameOutput, WeatherLibrary, WetnessState, WindAnimState,
+    DEFAULT_WETNESS_MULTIPLIERS,
 };
 use xray_vfs::{normalize_virtual_path, VfsError, VirtualFileSystem};
 
@@ -161,9 +165,11 @@ pub struct WorldWeatherState {
     pub wind: WindAnimState,
     pub rain: RainEffectState,
     pub thunderbolt: ThunderboltEffectState,
+    pub global_params: EnvGlobalParams,
     pub boost: EnvBoost,
     pub current_env: Option<MixedEnvironment>,
     pub last_rain_frame: Option<RainFrameOutput>,
+    pub last_thunderbolt: Option<ThunderboltFrameOutput>,
     pub surge_active: bool,
     pub psi_storm_active: bool,
 }
@@ -182,9 +188,11 @@ impl Default for WorldWeatherState {
             wind: WindAnimState::default(),
             rain: RainEffectState::default(),
             thunderbolt: ThunderboltEffectState::default(),
+            global_params: EnvGlobalParams::default(),
             boost: EnvBoost::default(),
             current_env: None,
             last_rain_frame: None,
+            last_thunderbolt: None,
             surge_active: false,
             psi_storm_active: false,
         }
@@ -277,9 +285,9 @@ impl WorldWeatherState {
             DEFAULT_WETNESS_MULTIPLIERS[1],
         );
 
-        let rain_out = if let Some(model) = cform {
+        let (rain_out, tb_out) = if let Some(model) = cform {
             let bvh = model.build_bvh();
-            self.rain.step_with_raycast(
+            let rain_frame = self.rain.step_with_raycast(
                 dt,
                 &mixed,
                 camera_pos,
@@ -287,17 +295,42 @@ impl WorldWeatherState {
                 None,
                 mixed.hemi_color[1].max(0.0),
                 |orig, dir, max_dist| bvh.raycast_nearest(orig, dir, max_dist, true).map(|h| h.range),
-            )
+            );
+            let tb_frame = self.thunderbolt.step_with_raycast(
+                dt,
+                &mixed,
+                &self.global_params,
+                lib,
+                None,
+                camera_pos,
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                |orig, dir, max_dist| bvh.raycast_nearest(orig, dir, max_dist, true).map(|h| h.range),
+            );
+            (rain_frame, tb_frame)
         } else {
-            self.rain.step_no_collision(
+            let rain_frame = self.rain.step_no_collision(
                 dt,
                 &mixed,
                 camera_pos,
                 camera_dir,
                 mixed.hemi_color[1].max(0.0),
-            )
+            );
+            let tb_frame = self.thunderbolt.step_with_raycast(
+                dt,
+                &mixed,
+                &self.global_params,
+                lib,
+                None,
+                camera_pos,
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                |_orig, _dir, _max_dist| None,
+            );
+            (rain_frame, tb_frame)
         };
         self.last_rain_frame = Some(rain_out);
+        self.last_thunderbolt = Some(tb_out);
         self.current_env = Some(mixed);
         self.current_env.as_ref()
     }
@@ -339,6 +372,9 @@ pub struct LoadedWorld {
     pub level_gct: Option<LevelCrossTable>,
     pub level_spawn: Option<LevelSpawnData>,
     pub level_game: Option<LevelGameData>,
+    pub gamemtl: Option<GameMaterialLibrary>,
+    pub sound_occlusion: Option<SoundOcclusionMesh>,
+    pub static_sounds: Option<LevelStaticSounds>,
     pub visual_meshes: Vec<LoadedVisualMesh>,
     pub dynamic_models: BTreeMap<String, LoadedDynamicModel>,
     pub weather: WorldWeatherState,
@@ -504,22 +540,37 @@ impl WorldLoader {
             .next()
             .filter(|s| !s.is_empty() && !s.starts_with('$'));
 
-        let (hom, details, env_mods, fog_volumes, static_particles, level_ai, level_gct, level_spawn, level_game) =
-            if config.load_optional_aux {
-                (
-                    load_optional(|| load_hom_from_vfs(vfs, &config.level_dir))?,
-                    load_optional(|| load_details_from_vfs(vfs, &config.level_dir))?,
-                    load_optional(|| load_env_mods_from_vfs(vfs, &config.level_dir, level_leaf))?,
-                    load_optional(|| load_fog_volumes_from_vfs(vfs, &config.level_dir))?,
-                    load_optional(|| load_ps_static_from_vfs(vfs, &config.level_dir))?,
-                    load_optional(|| load_level_ai_from_vfs(vfs, &config.level_dir))?,
-                    load_optional(|| load_level_gct_from_vfs(vfs, &config.level_dir))?,
-                    load_optional(|| load_level_spawn_from_vfs(vfs, &config.level_dir))?,
-                    load_optional(|| load_level_game_from_vfs(vfs, &config.level_dir))?,
-                )
-            } else {
-                (None, None, None, None, None, None, None, None, None)
-            };
+        let (
+            hom,
+            details,
+            env_mods,
+            fog_volumes,
+            static_particles,
+            level_ai,
+            level_gct,
+            level_spawn,
+            level_game,
+            gamemtl,
+            sound_occlusion,
+            static_sounds,
+        ) = if config.load_optional_aux {
+            (
+                load_optional(|| load_hom_from_vfs(vfs, &config.level_dir))?,
+                load_optional(|| load_details_from_vfs(vfs, &config.level_dir))?,
+                load_optional(|| load_env_mods_from_vfs(vfs, &config.level_dir, level_leaf))?,
+                load_optional(|| load_fog_volumes_from_vfs(vfs, &config.level_dir))?,
+                load_optional(|| load_ps_static_from_vfs(vfs, &config.level_dir))?,
+                load_optional(|| load_level_ai_from_vfs(vfs, &config.level_dir))?,
+                load_optional(|| load_level_gct_from_vfs(vfs, &config.level_dir))?,
+                load_optional(|| load_level_spawn_from_vfs(vfs, &config.level_dir))?,
+                load_optional(|| load_level_game_from_vfs(vfs, &config.level_dir))?,
+                load_optional(|| load_gamemtl_from_vfs(vfs))?,
+                load_optional(|| load_som_from_vfs(vfs, &config.level_dir))?,
+                load_optional(|| load_static_sounds_from_vfs(vfs, &config.level_dir))?,
+            )
+        } else {
+            (None, None, None, None, None, None, None, None, None, None, None, None)
+        };
 
         let visual_meshes = if config.resolve_visual_meshes {
             resolve_level_visuals(
@@ -559,6 +610,9 @@ impl WorldLoader {
             level_gct,
             level_spawn,
             level_game,
+            gamemtl,
+            sound_occlusion,
+            static_sounds,
             visual_meshes,
             dynamic_models: BTreeMap::new(),
             weather,

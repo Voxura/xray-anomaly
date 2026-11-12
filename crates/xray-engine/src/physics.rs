@@ -63,6 +63,8 @@ pub struct StalkerController {
     pub crouching: bool,
     /// Last detected walkable surface normal.
     pub ground_normal: [f32; 3],
+    /// Material index (`CformTriangle::material`) of the walkable triangle currently supporting feet.
+    pub ground_material: Option<u16>,
     /// Capsule geometry & movement parameters.
     pub config: CapsuleConfig,
     /// When `false` (default), gravity is paused if no `CformBvh` is loaded (e.g., headless mode
@@ -80,6 +82,7 @@ impl Default for StalkerController {
             grounded: false,
             crouching: false,
             ground_normal: [0.0, 1.0, 0.0],
+            ground_material: None,
             config,
             apply_gravity_without_cform: false,
         }
@@ -146,7 +149,7 @@ impl StalkerController {
     /// Returns `true` if ground was found and feet were clamped.
     pub fn snap_to_ground(&mut self, bvh: &CformBvh<'_>, probe_up: f32, max_drop: f32) -> bool {
         let min_floor_ny = self.config.max_slope_deg.to_radians().cos();
-        if let Some((ground_y, normal)) = sample_ground_height(
+        if let Some((ground_y, normal, material)) = sample_ground_height(
             bvh,
             self.feet_position,
             self.config.radius,
@@ -158,8 +161,10 @@ impl StalkerController {
             self.velocity[1] = 0.0;
             self.grounded = true;
             self.ground_normal = normal;
+            self.ground_material = Some(material);
             return true;
         }
+        self.ground_material = None;
         false
     }
 
@@ -304,7 +309,7 @@ impl StalkerController {
 
                 if raised_dist_sq > flat_dist_sq + 1e-6 {
                     // Check for walkable floor between current feet level and raised position
-                    if let Some((step_ground_y, step_normal)) = sample_ground_height(
+                    if let Some((step_ground_y, step_normal, step_material)) = sample_ground_height(
                         bvh,
                         raised_pos,
                         radius,
@@ -317,6 +322,7 @@ impl StalkerController {
                             new_pos = [raised_pos[0], step_ground_y, raised_pos[2]];
                             self.grounded = true;
                             self.ground_normal = step_normal;
+                            self.ground_material = Some(step_material);
                             self.velocity[1] = 0.0;
                             stepped_up = true;
                         }
@@ -357,6 +363,7 @@ impl StalkerController {
                 self.feet_position[1] = next_y;
             }
             self.grounded = false;
+            self.ground_material = None;
             return;
         }
 
@@ -373,7 +380,7 @@ impl StalkerController {
             (-desired_dy).max(0.0) + 0.02
         };
 
-        if let Some((ground_y, normal)) = sample_ground_height(
+        if let Some((ground_y, normal, material)) = sample_ground_height(
             bvh,
             self.feet_position,
             radius,
@@ -386,12 +393,14 @@ impl StalkerController {
             self.velocity[1] = 0.0;
             self.grounded = true;
             self.ground_normal = normal;
+            self.ground_material = Some(material);
             return;
         }
 
         // Remain airborne and apply vertical drop
         self.feet_position[1] = target_y;
         self.grounded = false;
+        self.ground_material = None;
     }
 }
 
@@ -487,7 +496,7 @@ fn sample_ground_height(
     probe_up: f32,
     drop_allowance: f32,
     min_floor_ny: f32,
-) -> Option<(f32, [f32; 3])> {
+) -> Option<(f32, [f32; 3], u16)> {
     let r = radius * 0.98;
     let d = radius * 0.70;
     let offsets = [
@@ -504,6 +513,7 @@ fn sample_ground_height(
     let max_range = probe_up + drop_allowance;
     let mut best_y = f32::NEG_INFINITY;
     let mut best_normal = [0.0f32, 1.0, 0.0];
+    let mut best_material = 0u16;
 
     for [ox, oz] in offsets {
         let origin = [feet_pos[0] + ox, feet_pos[1] + probe_up, feet_pos[2] + oz];
@@ -516,12 +526,13 @@ fn sample_ground_height(
             if n[1] >= min_floor_ny && hit.point[1] > best_y {
                 best_y = hit.point[1];
                 best_normal = n;
+                best_material = hit.material;
             }
         }
     }
 
     if best_y.is_finite() {
-        Some((best_y, best_normal))
+        Some((best_y, best_normal, best_material))
     } else {
         None
     }

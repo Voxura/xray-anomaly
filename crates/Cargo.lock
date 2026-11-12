@@ -149,6 +149,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "xray-audio"
+version = "0.1.0"
+dependencies = [
+ "windows",
+ "xray-core",
+ "xray-formats",
+ "xray-vfs",
+]
+
+[[package]]
 name = "xray-core"
 version = "0.1.0"
 
@@ -164,6 +174,7 @@ name = "xray-engine"
 version = "0.1.0"
 dependencies = [
  "windows",
+ "xray-audio",
  "xray-core",
  "xray-formats",
  "xray-net",

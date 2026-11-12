@@ -10,6 +10,7 @@
 //! - DirectX 12 render graph bridge (`render_bridge`)
 //! - Level world streaming, BVH collision & weather simulation (`world_loader`)
 //! - Live ALife entity spawn manager & `.scop`/`.scoc` co-op state sync (`alife_manager`)
+//! - Pure-Rust 3D spatial audio subsystem (`xray_audio`)
 
 pub mod alife_manager;
 pub mod camera;
@@ -20,6 +21,9 @@ pub mod render_bridge;
 pub mod timer;
 pub mod window;
 pub mod world_loader;
+
+pub use xray_audio;
+pub use xray_audio::{AudioListener, AudioManager, AudioManagerConfig, SurfaceMaterialCategory};
 
 pub use alife_manager::{AlifeManager, EntityRole, LiveAlifeEntity, RemotePeerAvatar};
 pub use camera::{FirstPersonCamera, DEFAULT_FAR_Z, DEFAULT_FOV_DEG, DEFAULT_NEAR_Z};

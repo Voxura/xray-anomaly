@@ -13,6 +13,7 @@ xray-vfs = { path = "../xray-vfs" }
 xray-formats = { path = "../xray-formats" }
 xray-render-dx12 = { path = "../xray-render-dx12" }
 xray-net = { path = "../xray-net" }
+xray-audio = { path = "../xray-audio" }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D12",

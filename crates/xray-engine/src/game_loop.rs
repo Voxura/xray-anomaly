@@ -4,9 +4,10 @@
 //! fixed-timestep simulation ticks (capsule physics/ALife/network), and the 7-stage
 //! DirectX 12 render graph frame pipeline.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::alife_manager::AlifeManager;
+use crate::alife_manager::{AlifeManager, EntityRole};
 use crate::camera::FirstPersonCamera;
 use crate::input::{Action, EngineInput};
 use crate::physics::StalkerController;
@@ -14,6 +15,7 @@ use crate::render_bridge::{HudOverlayState, RenderBridge, RenderBridgeConfig};
 use crate::timer::EngineTimer;
 use crate::window::{EngineWindow, WindowConfig};
 use crate::world_loader::{LevelLoadConfig, LoadedWorld, WorldLoader};
+use xray_audio::{AudioListener, AudioManager, AudioManagerConfig};
 use xray_formats::cform::CformBvh;
 use xray_net::{ClientSession, EntityDelta, HostSession};
 use xray_render_dx12::Dx12Renderer;
@@ -72,6 +74,7 @@ pub struct EngineRuntime {
     pub physics: StalkerController,
     pub renderer: Option<Dx12Renderer>,
     pub render_bridge: Option<RenderBridge>,
+    pub audio: AudioManager,
     pub hud: HudOverlayState,
     pub network: Option<NetworkSession>,
     pub world: Option<LoadedWorld>,
@@ -104,6 +107,11 @@ impl EngineRuntime {
             (None, None)
         };
 
+        let audio = AudioManager::new(AudioManagerConfig {
+            prefer_hardware_output: init_renderer && config.window.visible,
+            ..Default::default()
+        });
+
         Ok(Self {
             config,
             window,
@@ -113,6 +121,7 @@ impl EngineRuntime {
             physics,
             renderer,
             render_bridge,
+            audio,
             hud: HudOverlayState::default(),
             network: None,
             world: None,
@@ -123,8 +132,9 @@ impl EngineRuntime {
         })
     }
 
-    /// Attach a shared [`VirtualFileSystem`] for on-demand dynamic model/texture GPU streaming.
+    /// Attach a shared [`VirtualFileSystem`] for on-demand dynamic model/texture/audio streaming.
     pub fn attach_vfs(&mut self, vfs: Arc<VirtualFileSystem>) {
+        self.audio.attach_vfs(Arc::clone(&vfs));
         self.vfs = Some(vfs);
     }
 
@@ -141,6 +151,8 @@ impl EngineRuntime {
         if let Some(rb) = &mut self.render_bridge {
             rb.invalidate_world();
         }
+        self.audio
+            .set_occlusion_mesh(world.sound_occlusion.clone().map(Arc::new));
         self.world = Some(world);
     }
 
@@ -251,14 +263,16 @@ impl EngineRuntime {
             .as_ref()
             .and_then(|w| w.cform.as_ref())
             .map(CformBvh::build);
+        let gamemtl_ref = self.world.as_ref().and_then(|w| w.gamemtl.as_ref());
 
-        // 5. Fixed-timestep simulation steps (capsule physics, ALife, network sync)
+        // 5. Fixed-timestep simulation steps (capsule physics, footsteps, ALife, network sync)
         let fixed_dt = self.config.fixed_dt;
         let physics = &mut self.physics;
         let camera = &mut self.camera;
         let net = &mut self.network;
         let alife = &mut self.alife;
         let hud = &mut self.hud;
+        let audio = &mut self.audio;
         self.timer.step_fixed(fixed_dt, |f_dt| {
             let jump_req = std::mem::take(&mut jump_pending);
             physics.step(
@@ -270,6 +284,17 @@ impl EngineRuntime {
                 cform_bvh.as_ref(),
             );
             camera.position = physics.eye_position();
+
+            let horiz_speed = physics.velocity[0].hypot(physics.velocity[2]);
+            audio.step_footsteps(
+                f_dt,
+                physics.feet_position,
+                horiz_speed,
+                physics.grounded,
+                physics.crouching,
+                physics.ground_material,
+                gamemtl_ref,
+            );
 
             if let Some(session) = net.as_mut()
                 && let Ok(deltas) = session.update()
@@ -298,12 +323,27 @@ impl EngineRuntime {
             }
         });
 
-        // Keep host ALife actor orientation synced even if frame elapsed < fixed_dt
+        // Keep host ALife actor orientation & 3D audio listener synced every frame
         if let Some(mgr) = &mut self.alife {
             mgr.set_host_camera_transform(
                 self.camera.position,
                 self.camera.yaw,
                 self.camera.pitch,
+                self.physics.velocity,
+            );
+        }
+        self.audio.update_listener(AudioListener::from_basis(
+            self.camera.position,
+            self.camera.forward(),
+            self.camera.up(),
+            self.camera.right(),
+            self.physics.velocity,
+        ));
+
+        if self.input.is_action_just_pressed(Action::PrimaryFire) {
+            self.audio.trigger_weapon_sound(
+                "weapons\\ak74_shoot",
+                self.camera.position,
                 self.physics.velocity,
             );
         }
@@ -315,6 +355,61 @@ impl EngineRuntime {
                 self.camera.forward(),
                 self.camera.far_z,
             );
+
+            let (wind_vel, rain_dens) = world
+                .weather
+                .current_env
+                .as_ref()
+                .map(|e| (e.wind_velocity, e.rain_density))
+                .unwrap_or((1.5, 0.0));
+            let thunder_trigger = world.weather.last_thunderbolt.as_ref().and_then(|tb| {
+                tb.triggered_sound
+                    .as_deref()
+                    .map(|snd| (snd, tb.triggered_sound_pos, tb.triggered_distance.max(450.0)))
+            });
+            self.audio.update_weather(
+                wind_vel,
+                rain_dens,
+                world.weather.wetness.factor,
+                self.camera.position,
+                thunder_trigger,
+            );
+
+            if let Some(static_sounds) = &world.static_sounds {
+                let hour_24 = world.weather.cycle_time_sec / 3600.0;
+                self.audio.sync_static_sounds(static_sounds, hour_24);
+            }
+        }
+
+        if let Some(mgr) = &self.alife {
+            let mut active_keys = BTreeSet::new();
+            for entity in mgr.entities.values() {
+                if !entity.online || entity.role == EntityRole::LocalHostActor {
+                    continue;
+                }
+                let tracked = matches!(
+                    entity.role,
+                    EntityRole::Stalker
+                        | EntityRole::Mutant
+                        | EntityRole::Trader
+                        | EntityRole::RemotePeerActor { .. }
+                );
+                if tracked {
+                    let key = u64::from(entity.id);
+                    active_keys.insert(key);
+                    let speed_sq = entity.velocity[0] * entity.velocity[0]
+                        + entity.velocity[2] * entity.velocity[2];
+                    let moving = speed_sq > 0.05 || entity.anim_state != 0;
+                    self.audio.update_alife_emitter(
+                        key,
+                        entity.position,
+                        entity.velocity,
+                        moving,
+                        dt,
+                    );
+                }
+            }
+            self.audio.retain_alife_emitters(&active_keys);
         }
 
         // 6. Direct3D 12 7-stage render graph presentation
