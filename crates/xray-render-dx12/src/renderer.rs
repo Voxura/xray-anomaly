@@ -70,6 +70,10 @@ pub struct Dx12Renderer {
     pub clouds_renderer: Option<crate::clouds::CloudRenderer>,
     pub rain_renderer: Option<crate::rain::RainRenderer>,
     pub rain_manager: Option<crate::rain::RainManager>,
+    pub wallmark_renderer: Option<crate::wallmarks::WallmarkRenderer>,
+    pub wallmarks_manager: Option<crate::wallmarks::WallmarksManager>,
+    pub detail_renderer: Option<crate::details::DetailRenderer>,
+    pub detail_manager: Option<crate::details::DetailManager>,
     pub ui_canvas_pipeline: Option<crate::ui_canvas::UiCanvasPipeline>,
     pub ui_canvas: crate::ui_canvas::UiCanvas,
     pub(crate) geometry: GeometryState,
@@ -134,6 +138,10 @@ impl Dx12Renderer {
             clouds_renderer: None,
             rain_renderer: None,
             rain_manager: None,
+            wallmark_renderer: None,
+            wallmarks_manager: None,
+            detail_renderer: None,
+            detail_manager: None,
             ui_canvas_pipeline: None,
             ui_canvas: crate::ui_canvas::UiCanvas::default(),
             geometry: GeometryState::default(),
@@ -770,6 +778,129 @@ impl Dx12Renderer {
             &self.bindless_heap,
             raindrops_va,
             num_drops,
+            push,
+            rtv,
+            Some(dsv),
+            self.width,
+            self.height,
+        );
+        Ok(())
+    }
+
+    /// Access mutable reference to wallmarks manager
+    pub fn wallmarks_manager_mut(&mut self) -> &mut crate::wallmarks::WallmarksManager {
+        if self.wallmarks_manager.is_none() {
+            self.wallmarks_manager = Some(crate::wallmarks::WallmarksManager::new());
+        }
+        self.wallmarks_manager.as_mut().unwrap()
+    }
+
+    /// Record a draw call rendering static wallmark decals
+    pub fn draw_wallmarks(
+        &mut self,
+        vertices: &[crate::wallmarks::GpuWallmarkVertex],
+        push: &crate::wallmarks::WallmarkPushConstants,
+    ) -> WinResult<()> {
+        if vertices.is_empty() {
+            return Ok(());
+        }
+        if self.wallmark_renderer.is_none() {
+            self.wallmark_renderer = Some(crate::wallmarks::WallmarkRenderer::new(&self.device_ctx.device)?);
+        }
+        if self.wallmarks_manager.is_none() {
+            self.wallmarks_manager = Some(crate::wallmarks::WallmarksManager::new());
+        }
+        let vertices_va = self
+            .wallmarks_manager
+            .as_mut()
+            .unwrap()
+            .upload(&self.device_ctx.device, vertices)?;
+        let wallmark = self.wallmark_renderer.as_ref().unwrap();
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let camera_va = self
+            .geometry
+            .camera_gpu_va()
+            .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
+
+        wallmark.render(
+            cmd,
+            camera_va,
+            &self.bindless_heap,
+            vertices_va,
+            vertices.len() as u32,
+            push,
+            rtv,
+            Some(dsv),
+            self.width,
+            self.height,
+        );
+        Ok(())
+    }
+
+    /// Access mutable reference to detail manager
+    pub fn detail_manager_mut(&mut self) -> &mut crate::details::DetailManager {
+        if self.detail_manager.is_none() {
+            self.detail_manager = Some(crate::details::DetailManager::new());
+        }
+        self.detail_manager.as_mut().unwrap()
+    }
+
+    /// Record a draw call rendering instanced detail foliage
+    pub fn draw_details(
+        &mut self,
+        mesh_vertices: &[crate::details::GpuDetailVertex],
+        push: &crate::details::DetailPushConstants,
+    ) -> WinResult<()> {
+        if mesh_vertices.is_empty() {
+            return Ok(());
+        }
+        if self.detail_renderer.is_none() {
+            self.detail_renderer = Some(crate::details::DetailRenderer::new(&self.device_ctx.device)?);
+        }
+        if self.detail_manager.is_none() {
+            self.detail_manager = Some(crate::details::DetailManager::new());
+        }
+        let mgr = self.detail_manager.as_mut().unwrap();
+        let instance_count = mgr.instance_count() as u32;
+        if instance_count == 0 {
+            return Ok(());
+        }
+        let vertices_va = mgr.upload_mesh(&self.device_ctx.device, mesh_vertices)?;
+        let instances_va = mgr.upload_instances(&self.device_ctx.device)?;
+
+        let detail = self.detail_renderer.as_ref().unwrap();
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let camera_va = self
+            .geometry
+            .camera_gpu_va()
+            .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
+
+        detail.render(
+            cmd,
+            camera_va,
+            &self.bindless_heap,
+            vertices_va,
+            instances_va,
+            mesh_vertices.len() as u32,
+            instance_count,
             push,
             rtv,
             Some(dsv),

@@ -7,11 +7,18 @@
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::manual_div_ceil)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_is_multiple_of)]
+#![allow(clippy::chunks_exact_to_as_chunks)]
 
 pub mod allocators;
 pub mod bindless;
 pub mod clouds;
 pub mod deferred;
+pub mod details;
 pub mod device;
 pub mod ffi;
 pub mod graph;
@@ -30,8 +37,12 @@ pub mod sky;
 pub mod swapchain;
 pub mod texture;
 pub mod ui_canvas;
+pub mod wallmarks;
 
 pub use clouds::{CloudRenderer, CloudSimulation, CloudsPushConstants};
+pub use details::{
+    DetailManager, DetailPushConstants, DetailRenderer, GpuDetailInstance, GpuDetailVertex,
+};
 pub use geometry::PushDrawConstants;
 pub use geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
 pub use lighting::{DynamicLight, GpuLight, LightManager, LightType};
@@ -40,3 +51,6 @@ pub use rain::{GpuRainDrop, RainManager, RainPushConstants, RainRenderer};
 pub use shadow::DirectionalShadowMap;
 pub use sky::{SkyPushConstants, SkyRenderer};
 pub use ui_canvas::{GlyphQuad, GpuUiQuad, UiCanvas, UiCanvasPipeline, UiPushConstants};
+pub use wallmarks::{
+    GpuWallmarkVertex, WallmarkPushConstants, WallmarkRenderer, WallmarksManager,
+};

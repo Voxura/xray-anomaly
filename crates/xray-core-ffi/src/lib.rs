@@ -3,6 +3,8 @@
 //! Provides a generational slot-map handle registry and 100% panic containment across the DLL boundary.
 //! Prevents dangling pointers, use-after-free, double-free, and wild pointer crashes from C++.
 
+#![allow(clippy::missing_safety_doc)]
+
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic::catch_unwind;
