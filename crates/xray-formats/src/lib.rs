@@ -16,7 +16,7 @@
 //! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
 //! - `particle_sim`: Pure-Rust PAPI runtime simulator, 3D Perlin noise, `ParticleGroupInstance` timeline & billboard emitter
 //! - `particles`: `particles.xr` / loose `.pe` & `.pg` PAPI bytecode systems + LTX blood wallmark configs (no binary `level.wallmarks` in Anomaly/CoP)
-//! - `postprocess`: Phase-13 PPE noise UVs, Gaussian bloom kernels/adaptation, Uncharted2 tonemap, display gamma LUT & HDR10 parameters
+//! - `postprocess`: Phase-13+ PPE noise UVs, bloom kernels/adaptation, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision & SSFX TAA
 //! - `savegames`: Anomaly `.scop` LZO1X ALife savegame reader/writer (`GameDateTime`, spawn header, dynamic objects & 7 binary registries)
 //! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
 //! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, OMF pose evaluation & `1W`–`4W` CPU skinning
@@ -164,10 +164,12 @@ pub use particles::{
 pub use postprocess::{
     apply_st2084_pq_rgb, apply_vignette_rgb, bloom_build_4tap_uvs, bloom_filter_taps_horizontal,
     bloom_filter_taps_vertical, calc_gauss_k7, calc_gauss_wave, effects_sun_hdr_blend_factor,
-    uncharted2_tonemap_curve, BloomAdaptState, BloomConfig, BloomFilterGpuWeights,
-    GammaControlConfig, Hdr10Colorspace, Hdr10Config, Hdr10GpuParams, Hdr10TonemapMode,
-    Hdr10Tonemapper, ImageCorrectionConfig, ImageCorrectionGpuParams, PostprocessNoiseState,
-    SsfxBloomGpuParams, TonemapGpuParams, TonemapParams,
+    uncharted2_tonemap_curve, BloomAdaptState, BloomConfig, BloomFilterGpuWeights, DofConfig,
+    DofGpuParams, GammaControlConfig, GasmaskConfig, GasmaskGpuParams, Hdr10Colorspace,
+    Hdr10Config, Hdr10GpuParams, Hdr10PassKind, Hdr10PingPongPass, Hdr10TonemapMode,
+    Hdr10Tonemapper, HeatVisionConfig, HeatVisionGpuParams, ImageCorrectionConfig,
+    ImageCorrectionGpuParams, NightVisionGen, NightVisionProfile, PostprocessNoiseState,
+    SsfxBloomGpuParams, SsfxScreenConfig, SsfxTaaConfig, TonemapGpuParams, TonemapParams,
 };
 pub use savegames::{
     compress_scop, decompress_scop, validate_scop_header, ActorStatDetail, ActorStatSection,

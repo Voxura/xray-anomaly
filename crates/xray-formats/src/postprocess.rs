@@ -999,6 +999,496 @@ impl Hdr10Config {
             ],
         }
     }
+
+    /// Generate the half-resolution Kawase downsample + ping-pong blur pass schedule matching
+    /// `CRenderTarget::phase_hdr10_bloom` (`r4_rendertarget_phase_hdr10_bloom.cpp:27-76`).
+    pub fn bloom_blur_schedule(&self, screen_w: u32, screen_h: u32) -> Vec<Hdr10PingPongPass> {
+        build_hdr10_kawase_schedule(
+            screen_w,
+            screen_h,
+            self.bloom_blur_passes,
+            self.bloom_blur_scale,
+            false,
+        )
+    }
+
+    /// Generate the half-resolution Karis downsample, feature-gen & Kawase blur pass schedule
+    /// matching `CRenderTarget::phase_hdr10_lens_flare` (`r4_rendertarget_phase_hdr10_lens_flare.cpp:27-92`).
+    pub fn flare_blur_schedule(&self, screen_w: u32, screen_h: u32) -> Vec<Hdr10PingPongPass> {
+        build_hdr10_kawase_schedule(
+            screen_w,
+            screen_h,
+            self.flare_blur_passes,
+            self.flare_blur_scale,
+            true,
+        )
+    }
+}
+
+/// Kind of pass inside the half-res HDR10 bloom / lens-flare Kawase ping-pong chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hdr10PassKind {
+    Downsample,
+    FeatureGen,
+    BlurHorizontal,
+    BlurVertical,
+}
+
+/// Single render pass descriptor emitted by `Hdr10Config::{bloom_blur_schedule, flare_blur_schedule}`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hdr10PingPongPass {
+    pub kind: Hdr10PassKind,
+    /// `None` means sampling full-res scene color; `Some(0|1)` samples `rt_HDR10_HalfRes[slot]`.
+    pub src_halfres_slot: Option<u8>,
+    pub dst_halfres_slot: u8,
+    pub viewport_w: u32,
+    pub viewport_h: u32,
+    /// Constant value for `hdr10_bloom_sparams` / `hdr10_flare_sparams` (`[dx, dy, is_horz, 0.0]`).
+    pub sparams: [f32; 4],
+}
+
+fn build_hdr10_kawase_schedule(
+    screen_w: u32,
+    screen_h: u32,
+    blur_passes: u32,
+    blur_scale: f32,
+    with_feature_gen: bool,
+) -> Vec<Hdr10PingPongPass> {
+    let orig_w = screen_w.max(1) as f32;
+    let orig_h = screen_h.max(1) as f32;
+    let half_w = (screen_w / 2).max(1);
+    let half_h = (screen_h / 2).max(1);
+    let half_wf = half_w as f32;
+    let half_hf = half_h as f32;
+
+    let mut passes = Vec::with_capacity(
+        1 + usize::from(with_feature_gen) + (blur_passes as usize) * 2,
+    );
+    let mut src: u8 = 0;
+    let mut dst: u8 = 1;
+
+    passes.push(Hdr10PingPongPass {
+        kind: Hdr10PassKind::Downsample,
+        src_halfres_slot: None,
+        dst_halfres_slot: dst,
+        viewport_w: half_w,
+        viewport_h: half_h,
+        sparams: [1.0 / orig_w, 1.0 / orig_h, 0.0, 0.0],
+    });
+
+    if with_feature_gen {
+        std::mem::swap(&mut src, &mut dst);
+        passes.push(Hdr10PingPongPass {
+            kind: Hdr10PassKind::FeatureGen,
+            src_halfres_slot: Some(src),
+            dst_halfres_slot: dst,
+            viewport_w: half_w,
+            viewport_h: half_h,
+            sparams: [1.0 / orig_w, 1.0 / orig_h, 0.0, 0.0],
+        });
+    }
+
+    for pass in 0..blur_passes {
+        let radius = blur_scale * (pass + 1) as f32;
+        let dx = radius / half_wf;
+        let dy = radius / half_hf;
+        for dir in 0..2u32 {
+            std::mem::swap(&mut src, &mut dst);
+            let is_horz = (dir % 2) == 1;
+            passes.push(Hdr10PingPongPass {
+                kind: if is_horz {
+                    Hdr10PassKind::BlurHorizontal
+                } else {
+                    Hdr10PassKind::BlurVertical
+                },
+                src_halfres_slot: Some(src),
+                dst_halfres_slot: dst,
+                viewport_w: half_w,
+                viewport_h: half_h,
+                sparams: [dx, dy, if is_horz { 1.0 } else { 0.0 }, 0.0],
+            });
+        }
+    }
+
+    passes
+}
+
+// ============================================================================
+// Depth of Field, Gasmask Visor, Night/Heat Vision & SSFX Screen-Space Params
+// ============================================================================
+
+/// Depth of Field configuration (`ps_r2_dof*` in `xrRender_console.cpp:492-494`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DofConfig {
+    pub near: f32,
+    pub focus: f32,
+    pub far: f32,
+    pub sky_distance: f32,
+    pub kernel_size: f32,
+}
+
+impl Default for DofConfig {
+    fn default() -> Self {
+        Self {
+            near: -1.25,
+            focus: 0.0,
+            far: 600.0,
+            sky_distance: 30.0,
+            kernel_size: 0.25,
+        }
+    }
+}
+
+/// 32-byte GPU constant layout for `dof_params` + `dof_kernel` (`rendertarget_phase_dof.cpp:50-51`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DofGpuParams {
+    /// `[near, focus, far, ps_r2_dof_sky]`.
+    pub dof_params: [f32; 4],
+    /// `[0.5 / screen_w * kernel_size, 0.5 / screen_h * kernel_size, kernel_size, 0.0]`.
+    pub dof_kernel: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<DofGpuParams>() == 32);
+
+impl DofConfig {
+    #[inline]
+    pub fn to_gpu_params(&self, screen_w: u32, screen_h: u32) -> DofGpuParams {
+        let kx = (0.5 / screen_w.max(1) as f32) * self.kernel_size;
+        let ky = (0.5 / screen_h.max(1) as f32) * self.kernel_size;
+        DofGpuParams {
+            dof_params: [self.near, self.focus, self.far, self.sky_distance],
+            dof_kernel: [kx, ky, self.kernel_size, 0.0],
+        }
+    }
+}
+
+/// Visor gasmask & raindrop overlay settings (`ps_r2_mask_control`, `ps_r2_drops_control`,
+/// `xrRender_console.cpp:257-258`, `rendertarget_phase_gasmask_drops.cpp:47-48`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GasmaskConfig {
+    pub mask_control: [f32; 4],
+    pub drops_control: [f32; 3],
+}
+
+impl Default for GasmaskConfig {
+    fn default() -> Self {
+        Self {
+            mask_control: [0.0; 4],
+            drops_control: [0.0, 1.15, 0.0],
+        }
+    }
+}
+
+/// 32-byte GPU constant layout for `mask_control` + `drops_control`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GasmaskGpuParams {
+    pub mask_control: [f32; 4],
+    pub drops_control: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<GasmaskGpuParams>() == 32);
+
+impl GasmaskConfig {
+    #[inline]
+    pub fn is_mask_active(&self) -> bool {
+        self.mask_control[0] > 0.0
+    }
+
+    #[inline]
+    pub fn are_drops_active(&self) -> bool {
+        self.is_mask_active() && self.drops_control[0] > 0.0
+    }
+
+    #[inline]
+    pub fn to_gpu_params(&self) -> GasmaskGpuParams {
+        GasmaskGpuParams {
+            mask_control: self.mask_control,
+            drops_control: [
+                self.drops_control[0],
+                self.drops_control[1],
+                self.drops_control[2],
+                0.0,
+            ],
+        }
+    }
+}
+
+/// Beef's shader-based night vision generations (`r__nightvision` & `night_vision.h:27-137`).
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NightVisionGen {
+    #[default]
+    Off = 0,
+    Gen1 = 1,
+    Gen2 = 2,
+    Gen3 = 3,
+    Gen1Flipped = 10,
+    Gen1Centered = 11,
+}
+
+impl NightVisionGen {
+    #[inline]
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            1 => Self::Gen1,
+            2 => Self::Gen2,
+            3 => Self::Gen3,
+            10 => Self::Gen1Flipped,
+            11 => Self::Gen1Centered,
+            _ => Self::Off,
+        }
+    }
+
+    #[inline]
+    pub fn profile(self) -> Option<NightVisionProfile> {
+        match self {
+            Self::Off => None,
+            Self::Gen1 | Self::Gen1Flipped | Self::Gen1Centered => Some(NightVisionProfile {
+                min_blur: 0.25,
+                max_blur: 0.95,
+                min_vision_distance: 30.0,
+                max_vision_distance: 250.0,
+                dim_threshold: 0.7,
+                bloom_threshold: 0.11,
+                bloom_multiplier: 2.5,
+                crt_effect_factor: 0.05,
+                noise_factor: 0.15,
+                scintillation_constant: 0.999,
+                saturation_color: [0.4, 1.0, 0.1],
+                vignette_amount: 0.10,
+                circle_radius: 0.5,
+            }),
+            Self::Gen2 => Some(NightVisionProfile {
+                min_blur: 0.20,
+                max_blur: 0.80,
+                min_vision_distance: 30.0,
+                max_vision_distance: 400.0,
+                dim_threshold: 0.7,
+                bloom_threshold: 0.18,
+                bloom_multiplier: 2.0,
+                crt_effect_factor: 0.20,
+                noise_factor: 0.15,
+                scintillation_constant: 0.9993,
+                saturation_color: [0.3, 1.0, 0.3],
+                vignette_amount: 0.08,
+                circle_radius: 0.5,
+            }),
+            Self::Gen3 => Some(NightVisionProfile {
+                min_blur: 0.10,
+                max_blur: 0.60,
+                min_vision_distance: 30.0,
+                max_vision_distance: 600.0,
+                dim_threshold: 0.7,
+                bloom_threshold: 0.29,
+                bloom_multiplier: 2.0,
+                crt_effect_factor: 0.40,
+                noise_factor: 0.15,
+                scintillation_constant: 0.9995,
+                saturation_color: [0.1, 1.0, 0.8],
+                vignette_amount: 0.05,
+                circle_radius: 0.5,
+            }),
+        }
+    }
+
+    /// Evaluate Beef's NVG circular tube lens mask in `[0.0, 1.0]` with aspect-ratio correction
+    /// (`compute_lens_mask` & `aspect_ratio_correction` in `night_vision.h:97-148`).
+    pub fn lens_mask(self, uv: [f32; 2], screen_w: u32, screen_h: u32) -> f32 {
+        let aspect = screen_w.max(1) as f32 / screen_h.max(1) as f32;
+        let corrected = [(uv[0] - 0.5) * aspect + 0.5, uv[1]];
+        let in_circle = |center: [f32; 2]| -> bool {
+            let dx = corrected[0] - center[0];
+            let dy = corrected[1] - center[1];
+            (dx * dx + dy * dy).sqrt() <= 0.5
+        };
+        let inside = match self {
+            Self::Off => false,
+            Self::Gen1 => in_circle([0.75, 0.5]),
+            Self::Gen1Flipped => in_circle([0.25, 0.5]),
+            Self::Gen1Centered => in_circle([0.5, 0.5]),
+            Self::Gen2 => in_circle([0.25, 0.5]) || in_circle([0.75, 0.5]),
+            Self::Gen3 => {
+                in_circle([0.05, 0.5])
+                    || in_circle([0.30, 0.5])
+                    || in_circle([0.70, 0.5])
+                    || in_circle([0.95, 0.5])
+            }
+        };
+        if inside {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Per-generation physical optic/intensifier constants (`night_vision.h:36-92`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NightVisionProfile {
+    pub min_blur: f32,
+    pub max_blur: f32,
+    pub min_vision_distance: f32,
+    pub max_vision_distance: f32,
+    pub dim_threshold: f32,
+    pub bloom_threshold: f32,
+    pub bloom_multiplier: f32,
+    pub crt_effect_factor: f32,
+    pub noise_factor: f32,
+    pub scintillation_constant: f32,
+    pub saturation_color: [f32; 3],
+    pub vignette_amount: f32,
+    pub circle_radius: f32,
+}
+
+/// Thermal / HeatVision shader settings (`xrRender_console.cpp:274-282`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeatVisionConfig {
+    pub enabled: bool,
+    pub mode: f32,
+    pub cooldown_enabled: bool,
+    pub cooldown_time_ms: f32,
+    pub zombie_cold: bool,
+    pub steps: [f32; 4],
+    pub blurring: [f32; 4],
+    pub args_1: [f32; 4],
+    pub args_2: [f32; 4],
+}
+
+impl Default for HeatVisionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: 0.0,
+            cooldown_enabled: true,
+            cooldown_time_ms: 20_000.0,
+            zombie_cold: false,
+            steps: [0.45, 0.65, 0.76, 0.0],
+            blurring: [15.0, 4.0, 60.0, 0.0],
+            args_1: [0.0; 4],
+            args_2: [0.0; 4],
+        }
+    }
+}
+
+/// 64-byte GPU constant layout for `heatvision_params1/2` and `args1/2`
+/// (`Blender_Recorder_StandartBinding.cpp:473-498`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HeatVisionGpuParams {
+    pub params1: [f32; 4],
+    pub params2: [f32; 4],
+    pub args_1: [f32; 4],
+    pub args_2: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<HeatVisionGpuParams>() == 64);
+
+impl HeatVisionConfig {
+    #[inline]
+    pub fn to_gpu_params(&self) -> HeatVisionGpuParams {
+        HeatVisionGpuParams {
+            params1: [
+                if self.enabled { 1.0 } else { 0.0 },
+                self.steps[0],
+                self.steps[1],
+                self.steps[2],
+            ],
+            params2: [
+                self.blurring[0],
+                self.blurring[1],
+                self.blurring[2],
+                self.mode,
+            ],
+            args_1: self.args_1,
+            args_2: self.args_2,
+        }
+    }
+}
+
+/// Screen Space Shaders TAA jitter & sharpness settings (`ps_ssfx_taa`,
+/// `xrRender_console.cpp:408`, `Blender_Recorder_StandartBinding.cpp:1173-1193`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsfxTaaConfig {
+    pub enabled: f32,
+    pub jitter_amount: f32,
+    pub sharpness: f32,
+    pub extra: f32,
+}
+
+impl Default for SsfxTaaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: 1.0,
+            jitter_amount: 0.5,
+            sharpness: 0.6,
+            extra: 0.0,
+        }
+    }
+}
+
+impl SsfxTaaConfig {
+    /// 4-sample cross pattern (`TAA_Offset[4]`, `Blender_Recorder_StandartBinding.cpp:1179-1185`).
+    pub const TAA_OFFSETS: [[f32; 2]; 4] = [[0.0, -1.0], [-1.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+
+    /// Compute `ssfx_jitter` uniform `[jitter_x * amount, jitter_y * amount, enabled, extra]`.
+    #[inline]
+    pub fn jitter_for_frame(
+        &self,
+        frame_index: u32,
+        screen_w: u32,
+        screen_h: u32,
+        taa_feature_enabled: bool,
+    ) -> [f32; 4] {
+        if self.enabled > 0.0 && taa_feature_enabled {
+            let offset = Self::TAA_OFFSETS[(frame_index % 4) as usize];
+            let jx = (offset[0] / screen_w.max(1) as f32) * self.jitter_amount;
+            let jy = (offset[1] / screen_h.max(1) as f32) * self.jitter_amount;
+            [jx, jy, self.enabled, self.extra]
+        } else {
+            [0.0, 0.0, self.enabled, self.extra]
+        }
+    }
+
+    #[inline]
+    pub fn to_taa_setup(&self) -> [f32; 4] {
+        [self.enabled, self.jitter_amount, self.sharpness, self.extra]
+    }
+}
+
+/// SSFX fog, volumetric shadow & cascade settings (`xrRender_console.cpp:407-410, 449-454, 481-489`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsfxScreenConfig {
+    pub fog: [f32; 4],
+    pub fog_scattering: f32,
+    pub motionblur: [f32; 4],
+    pub lut: [f32; 4],
+    pub shadows: [f32; 3],
+    pub shadow_cascades: [f32; 3],
+    pub shadow_bias: [f32; 3],
+    pub grass_shadows: [f32; 4],
+    pub volumetric: [f32; 4],
+    pub wpn_dof_1: [f32; 4],
+    pub wpn_dof_2: f32,
+}
+
+impl Default for SsfxScreenConfig {
+    fn default() -> Self {
+        Self {
+            fog: [8.0, 1.3, 0.1, 0.0],
+            fog_scattering: 0.6,
+            motionblur: [6.0, 0.0, 0.0, 0.0],
+            lut: [0.0; 4],
+            shadows: [256.0, 1536.0, 0.0],
+            shadow_cascades: [20.0, 40.0, 160.0],
+            shadow_bias: [0.4, 0.03, 0.0],
+            grass_shadows: [0.0, 0.35, 30.0, 0.0],
+            volumetric: [1.0, 1.0, 3.0, 1.0],
+            wpn_dof_1: [0.0; 4],
+            wpn_dof_2: 1.0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1140,5 +1630,77 @@ mod tests {
         assert_eq!(effects_sun_hdr_blend_factor(12.0, 4.5, 6.0, 18.5, 21.0), 1.0);
         let dusk = effects_sun_hdr_blend_factor(19.75, 4.5, 6.0, 18.5, 21.0);
         assert!((dusk - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn hdr10_kawase_schedules_alternate_ping_pong_slots() {
+        let cfg = Hdr10Config {
+            bloom_blur_passes: 2,
+            flare_blur_passes: 1,
+            ..Hdr10Config::default()
+        };
+        let bloom_sched = cfg.bloom_blur_schedule(1920, 1080);
+        assert_eq!(bloom_sched.len(), 5);
+        assert_eq!(bloom_sched[0].kind, Hdr10PassKind::Downsample);
+        assert_eq!(bloom_sched[0].src_halfres_slot, None);
+        assert_eq!(bloom_sched[0].dst_halfres_slot, 1);
+        assert_eq!(bloom_sched[1].kind, Hdr10PassKind::BlurVertical);
+        assert_eq!(bloom_sched[1].src_halfres_slot, Some(1));
+        assert_eq!(bloom_sched[1].dst_halfres_slot, 0);
+        assert_eq!(bloom_sched[1].sparams[2], 0.0);
+        assert_eq!(bloom_sched[2].kind, Hdr10PassKind::BlurHorizontal);
+        assert_eq!(bloom_sched[2].src_halfres_slot, Some(0));
+        assert_eq!(bloom_sched[2].dst_halfres_slot, 1);
+        assert_eq!(bloom_sched[2].sparams[2], 1.0);
+
+        let flare_sched = cfg.flare_blur_schedule(1280, 720);
+        assert_eq!(flare_sched.len(), 4);
+        assert_eq!(flare_sched[0].kind, Hdr10PassKind::Downsample);
+        assert_eq!(flare_sched[1].kind, Hdr10PassKind::FeatureGen);
+        assert_eq!(flare_sched[1].src_halfres_slot, Some(1));
+        assert_eq!(flare_sched[1].dst_halfres_slot, 0);
+        assert_eq!(flare_sched[2].kind, Hdr10PassKind::BlurVertical);
+        assert_eq!(flare_sched[2].src_halfres_slot, Some(0));
+        assert_eq!(flare_sched[2].dst_halfres_slot, 1);
+    }
+
+    #[test]
+    fn dof_gasmask_nvg_heatvision_and_ssfx_configs() {
+        let dof = DofConfig::default().to_gpu_params(1920, 1080);
+        assert_eq!(dof.dof_params, [-1.25, 0.0, 600.0, 30.0]);
+        assert!((dof.dof_kernel[0] - (0.5 / 1920.0 * 0.25)).abs() < 1e-7);
+
+        let mut gm = GasmaskConfig::default();
+        assert!(!gm.is_mask_active());
+        gm.mask_control[0] = 1.0;
+        gm.drops_control[0] = 0.75;
+        assert!(gm.is_mask_active() && gm.are_drops_active());
+        assert_eq!(gm.to_gpu_params().drops_control, [0.75, 1.15, 0.0, 0.0]);
+
+        assert!(NightVisionGen::Off.profile().is_none());
+        let gen3 = NightVisionGen::Gen3.profile().unwrap();
+        assert_eq!(gen3.max_vision_distance, 600.0);
+        assert_eq!(NightVisionGen::Gen1Centered.lens_mask([0.5, 0.5], 1920, 1080), 1.0);
+        assert_eq!(NightVisionGen::Gen1Centered.lens_mask([0.0, 0.0], 1920, 1080), 0.0);
+        assert_eq!(NightVisionGen::Gen2.lens_mask([0.25, 0.5], 1000, 1000), 1.0);
+
+        let hv = HeatVisionConfig {
+            enabled: true,
+            mode: 1.0,
+            ..HeatVisionConfig::default()
+        }
+        .to_gpu_params();
+        assert_eq!(hv.params1, [1.0, 0.45, 0.65, 0.76]);
+        assert_eq!(hv.params2[3], 1.0);
+
+        let taa = SsfxTaaConfig::default();
+        let j0 = taa.jitter_for_frame(0, 1000, 1000, true);
+        assert_eq!(j0, [0.0, -0.0005, 1.0, 0.0]);
+        let j_off = taa.jitter_for_frame(1, 1000, 1000, false);
+        assert_eq!(j_off, [0.0, 0.0, 1.0, 0.0]);
+
+        let ssfx = SsfxScreenConfig::default();
+        assert_eq!(ssfx.shadow_cascades, [20.0, 40.0, 160.0]);
+        assert_eq!(ssfx.fog_scattering, 0.6);
     }
 }
