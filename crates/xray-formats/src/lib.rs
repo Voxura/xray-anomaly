@@ -12,6 +12,7 @@
 //! - `hom`: `level.hom` Hierarchical Occlusion Mapping parser, `ClipFrustum` & 64x64->8 `OccRasterizer`
 //! - `lanims`: `$game_data$/lanims.xr` keyframed `LightAnimItem` / `LightAnimLibrary` color anims
 //! - `level`: `level` & `level.geom`/`level.geomx` scene, visuals, sectors, portals, lights & `D3DVERTEXELEMENT9` VB/IB/SWIS decoders
+//! - `lighting`: Pure-Rust dynamic lights, `SMAP_Allocator`, `ComputeXFS`, spot/point accumulation matrices & `LightTrack` hemisphere/visibility cache
 //! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, LOD, tree, and skeletal mesh + bone/IK parser
 //! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
 //! - `particle_sim`: Pure-Rust PAPI runtime simulator, 3D Perlin noise, `ParticleGroupInstance` timeline & billboard emitter
@@ -41,6 +42,7 @@ pub mod gamemtl;
 pub mod hom;
 pub mod lanims;
 pub mod level;
+pub mod lighting;
 pub mod ogf;
 pub mod omf;
 pub mod particle_sim;
@@ -125,6 +127,17 @@ pub use level::{
     BuildLightRecord, BuildLights, LevelData, LevelGeometry, LevelGlow, LevelLight, LevelPortal,
     LevelSector, LevelShaderRef, LevelVertexBuffer, ResolvedLevelMesh, TorchLightConfig,
     VertexDeclarator, VertexElement9, BUILD_LIGHT_RECORD_SIZE, LEVEL_GLOW_RECORD_SIZE,
+};
+pub use lighting::{
+    accum_hemi_cube, compute_r_ssa_glod_bounds, compute_spot_accum_constants,
+    compute_texgen_jitter, compute_texgen_screen, compute_u_diffuse2s, hemi_cube_faces,
+    near_plane_intersects_sphere, pack_smap_requests, DynamicLight, GlossConfig, LightSmapConfig,
+    LightSmapXform, LightTrackConfig, ObjectLightTracker, OmnipartFaceLight, RenderLightType,
+    SmapAllocator, SmapPackAssignment, SmapRect, SpotAccumConfig, SpotAccumConstants,
+    TrackedLightEntry, HEMI_SAMPLE_DIRS, LIGHT_LS_SQUALITY_DEFAULT, LIGHT_SLIGHT_FADE_DEFAULT,
+    LIGHT_SSA_GLOD_END_DEFAULT, LIGHT_SSA_GLOD_START_DEFAULT, LT_DEC, LT_HEMISAMPLES, LT_INC,
+    OMNIPART_CUBE_DIRS, OMNIPART_CUBE_UP_HINTS, SMAP_ADAPT_MAX, SMAP_ADAPT_MIN, SMAP_ADAPT_OPTIMAL,
+    SMAP_NEAR_PLANE, TEX_JITTER_SIZE,
 };
 pub use ogf::{
     bone_shape_flags, fvf_flags, matrix_forward_dir, matrix_invert_43, matrix_mul_43,
@@ -230,9 +243,10 @@ pub use spawns::{
     POINT_BASE, RPOINT_CHUNK, SPAWN_VERSION, WAYOBJECT_VERSION, WAY_BASE, WAY_PATROLPATH_CHUNK,
 };
 pub use sun::{
-    compute_sun_cascades, matrix_invert_44, matrix_ortho_off_center_lh, matrix_translate,
-    snap_sun_cascade_to_texels, DumbConvexVolume, FixedConvexVolume, SunCascadeConfig,
-    SunCascadeResult, SunCascadeSpec, SunRay, SUN_FRUSTUM_CORNERS, SUN_FRUSTUM_FACETABLE,
+    compute_sun_cascades, compute_sun_shadow_matrix, matrix_invert_44,
+    matrix_ortho_off_center_lh, matrix_translate, snap_sun_cascade_to_texels, CloudsShadowState,
+    DumbConvexVolume, FixedConvexVolume, SunCascadeBiasConfig, SunCascadeConfig, SunCascadeResult,
+    SunCascadeSpec, SunRay, SUN_FRUSTUM_CORNERS, SUN_FRUSTUM_FACETABLE,
 };
 pub use thm::{
     dds_caps2, strip_texture_extension, texture_flags, texture_stem_to_dds_vpath,

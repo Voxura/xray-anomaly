@@ -7,8 +7,11 @@
 
 use crate::camera::matrix_build_camera_dir;
 use crate::hom::{ClipFrustum, Plane};
-use crate::ogf::{matrix_mul_44, matrix_transform_projected, XRayMatrix, XRAY_IDENTITY_MATRIX};
+use crate::ogf::{
+    matrix_mul_44, matrix_scale, matrix_transform_projected, XRayMatrix, XRAY_IDENTITY_MATRIX,
+};
 use crate::skinning::matrix_transform_dir;
+use crate::weather::dir_from_hp;
 
 const EPS_L: f32 = 1e-3;
 const EPS_S: f32 = 1e-7;
@@ -862,6 +865,110 @@ pub fn compute_sun_cascades(
     results
 }
 
+/// Depth range/bias & TSM parameters for `accum_direct` shadow projection
+/// (`xrRender_console.cpp:229-239`, `r4_rendertarget_accum_direct.cpp:165-196`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SunCascadeBiasConfig {
+    pub near_scale: f32,
+    pub near_bias: f32,
+    pub far_scale: f32,
+    pub far_bias: f32,
+    pub tsm_bias: f32,
+}
+
+impl Default for SunCascadeBiasConfig {
+    fn default() -> Self {
+        Self {
+            near_scale: 1.0,
+            near_bias: 0.00001,
+            far_scale: 1.0,
+            far_bias: -0.00002,
+            tsm_bias: -0.01,
+        }
+    }
+}
+
+/// Build the view-space -> sun shadow-map UV+depth transform (`m_shadow`) for `accum_direct`
+/// (`r4_rendertarget_accum_direct.cpp:165-196`).
+pub fn compute_sun_shadow_matrix(
+    is_near_cascade: bool,
+    apply_tsm_bias: bool,
+    sun_combine: &XRayMatrix,
+    inv_view: &XRayMatrix,
+    sun_dir_view: [f32; 3],
+    cfg: &SunCascadeBiasConfig,
+) -> XRayMatrix {
+    let f_range = if is_near_cascade {
+        cfg.near_scale
+    } else {
+        cfg.far_scale
+    };
+    let f_bias = if is_near_cascade {
+        -cfg.near_bias
+    } else {
+        cfg.far_bias
+    };
+    let m_texel_adjust: XRayMatrix = [
+        [0.5, 0.0, 0.0, 0.0],
+        [0.0, -0.5, 0.0, 0.0],
+        [0.0, 0.0, f_range, 0.0],
+        [0.5, 0.5, f_bias, 1.0],
+    ];
+    let xf_project = matrix_mul_44(&m_texel_adjust, sun_combine);
+    let mut m_shadow = matrix_mul_44(&xf_project, inv_view);
+    if apply_tsm_bias {
+        let dir = normalize3_or(sun_dir_view, [0.0, 0.0, 1.0]);
+        let bias_t = matrix_translate([
+            dir[0] * cfg.tsm_bias,
+            dir[1] * cfg.tsm_bias,
+            dir[2] * cfg.tsm_bias,
+        ]);
+        m_shadow = matrix_mul_44(&m_shadow, &bias_t);
+    }
+    m_shadow
+}
+
+/// Persistent scrolling UV transform generator for directional cloud shadows (`m_sunmask`,
+/// `r4_rendertarget_accum_direct.cpp:200-222`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CloudsShadowState {
+    pub w_shift: f32,
+}
+
+impl CloudsShadowState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Advance cloud shadow scrolling by `dt` seconds and return the view-space `m_sunmask` matrix.
+    pub fn step_and_matrix(
+        &mut self,
+        dt: f32,
+        sun_dir_world: [f32; 3],
+        wind_direction_rad: f32,
+        wind_velocity: f32,
+        inv_view: &XRayMatrix,
+    ) -> XRayMatrix {
+        let w_speed = (wind_velocity * 0.001).clamp(0.1, 1.0);
+        self.w_shift -= 0.005 * w_speed * dt.max(0.0);
+
+        let normal = dir_from_hp(-wind_direction_rad, 0.0);
+        let dir = normalize3_or(sun_dir_world, [0.0, -1.0, 0.0]);
+        let m_xform = matrix_build_camera_dir([0.0, 0.0, 0.0], dir, normal);
+        let local_normal = normalize3_or(matrix_transform_dir(&m_xform, normal), [0.0, 1.0, 0.0]);
+
+        let mut m_clouds_shadow = matrix_mul_44(&m_xform, inv_view);
+        let m_scale = matrix_scale(0.002, 0.002, 1.0);
+        m_clouds_shadow = matrix_mul_44(&m_scale, &m_clouds_shadow);
+        let m_trans = matrix_translate([
+            local_normal[0] * self.w_shift,
+            local_normal[1] * self.w_shift,
+            local_normal[2] * self.w_shift,
+        ]);
+        matrix_mul_44(&m_trans, &m_clouds_shadow)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -927,5 +1034,35 @@ mod tests {
                 assert!(row.iter().all(|v| v.is_finite()));
             }
         }
+
+        let inv_view = matrix_invert_44(&view).unwrap();
+        let sun_dir_view = matrix_transform_dir(&view, sun_dir);
+        let bias_cfg = SunCascadeBiasConfig::default();
+        let near_mat = compute_sun_shadow_matrix(
+            true,
+            false,
+            &cascades[0].view_proj,
+            &inv_view,
+            sun_dir_view,
+            &bias_cfg,
+        );
+        let far_mat = compute_sun_shadow_matrix(
+            false,
+            true,
+            &cascades[2].view_proj,
+            &inv_view,
+            sun_dir_view,
+            &bias_cfg,
+        );
+        assert!(near_mat.iter().flatten().all(|v| v.is_finite()));
+        assert!(far_mat.iter().flatten().all(|v| v.is_finite()));
+        assert_ne!(near_mat, far_mat);
+
+        let mut clouds = CloudsShadowState::new();
+        let c0 = clouds.step_and_matrix(1.0, sun_dir, 0.5, 50.0, &inv_view);
+        assert!((clouds.w_shift - (-0.005 * 0.1 * 1.0)).abs() < 1e-6);
+        let c1 = clouds.step_and_matrix(2.0, sun_dir, 0.5, 500.0, &inv_view);
+        assert!((clouds.w_shift - (-0.0005 - 0.005 * 0.5 * 2.0)).abs() < 1e-6);
+        assert_ne!(c0[3][1], c1[3][1]);
     }
 }
