@@ -4,6 +4,8 @@
 //! `src/Layers/xrRender/ETextureParams.cpp`, and `src/Layers/xrRender/TextureDescrManager.cpp`
 //! (including companion `[texture]` `.ltx` fallback metadata).
 
+use std::collections::BTreeMap;
+
 use xray_core::LtxDocument;
 
 use crate::chunk::{ByteCursor, ChunkReader, FormatError};
@@ -475,6 +477,245 @@ pub fn texture_stem_to_thm_vpath(tex_name: &str) -> String {
         format!("{work}.thm")
     } else {
         format!("textures\\{work}.thm")
+    }
+}
+
+/// Default `r__dtex_range` detail-texture fade distance (`TextureDescrManager.cpp:9`).
+pub const DTEX_RANGE_DEFAULT: f32 = 50.0;
+
+/// Detail usage bitmask stored in [`TextureAssoc::usage`] (`TextureDescrManager.cpp:83-87, 235-237`).
+pub mod detail_usage {
+    pub const DIFFUSE: u8 = 1 << 0;
+    pub const BUMP: u8 = 1 << 1;
+}
+
+/// Detail-texture scale binder (`class cl_dt_scaler` in `TextureDescrManager.cpp:11-24`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailScaler {
+    pub scale: f32,
+}
+
+impl Default for DetailScaler {
+    fn default() -> Self {
+        Self { scale: 1.0 }
+    }
+}
+
+impl DetailScaler {
+    /// Evaluate `dt_params = [scale, scale, scale, 1.0 / r_dtex_range]` (`TextureDescrManager.cpp:22`).
+    #[inline]
+    pub fn to_dt_params(self, r_dtex_range: f32) -> [f32; 4] {
+        let inv_range = if r_dtex_range.abs() > 1e-6 && r_dtex_range.is_finite() {
+            1.0 / r_dtex_range
+        } else {
+            1.0 / DTEX_RANGE_DEFAULT
+        };
+        [self.scale, self.scale, self.scale, inv_range]
+    }
+}
+
+/// Detail-map association (`texture_assoc` in `TextureDescrManager.h`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureAssoc {
+    pub detail_name: String,
+    pub usage: u8,
+}
+
+/// Bump/parallax & surface-material association (`texture_spec` in `TextureDescrManager.h`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextureSpec {
+    pub bump_name: String,
+    pub material: f32,
+    pub use_steep_parallax: bool,
+}
+
+/// Combined descriptor record (`texture_desc` in `TextureDescrManager.h`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TextureDescrEntry {
+    pub assoc: Option<TextureAssoc>,
+    pub spec: Option<TextureSpec>,
+}
+
+#[inline]
+fn normalize_descr_key(tex_name: &str) -> String {
+    strip_texture_extension(tex_name)
+        .replace('/', "\\")
+        .trim_start_matches('\\')
+        .to_ascii_lowercase()
+}
+
+/// Multi-texture descriptor lookup table matching `CTextureDescrMngr`
+/// (`src/Layers/xrRender/TextureDescrManager.cpp:40-257`).
+///
+/// Mirrors X-Ray's load priority: `$game_textures$` `.thm` -> `$level$` `.thm` -> `.ltx` fallback
+/// (without overwriting entries already loaded from `.thm`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TextureDescrTable {
+    entries: BTreeMap<String, TextureDescrEntry>,
+    detail_scalers: BTreeMap<String, DetailScaler>,
+}
+
+impl TextureDescrTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Insert or update an entry from a parsed `.thm` (`CTextureDescrMngr::LoadTHM`,
+    /// `TextureDescrManager.cpp:62-105`).
+    ///
+    /// Returns `true` if `params.texture_type` is registered (`Image`, `Terrain`, `NormalMap`).
+    pub fn insert_thm(&mut self, tex_name: &str, params: &TextureParams) -> bool {
+        if !matches!(
+            params.texture_type,
+            TextureType::Image | TextureType::Terrain | TextureType::NormalMap
+        ) {
+            return false;
+        }
+        let key = normalize_descr_key(tex_name);
+        let entry = self.entries.entry(key.clone()).or_default();
+
+        let has_diffuse_or_bump_flag = (params.flags
+            & (texture_flags::FL_DIFFUSE_DETAIL | texture_flags::FL_BUMP_DETAIL))
+            != 0;
+        if !params.detail_name.is_empty() && has_diffuse_or_bump_flag {
+            let mut usage = 0u8;
+            if (params.flags & texture_flags::FL_DIFFUSE_DETAIL) != 0 {
+                usage |= detail_usage::DIFFUSE;
+            }
+            if (params.flags & texture_flags::FL_BUMP_DETAIL) != 0 {
+                usage |= detail_usage::BUMP;
+            }
+            entry.assoc = Some(TextureAssoc {
+                detail_name: params.detail_name.clone(),
+                usage,
+            });
+            self.detail_scalers.insert(
+                key,
+                DetailScaler {
+                    scale: params.detail_scale,
+                },
+            );
+        }
+
+        let (bump_name, use_steep_parallax) = match params.bump_mode {
+            TextureBumpMode::Use => (params.bump_name.clone(), false),
+            TextureBumpMode::UseParallax => (params.bump_name.clone(), true),
+            TextureBumpMode::Reserved | TextureBumpMode::None => (String::new(), false),
+        };
+        entry.spec = Some(TextureSpec {
+            bump_name,
+            material: params.effective_material_id(),
+            use_steep_parallax,
+        });
+        true
+    }
+
+    /// Insert a companion `[texture]` `.ltx` fallback if `tex_name` is not already present
+    /// (`CTextureDescrMngr::LoadLTX`, `TextureDescrManager.cpp:109-158`).
+    ///
+    /// Returns `Ok(true)` if inserted, `Ok(false)` if already present (`.thm` priority) or missing
+    /// the `[texture]` section.
+    pub fn insert_ltx_fallback(&mut self, tex_name: &str, ltx_text: &str) -> Result<bool, FormatError> {
+        let key = normalize_descr_key(tex_name);
+        if self.entries.contains_key(&key) {
+            return Ok(false);
+        }
+        let params = match TextureParams::from_ltx_fallback(&key, ltx_text) {
+            Ok(tp) => tp,
+            Err(FormatError::MissingChunk(_)) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        let material = params.effective_material_id();
+        let use_steep_parallax = params.bump_mode == TextureBumpMode::UseParallax;
+        self.entries.insert(
+            key,
+            TextureDescrEntry {
+                assoc: None,
+                spec: Some(TextureSpec {
+                    bump_name: params.bump_name,
+                    material,
+                    use_steep_parallax,
+                }),
+            },
+        );
+        Ok(true)
+    }
+
+    /// Look up raw descriptor entry by texture stem or filename.
+    #[inline]
+    pub fn get(&self, tex_name: &str) -> Option<&TextureDescrEntry> {
+        let key = normalize_descr_key(tex_name);
+        self.entries.get(&key)
+    }
+
+    /// Matching `CTextureDescrMngr::GetBumpName` (`TextureDescrManager.cpp:189-200`).
+    #[inline]
+    pub fn get_bump_name(&self, tex_name: &str) -> &str {
+        self.get(tex_name)
+            .and_then(|e| e.spec.as_ref())
+            .map(|s| s.bump_name.as_str())
+            .unwrap_or("")
+    }
+
+    /// Matching `CTextureDescrMngr::UseSteepParallax` (`TextureDescrManager.cpp:202-213`).
+    #[inline]
+    pub fn use_steep_parallax(&self, tex_name: &str) -> bool {
+        self.get(tex_name)
+            .and_then(|e| e.spec.as_ref())
+            .is_some_and(|s| s.use_steep_parallax)
+    }
+
+    /// Matching `CTextureDescrMngr::GetMaterial` (`TextureDescrManager.cpp:215-226`, default `1.0`).
+    #[inline]
+    pub fn get_material(&self, tex_name: &str) -> f32 {
+        self.get(tex_name)
+            .and_then(|e| e.spec.as_ref())
+            .map(|s| s.material)
+            .unwrap_or(1.0)
+    }
+
+    /// Matching `CTextureDescrMngr::GetTextureUsage` (`TextureDescrManager.cpp:228-240`).
+    ///
+    /// Returns `(has_diffuse_detail, has_bump_detail)`.
+    #[inline]
+    pub fn get_texture_usage(&self, tex_name: &str) -> (bool, bool) {
+        self.get(tex_name)
+            .and_then(|e| e.assoc.as_ref())
+            .map(|a| {
+                (
+                    (a.usage & detail_usage::DIFFUSE) != 0,
+                    (a.usage & detail_usage::BUMP) != 0,
+                )
+            })
+            .unwrap_or((false, false))
+    }
+
+    /// Matching `CTextureDescrMngr::GetDetailTexture` (`TextureDescrManager.cpp:242-257`).
+    #[inline]
+    pub fn get_detail_texture(&self, tex_name: &str) -> Option<(&str, Option<DetailScaler>)> {
+        let key = normalize_descr_key(tex_name);
+        let assoc = self.entries.get(&key)?.assoc.as_ref()?;
+        let scaler = self.detail_scalers.get(&key).copied();
+        Some((assoc.detail_name.as_str(), scaler))
+    }
+}
+
+impl From<TextureSpec> for TextureDescrEntry {
+    fn from(spec: TextureSpec) -> Self {
+        Self {
+            assoc: None,
+            spec: Some(spec),
+        }
     }
 }
 
@@ -1268,5 +1509,56 @@ mod tests {
         );
         let thm = TextureParams::parse(&thm_w.into_bytes()).unwrap();
         assert!(thm.is_cubemap());
+    }
+
+    #[test]
+    fn texture_descr_table_thm_priority_ltx_fallback_and_detail_scaler() {
+        let mut table = TextureDescrTable::new();
+        assert!(table.is_empty());
+        assert_eq!(table.get_material("missing\\tex"), 1.0);
+        assert_eq!(table.get_bump_name("missing\\tex"), "");
+        assert!(!table.use_steep_parallax("missing\\tex"));
+        assert_eq!(table.get_texture_usage("missing\\tex"), (false, false));
+
+        let wall_thm = TextureParams {
+            texture_type: TextureType::Image,
+            flags: texture_flags::FL_DIFFUSE_DETAIL | texture_flags::FL_BUMP_DETAIL,
+            detail_name: "detail\\detail_brick".to_string(),
+            detail_scale: 4.5,
+            material: TextureMaterial::PhongMetal as u32,
+            material_weight: 0.25,
+            bump_mode: TextureBumpMode::UseParallax,
+            bump_name: "wall\\wall_brick_bump".to_string(),
+            ..TextureParams::default()
+        };
+        assert!(table.insert_thm("wall/wall_brick.dds", &wall_thm));
+
+        // Cubemap THM entries are skipped by LoadTHM
+        let sky_thm = TextureParams {
+            texture_type: TextureType::CubeMap,
+            ..TextureParams::default()
+        };
+        assert!(!table.insert_thm("sky\\sky_01", &sky_thm));
+
+        // .ltx cannot overwrite an existing .thm entry
+        let ltx_override_attempt = "[texture]\nbump_mode = use\nbump_name = wrong_bump\nmaterial = 0.5\n";
+        assert!(!table.insert_ltx_fallback("wall\\wall_brick", ltx_override_attempt).unwrap());
+
+        assert_eq!(table.get_bump_name("WALL\\wall_brick.TGA"), "wall\\wall_brick_bump");
+        assert!(table.use_steep_parallax("wall\\wall_brick"));
+        assert!((table.get_material("wall\\wall_brick") - 2.25).abs() < 1e-6);
+        assert_eq!(table.get_texture_usage("wall\\wall_brick"), (true, true));
+
+        let (det_name, scaler) = table.get_detail_texture("wall\\wall_brick").unwrap();
+        assert_eq!(det_name, "detail\\detail_brick");
+        let dt = scaler.unwrap().to_dt_params(DTEX_RANGE_DEFAULT);
+        assert_eq!(dt, [4.5, 4.5, 4.5, 1.0 / 50.0]);
+
+        // .ltx fallback populates missing entry
+        let fallback_ltx = "[texture]\nbump_mode = parallax\nmaterial = 1.75\n";
+        assert!(table.insert_ltx_fallback("floor\\tile_01", fallback_ltx).unwrap());
+        assert_eq!(table.get_bump_name("floor\\tile_01"), "floor\\tile_01_bump");
+        assert!(table.use_steep_parallax("floor\\tile_01"));
+        assert!((table.get_material("floor\\tile_01") - 1.75).abs() < 1e-6);
     }
 }

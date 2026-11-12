@@ -1740,6 +1740,178 @@ impl PdaShaderParams {
     }
 }
 
+/// Global engine shader constants (`CGShaderConstants` / `g_pGamePersistent->m_pGShaderConstants`,
+/// `Blender_Recorder_StandartBinding.cpp:646-676`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GlobalShaderConstants {
+    pub hud_params: [f32; 4],
+    pub hud_fov_params: [f32; 4],
+    pub m_script_params: [f32; 4],
+    pub m_blender_mode: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<GlobalShaderConstants>() == 64);
+
+/// Developer shader tweak constants `shader_param_1..8` (`ps_dev_param_1..8`,
+/// `Blender_Recorder_StandartBinding.cpp:810-881`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DevDebugParams {
+    pub params: [[f32; 4]; 8],
+}
+
+const _: () = assert!(std::mem::size_of::<DevDebugParams>() == 128);
+
+/// Remaining SSFX surface, flora, wind, POM, HUD drop & timing console settings
+/// (`xrRender_console.cpp:406-475`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsfxSurfaceConfig {
+    pub floravariation: [f32; 4],
+    pub pom: [f32; 4],
+    pub terrain_pom: [f32; 4],
+    pub terrain_offset: [f32; 4],
+    pub wind_grass: [f32; 4],
+    pub wind_trees: [f32; 4],
+    pub florafixes_1: [f32; 4],
+    pub florafixes_2: [f32; 4],
+    pub wetsurfaces_1: [f32; 4],
+    pub wetsurfaces_2: [f32; 4],
+    pub is_underground: bool,
+    pub gloss_factor: f32,
+    pub gloss_minmax: [f32; 3],
+    pub lightsetup_1: [f32; 4],
+    pub hud_drops_1: [f32; 4],
+    pub hud_drops_2: [f32; 4],
+    pub hud_hemi: f32,
+    pub blood_decals: [f32; 4],
+}
+
+impl Default for SsfxSurfaceConfig {
+    fn default() -> Self {
+        Self {
+            floravariation: [0.025, 0.1, 0.025, 0.05],
+            pom: [16.0, 12.0, 0.035, 0.4],
+            terrain_pom: [12.0, 20.0, 0.04, 1.0],
+            terrain_offset: [0.0; 4],
+            wind_grass: [9.5, 1.4, 1.5, 0.4],
+            wind_trees: [11.0, 0.15, 0.5, 0.15],
+            florafixes_1: [0.3, 0.21, 0.3, 0.21],
+            florafixes_2: [2.0, 1.0, 0.0, 0.0],
+            wetsurfaces_1: [1.0; 4],
+            wetsurfaces_2: [1.0; 4],
+            is_underground: false,
+            gloss_factor: 0.5,
+            gloss_minmax: [0.0, 0.92, 0.0],
+            lightsetup_1: [0.35, 0.5, 0.0, 0.0],
+            hud_drops_1: [1.0; 4],
+            hud_drops_2: [1.5, 0.85, 0.0, 2.0],
+            hud_hemi: 0.15,
+            blood_decals: [0.6, 0.6, 0.0, 0.0],
+        }
+    }
+}
+
+/// 304-byte packed GPU uniform block for SSFX surface/flora/HUD/timing constants
+/// (`Blender_Recorder_StandartBinding.cpp:899-1227`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SsfxSurfaceUniforms {
+    pub ssfx_gloss: [f32; 4],
+    pub ssfx_wetsurfaces_1: [f32; 4],
+    pub ssfx_wetsurfaces_2: [f32; 4],
+    pub ssfx_floravariation: [f32; 4],
+    pub ssfx_florafixes_1: [f32; 4],
+    pub ssfx_florafixes_2: [f32; 4],
+    pub ssfx_wsetup_grass: [f32; 4],
+    pub ssfx_wsetup_trees: [f32; 4],
+    pub ssfx_pom: [f32; 4],
+    pub ssfx_terrain_pom: [f32; 4],
+    pub ssfx_terrain_offset: [f32; 4],
+    pub ssfx_lightsetup_1: [f32; 4],
+    pub ssfx_hud_drops_1: [f32; 4],
+    pub ssfx_hud_drops_2: [f32; 4],
+    pub ssfx_hud_hemi: [f32; 4],
+    pub ssfx_blood_decals: [f32; 4],
+    pub ssfx_is_underground: [f32; 4],
+    pub ssfx_issvp: [f32; 4],
+    pub ssfx_timedelta: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<SsfxSurfaceUniforms>() == 304);
+
+impl SsfxSurfaceConfig {
+    #[inline]
+    pub fn to_gpu_uniforms(
+        &self,
+        is_svp_frame: bool,
+        time_delta_sec: f32,
+        frame_index: u32,
+    ) -> SsfxSurfaceUniforms {
+        SsfxSurfaceUniforms {
+            ssfx_gloss: [
+                self.gloss_minmax[0],
+                self.gloss_minmax[1],
+                self.gloss_factor,
+                0.0,
+            ],
+            ssfx_wetsurfaces_1: self.wetsurfaces_1,
+            ssfx_wetsurfaces_2: self.wetsurfaces_2,
+            ssfx_floravariation: self.floravariation,
+            ssfx_florafixes_1: self.florafixes_1,
+            ssfx_florafixes_2: self.florafixes_2,
+            ssfx_wsetup_grass: self.wind_grass,
+            ssfx_wsetup_trees: self.wind_trees,
+            ssfx_pom: self.pom,
+            ssfx_terrain_pom: self.terrain_pom,
+            ssfx_terrain_offset: self.terrain_offset,
+            ssfx_lightsetup_1: self.lightsetup_1,
+            ssfx_hud_drops_1: self.hud_drops_1,
+            ssfx_hud_drops_2: self.hud_drops_2,
+            ssfx_hud_hemi: [self.hud_hemi, 0.0, 0.0, 0.0],
+            ssfx_blood_decals: self.blood_decals,
+            ssfx_is_underground: [if self.is_underground { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            ssfx_issvp: [if is_svp_frame { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            ssfx_timedelta: [time_delta_sec, frame_index as f32, 0.0, 0.0],
+        }
+    }
+}
+
+/// Tracks active `$user$cmap0` / `$user$cmap1` color-grading texture names and detects changes
+/// matching `ColorMapManager` (`ColorMapManager.cpp:13-51`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColorMapCacheState {
+    slots: [String; 2],
+}
+
+impl ColorMapCacheState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn slot_names(&self) -> [&str; 2] {
+        [&self.slots[0], &self.slots[1]]
+    }
+
+    /// Update a single `$user$cmap{0,1}` slot, returning `true` when the bound texture changed
+    /// (`ColorMapManager::UpdateTexture`, `ColorMapManager.cpp:20-51`).
+    pub fn update_slot(&mut self, index: usize, tex_name: &str) -> bool {
+        if index >= 2 || self.slots[index] == tex_name {
+            return false;
+        }
+        self.slots[index] = tex_name.to_string();
+        true
+    }
+
+    /// Update both color-map slots together (`ColorMapManager::SetTextures`), returning per-slot
+    /// dirty flags `[cmap0_changed, cmap1_changed]`.
+    #[inline]
+    pub fn set_textures(&mut self, tex0: &str, tex1: &str) -> [bool; 2] {
+        [self.update_slot(0, tex0), self.update_slot(1, tex1)]
+    }
+}
+
 /// Blended atmospheric state output by `lerp_descriptors` (`CEnvDescriptorMixer`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MixedEnvironment {
@@ -4477,5 +4649,34 @@ sun = sun_clear
             display_brightness: 0.9,
         };
         assert_eq!(pda.to_vec4(), [0.75, 0.25, 0.9, 0.0]);
+
+        let g_consts = GlobalShaderConstants {
+            hud_params: [1.0, 0.5, 0.0, 1.0],
+            ..GlobalShaderConstants::default()
+        };
+        assert_eq!(std::mem::size_of::<GlobalShaderConstants>(), 64);
+        assert_eq!(g_consts.hud_params[1], 0.5);
+
+        let dev = DevDebugParams::default();
+        assert_eq!(std::mem::size_of::<DevDebugParams>(), 128);
+        assert_eq!(dev.params[7], [0.0; 4]);
+
+        let ssfx = SsfxSurfaceConfig {
+            is_underground: true,
+            ..SsfxSurfaceConfig::default()
+        }
+        .to_gpu_uniforms(true, 0.016, 42);
+        assert_eq!(std::mem::size_of::<SsfxSurfaceUniforms>(), 304);
+        assert_eq!(ssfx.ssfx_gloss, [0.0, 0.92, 0.5, 0.0]);
+        assert_eq!(ssfx.ssfx_hud_hemi, [0.15, 0.0, 0.0, 0.0]);
+        assert_eq!(ssfx.ssfx_is_underground, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(ssfx.ssfx_issvp, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(ssfx.ssfx_timedelta, [0.016, 42.0, 0.0, 0.0]);
+
+        let mut cmap = ColorMapCacheState::new();
+        assert_eq!(cmap.set_textures("fx\\cmap_day", ""), [true, false]);
+        assert_eq!(cmap.set_textures("fx\\cmap_day", "fx\\cmap_night"), [false, true]);
+        assert_eq!(cmap.set_textures("", "fx\\cmap_night"), [true, false]);
+        assert_eq!(cmap.slot_names(), ["", "fx\\cmap_night"]);
     }
 }

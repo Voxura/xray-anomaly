@@ -1882,6 +1882,73 @@ pub struct VolumetricSpotParams {
     pub quality_normalized: f32,
 }
 
+/// Result of SSFX volumetric light distance fade evaluation (`CRenderTarget::accum_volumetric`,
+/// `r4_rendertarget_accum_spot.cpp:278-287`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsfxVolumetricDistanceResult {
+    pub intensity: f32,
+    pub active: bool,
+}
+
+/// Evaluate SSFX distance-based volumetric fade matching `CRenderTarget::accum_volumetric`
+/// (`r4_rendertarget_accum_spot.cpp:279-284`).
+#[inline]
+pub fn ssfx_volumetric_distance_fade(
+    vis_distance: f32,
+    ssfx_volumetric: [f32; 4],
+) -> SsfxVolumetricDistanceResult {
+    if ssfx_volumetric[0] > 0.0 {
+        let falloff = ssfx_volumetric[1]
+            - ((vis_distance - 20.0) * 0.01).clamp(0.0, 1.0) * ssfx_volumetric[1];
+        SsfxVolumetricDistanceResult {
+            intensity: falloff,
+            active: falloff > 0.0,
+        }
+    } else {
+        SsfxVolumetricDistanceResult {
+            intensity: 1.0,
+            active: true,
+        }
+    }
+}
+
+/// Apply [`ssfx_volumetric_distance_fade`] to `vol_cfg` (`r4_rendertarget_accum_spot.cpp:278-287`)
+/// and compute [`VolumetricSpotParams`] if the volumetric light remains active at `vis_distance`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_volumetric_spot_params_with_fade(
+    light: &DynamicLight,
+    smap_xform: &LightSmapXform,
+    atlas_rect: SmapRect,
+    camera_pos: [f32; 3],
+    vis_distance: f32,
+    view_matrix: &XRayMatrix,
+    inv_view_matrix: &XRayMatrix,
+    inv_full_transform: &XRayMatrix,
+    vol_cfg: &VolumetricLightConfig,
+) -> Option<VolumetricSpotParams> {
+    if !light.is_volumetric {
+        return None;
+    }
+    let mut cfg = *vol_cfg;
+    if cfg.ssfx_volumetric[0] > 0.0 {
+        let fade = ssfx_volumetric_distance_fade(vis_distance, cfg.ssfx_volumetric);
+        if !fade.active {
+            return None;
+        }
+        cfg.volumetric_intensity = fade.intensity;
+    }
+    Some(compute_volumetric_spot_params(
+        light,
+        smap_xform,
+        atlas_rect,
+        camera_pos,
+        view_matrix,
+        inv_view_matrix,
+        inv_full_transform,
+        &cfg,
+    ))
+}
+
 /// Transform world-space frustum clip planes to negated camera clip space matching
 /// `r4_rendertarget_accum_spot.cpp:564-576` (`PlaneTransform = transpose(mInvFullTransform)`).
 pub fn transform_volumetric_clip_planes(
@@ -3293,5 +3360,46 @@ mod tests {
         );
         assert_eq!(rig_dynamic.sun_adapted.direction, rig_dynamic.sun_original.direction);
         assert_eq!(rig_dynamic.sun_adapted.position, rig_dynamic.sun_original.position);
+
+        let f_near = ssfx_volumetric_distance_fade(15.0, [1.0, 0.8, 3.0, 1.0]);
+        assert!(f_near.active && (f_near.intensity - 0.8).abs() < 1e-6);
+        let f_mid = ssfx_volumetric_distance_fade(70.0, [1.0, 0.8, 3.0, 1.0]);
+        assert!(f_mid.active && (f_mid.intensity - 0.4).abs() < 1e-6);
+        let f_far = ssfx_volumetric_distance_fade(120.0, [1.0, 0.8, 3.0, 1.0]);
+        assert!(!f_far.active && f_far.intensity <= 0.0);
+
+        let vol_spot = DynamicLight {
+            is_volumetric: true,
+            ..gi_spot
+        };
+        let xf = vol_spot.compute_smap_xform([0.0, 0.0, -5.0], &LightSmapConfig::default());
+        let rect = SmapRect::setup([0, 0], xf.size);
+        let inv_cam = matrix_invert_44(&cam_view).unwrap();
+        let inv_full = matrix_invert_44(&full).unwrap();
+        assert!(compute_volumetric_spot_params_with_fade(
+            &vol_spot,
+            &xf,
+            rect,
+            [0.0, 0.0, -5.0],
+            125.0,
+            &cam_view,
+            &inv_cam,
+            &inv_full,
+            &VolumetricLightConfig::default(),
+        )
+        .is_none());
+        let active_vol = compute_volumetric_spot_params_with_fade(
+            &vol_spot,
+            &xf,
+            rect,
+            [0.0, 0.0, -5.0],
+            70.0,
+            &cam_view,
+            &inv_cam,
+            &inv_full,
+            &VolumetricLightConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(active_vol.num_slices, 72);
     }
 }

@@ -1,8 +1,9 @@
-//! Pure Rust X-Ray Shaders, Lightmap Compilers, Environment Modifiers, Particles & Fog Volumes
+//! Pure Rust X-Ray Shaders, Lightmap Compilers, R4/Anomaly Blender Passes, Environment Modifiers, Particles & Fog Volumes
 //!
 //! Covers:
 //! - `shaders_xrlc.xr`: 144-byte `Shader_xrLC` collision/rendering/lightmap compiler entries
 //! - `shaders.xr`: `WaveForm`, `CConstant` (chunk 0), `CMatrix` (chunk 1), `IBlender` descriptors + properties (chunk 2)
+//! - R4 / DX11 / Anomaly blender compiler & `uber_deffer` / `uber_shadow` / `dxUIRender` pure-Rust pass planners
 //! - `level.env_mod` & Anomaly `environment\env_mods\<level>.ltx`: `CEnvModifier` zones + spatial evaluation
 //! - `level.ps_static`: Static world particle emitters (`CPGDef` / `CParticleGroup`)
 //! - `level.fog_vol`: Volumetric fog & obstacle matrices (`dx103DFluidVolume` / `v2` & `v3`)
@@ -14,6 +15,7 @@ use xray_core::LtxDocument;
 
 use crate::chunk::{ByteCursor, ChunkReader, FormatError};
 use crate::ogf::{matrix_invert_43, matrix_mul_43, XRayMatrix, XRAY_IDENTITY_MATRIX};
+use crate::thm::TextureDescrTable;
 
 /// `CMatrix` evaluation mode (`src/Layers/xrRender/SH_Matrix.h:13`).
 pub mod matrix_mode {
@@ -984,6 +986,2692 @@ impl LevelFogVolumes {
     }
 }
 
+// ============================================================================
+// Pure-Rust R4 / DX11 / Anomaly Blender Compiler & UI Render Helpers
+// ============================================================================
+
+/// Known X-Ray `IBlender` 64-bit `MK_CLSID` identifiers (`src/Layers/xrRender/blenders/Blender_CLSID.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlenderClsid {
+    Default,
+    DefaultAref,
+    Vert,
+    VertAref,
+    LmBmmD,
+    LaEmB,
+    LmEbB,
+    B,
+    BmmD,
+    Particle,
+    ScreenSet,
+    ScreenGray,
+    Light,
+    Blur,
+    ShadowTex,
+    ShadowWorld,
+    Detail,
+    Tree,
+    Model,
+    ModelEbB,
+    EditorWire,
+    EditorSel,
+}
+
+impl BlenderClsid {
+    /// 8-byte `MK_CLSID` representation matching `u64::from_be_bytes`.
+    pub const fn to_u64(self) -> u64 {
+        let bytes: [u8; 8] = match self {
+            Self::Default => *b"LM      ",
+            Self::DefaultAref => *b"LM_AREF ",
+            Self::Vert => *b"V       ",
+            Self::VertAref => *b"V_AREF  ",
+            Self::LmBmmD => *b"LmBmmD  ",
+            Self::LaEmB => *b"LaEmB   ",
+            Self::LmEbB => *b"LmEbB   ",
+            Self::B => *b"BmmD    ",
+            Self::BmmD => *b"BmmDold ",
+            Self::Particle => *b"PARTICLE",
+            Self::ScreenSet => *b"S_SET   ",
+            Self::ScreenGray => *b"S_GRAY  ",
+            Self::Light => *b"LIGHT   ",
+            Self::Blur => *b"BLUR    ",
+            Self::ShadowTex => *b"SH_TEX  ",
+            Self::ShadowWorld => *b"SH_WORLD",
+            Self::Detail => *b"D_STILL ",
+            Self::Tree => *b"D_TREE  ",
+            Self::Model => *b"MODEL   ",
+            Self::ModelEbB => *b"MODELEbB",
+            Self::EditorWire => *b"E_WIRE  ",
+            Self::EditorSel => *b"E_SEL   ",
+        };
+        u64::from_be_bytes(bytes)
+    }
+
+    /// Decode a raw 64-bit `CLASS_ID` from [`BlenderDesc::clsid`].
+    pub const fn from_u64(clsid: u64) -> Option<Self> {
+        match &clsid.to_be_bytes() {
+            b"LM      " => Some(Self::Default),
+            b"LM_AREF " => Some(Self::DefaultAref),
+            b"V       " => Some(Self::Vert),
+            b"V_AREF  " => Some(Self::VertAref),
+            b"LmBmmD  " => Some(Self::LmBmmD),
+            b"LaEmB   " => Some(Self::LaEmB),
+            b"LmEbB   " => Some(Self::LmEbB),
+            b"BmmD    " => Some(Self::B),
+            b"BmmDold " => Some(Self::BmmD),
+            b"PARTICLE" => Some(Self::Particle),
+            b"S_SET   " => Some(Self::ScreenSet),
+            b"S_GRAY  " => Some(Self::ScreenGray),
+            b"LIGHT   " => Some(Self::Light),
+            b"BLUR    " => Some(Self::Blur),
+            b"SH_TEX  " => Some(Self::ShadowTex),
+            b"SH_WORLD" => Some(Self::ShadowWorld),
+            b"D_STILL " => Some(Self::Detail),
+            b"D_TREE  " => Some(Self::Tree),
+            b"MODEL   " => Some(Self::Model),
+            b"MODELEbB" => Some(Self::ModelEbB),
+            b"E_WIRE  " => Some(Self::EditorWire),
+            b"E_SEL   " => Some(Self::EditorSel),
+            _ => None,
+        }
+    }
+
+    /// Matches `IBlender::canBeDetailed()` in R4.
+    pub const fn can_be_detailed(self) -> bool {
+        matches!(
+            self,
+            Self::Default
+                | Self::Vert
+                | Self::DefaultAref
+                | Self::VertAref
+                | Self::LmBmmD
+                | Self::BmmD
+                | Self::Tree
+                | Self::Model
+        )
+    }
+
+    /// Matches `IBlender::canBeLMAPped()` in R4.
+    pub const fn can_be_lmapped(self) -> bool {
+        matches!(
+            self,
+            Self::DefaultAref | Self::LmBmmD | Self::BmmD | Self::LmEbB
+        )
+    }
+
+    /// Matches `IBlender::canUseSteepParallax()` in R4.
+    pub const fn can_use_steep_parallax(self) -> bool {
+        matches!(
+            self,
+            Self::Default | Self::Vert | Self::DefaultAref | Self::VertAref
+        )
+    }
+}
+
+/// Hardware tessellation mode for deferred R4 shaders (`CBlender_Compile::TessMethod`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum TessMethod {
+    #[default]
+    NoTess = 0,
+    TessPn = 1,
+    TessHm = 2,
+    TessPnHm = 3,
+}
+
+impl TessMethod {
+    pub const fn from_u32(val: u32) -> Self {
+        match val {
+            1 => Self::TessPn,
+            2 => Self::TessHm,
+            3 => Self::TessPnHm,
+            _ => Self::NoTess,
+        }
+    }
+}
+
+/// DX10/DX11 MSAA alpha-test strategy (`CRender::MSAA_ATEST_*` in `r4.h:39-47`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum Dx10MsaaAlphaTest {
+    #[default]
+    Off = 0,
+    Dx100Atoc = 1,
+    Dx101Native = 2,
+    Dx101Atoc = 3,
+}
+
+/// Deferred shader element index (`SE_R2_*` and Anomaly SSFX element `3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum DefferElement {
+    #[default]
+    NormalHq = 0,
+    NormalLq = 1,
+    Shadow = 2,
+    SsfxTerrainLow = 3,
+}
+
+/// Depth/stencil comparison function matching `D3DCMPFUNC` -> `D3D_COMPARISON_FUNC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CmpFunc {
+    Never,
+    Less,
+    Equal,
+    #[default]
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
+}
+
+/// Stencil operation matching `D3DSTENCILOP` -> `D3D_STENCIL_OP`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StencilOp {
+    #[default]
+    Keep,
+    Zero,
+    Replace,
+    IncrSat,
+    DecrSat,
+    Invert,
+    Incr,
+    Decr,
+}
+
+/// Per-pass stencil state (`CBlender_Compile::r_Stencil` / `r_StencilRef`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StencilState {
+    pub enable: bool,
+    pub func: CmpFunc,
+    pub mask: u8,
+    pub write_mask: u8,
+    pub fail: StencilOp,
+    pub pass: StencilOp,
+    pub zfail: StencilOp,
+    pub ref_value: u8,
+}
+
+impl Default for StencilState {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            func: CmpFunc::Always,
+            mask: 0x00,
+            write_mask: 0x00,
+            fail: StencilOp::Keep,
+            pass: StencilOp::Keep,
+            zfail: StencilOp::Keep,
+            ref_value: 0x00,
+        }
+    }
+}
+
+/// Blend factor matching `D3DBLEND` -> `D3D_BLEND`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendFactor {
+    Zero,
+    #[default]
+    One,
+    SrcColor,
+    InvSrcColor,
+    SrcAlpha,
+    InvSrcAlpha,
+    DestAlpha,
+    InvDestAlpha,
+    DestColor,
+    InvDestColor,
+    SrcAlphaSat,
+}
+
+/// Per-pass blend and color-write state (`PassSET_Blend` / `r_ColorWriteEnable`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendState {
+    pub enable: bool,
+    pub src: BlendFactor,
+    pub dst: BlendFactor,
+    pub alpha_test: bool,
+    pub alpha_ref: u8,
+    pub alpha_to_coverage: bool,
+    pub color_write_enable: [bool; 4],
+}
+
+impl Default for BlendState {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            src: BlendFactor::One,
+            dst: BlendFactor::Zero,
+            alpha_test: false,
+            alpha_ref: 0,
+            alpha_to_coverage: false,
+            color_write_enable: [true; 4],
+        }
+    }
+}
+
+/// Rasterizer cull mode matching `D3DCULL` (`r_CullMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CullMode {
+    None,
+    Cw,
+    #[default]
+    Ccw,
+}
+
+/// Sampler addressing mode (`D3DTEXTUREADDRESS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TexAddressMode {
+    #[default]
+    Wrap,
+    Clamp,
+    Border,
+}
+
+/// Standard DX10/DX11 sampler preset recognized by `CBlender_Compile::r_dx10Sampler`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplerFilterMode {
+    BaseAniso,
+    Linear,
+    Linear2,
+    RtLinear,
+    NoFilter,
+    Material,
+    Smap,
+    Jitter,
+    Point,
+}
+
+/// Texture resource binding emitted by `CBlender_Compile::r_dx10Texture`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureBindingSpec {
+    pub resource_name: String,
+    pub texture_name: String,
+}
+
+/// Sampler binding and overrides emitted by `CBlender_Compile::r_dx10Sampler` + `i_dx10*`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamplerBindingSpec {
+    pub resource_name: String,
+    pub filter_mode: SamplerFilterMode,
+    pub address_mode: TexAddressMode,
+    pub address_w: TexAddressMode,
+    pub anisotropic_override: Option<bool>,
+}
+
+/// Complete DX10/DX11/DX12 render state + shader + resource recipe for a single pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledPassPlan {
+    pub vs: String,
+    pub hs: String,
+    pub ds: String,
+    pub gs: String,
+    pub ps: String,
+    pub fog: bool,
+    pub lighting: bool,
+    pub z_test: bool,
+    pub z_write: bool,
+    pub z_func: CmpFunc,
+    pub cull_mode: CullMode,
+    pub wireframe: bool,
+    pub blend: BlendState,
+    pub stencil: StencilState,
+    pub shader_options: Vec<(String, String)>,
+    pub textures: Vec<TextureBindingSpec>,
+    pub samplers: Vec<SamplerBindingSpec>,
+}
+
+/// Result of compiling an R4 blender for one element index (`ShaderElement`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompiledShaderPlan {
+    pub priority: i32,
+    pub strict_sorting: bool,
+    pub is_landscape_prepass: bool,
+    pub is_landscape: bool,
+    pub passes: Vec<CompiledPassPlan>,
+}
+
+/// Strip image file extensions exactly matching X-Ray's `fix_texture_name`
+/// (`src/Layers/xrRenderDX10/dx10Texture.cpp:19-28`).
+pub fn fix_texture_name(name: &str) -> String {
+    const EXTS: &[&str] = &[".tga", ".dds", ".bmp", ".ogm", ".gif"];
+    if let Some(dot) = name.rfind('.') {
+        let ext = &name[dot..];
+        if EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+            return name[..dot].to_string();
+        }
+    }
+    name.to_string()
+}
+
+struct PassCompiler {
+    plan: CompiledShaderPlan,
+    current: Option<CompiledPassPlan>,
+}
+
+impl PassCompiler {
+    fn new(priority: i32, strict_sorting: bool) -> Self {
+        Self {
+            plan: CompiledShaderPlan {
+                priority,
+                strict_sorting,
+                is_landscape_prepass: false,
+                is_landscape: false,
+                passes: Vec::new(),
+            },
+            current: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn r_pass_full(
+        &mut self,
+        vs: &str,
+        gs: &str,
+        ps: &str,
+        fog: bool,
+        z_test: bool,
+        z_write: bool,
+        blend_enable: bool,
+        src: BlendFactor,
+        dst: BlendFactor,
+        alpha_test: bool,
+        alpha_ref: u32,
+    ) {
+        let mut z_w = z_write;
+        if !self.plan.passes.is_empty() {
+            z_w = false;
+        }
+        let mut ab = blend_enable;
+        if ab && src == BlendFactor::One && dst == BlendFactor::Zero {
+            ab = false;
+        }
+        let pass = CompiledPassPlan {
+            vs: vs.to_string(),
+            hs: "null".to_string(),
+            ds: "null".to_string(),
+            gs: gs.to_string(),
+            ps: ps.to_string(),
+            fog,
+            lighting: false,
+            z_test,
+            z_write: z_w,
+            z_func: if z_test { CmpFunc::LessEqual } else { CmpFunc::Always },
+            cull_mode: CullMode::Ccw,
+            wireframe: false,
+            blend: BlendState {
+                enable: ab,
+                src: if ab { src } else { BlendFactor::One },
+                dst: if ab { dst } else { BlendFactor::Zero },
+                alpha_test,
+                alpha_ref: alpha_ref.min(255) as u8,
+                alpha_to_coverage: false,
+                color_write_enable: [true; 4],
+            },
+            stencil: StencilState::default(),
+            shader_options: Vec::new(),
+            textures: Vec::new(),
+            samplers: Vec::new(),
+        };
+        self.current = Some(pass);
+    }
+
+    fn r_pass_default(&mut self, vs: &str, ps: &str, fog: bool, z_test: bool, z_write: bool) {
+        self.r_pass_full(
+            vs,
+            "null",
+            ps,
+            fog,
+            z_test,
+            z_write,
+            false,
+            BlendFactor::One,
+            BlendFactor::Zero,
+            false,
+            0,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn r_tess_pass(
+        &mut self,
+        vs: &str,
+        hs: &str,
+        ds: &str,
+        gs: &str,
+        ps: &str,
+        fog: bool,
+        z_test: bool,
+        z_write: bool,
+    ) {
+        self.r_pass_default(vs, ps, fog, z_test, z_write);
+        if let Some(pass) = self.current.as_mut() {
+            pass.gs = gs.to_string();
+            pass.hs = hs.to_string();
+            pass.ds = ds.to_string();
+        }
+    }
+
+    fn pass_set_zb(&mut self, z_test: bool, mut z_write: bool) {
+        if !self.plan.passes.is_empty() {
+            z_write = false;
+        }
+        if let Some(pass) = self.current.as_mut() {
+            pass.z_test = z_test;
+            pass.z_write = z_write;
+            pass.z_func = if z_test { CmpFunc::LessEqual } else { CmpFunc::Always };
+        }
+    }
+
+    fn pass_set_blend(
+        &mut self,
+        mut blend_enable: bool,
+        src: BlendFactor,
+        dst: BlendFactor,
+        alpha_test: bool,
+        alpha_ref: i32,
+    ) {
+        if blend_enable && src == BlendFactor::One && dst == BlendFactor::Zero {
+            blend_enable = false;
+        }
+        if let Some(pass) = self.current.as_mut() {
+            pass.blend.enable = blend_enable;
+            pass.blend.src = if blend_enable { src } else { BlendFactor::One };
+            pass.blend.dst = if blend_enable { dst } else { BlendFactor::Zero };
+            pass.blend.alpha_test = alpha_test;
+            pass.blend.alpha_ref = alpha_ref.clamp(0, 255) as u8;
+        }
+    }
+
+    fn pass_set_light_fog(&mut self, lighting: bool, fog: bool) {
+        if let Some(pass) = self.current.as_mut() {
+            pass.lighting = lighting;
+            pass.fog = fog;
+        }
+    }
+
+    fn set_z_func(&mut self, z_func: CmpFunc) {
+        if let Some(pass) = self.current.as_mut() {
+            pass.z_func = z_func;
+        }
+    }
+
+    fn set_wireframe(&mut self, wireframe: bool) {
+        if let Some(pass) = self.current.as_mut() {
+            pass.wireframe = wireframe;
+        }
+    }
+
+    fn set_alpha_to_coverage(&mut self, enable: bool) {
+        if let Some(pass) = self.current.as_mut() {
+            pass.blend.alpha_to_coverage = enable;
+        }
+    }
+
+    fn set_shader_options(&mut self, opts: Vec<(String, String)>) {
+        if let Some(pass) = self.current.as_mut() {
+            pass.shader_options = opts;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn r_stencil(
+        &mut self,
+        enable: bool,
+        func: CmpFunc,
+        mask: u8,
+        write_mask: u8,
+        fail: StencilOp,
+        pass_op: StencilOp,
+        zfail: StencilOp,
+    ) {
+        if let Some(pass) = self.current.as_mut() {
+            pass.stencil.enable = enable;
+            if enable {
+                pass.stencil.func = func;
+                pass.stencil.mask = mask;
+                pass.stencil.write_mask = write_mask;
+                pass.stencil.fail = fail;
+                pass.stencil.pass = pass_op;
+                pass.stencil.zfail = zfail;
+            }
+        }
+    }
+
+    fn r_stencil_ref(&mut self, ref_value: u8) {
+        if let Some(pass) = self.current.as_mut() {
+            pass.stencil.ref_value = ref_value;
+        }
+    }
+
+    fn r_cull_mode(&mut self, cull: CullMode) {
+        if let Some(pass) = self.current.as_mut() {
+            pass.cull_mode = cull;
+        }
+    }
+
+    fn r_color_write_enable(&mut self, r: bool, g: bool, b: bool, a: bool) {
+        if let Some(pass) = self.current.as_mut() {
+            pass.blend.color_write_enable = [r, g, b, a];
+        }
+    }
+
+    fn r_dx10_texture(&mut self, resource_name: &str, texture_name: &str) {
+        if let Some(pass) = self.current.as_mut() {
+            pass.textures.push(TextureBindingSpec {
+                resource_name: resource_name.to_string(),
+                texture_name: fix_texture_name(texture_name),
+            });
+        }
+    }
+
+    fn r_dx10_sampler(&mut self, resource_name: &str) -> usize {
+        let fixed = fix_texture_name(resource_name);
+        let (filter_mode, address_mode, address_w, aniso) = match fixed.as_str() {
+            "smp_nofilter" => (
+                SamplerFilterMode::NoFilter,
+                TexAddressMode::Clamp,
+                TexAddressMode::Clamp,
+                None,
+            ),
+            "smp_rtlinear" => (
+                SamplerFilterMode::RtLinear,
+                TexAddressMode::Clamp,
+                TexAddressMode::Clamp,
+                None,
+            ),
+            "smp_linear" => (
+                SamplerFilterMode::Linear,
+                TexAddressMode::Wrap,
+                TexAddressMode::Wrap,
+                None,
+            ),
+            "smp_linear2" => (
+                SamplerFilterMode::Linear2,
+                TexAddressMode::Wrap,
+                TexAddressMode::Wrap,
+                None,
+            ),
+            "smp_material" => (
+                SamplerFilterMode::Material,
+                TexAddressMode::Clamp,
+                TexAddressMode::Wrap,
+                None,
+            ),
+            "smp_smap" => (
+                SamplerFilterMode::Smap,
+                TexAddressMode::Clamp,
+                TexAddressMode::Clamp,
+                None,
+            ),
+            "smp_jitter" => (
+                SamplerFilterMode::Jitter,
+                TexAddressMode::Wrap,
+                TexAddressMode::Wrap,
+                None,
+            ),
+            "smp_point" => (
+                SamplerFilterMode::Point,
+                TexAddressMode::Wrap,
+                TexAddressMode::Wrap,
+                None,
+            ),
+            _ => (
+                SamplerFilterMode::BaseAniso,
+                TexAddressMode::Wrap,
+                TexAddressMode::Wrap,
+                Some(true),
+            ),
+        };
+        if let Some(pass) = self.current.as_mut() {
+            let idx = pass.samplers.len();
+            pass.samplers.push(SamplerBindingSpec {
+                resource_name: fixed,
+                filter_mode,
+                address_mode,
+                address_w,
+                anisotropic_override: aniso,
+            });
+            idx
+        } else {
+            usize::MAX
+        }
+    }
+
+    fn i_dx10_address(&mut self, stage: usize, address: TexAddressMode) {
+        if let Some(pass) = self.current.as_mut()
+            && let Some(s) = pass.samplers.get_mut(stage)
+        {
+            s.address_mode = address;
+            s.address_w = address;
+        }
+    }
+
+    fn i_dx10_filter_anizo(&mut self, stage: usize, aniso: bool) {
+        if let Some(pass) = self.current.as_mut()
+            && let Some(s) = pass.samplers.get_mut(stage)
+        {
+            s.anisotropic_override = Some(aniso);
+        }
+    }
+
+    fn r_end(&mut self) {
+        if let Some(pass) = self.current.take() {
+            self.plan.passes.push(pass);
+        }
+    }
+}
+
+/// Inputs for standalone `uber_deffer` evaluation (`src/Layers/xrRender/uber_deffer.cpp:7-221`).
+#[derive(Debug, Clone, Default)]
+pub struct UberDefferInput<'a> {
+    pub hq: bool,
+    pub vspec: &'a str,
+    pub pspec: &'a str,
+    pub aref: bool,
+    pub detail_replace: Option<&'a str>,
+    pub do_not_write: bool,
+    pub l_textures: &'a [&'a str],
+    pub base_detail_texture: &'a str,
+    pub detail_diffuse: bool,
+    pub detail_bump: bool,
+    pub use_steep_parallax: bool,
+    pub tess_method: TessMethod,
+    pub dx11_enable_tessellation: bool,
+    pub wireframe: bool,
+}
+
+/// Inputs for standalone `uber_shadow` evaluation (`src/Layers/xrRender/uber_deffer.cpp:224-338`).
+#[derive(Debug, Clone, Default)]
+pub struct UberShadowInput<'a> {
+    pub vspec: &'a str,
+    pub l_textures: &'a [&'a str],
+    pub base_detail_texture: &'a str,
+    pub detail_diffuse: bool,
+    pub detail_bump: bool,
+    pub tess_method: TessMethod,
+    pub dx11_enable_tessellation: bool,
+    pub wireframe: bool,
+}
+
+#[inline]
+fn detect_lmap_slot2(l_textures: &[&str]) -> bool {
+    l_textures
+        .get(2)
+        .is_some_and(|tex| tex.starts_with("lmap"))
+}
+
+fn build_tess_params_and_options(
+    tess_method: TessMethod,
+    lmap: bool,
+    detail_diffuse: bool,
+    detail_bump: bool,
+) -> (String, Vec<(String, String)>) {
+    let mut params = String::from("(");
+    let mut opts = Vec::new();
+    if matches!(tess_method, TessMethod::TessPn | TessMethod::TessPnHm) {
+        opts.push(("TESS_PN".to_string(), "1".to_string()));
+        params.push_str("TESS_PN,");
+    }
+    if matches!(tess_method, TessMethod::TessHm | TessMethod::TessPnHm) {
+        opts.push(("TESS_HM".to_string(), "1".to_string()));
+        params.push_str("TESS_HM,");
+    }
+    if lmap {
+        opts.push(("USE_LM_HEMI".to_string(), "1".to_string()));
+        params.push_str("USE_LM_HEMI,");
+    }
+    if detail_diffuse {
+        opts.push(("USE_TDETAIL".to_string(), "1".to_string()));
+        params.push_str("USE_TDETAIL,");
+    }
+    if detail_bump {
+        opts.push(("USE_TDETAIL_BUMP".to_string(), "1".to_string()));
+        params.push_str("USE_TDETAIL_BUMP,");
+    }
+    params.push(')');
+    (params, opts)
+}
+
+fn compile_uber_deffer_into(
+    compiler: &mut PassCompiler,
+    input: &UberDefferInput<'_>,
+    textures_descr: &TextureDescrTable,
+) {
+    let fname = input
+        .l_textures
+        .first()
+        .map(|s| fix_texture_name(s))
+        .unwrap_or_default();
+    let bump_name = if fname.is_empty() {
+        String::new()
+    } else {
+        textures_descr.get_bump_name(&fname).to_string()
+    };
+    let bump = !bump_name.is_empty();
+    let lmap = detect_lmap_slot2(input.l_textures);
+
+    let lmh = if lmap { "_lmh" } else { "" };
+    let mut vs = format!("deffer_{}{lmh}", input.vspec);
+    let mut ps = format!("deffer_{}{lmh}", input.pspec);
+    let dt = input.detail_replace.unwrap_or(input.base_detail_texture);
+
+    let mut tex_detail_bump = String::new();
+    let mut tex_detail_bump_x = String::new();
+    let mut has_detail_bump = false;
+    if input.detail_bump {
+        let det_bump = textures_descr.get_bump_name(dt);
+        if !det_bump.is_empty() {
+            has_detail_bump = true;
+            tex_detail_bump = det_bump.to_string();
+            tex_detail_bump_x = format!("{det_bump}#");
+        }
+    }
+
+    if input.aref {
+        ps.push_str("_aref");
+    }
+
+    let (fname_a, fname_b) = if !bump {
+        vs.push_str("_flat");
+        ps.push_str("_flat");
+        if input.hq && (input.detail_diffuse || input.detail_bump) {
+            vs.push_str("_d");
+            ps.push_str("_d");
+        }
+        (String::new(), String::new())
+    } else {
+        vs.push_str("_bump");
+        if input.hq && input.use_steep_parallax {
+            ps.push_str("_steep");
+        } else {
+            ps.push_str("_bump");
+        }
+        if input.hq && (input.detail_diffuse || input.detail_bump) {
+            vs.push_str("_d");
+            if has_detail_bump {
+                ps.push_str("_db");
+            } else {
+                ps.push_str("_d");
+            }
+        }
+        (bump_name.clone(), format!("{bump_name}#"))
+    };
+
+    if bump && input.hq {
+        vs.push_str("-hq");
+        ps.push_str("-hq");
+    }
+
+    if bump && input.hq && input.dx11_enable_tessellation && input.tess_method != TessMethod::NoTess
+    {
+        let (params, opts) = build_tess_params_and_options(
+            input.tess_method,
+            lmap,
+            input.detail_diffuse,
+            input.detail_bump,
+        );
+        let tess_vs = format!("deffer_{}_bump{params}", input.vspec);
+        let aref_suffix = if input.aref { "_aref" } else { "" };
+        let tess_ps = format!("deffer_{}{aref_suffix}_bump{params}", input.pspec);
+        let hs = format!("DX11\\tess{params}");
+        let ds = format!("DX11\\tess{params}");
+        compiler.r_tess_pass(&tess_vs, &hs, &ds, "null", &tess_ps, false, true, true);
+        compiler.set_shader_options(opts);
+        let stage = compiler.r_dx10_sampler("smp_bump_ds");
+        if stage != usize::MAX {
+            compiler.i_dx10_address(stage, TexAddressMode::Wrap);
+            compiler.i_dx10_filter_anizo(stage, true);
+        }
+        if input.wireframe {
+            compiler.set_wireframe(true);
+        }
+        compiler.r_dx10_texture("s_tbump", &fname_a);
+        compiler.r_dx10_texture("s_tbumpX", &fname_b);
+        if has_detail_bump {
+            compiler.r_dx10_texture("s_tdetailBumpX", &tex_detail_bump_x);
+        }
+    } else if input.do_not_write {
+        compiler.r_pass_default(&vs, &ps, false, true, false);
+    } else {
+        compiler.r_pass_default(&vs, &ps, false, true, true);
+    }
+
+    if let Some(base_tex) = input.l_textures.first() {
+        compiler.r_dx10_texture("s_base", base_tex);
+    }
+    compiler.r_dx10_texture("s_bumpX", &fname_b);
+    compiler.r_dx10_texture("s_bump", &fname_a);
+    compiler.r_dx10_texture("s_bumpD", dt);
+    compiler.r_dx10_texture("s_detail", dt);
+    if has_detail_bump {
+        compiler.r_dx10_texture("s_detailBump", &tex_detail_bump);
+        compiler.r_dx10_texture("s_detailBumpX", &tex_detail_bump_x);
+    }
+    compiler.r_dx10_sampler("smp_base");
+    compiler.r_dx10_sampler("smp_linear");
+    if lmap {
+        compiler.r_dx10_texture("s_hemi", input.l_textures[2]);
+        compiler.r_dx10_sampler("smp_rtlinear");
+    }
+}
+
+/// Evaluate standalone DX11/R4 `uber_deffer` pass setup (`uber_deffer.cpp:7-221`).
+pub fn plan_uber_deffer(
+    input: &UberDefferInput<'_>,
+    textures_descr: &TextureDescrTable,
+) -> CompiledPassPlan {
+    let mut compiler = PassCompiler::new(1, false);
+    compile_uber_deffer_into(&mut compiler, input, textures_descr);
+    compiler.r_end();
+    compiler.plan.passes.pop().expect("uber_deffer always emits one pass")
+}
+
+fn compile_uber_shadow_into(
+    compiler: &mut PassCompiler,
+    input: &UberShadowInput<'_>,
+    textures_descr: &TextureDescrTable,
+) {
+    let fname = input
+        .l_textures
+        .first()
+        .map(|s| fix_texture_name(s))
+        .unwrap_or_default();
+    let bump_name = if fname.is_empty() {
+        String::new()
+    } else {
+        textures_descr.get_bump_name(&fname).to_string()
+    };
+    let bump = !bump_name.is_empty();
+    let lmap = detect_lmap_slot2(input.l_textures);
+
+    let dt = input.base_detail_texture;
+    let mut tex_detail_bump = String::new();
+    let mut tex_detail_bump_x = String::new();
+    let mut has_detail_bump = false;
+    if input.detail_bump {
+        let det_bump = textures_descr.get_bump_name(dt);
+        if !det_bump.is_empty() {
+            has_detail_bump = true;
+            tex_detail_bump = det_bump.to_string();
+            tex_detail_bump_x = format!("{det_bump}#");
+        }
+    }
+
+    let (fname_a, fname_b) = if !bump {
+        (String::new(), String::new())
+    } else {
+        (bump_name.clone(), format!("{bump_name}#"))
+    };
+
+    if bump && input.dx11_enable_tessellation && input.tess_method != TessMethod::NoTess {
+        let (params, opts) = build_tess_params_and_options(
+            input.tess_method,
+            lmap,
+            input.detail_diffuse,
+            input.detail_bump,
+        );
+        let vs = format!("deffer_{}_bump{params}", input.vspec);
+        let hs = format!("DX11\\tess{params}");
+        let ds = format!("DX11\\tess_shadow{params}");
+        compiler.r_tess_pass(&vs, &hs, &ds, "null", "dumb", false, true, true);
+        compiler.set_shader_options(opts);
+        if let Some(base_tex) = input.l_textures.first() {
+            compiler.r_dx10_texture("s_base", base_tex);
+        }
+        compiler.r_dx10_texture("s_bumpX", &fname_b);
+        compiler.r_dx10_texture("s_bump", &fname_a);
+        if has_detail_bump {
+            compiler.r_dx10_texture("s_detailBump", &tex_detail_bump);
+            compiler.r_dx10_texture("s_detailBumpX", &tex_detail_bump_x);
+        }
+        let stage = compiler.r_dx10_sampler("smp_bump_ds");
+        if stage != usize::MAX {
+            compiler.i_dx10_address(stage, TexAddressMode::Wrap);
+            compiler.i_dx10_filter_anizo(stage, true);
+        }
+        if input.wireframe {
+            compiler.set_wireframe(true);
+        }
+    } else {
+        compiler.r_pass_default("shadow_direct_base", "dumb", false, true, true);
+    }
+}
+
+/// Evaluate standalone DX11/R4 `uber_shadow` pass setup (`uber_deffer.cpp:224-338`).
+pub fn plan_uber_shadow(
+    input: &UberShadowInput<'_>,
+    textures_descr: &TextureDescrTable,
+) -> CompiledPassPlan {
+    let mut compiler = PassCompiler::new(1, false);
+    compile_uber_shadow_into(&mut compiler, input, textures_descr);
+    compiler.r_end();
+    compiler.plan.passes.pop().expect("uber_shadow always emits one pass")
+}
+
+/// Engine render options affecting R4/Anomaly blender pass compilation.
+#[derive(Debug, Clone)]
+pub struct R4CompileConfig {
+    pub element: DefferElement,
+    pub hud_element: bool,
+    pub allow_detail: bool,
+    pub advanced_pp: bool,
+    pub r2_detail_bump: bool,
+    pub terrain_prepass: bool,
+    pub dx11_enable_tessellation: bool,
+    pub wireframe: bool,
+    pub msaa_alphatest: Dx10MsaaAlphaTest,
+    pub ssfx_terrain: bool,
+    pub ssfx_branches: bool,
+    pub ssfx_glass: bool,
+    /// Set `true` when `$game_textures$\{tex0}_lod_textures.dds` exists in VFS (`blender_BmmD.cpp:331`).
+    pub terrain_has_lod_textures_dds: bool,
+}
+
+impl Default for R4CompileConfig {
+    fn default() -> Self {
+        Self {
+            element: DefferElement::NormalHq,
+            hud_element: false,
+            allow_detail: true,
+            advanced_pp: true,
+            r2_detail_bump: true,
+            terrain_prepass: false,
+            dx11_enable_tessellation: false,
+            wireframe: false,
+            msaa_alphatest: Dx10MsaaAlphaTest::Off,
+            ssfx_terrain: false,
+            ssfx_branches: false,
+            ssfx_glass: false,
+            terrain_has_lod_textures_dds: false,
+        }
+    }
+}
+
+/// High-level R4 blender parameter block matching concrete `CBlender_*` subclasses in `r2_blenders.cpp`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum R4BlenderSpec {
+    DefferFlat {
+        priority: i32,
+        strict_sorting: bool,
+        base_texture: String,
+        tessellation: TessMethod,
+    },
+    DefferAref {
+        priority: i32,
+        strict_sorting: bool,
+        base_texture: String,
+        lmapped: bool,
+        alpha_ref: i32,
+        alpha_blend: bool,
+    },
+    DefferModel {
+        priority: i32,
+        strict_sorting: bool,
+        base_texture: String,
+        alpha_blend: bool,
+        alpha_ref: i32,
+        tessellation: TessMethod,
+    },
+    ModelEbB {
+        priority: i32,
+        strict_sorting: bool,
+        base_texture: String,
+        env_texture: String,
+        alpha_blend: bool,
+    },
+    LmEbB {
+        priority: i32,
+        strict_sorting: bool,
+        base_texture: String,
+        env_texture: String,
+        alpha_blend: bool,
+    },
+    BmmD {
+        priority: i32,
+        strict_sorting: bool,
+        base_texture: String,
+        detail_texture: String,
+        r_detail: String,
+        g_detail: String,
+        b_detail: String,
+        a_detail: String,
+    },
+    DetailStill {
+        priority: i32,
+        strict_sorting: bool,
+        base_texture: String,
+        alpha_blend: bool,
+    },
+    Tree {
+        priority: i32,
+        strict_sorting: bool,
+        base_texture: String,
+        alpha_blend: bool,
+        not_an_tree: bool,
+    },
+    ScreenSet {
+        priority: i32,
+        strict_sorting: bool,
+        base_texture: String,
+        blend_mode: u32,
+        clamp: bool,
+        alpha_ref: i32,
+        z_test: bool,
+        z_write: bool,
+        lighting: bool,
+        fog: bool,
+    },
+    Particle {
+        priority: i32,
+        strict_sorting: bool,
+        base_texture: String,
+        blend_mode: u32,
+        clamp: bool,
+    },
+    EditorWire {
+        priority: i32,
+        strict_sorting: bool,
+    },
+    EditorSel {
+        priority: i32,
+        strict_sorting: bool,
+    },
+}
+
+fn find_nth_prop<'a>(
+    props: &'a [BlenderProperty],
+    name: &str,
+    nth: usize,
+) -> Option<&'a BlenderPropertyValue> {
+    let mut seen = 0usize;
+    for p in props {
+        if p.name.eq_ignore_ascii_case(name) {
+            if seen == nth {
+                return Some(&p.value);
+            }
+            seen += 1;
+        }
+    }
+    None
+}
+
+fn prop_bool(props: &[BlenderProperty], name: &str, default: bool) -> bool {
+    match find_nth_prop(props, name, 0) {
+        Some(BlenderPropertyValue::Bool(v)) => *v,
+        _ => default,
+    }
+}
+
+fn prop_int(props: &[BlenderProperty], name: &str, default: i32) -> i32 {
+    match find_nth_prop(props, name, 0) {
+        Some(BlenderPropertyValue::Integer { value, .. }) => *value,
+        _ => default,
+    }
+}
+
+fn prop_token(props: &[BlenderProperty], name: &str, default: u32) -> u32 {
+    match find_nth_prop(props, name, 0) {
+        Some(BlenderPropertyValue::Token { selected, .. }) => *selected,
+        _ => default,
+    }
+}
+
+fn prop_texture_nth(props: &[BlenderProperty], name: &str, nth: usize, default: &str) -> String {
+    match find_nth_prop(props, name, nth) {
+        Some(BlenderPropertyValue::Texture(s)) => s.clone(),
+        _ => default.to_string(),
+    }
+}
+
+impl R4BlenderSpec {
+    /// Convert a parsed [`BlenderShader`] entry from `shaders.xr` into its R4 compiler spec
+    /// (`r2_blenders.cpp:18-46`). Returns `None` for legacy/disabled R1/R2 CLSIDs (`BLUR`, `LIGHT`, etc.).
+    pub fn from_blender_shader(shader: &BlenderShader) -> Option<Self> {
+        let clsid = BlenderClsid::from_u64(shader.desc.clsid)?;
+        let p = &shader.properties;
+        let priority = shader.priority;
+        let strict_sorting = shader.strict_sorting;
+        let base_texture = shader.base_texture.clone();
+
+        match clsid {
+            BlenderClsid::Default | BlenderClsid::Vert => Some(Self::DefferFlat {
+                priority,
+                strict_sorting,
+                base_texture,
+                tessellation: TessMethod::from_u32(prop_token(p, "Tessellation", 0)),
+            }),
+            BlenderClsid::DefaultAref | BlenderClsid::VertAref => Some(Self::DefferAref {
+                priority,
+                strict_sorting,
+                base_texture,
+                lmapped: clsid == BlenderClsid::DefaultAref,
+                alpha_ref: prop_int(p, "Alpha ref", 200),
+                alpha_blend: prop_bool(p, "Alpha-blend", false),
+            }),
+            BlenderClsid::Model => Some(Self::DefferModel {
+                priority,
+                strict_sorting,
+                base_texture,
+                alpha_blend: prop_bool(p, "Use alpha-channel", false),
+                alpha_ref: prop_int(p, "Alpha ref", 32),
+                tessellation: TessMethod::from_u32(prop_token(p, "Tessellation", 0)),
+            }),
+            BlenderClsid::ModelEbB => Some(Self::ModelEbB {
+                priority,
+                strict_sorting,
+                base_texture,
+                env_texture: prop_texture_nth(p, "Name", 1, "$null"),
+                alpha_blend: prop_bool(p, "Alpha-Blend", false),
+            }),
+            BlenderClsid::LmEbB => Some(Self::LmEbB {
+                priority,
+                strict_sorting,
+                base_texture,
+                env_texture: prop_texture_nth(p, "Name", 1, "$null"),
+                alpha_blend: prop_bool(p, "Alpha-Blend", false),
+            }),
+            BlenderClsid::LmBmmD | BlenderClsid::BmmD => Some(Self::BmmD {
+                priority,
+                strict_sorting,
+                base_texture,
+                detail_texture: prop_texture_nth(p, "Name", 1, "$null"),
+                r_detail: prop_texture_nth(p, "R2-R", 0, "detail\\detail_grnd_grass"),
+                g_detail: prop_texture_nth(p, "R2-G", 0, "detail\\detail_grnd_asphalt"),
+                b_detail: prop_texture_nth(p, "R2-B", 0, "detail\\detail_grnd_earth"),
+                a_detail: prop_texture_nth(p, "R2-A", 0, "detail\\detail_grnd_yantar"),
+            }),
+            BlenderClsid::Detail => Some(Self::DetailStill {
+                priority,
+                strict_sorting,
+                base_texture,
+                alpha_blend: prop_bool(p, "Alpha-blend", false),
+            }),
+            BlenderClsid::Tree => Some(Self::Tree {
+                priority,
+                strict_sorting,
+                base_texture,
+                alpha_blend: prop_bool(p, "Alpha-blend", false),
+                not_an_tree: prop_bool(p, "Object LOD", false),
+            }),
+            BlenderClsid::ScreenSet => Some(Self::ScreenSet {
+                priority,
+                strict_sorting,
+                base_texture,
+                blend_mode: prop_token(p, "Blending", 0),
+                clamp: prop_bool(p, "Texture clamp", true),
+                alpha_ref: prop_int(p, "Alpha ref", 32),
+                z_test: prop_bool(p, "Z-test", false),
+                z_write: prop_bool(p, "Z-write", false),
+                lighting: prop_bool(p, "Lighting", false),
+                fog: prop_bool(p, "Fog", false),
+            }),
+            BlenderClsid::Particle => Some(Self::Particle {
+                priority,
+                strict_sorting,
+                base_texture,
+                blend_mode: prop_token(p, "Blending", 0),
+                clamp: prop_bool(p, "Texture clamp", true),
+            }),
+            BlenderClsid::EditorWire => Some(Self::EditorWire {
+                priority,
+                strict_sorting,
+            }),
+            BlenderClsid::EditorSel => Some(Self::EditorSel {
+                priority,
+                strict_sorting,
+            }),
+            BlenderClsid::ScreenGray
+            | BlenderClsid::Light
+            | BlenderClsid::Blur
+            | BlenderClsid::ShadowTex
+            | BlenderClsid::ShadowWorld
+            | BlenderClsid::LaEmB
+            | BlenderClsid::B => None,
+        }
+    }
+
+    #[inline]
+    pub fn clsid(&self) -> BlenderClsid {
+        match self {
+            Self::DefferFlat { .. } => BlenderClsid::Default,
+            Self::DefferAref { lmapped: true, .. } => BlenderClsid::DefaultAref,
+            Self::DefferAref { lmapped: false, .. } => BlenderClsid::VertAref,
+            Self::DefferModel { .. } => BlenderClsid::Model,
+            Self::ModelEbB { .. } => BlenderClsid::ModelEbB,
+            Self::LmEbB { .. } => BlenderClsid::LmEbB,
+            Self::BmmD { .. } => BlenderClsid::BmmD,
+            Self::DetailStill { .. } => BlenderClsid::Detail,
+            Self::Tree { .. } => BlenderClsid::Tree,
+            Self::ScreenSet { .. } => BlenderClsid::ScreenSet,
+            Self::Particle { .. } => BlenderClsid::Particle,
+            Self::EditorWire { .. } => BlenderClsid::EditorWire,
+            Self::EditorSel { .. } => BlenderClsid::EditorSel,
+        }
+    }
+
+    #[inline]
+    pub fn base_texture(&self) -> &str {
+        match self {
+            Self::DefferFlat { base_texture, .. }
+            | Self::DefferAref { base_texture, .. }
+            | Self::DefferModel { base_texture, .. }
+            | Self::ModelEbB { base_texture, .. }
+            | Self::LmEbB { base_texture, .. }
+            | Self::BmmD { base_texture, .. }
+            | Self::DetailStill { base_texture, .. }
+            | Self::Tree { base_texture, .. }
+            | Self::ScreenSet { base_texture, .. }
+            | Self::Particle { base_texture, .. } => base_texture,
+            Self::EditorWire { .. } | Self::EditorSel { .. } => "$base0",
+        }
+    }
+
+    #[inline]
+    pub fn header(&self) -> (i32, bool) {
+        match self {
+            Self::DefferFlat { priority, strict_sorting, .. }
+            | Self::DefferAref { priority, strict_sorting, .. }
+            | Self::DefferModel { priority, strict_sorting, .. }
+            | Self::ModelEbB { priority, strict_sorting, .. }
+            | Self::LmEbB { priority, strict_sorting, .. }
+            | Self::BmmD { priority, strict_sorting, .. }
+            | Self::DetailStill { priority, strict_sorting, .. }
+            | Self::Tree { priority, strict_sorting, .. }
+            | Self::ScreenSet { priority, strict_sorting, .. }
+            | Self::Particle { priority, strict_sorting, .. }
+            | Self::EditorWire { priority, strict_sorting }
+            | Self::EditorSel { priority, strict_sorting } => (*priority, *strict_sorting),
+        }
+    }
+}
+
+fn parse_base_slot_name<'a>(slot: &'a str, l_textures: &'a [&'a str]) -> Option<&'a str> {
+    match slot {
+        "$null" => None,
+        "$base0" => l_textures.first().copied(),
+        "$base1" => l_textures.get(1).copied(),
+        "$base2" => l_textures.get(2).copied(),
+        "$base3" => l_textures.get(3).copied(),
+        "$base4" => l_textures.get(4).copied(),
+        "$base5" => l_textures.get(5).copied(),
+        "$base6" => l_textures.get(6).copied(),
+        "$base7" => l_textures.get(7).copied(),
+        other => Some(other),
+    }
+}
+
+fn push_deffer_stencil_one(compiler: &mut PassCompiler) {
+    compiler.r_stencil(
+        true,
+        CmpFunc::Always,
+        0xFF,
+        0x7F,
+        StencilOp::Keep,
+        StencilOp::Replace,
+        StencilOp::Keep,
+    );
+    compiler.r_stencil_ref(0x01);
+}
+
+/// Compile any supported R4/Anomaly blender into its pass list (`CBlender_Compile::_cpp_Compile`
+/// in `Blender_Recorder.cpp:40-136` + all `CRender::blender_create` classes in `r2_blenders.cpp`).
+pub fn plan_r4_blender_compile(
+    spec: &R4BlenderSpec,
+    l_textures: &[&str],
+    config: &R4CompileConfig,
+    textures_descr: &TextureDescrTable,
+) -> CompiledShaderPlan {
+    let clsid = spec.clsid();
+    let base_resolved = parse_base_slot_name(spec.base_texture(), l_textures);
+
+    let mut b_detail = config.allow_detail && clsid.can_be_detailed();
+    let mut base_detail_texture = "";
+    if b_detail {
+        if let Some(base) = base_resolved {
+            if let Some((det, _scaler)) = textures_descr.get_detail_texture(base) {
+                base_detail_texture = det;
+            } else {
+                b_detail = false;
+            }
+        } else {
+            b_detail = false;
+        }
+    }
+
+    let mut detail_diffuse = false;
+    let mut detail_bump = false;
+    if b_detail && let Some(base) = base_resolved {
+        let (d, b) = textures_descr.get_texture_usage(base);
+        detail_diffuse = d;
+        detail_bump = b;
+        if !(config.advanced_pp && config.r2_detail_bump) {
+            detail_diffuse |= detail_bump;
+            detail_bump = false;
+        }
+    }
+
+    let use_steep_parallax = clsid.can_use_steep_parallax()
+        && base_resolved.is_some_and(|base| textures_descr.use_steep_parallax(base));
+
+    let (init_priority, init_strict) = spec.header();
+    let mut compiler = PassCompiler::new(init_priority, init_strict);
+    let tex0 = l_textures.first().copied().unwrap_or("");
+    let b_use_atoc = config.msaa_alphatest == Dx10MsaaAlphaTest::Dx100Atoc;
+
+    match spec {
+        R4BlenderSpec::DefferFlat { tessellation, .. } => match config.element {
+            DefferElement::NormalHq | DefferElement::NormalLq => {
+                let hq = config.element == DefferElement::NormalHq;
+                compile_uber_deffer_into(
+                    &mut compiler,
+                    &UberDefferInput {
+                        hq,
+                        vspec: "base",
+                        pspec: "base",
+                        aref: false,
+                        detail_replace: None,
+                        do_not_write: false,
+                        l_textures,
+                        base_detail_texture,
+                        detail_diffuse,
+                        detail_bump,
+                        use_steep_parallax,
+                        tess_method: *tessellation,
+                        dx11_enable_tessellation: config.dx11_enable_tessellation,
+                        wireframe: config.wireframe,
+                    },
+                    textures_descr,
+                );
+                push_deffer_stencil_one(&mut compiler);
+                compiler.r_end();
+            }
+            DefferElement::Shadow => {
+                compile_uber_shadow_into(
+                    &mut compiler,
+                    &UberShadowInput {
+                        vspec: "base",
+                        l_textures,
+                        base_detail_texture,
+                        detail_diffuse,
+                        detail_bump,
+                        tess_method: *tessellation,
+                        dx11_enable_tessellation: config.dx11_enable_tessellation,
+                        wireframe: config.wireframe,
+                    },
+                    textures_descr,
+                );
+                compiler.r_dx10_texture("s_base", tex0);
+                compiler.r_dx10_sampler("smp_base");
+                compiler.r_dx10_sampler("smp_linear");
+                compiler.r_color_write_enable(false, false, false, false);
+                compiler.r_end();
+            }
+            DefferElement::SsfxTerrainLow => {}
+        },
+
+        R4BlenderSpec::DefferAref {
+            lmapped,
+            alpha_ref,
+            alpha_blend,
+            ..
+        } => {
+            if *alpha_blend {
+                match config.element {
+                    DefferElement::NormalHq | DefferElement::NormalLq => {
+                        if *lmapped {
+                            compiler.r_pass_full(
+                                "lmapE",
+                                "null",
+                                "lmapE",
+                                true,
+                                true,
+                                false,
+                                true,
+                                BlendFactor::SrcAlpha,
+                                BlendFactor::InvSrcAlpha,
+                                true,
+                                (*alpha_ref).max(0) as u32,
+                            );
+                            compiler.r_dx10_texture("s_base", tex0);
+                            if let Some(t1) = l_textures.get(1) {
+                                compiler.r_dx10_texture("s_lmap", t1);
+                            }
+                            if let Some(t2) = l_textures.get(2) {
+                                compiler.r_dx10_texture("s_hemi", t2);
+                            }
+                            compiler.r_dx10_texture("s_env", "$user$env_s0");
+                            compiler.r_dx10_sampler("smp_base");
+                            compiler.r_dx10_sampler("smp_linear");
+                            compiler.r_dx10_sampler("smp_rtlinear");
+                            compiler.r_end();
+                        } else {
+                            compiler.r_pass_full(
+                                "vert",
+                                "null",
+                                "vert",
+                                true,
+                                true,
+                                false,
+                                true,
+                                BlendFactor::SrcAlpha,
+                                BlendFactor::InvSrcAlpha,
+                                true,
+                                (*alpha_ref).max(0) as u32,
+                            );
+                            compiler.r_dx10_texture("s_base", tex0);
+                            compiler.r_dx10_sampler("smp_base");
+                            compiler.r_end();
+                        }
+                    }
+                    DefferElement::Shadow | DefferElement::SsfxTerrainLow => {}
+                }
+            } else {
+                compiler.plan.priority = 1;
+                compiler.plan.strict_sorting = false;
+                match config.element {
+                    DefferElement::NormalHq | DefferElement::NormalLq => {
+                        let hq = config.element == DefferElement::NormalHq;
+                        if b_use_atoc {
+                            compile_uber_deffer_into(
+                                &mut compiler,
+                                &UberDefferInput {
+                                    hq,
+                                    vspec: "base",
+                                    pspec: "base_atoc",
+                                    aref: true,
+                                    detail_replace: None,
+                                    do_not_write: false,
+                                    l_textures,
+                                    base_detail_texture,
+                                    detail_diffuse,
+                                    detail_bump,
+                                    use_steep_parallax,
+                                    tess_method: TessMethod::NoTess,
+                                    dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                    wireframe: config.wireframe,
+                                },
+                                textures_descr,
+                            );
+                            push_deffer_stencil_one(&mut compiler);
+                            compiler.r_color_write_enable(false, false, false, false);
+                            compiler.set_alpha_to_coverage(true);
+                            compiler.r_end();
+                        }
+                        compile_uber_deffer_into(
+                            &mut compiler,
+                            &UberDefferInput {
+                                hq,
+                                vspec: "base",
+                                pspec: "base",
+                                aref: true,
+                                detail_replace: None,
+                                do_not_write: false,
+                                l_textures,
+                                base_detail_texture,
+                                detail_diffuse,
+                                detail_bump,
+                                use_steep_parallax,
+                                tess_method: TessMethod::NoTess,
+                                dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                wireframe: config.wireframe,
+                            },
+                            textures_descr,
+                        );
+                        push_deffer_stencil_one(&mut compiler);
+                        if b_use_atoc {
+                            compiler.set_z_func(CmpFunc::Equal);
+                        }
+                        compiler.r_end();
+                    }
+                    DefferElement::Shadow => {
+                        compiler.r_pass_default(
+                            "shadow_direct_base_aref",
+                            "shadow_direct_base_aref",
+                            false,
+                            true,
+                            true,
+                        );
+                        compiler.r_dx10_texture("s_base", tex0);
+                        compiler.r_dx10_sampler("smp_base");
+                        compiler.r_dx10_sampler("smp_linear");
+                        compiler.r_color_write_enable(false, false, false, false);
+                        compiler.r_end();
+                    }
+                    DefferElement::SsfxTerrainLow => {}
+                }
+            }
+        }
+
+        R4BlenderSpec::DefferModel {
+            strict_sorting,
+            alpha_blend,
+            alpha_ref,
+            tessellation,
+            ..
+        } => {
+            let b_forward = (*alpha_blend && *alpha_ref < 16) || *strict_sorting;
+            if b_forward {
+                if matches!(
+                    config.element,
+                    DefferElement::NormalHq | DefferElement::NormalLq
+                ) {
+                    compiler.r_pass_full(
+                        "model_def_lq",
+                        "null",
+                        "model_def_lq",
+                        true,
+                        true,
+                        false,
+                        true,
+                        BlendFactor::SrcAlpha,
+                        BlendFactor::InvSrcAlpha,
+                        true,
+                        (*alpha_ref).max(0) as u32,
+                    );
+                    compiler.r_dx10_texture("s_base", tex0);
+                    compiler.r_dx10_sampler("smp_base");
+                    compiler.r_end();
+                }
+            } else {
+                let b_aref = *alpha_blend;
+                let model_atoc = b_aref && b_use_atoc;
+                match config.element {
+                    DefferElement::NormalHq => {
+                        if model_atoc {
+                            compile_uber_deffer_into(
+                                &mut compiler,
+                                &UberDefferInput {
+                                    hq: true,
+                                    vspec: "model",
+                                    pspec: "base_atoc",
+                                    aref: b_aref,
+                                    detail_replace: None,
+                                    do_not_write: false,
+                                    l_textures,
+                                    base_detail_texture,
+                                    detail_diffuse,
+                                    detail_bump,
+                                    use_steep_parallax,
+                                    tess_method: *tessellation,
+                                    dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                    wireframe: config.wireframe,
+                                },
+                                textures_descr,
+                            );
+                            push_deffer_stencil_one(&mut compiler);
+                            compiler.r_color_write_enable(false, false, false, false);
+                            compiler.set_alpha_to_coverage(true);
+                            compiler.r_end();
+                        }
+                        if config.hud_element {
+                            compile_uber_deffer_into(
+                                &mut compiler,
+                                &UberDefferInput {
+                                    hq: true,
+                                    vspec: "model_hud",
+                                    pspec: "base_hud",
+                                    aref: b_aref,
+                                    detail_replace: None,
+                                    do_not_write: false,
+                                    l_textures,
+                                    base_detail_texture,
+                                    detail_diffuse,
+                                    detail_bump,
+                                    use_steep_parallax,
+                                    tess_method: *tessellation,
+                                    dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                    wireframe: config.wireframe,
+                                },
+                                textures_descr,
+                            );
+                            compiler.r_dx10_texture("s_hud_rain", "fx\\hud_rain");
+                        } else {
+                            compile_uber_deffer_into(
+                                &mut compiler,
+                                &UberDefferInput {
+                                    hq: true,
+                                    vspec: "model",
+                                    pspec: "base",
+                                    aref: b_aref,
+                                    detail_replace: None,
+                                    do_not_write: false,
+                                    l_textures,
+                                    base_detail_texture,
+                                    detail_diffuse,
+                                    detail_bump,
+                                    use_steep_parallax,
+                                    tess_method: *tessellation,
+                                    dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                    wireframe: config.wireframe,
+                                },
+                                textures_descr,
+                            );
+                        }
+                        push_deffer_stencil_one(&mut compiler);
+                        if model_atoc {
+                            compiler.set_z_func(CmpFunc::Equal);
+                        }
+                        compiler.r_end();
+                    }
+                    DefferElement::NormalLq => {
+                        if model_atoc {
+                            compile_uber_deffer_into(
+                                &mut compiler,
+                                &UberDefferInput {
+                                    hq: false,
+                                    vspec: "model",
+                                    pspec: "base_atoc",
+                                    aref: b_aref,
+                                    detail_replace: None,
+                                    do_not_write: false,
+                                    l_textures,
+                                    base_detail_texture,
+                                    detail_diffuse,
+                                    detail_bump,
+                                    use_steep_parallax,
+                                    tess_method: *tessellation,
+                                    dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                    wireframe: config.wireframe,
+                                },
+                                textures_descr,
+                            );
+                            push_deffer_stencil_one(&mut compiler);
+                            compiler.r_color_write_enable(false, false, false, false);
+                            compiler.set_alpha_to_coverage(true);
+                            compiler.r_end();
+                        }
+                        compile_uber_deffer_into(
+                            &mut compiler,
+                            &UberDefferInput {
+                                hq: false,
+                                vspec: "model",
+                                pspec: "base",
+                                aref: b_aref,
+                                detail_replace: None,
+                                do_not_write: false,
+                                l_textures,
+                                base_detail_texture,
+                                detail_diffuse,
+                                detail_bump,
+                                use_steep_parallax,
+                                tess_method: *tessellation,
+                                dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                wireframe: config.wireframe,
+                            },
+                            textures_descr,
+                        );
+                        push_deffer_stencil_one(&mut compiler);
+                        if model_atoc {
+                            compiler.set_z_func(CmpFunc::Equal);
+                        }
+                        compiler.r_end();
+                    }
+                    DefferElement::Shadow => {
+                        if b_aref {
+                            compiler.r_pass_full(
+                                "shadow_direct_model_aref",
+                                "null",
+                                "shadow_direct_base_aref",
+                                false,
+                                true,
+                                true,
+                                false,
+                                BlendFactor::Zero,
+                                BlendFactor::One,
+                                true,
+                                220,
+                            );
+                        } else {
+                            compiler.r_pass_default("shadow_direct_model", "dumb", false, true, true);
+                        }
+                        compiler.r_dx10_texture("s_base", tex0);
+                        compiler.r_dx10_sampler("smp_base");
+                        compiler.r_dx10_sampler("smp_linear");
+                        compiler.r_color_write_enable(false, false, false, false);
+                        compiler.r_end();
+                    }
+                    DefferElement::SsfxTerrainLow => {}
+                }
+            }
+        }
+
+        R4BlenderSpec::ModelEbB {
+            env_texture,
+            alpha_blend,
+            ..
+        } => {
+            if *alpha_blend {
+                if matches!(
+                    config.element,
+                    DefferElement::NormalHq | DefferElement::NormalLq
+                ) {
+                    let shader_name = if config.ssfx_glass && !config.hud_element {
+                        "ssfx_glass"
+                    } else {
+                        "model_env_lq"
+                    };
+                    compiler.r_pass_full(
+                        shader_name,
+                        "null",
+                        shader_name,
+                        true,
+                        true,
+                        false,
+                        true,
+                        BlendFactor::SrcAlpha,
+                        BlendFactor::InvSrcAlpha,
+                        true,
+                        0,
+                    );
+                    compiler.r_dx10_texture("s_base", tex0);
+                    compiler.r_dx10_texture("s_env", env_texture);
+                    if config.ssfx_glass {
+                        compiler.r_dx10_texture("s_accumulator", "$user$accum");
+                        compiler.r_dx10_texture("s_screen", "$user$generic_temp");
+                        compiler.r_dx10_texture("s_glass", "fx\\glass_normal");
+                    }
+                    compiler.r_dx10_sampler("smp_base");
+                    compiler.r_dx10_sampler("smp_rtlinear");
+                    compiler.r_end();
+                }
+            } else {
+                match config.element {
+                    DefferElement::NormalHq => {
+                        if config.hud_element {
+                            compile_uber_deffer_into(
+                                &mut compiler,
+                                &UberDefferInput {
+                                    hq: true,
+                                    vspec: "model_hud",
+                                    pspec: "base_hud",
+                                    aref: false,
+                                    detail_replace: None,
+                                    do_not_write: false,
+                                    l_textures,
+                                    base_detail_texture,
+                                    detail_diffuse,
+                                    detail_bump,
+                                    use_steep_parallax,
+                                    tess_method: TessMethod::NoTess,
+                                    dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                    wireframe: config.wireframe,
+                                },
+                                textures_descr,
+                            );
+                            compiler.r_dx10_texture("s_hud_rain", "fx\\hud_rain");
+                        } else {
+                            compile_uber_deffer_into(
+                                &mut compiler,
+                                &UberDefferInput {
+                                    hq: true,
+                                    vspec: "model",
+                                    pspec: "base",
+                                    aref: false,
+                                    detail_replace: None,
+                                    do_not_write: false,
+                                    l_textures,
+                                    base_detail_texture,
+                                    detail_diffuse,
+                                    detail_bump,
+                                    use_steep_parallax,
+                                    tess_method: TessMethod::NoTess,
+                                    dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                    wireframe: config.wireframe,
+                                },
+                                textures_descr,
+                            );
+                        }
+                        push_deffer_stencil_one(&mut compiler);
+                        compiler.r_end();
+                    }
+                    DefferElement::NormalLq => {
+                        compile_uber_deffer_into(
+                            &mut compiler,
+                            &UberDefferInput {
+                                hq: false,
+                                vspec: "model",
+                                pspec: "base",
+                                aref: false,
+                                detail_replace: None,
+                                do_not_write: false,
+                                l_textures,
+                                base_detail_texture,
+                                detail_diffuse,
+                                detail_bump,
+                                use_steep_parallax,
+                                tess_method: TessMethod::NoTess,
+                                dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                wireframe: config.wireframe,
+                            },
+                            textures_descr,
+                        );
+                        push_deffer_stencil_one(&mut compiler);
+                        compiler.r_end();
+                    }
+                    DefferElement::Shadow => {
+                        compiler.r_pass_default("shadow_direct_model", "dumb", false, true, true);
+                        compiler.r_dx10_texture("s_base", tex0);
+                        compiler.r_dx10_sampler("smp_base");
+                        compiler.r_dx10_sampler("smp_linear");
+                        compiler.r_color_write_enable(false, false, false, false);
+                        compiler.r_end();
+                    }
+                    DefferElement::SsfxTerrainLow => {}
+                }
+            }
+        }
+
+        R4BlenderSpec::LmEbB {
+            env_texture,
+            alpha_blend,
+            ..
+        } => {
+            if *alpha_blend {
+                compiler.r_pass_full(
+                    "lmapE",
+                    "null",
+                    "lmapE",
+                    true,
+                    true,
+                    false,
+                    true,
+                    BlendFactor::SrcAlpha,
+                    BlendFactor::InvSrcAlpha,
+                    true,
+                    0,
+                );
+            } else {
+                compiler.r_pass_default("lmapE", "lmapE", true, true, true);
+            }
+            compiler.r_dx10_texture("s_base", tex0);
+            compiler.r_dx10_sampler("smp_base");
+            if let Some(t1) = l_textures.get(1) {
+                compiler.r_dx10_texture("s_lmap", t1);
+            }
+            compiler.r_dx10_sampler("smp_linear");
+            if let Some(t2) = l_textures.get(2) {
+                compiler.r_dx10_texture("s_hemi", t2);
+            }
+            compiler.r_dx10_sampler("smp_rtlinear");
+            compiler.r_dx10_texture("s_env", env_texture);
+            compiler.r_end();
+        }
+
+        R4BlenderSpec::BmmD {
+            detail_texture,
+            r_detail,
+            g_detail,
+            b_detail,
+            a_detail,
+            ..
+        } => {
+            let mask_tex = format!("{tex0}_mask");
+            let detail_rep = if detail_texture.is_empty() {
+                None
+            } else {
+                Some(detail_texture.as_str())
+            };
+            let z_prepass = config.terrain_prepass;
+
+            match config.element {
+                DefferElement::NormalHq => {
+                    if z_prepass {
+                        compiler.plan.is_landscape_prepass = true;
+                        compiler.r_pass_default(
+                            "shadow_direct_base",
+                            "shadow_direct_base",
+                            false,
+                            true,
+                            true,
+                        );
+                        compiler.r_color_write_enable(false, false, false, false);
+                        compiler.r_end();
+                    }
+                    let (vspec, pspec) = if config.ssfx_terrain {
+                        compiler.plan.is_landscape = true;
+                        ("terrain", "terrain_high")
+                    } else {
+                        ("impl", "impl")
+                    };
+                    compile_uber_deffer_into(
+                        &mut compiler,
+                        &UberDefferInput {
+                            hq: true,
+                            vspec,
+                            pspec,
+                            aref: false,
+                            detail_replace: detail_rep,
+                            do_not_write: z_prepass,
+                            l_textures,
+                            base_detail_texture,
+                            detail_diffuse,
+                            detail_bump,
+                            use_steep_parallax,
+                            tess_method: TessMethod::NoTess,
+                            dx11_enable_tessellation: config.dx11_enable_tessellation,
+                            wireframe: config.wireframe,
+                        },
+                        textures_descr,
+                    );
+                    if z_prepass {
+                        compiler.set_z_func(CmpFunc::Equal);
+                    }
+                    compiler.r_dx10_texture("s_mask", &mask_tex);
+                    if let Some(t1) = l_textures.get(1) {
+                        compiler.r_dx10_texture("s_lmap", t1);
+                    }
+                    compiler.r_dx10_texture("s_dt_r", r_detail);
+                    compiler.r_dx10_texture("s_dt_g", g_detail);
+                    compiler.r_dx10_texture("s_dt_b", b_detail);
+                    compiler.r_dx10_texture("s_dt_a", a_detail);
+                    compiler.r_dx10_texture("s_dn_r", &format!("{r_detail}_bump"));
+                    compiler.r_dx10_texture("s_dn_g", &format!("{g_detail}_bump"));
+                    compiler.r_dx10_texture("s_dn_b", &format!("{b_detail}_bump"));
+                    compiler.r_dx10_texture("s_dn_a", &format!("{a_detail}_bump"));
+                    if config.ssfx_terrain {
+                        compiler.r_dx10_texture("s_height_r", &format!("{r_detail}_height"));
+                        compiler.r_dx10_texture("s_height_g", &format!("{g_detail}_height"));
+                        compiler.r_dx10_texture("s_height_b", &format!("{b_detail}_height"));
+                        compiler.r_dx10_texture("s_height_a", &format!("{a_detail}_height"));
+                    }
+                    compiler.r_dx10_texture("s_puddles_normal", "fx\\water_normal");
+                    compiler.r_dx10_texture("s_puddles_perlin", "fx\\puddles_perlin");
+                    compiler.r_dx10_texture("s_puddles_mask", &format!("{tex0}_puddles_mask"));
+                    compiler.r_dx10_texture("s_rainsplash", "fx\\water_sbumpvolume");
+                    compiler.r_dx10_sampler("smp_base");
+                    compiler.r_dx10_sampler("smp_linear");
+                    push_deffer_stencil_one(&mut compiler);
+                    compiler.r_end();
+                }
+                DefferElement::NormalLq => {
+                    if z_prepass {
+                        compiler.plan.is_landscape_prepass = true;
+                        compiler.r_pass_default(
+                            "shadow_direct_base",
+                            "shadow_direct_base",
+                            false,
+                            true,
+                            true,
+                        );
+                        compiler.r_color_write_enable(false, false, false, false);
+                        compiler.r_end();
+                    }
+                    let pspec = if config.ssfx_terrain {
+                        compiler.plan.is_landscape = true;
+                        "terrain_mid"
+                    } else {
+                        "impl"
+                    };
+                    compile_uber_deffer_into(
+                        &mut compiler,
+                        &UberDefferInput {
+                            hq: false,
+                            vspec: "base",
+                            pspec,
+                            aref: false,
+                            detail_replace: detail_rep,
+                            do_not_write: z_prepass,
+                            l_textures,
+                            base_detail_texture,
+                            detail_diffuse,
+                            detail_bump,
+                            use_steep_parallax,
+                            tess_method: TessMethod::NoTess,
+                            dx11_enable_tessellation: config.dx11_enable_tessellation,
+                            wireframe: config.wireframe,
+                        },
+                        textures_descr,
+                    );
+                    if z_prepass {
+                        compiler.set_z_func(CmpFunc::Equal);
+                    }
+                    compiler.r_dx10_texture("s_mask", &mask_tex);
+                    if config.ssfx_terrain {
+                        let lod_tex = if config.terrain_has_lod_textures_dds {
+                            format!("{tex0}_lod_textures")
+                        } else {
+                            "terrain\\default_lod_textures".to_string()
+                        };
+                        compiler.r_dx10_texture("s_lod_texture", &lod_tex);
+                    }
+                    compiler.r_dx10_sampler("smp_base");
+                    compiler.r_dx10_sampler("smp_linear");
+                    push_deffer_stencil_one(&mut compiler);
+                    compiler.r_end();
+                }
+                DefferElement::SsfxTerrainLow => {
+                    if z_prepass {
+                        compiler.plan.is_landscape_prepass = true;
+                        compiler.r_pass_default(
+                            "shadow_direct_base",
+                            "shadow_direct_base",
+                            false,
+                            true,
+                            true,
+                        );
+                        compiler.r_color_write_enable(false, false, false, false);
+                        compiler.r_end();
+                    }
+                    compiler.plan.is_landscape = true;
+                    compile_uber_deffer_into(
+                        &mut compiler,
+                        &UberDefferInput {
+                            hq: false,
+                            vspec: "base",
+                            pspec: "terrain_low",
+                            aref: false,
+                            detail_replace: detail_rep,
+                            do_not_write: z_prepass,
+                            l_textures,
+                            base_detail_texture,
+                            detail_diffuse,
+                            detail_bump,
+                            use_steep_parallax,
+                            tess_method: TessMethod::NoTess,
+                            dx11_enable_tessellation: config.dx11_enable_tessellation,
+                            wireframe: config.wireframe,
+                        },
+                        textures_descr,
+                    );
+                    if z_prepass {
+                        compiler.set_z_func(CmpFunc::Equal);
+                    }
+                    compiler.r_dx10_sampler("smp_linear");
+                    push_deffer_stencil_one(&mut compiler);
+                    compiler.r_end();
+                }
+                DefferElement::Shadow => {
+                    let vs = if config.ssfx_terrain {
+                        "shadow_direct_terrain"
+                    } else {
+                        "shadow_direct_base"
+                    };
+                    compiler.r_pass_default(vs, "dumb", false, true, true);
+                    compiler.r_dx10_texture("s_base", tex0);
+                    compiler.r_dx10_sampler("smp_base");
+                    compiler.r_dx10_sampler("smp_linear");
+                    compiler.r_color_write_enable(false, false, false, false);
+                    compiler.r_end();
+                }
+            }
+        }
+
+        R4BlenderSpec::DetailStill { .. } => {
+            if let Some(vspec) = match config.element {
+                DefferElement::NormalHq => Some("detail_w"),
+                DefferElement::NormalLq => Some("detail_s"),
+                DefferElement::Shadow | DefferElement::SsfxTerrainLow => None,
+            } {
+                if b_use_atoc {
+                    compile_uber_deffer_into(
+                        &mut compiler,
+                        &UberDefferInput {
+                            hq: false,
+                            vspec,
+                            pspec: "base_atoc",
+                            aref: true,
+                            detail_replace: None,
+                            do_not_write: false,
+                            l_textures,
+                            base_detail_texture,
+                            detail_diffuse,
+                            detail_bump,
+                            use_steep_parallax,
+                            tess_method: TessMethod::NoTess,
+                            dx11_enable_tessellation: config.dx11_enable_tessellation,
+                            wireframe: config.wireframe,
+                        },
+                        textures_descr,
+                    );
+                    push_deffer_stencil_one(&mut compiler);
+                    compiler.r_color_write_enable(false, false, false, false);
+                    compiler.r_cull_mode(CullMode::None);
+                    compiler.set_alpha_to_coverage(true);
+                    compiler.r_end();
+                }
+                compile_uber_deffer_into(
+                    &mut compiler,
+                    &UberDefferInput {
+                        hq: false,
+                        vspec,
+                        pspec: "base",
+                        aref: true,
+                        detail_replace: None,
+                        do_not_write: false,
+                        l_textures,
+                        base_detail_texture,
+                        detail_diffuse,
+                        detail_bump,
+                        use_steep_parallax,
+                        tess_method: TessMethod::NoTess,
+                        dx11_enable_tessellation: config.dx11_enable_tessellation,
+                        wireframe: config.wireframe,
+                    },
+                    textures_descr,
+                );
+                push_deffer_stencil_one(&mut compiler);
+                compiler.r_cull_mode(CullMode::None);
+                if b_use_atoc {
+                    compiler.set_z_func(CmpFunc::Equal);
+                }
+                compiler.r_end();
+            }
+        }
+
+        R4BlenderSpec::Tree {
+            alpha_blend,
+            not_an_tree,
+            ..
+        } => {
+            let (mut tvs, mut tps) = (
+                if *not_an_tree { "tree_s" } else { "tree" },
+                "base",
+            );
+            let tvs_s = match (*not_an_tree, *alpha_blend) {
+                (true, true) => "shadow_direct_tree_s_aref",
+                (true, false) => "shadow_direct_tree_s",
+                (false, true) => "shadow_direct_tree_aref",
+                (false, false) => "shadow_direct_tree",
+            };
+            let tree_atoc = *alpha_blend && b_use_atoc;
+            match config.element {
+                DefferElement::NormalHq => {
+                    if *alpha_blend && config.ssfx_branches {
+                        tvs = "tree_branch";
+                        tps = "tree_branch";
+                    }
+                    if tree_atoc {
+                        let tps_atoc = format!("{tvs}_atoc");
+                        compile_uber_deffer_into(
+                            &mut compiler,
+                            &UberDefferInput {
+                                hq: true,
+                                vspec: tvs,
+                                pspec: &tps_atoc,
+                                aref: *alpha_blend,
+                                detail_replace: None,
+                                do_not_write: false,
+                                l_textures,
+                                base_detail_texture,
+                                detail_diffuse,
+                                detail_bump,
+                                use_steep_parallax,
+                                tess_method: TessMethod::NoTess,
+                                dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                wireframe: config.wireframe,
+                            },
+                            textures_descr,
+                        );
+                        push_deffer_stencil_one(&mut compiler);
+                        compiler.r_color_write_enable(false, false, false, false);
+                        compiler.set_alpha_to_coverage(true);
+                        compiler.r_end();
+                    }
+                    compile_uber_deffer_into(
+                        &mut compiler,
+                        &UberDefferInput {
+                            hq: true,
+                            vspec: tvs,
+                            pspec: tps,
+                            aref: *alpha_blend,
+                            detail_replace: None,
+                            do_not_write: false,
+                            l_textures,
+                            base_detail_texture,
+                            detail_diffuse,
+                            detail_bump,
+                            use_steep_parallax,
+                            tess_method: TessMethod::NoTess,
+                            dx11_enable_tessellation: config.dx11_enable_tessellation,
+                            wireframe: config.wireframe,
+                        },
+                        textures_descr,
+                    );
+                    push_deffer_stencil_one(&mut compiler);
+                    compiler.r_dx10_texture("s_waves", "fx\\wind_wave");
+                    compiler.r_dx10_sampler("smp_linear2");
+                    if tree_atoc {
+                        compiler.set_z_func(CmpFunc::Equal);
+                    }
+                    compiler.r_end();
+                }
+                DefferElement::NormalLq => {
+                    if tree_atoc {
+                        compile_uber_deffer_into(
+                            &mut compiler,
+                            &UberDefferInput {
+                                hq: false,
+                                vspec: tvs,
+                                pspec: "base_atoc",
+                                aref: *alpha_blend,
+                                detail_replace: None,
+                                do_not_write: false,
+                                l_textures,
+                                base_detail_texture,
+                                detail_diffuse,
+                                detail_bump,
+                                use_steep_parallax,
+                                tess_method: TessMethod::NoTess,
+                                dx11_enable_tessellation: config.dx11_enable_tessellation,
+                                wireframe: config.wireframe,
+                            },
+                            textures_descr,
+                        );
+                        push_deffer_stencil_one(&mut compiler);
+                        compiler.r_color_write_enable(false, false, false, false);
+                        compiler.set_alpha_to_coverage(true);
+                        compiler.r_end();
+                    }
+                    compile_uber_deffer_into(
+                        &mut compiler,
+                        &UberDefferInput {
+                            hq: false,
+                            vspec: tvs,
+                            pspec: "base",
+                            aref: *alpha_blend,
+                            detail_replace: None,
+                            do_not_write: false,
+                            l_textures,
+                            base_detail_texture,
+                            detail_diffuse,
+                            detail_bump,
+                            use_steep_parallax,
+                            tess_method: TessMethod::NoTess,
+                            dx11_enable_tessellation: config.dx11_enable_tessellation,
+                            wireframe: config.wireframe,
+                        },
+                        textures_descr,
+                    );
+                    push_deffer_stencil_one(&mut compiler);
+                    compiler.r_dx10_texture("s_waves", "fx\\wind_wave");
+                    compiler.r_dx10_sampler("smp_linear2");
+                    if tree_atoc {
+                        compiler.set_z_func(CmpFunc::Equal);
+                    }
+                    compiler.r_end();
+                }
+                DefferElement::Shadow => {
+                    if *alpha_blend {
+                        compiler.r_pass_full(
+                            tvs_s,
+                            "null",
+                            "shadow_direct_base_aref",
+                            false,
+                            true,
+                            true,
+                            true,
+                            BlendFactor::Zero,
+                            BlendFactor::One,
+                            true,
+                            200,
+                        );
+                    } else {
+                        compiler.r_pass_default(tvs_s, "shadow_direct_base", false, true, true);
+                    }
+                    compiler.r_dx10_texture("s_base", tex0);
+                    compiler.r_dx10_sampler("smp_base");
+                    compiler.r_dx10_sampler("smp_linear");
+                    compiler.r_dx10_texture("s_waves", "fx\\wind_wave");
+                    compiler.r_dx10_sampler("smp_linear2");
+                    compiler.r_color_write_enable(false, false, false, false);
+                    compiler.r_end();
+                }
+                DefferElement::SsfxTerrainLow => {}
+            }
+        }
+
+        R4BlenderSpec::ScreenSet {
+            blend_mode,
+            clamp,
+            alpha_ref,
+            z_test,
+            z_write,
+            lighting,
+            fog,
+            ..
+        } => {
+            if *blend_mode == 6 {
+                compiler.r_pass_default("stub_notransform_t", "stub_default_ma", false, true, true);
+            } else {
+                let vs = match *blend_mode {
+                    9 => "stub_notransform_t_m4",
+                    7 | 8 => "stub_notransform_t_m2",
+                    _ => "stub_notransform_t",
+                };
+                compiler.r_pass_default(vs, "stub_default", false, true, true);
+            }
+            compiler.r_dx10_texture("s_base", tex0);
+            let smp = compiler.r_dx10_sampler("smp_base");
+            if *clamp && smp != usize::MAX {
+                compiler.i_dx10_address(smp, TexAddressMode::Clamp);
+            }
+            compiler.pass_set_zb(*z_test, *z_write);
+            match *blend_mode {
+                0 => compiler.pass_set_blend(false, BlendFactor::One, BlendFactor::Zero, false, 0),
+                1 | 8 | 9 => compiler.pass_set_blend(
+                    true,
+                    BlendFactor::SrcAlpha,
+                    BlendFactor::InvSrcAlpha,
+                    true,
+                    *alpha_ref,
+                ),
+                2 => compiler.pass_set_blend(true, BlendFactor::One, BlendFactor::One, false, *alpha_ref),
+                3 => compiler.pass_set_blend(
+                    true,
+                    BlendFactor::DestColor,
+                    BlendFactor::Zero,
+                    false,
+                    *alpha_ref,
+                ),
+                4 | 6 => compiler.pass_set_blend(
+                    true,
+                    BlendFactor::DestColor,
+                    BlendFactor::SrcColor,
+                    false,
+                    *alpha_ref,
+                ),
+                5 => compiler.pass_set_blend(
+                    true,
+                    BlendFactor::SrcAlpha,
+                    BlendFactor::One,
+                    true,
+                    *alpha_ref,
+                ),
+                7 => compiler.pass_set_blend(true, BlendFactor::One, BlendFactor::Zero, true, 0),
+                _ => {}
+            }
+            compiler.pass_set_light_fog(*lighting, *fog);
+            compiler.r_end();
+        }
+
+        R4BlenderSpec::Particle {
+            blend_mode, clamp, ..
+        } => {
+            match config.element {
+                DefferElement::NormalHq | DefferElement::NormalLq => {
+                    let valid = match *blend_mode {
+                        0 => {
+                            compiler.r_pass_full(
+                                "deffer_particle",
+                                "null",
+                                "deffer_particle",
+                                false,
+                                true,
+                                true,
+                                false,
+                                BlendFactor::One,
+                                BlendFactor::Zero,
+                                false,
+                                200,
+                            );
+                            true
+                        }
+                        1 => {
+                            compiler.r_pass_full(
+                                "particle",
+                                "null",
+                                "particle",
+                                false,
+                                true,
+                                false,
+                                true,
+                                BlendFactor::SrcAlpha,
+                                BlendFactor::InvSrcAlpha,
+                                true,
+                                0,
+                            );
+                            true
+                        }
+                        2 => {
+                            compiler.r_pass_full(
+                                "particle",
+                                "null",
+                                "particle",
+                                false,
+                                true,
+                                false,
+                                true,
+                                BlendFactor::One,
+                                BlendFactor::One,
+                                true,
+                                0,
+                            );
+                            true
+                        }
+                        3 => {
+                            compiler.r_pass_full(
+                                "particle",
+                                "null",
+                                "particle",
+                                false,
+                                true,
+                                false,
+                                true,
+                                BlendFactor::DestColor,
+                                BlendFactor::Zero,
+                                true,
+                                0,
+                            );
+                            true
+                        }
+                        4 => {
+                            compiler.r_pass_full(
+                                "particle",
+                                "null",
+                                "particle",
+                                false,
+                                true,
+                                false,
+                                true,
+                                BlendFactor::DestColor,
+                                BlendFactor::SrcColor,
+                                true,
+                                0,
+                            );
+                            true
+                        }
+                        5 => {
+                            compiler.r_pass_full(
+                                "particle",
+                                "null",
+                                "particle",
+                                false,
+                                true,
+                                false,
+                                true,
+                                BlendFactor::SrcAlpha,
+                                BlendFactor::One,
+                                true,
+                                0,
+                            );
+                            true
+                        }
+                        _ => false,
+                    };
+                    if valid {
+                        compiler.r_dx10_texture("s_base", tex0);
+                        let smp = compiler.r_dx10_sampler("smp_base");
+                        if *clamp && smp != usize::MAX {
+                            compiler.i_dx10_address(smp, TexAddressMode::Clamp);
+                        }
+                        compiler.r_dx10_texture("s_position", "$user$position");
+                        compiler.r_dx10_sampler("smp_nofilter");
+                        compiler.r_end();
+                    }
+                }
+                DefferElement::Shadow => {
+                    let valid = match *blend_mode {
+                        0 => {
+                            compiler.r_pass_full(
+                                "particle",
+                                "null",
+                                "particle",
+                                false,
+                                true,
+                                true,
+                                false,
+                                BlendFactor::One,
+                                BlendFactor::Zero,
+                                true,
+                                200,
+                            );
+                            compiler.r_color_write_enable(false, false, false, false);
+                            true
+                        }
+                        1 => {
+                            compiler.r_pass_full(
+                                "particle-clip",
+                                "null",
+                                "particle_s-blend",
+                                false,
+                                true,
+                                false,
+                                true,
+                                BlendFactor::DestColor,
+                                BlendFactor::Zero,
+                                true,
+                                0,
+                            );
+                            true
+                        }
+                        2 => {
+                            compiler.r_pass_full(
+                                "particle-clip",
+                                "null",
+                                "particle_s-add",
+                                false,
+                                true,
+                                false,
+                                true,
+                                BlendFactor::DestColor,
+                                BlendFactor::Zero,
+                                true,
+                                0,
+                            );
+                            true
+                        }
+                        3 | 4 => {
+                            compiler.r_pass_full(
+                                "particle-clip",
+                                "null",
+                                "particle_s-mul",
+                                false,
+                                true,
+                                false,
+                                true,
+                                BlendFactor::DestColor,
+                                BlendFactor::Zero,
+                                true,
+                                0,
+                            );
+                            true
+                        }
+                        5 => {
+                            compiler.r_pass_full(
+                                "particle-clip",
+                                "null",
+                                "particle_s-aadd",
+                                false,
+                                true,
+                                false,
+                                true,
+                                BlendFactor::DestColor,
+                                BlendFactor::Zero,
+                                true,
+                                0,
+                            );
+                            true
+                        }
+                        _ => false,
+                    };
+                    if valid {
+                        compiler.r_dx10_texture("s_base", tex0);
+                        let smp = compiler.r_dx10_sampler("smp_base");
+                        if *clamp && smp != usize::MAX {
+                            compiler.i_dx10_address(smp, TexAddressMode::Clamp);
+                        }
+                        compiler.r_dx10_texture("s_position", "$user$position");
+                        compiler.r_dx10_sampler("smp_nofilter");
+                        compiler.r_end();
+                    }
+                }
+                DefferElement::SsfxTerrainLow => {}
+            }
+        }
+
+        R4BlenderSpec::EditorWire { .. } => {
+            compiler.r_pass_default("editor", "simple_color", false, false, false);
+            compiler.r_color_write_enable(true, true, true, true);
+            compiler.r_end();
+        }
+
+        R4BlenderSpec::EditorSel { .. } => {
+            compiler.r_pass_full(
+                "editor",
+                "null",
+                "simple_color",
+                false,
+                true,
+                false,
+                true,
+                BlendFactor::SrcAlpha,
+                BlendFactor::InvSrcAlpha,
+                false,
+                0,
+            );
+            compiler.r_end();
+        }
+    }
+
+    compiler.plan
+}
+
+/// UI vertex stream format (`dxUIRender::ePointType` in `dxUIRender.cpp:207-244`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiPointType {
+    #[default]
+    None,
+    Lit,
+    Tl,
+}
+
+/// UI primitive topology (`dxUIRender::ePrimitiveType` in `dxUIRender.cpp:273-294`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiPrimitiveType {
+    #[default]
+    None,
+    TriList,
+    TriStrip,
+    LineList,
+    LineStrip,
+}
+
+/// Resolve the effective UI shader name, switching to `"hud\\movie"` when an `.ogm` video
+/// companion exists (`dxUIRender::UpdateShaderName` in `dxUIRender.cpp:178-188`).
+#[inline]
+pub fn resolve_ui_shader_name(has_ogm_video: bool, sh_name: &str) -> &str {
+    if has_ogm_video {
+        "hud\\movie"
+    } else {
+        sh_name
+    }
+}
+
+/// Compute primitive count from pushed UI vertices matching `dxUIRender::FlushPrimitive`
+/// (`dxUIRender.cpp:273-294`).
+#[inline]
+pub const fn ui_primitive_count(prim_type: UiPrimitiveType, vertex_count: usize) -> usize {
+    match prim_type {
+        UiPrimitiveType::TriStrip => vertex_count.saturating_sub(2),
+        UiPrimitiveType::TriList => vertex_count / 3,
+        UiPrimitiveType::LineStrip => vertex_count.saturating_sub(1),
+        UiPrimitiveType::LineList => vertex_count / 2,
+        UiPrimitiveType::None => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,5 +3985,385 @@ use_flags = 5
         assert_eq!(accum.fog_density, 0.0);
         assert_eq!(accum.far_plane, 0.0);
         assert_eq!(accum.ambient, [0.0; 3]);
+    }
+
+    #[test]
+    fn r4_uber_deffer_uber_shadow_and_blenders_match_cpp() {
+        use crate::thm::{texture_flags, TextureBumpMode, TextureParams, TextureType};
+
+        let mut thm_tbl = TextureDescrTable::new();
+        let wall_thm = TextureParams {
+            texture_type: TextureType::Image,
+            flags: texture_flags::FL_DIFFUSE_DETAIL | texture_flags::FL_BUMP_DETAIL,
+            detail_name: "detail\\detail_brick".to_string(),
+            detail_scale: 3.0,
+            bump_mode: TextureBumpMode::UseParallax,
+            bump_name: "wall\\brick_bump".to_string(),
+            ..TextureParams::default()
+        };
+        let det_thm = TextureParams {
+            texture_type: TextureType::Image,
+            bump_mode: TextureBumpMode::Use,
+            bump_name: "detail\\detail_brick_bump".to_string(),
+            ..TextureParams::default()
+        };
+        thm_tbl.insert_thm("wall\\brick", &wall_thm);
+        thm_tbl.insert_thm("detail\\detail_brick", &det_thm);
+
+        // 1. Flat / non-bump deffer without lmap
+        let flat_pass = plan_uber_deffer(
+            &UberDefferInput {
+                hq: true,
+                vspec: "base",
+                pspec: "base",
+                aref: false,
+                l_textures: &["crete\\plain.dds"],
+                ..UberDefferInput::default()
+            },
+            &thm_tbl,
+        );
+        assert_eq!(flat_pass.vs, "deffer_base_flat");
+        assert_eq!(flat_pass.ps, "deffer_base_flat");
+        assert_eq!(flat_pass.textures[0].texture_name, "crete\\plain");
+
+        // 2. Bump + Steep Parallax + LMap + Detail Bump in HQ
+        let steep_pass = plan_uber_deffer(
+            &UberDefferInput {
+                hq: true,
+                vspec: "base",
+                pspec: "base",
+                aref: false,
+                l_textures: &["wall\\brick.dds", "lmap#1_1", "lmap#1_2"],
+                base_detail_texture: "detail\\detail_brick",
+                detail_diffuse: true,
+                detail_bump: true,
+                use_steep_parallax: true,
+                ..UberDefferInput::default()
+            },
+            &thm_tbl,
+        );
+        assert_eq!(steep_pass.vs, "deffer_base_lmh_bump_d-hq");
+        assert_eq!(steep_pass.ps, "deffer_base_lmh_steep_db-hq");
+        assert!(steep_pass
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_bumpX" && t.texture_name == "wall\\brick_bump#"));
+        assert!(steep_pass
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_detailBumpX" && t.texture_name == "detail\\detail_brick_bump#"));
+        assert!(steep_pass
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_hemi" && t.texture_name == "lmap#1_2"));
+
+        // 3. DX11 Tessellation (PN + HM + LM_HEMI + TDETAIL + TDETAIL_BUMP)
+        let tess_pass = plan_uber_deffer(
+            &UberDefferInput {
+                hq: true,
+                vspec: "base",
+                pspec: "base",
+                aref: true,
+                l_textures: &["wall\\brick", "lmap#1_1", "lmap#1_2"],
+                base_detail_texture: "detail\\detail_brick",
+                detail_diffuse: true,
+                detail_bump: true,
+                tess_method: TessMethod::TessPnHm,
+                dx11_enable_tessellation: true,
+                wireframe: true,
+                ..UberDefferInput::default()
+            },
+            &thm_tbl,
+        );
+        let expected_params = "(TESS_PN,TESS_HM,USE_LM_HEMI,USE_TDETAIL,USE_TDETAIL_BUMP,)";
+        assert_eq!(tess_pass.vs, format!("deffer_base_bump{expected_params}"));
+        assert_eq!(tess_pass.ps, format!("deffer_base_aref_bump{expected_params}"));
+        assert_eq!(tess_pass.hs, format!("DX11\\tess{expected_params}"));
+        assert_eq!(tess_pass.ds, format!("DX11\\tess{expected_params}"));
+        assert!(tess_pass.wireframe);
+        assert_eq!(tess_pass.shader_options.len(), 5);
+        assert!(tess_pass
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_tdetailBumpX"));
+        assert!(tess_pass
+            .samplers
+            .iter()
+            .any(|s| s.resource_name == "smp_bump_ds" && s.anisotropic_override == Some(true)));
+
+        let sh_tess = plan_uber_shadow(
+            &UberShadowInput {
+                vspec: "base",
+                l_textures: &["wall\\brick"],
+                detail_diffuse: false,
+                detail_bump: false,
+                tess_method: TessMethod::TessPn,
+                dx11_enable_tessellation: true,
+                wireframe: false,
+                ..UberShadowInput::default()
+            },
+            &thm_tbl,
+        );
+        assert_eq!(sh_tess.vs, "deffer_base_bump(TESS_PN,)");
+        assert_eq!(sh_tess.ds, "DX11\\tess_shadow(TESS_PN,)");
+        assert_eq!(sh_tess.ps, "dumb");
+
+        // 4. ATOC 2-pass deffer_aref: Pass 0 ATOC depth-only, Pass 1 main with ZWRITE=false & ZFUNC=Equal
+        let aref_spec = R4BlenderSpec::DefferAref {
+            priority: 1,
+            strict_sorting: false,
+            base_texture: "$base0".to_string(),
+            lmapped: true,
+            alpha_ref: 200,
+            alpha_blend: false,
+        };
+        let aref_plan = plan_r4_blender_compile(
+            &aref_spec,
+            &["crete\\fence"],
+            &R4CompileConfig {
+                element: DefferElement::NormalHq,
+                msaa_alphatest: Dx10MsaaAlphaTest::Dx100Atoc,
+                ..R4CompileConfig::default()
+            },
+            &thm_tbl,
+        );
+        assert_eq!(aref_plan.passes.len(), 2);
+        assert_eq!(aref_plan.passes[0].ps, "deffer_base_atoc_aref_flat");
+        assert!(aref_plan.passes[0].blend.alpha_to_coverage);
+        assert_eq!(aref_plan.passes[0].blend.color_write_enable, [false; 4]);
+        assert!(aref_plan.passes[0].z_write);
+        assert_eq!(aref_plan.passes[1].ps, "deffer_base_aref_flat");
+        assert!(!aref_plan.passes[1].z_write);
+        assert_eq!(aref_plan.passes[1].z_func, CmpFunc::Equal);
+        assert!(aref_plan.passes[1].stencil.enable);
+        assert_eq!(aref_plan.passes[1].stencil.ref_value, 1);
+
+        // 5. SSFX BmmD Terrain (prepass + terrain_high + height textures + terrain_mid _lod_texture + shadow_direct_terrain)
+        let bmmd = R4BlenderSpec::BmmD {
+            priority: 1,
+            strict_sorting: false,
+            base_texture: "$base0".to_string(),
+            detail_texture: "$null".to_string(),
+            r_detail: "detail\\grnd_grass".to_string(),
+            g_detail: "detail\\grnd_asphalt".to_string(),
+            b_detail: "detail\\grnd_earth".to_string(),
+            a_detail: "detail\\grnd_yantar".to_string(),
+        };
+        let hq_terrain = plan_r4_blender_compile(
+            &bmmd,
+            &["terrain\\terrain_escape", "lmap#1_1", "lmap#1_2"],
+            &R4CompileConfig {
+                element: DefferElement::NormalHq,
+                terrain_prepass: true,
+                ssfx_terrain: true,
+                allow_detail: false,
+                ..R4CompileConfig::default()
+            },
+            &thm_tbl,
+        );
+        assert!(hq_terrain.is_landscape_prepass);
+        assert!(hq_terrain.is_landscape);
+        assert_eq!(hq_terrain.passes.len(), 2);
+        assert_eq!(hq_terrain.passes[0].vs, "shadow_direct_base");
+        assert_eq!(hq_terrain.passes[0].blend.color_write_enable, [false; 4]);
+        assert_eq!(hq_terrain.passes[1].vs, "deffer_terrain_lmh_flat");
+        assert_eq!(hq_terrain.passes[1].ps, "deffer_terrain_high_lmh_flat");
+        assert_eq!(hq_terrain.passes[1].z_func, CmpFunc::Equal);
+        assert!(!hq_terrain.passes[1].z_write);
+        assert!(hq_terrain.passes[1]
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_height_r" && t.texture_name == "detail\\grnd_grass_height"));
+
+        let lq_terrain = plan_r4_blender_compile(
+            &bmmd,
+            &["terrain\\terrain_escape", "lmap#1_1"],
+            &R4CompileConfig {
+                element: DefferElement::NormalLq,
+                ssfx_terrain: true,
+                terrain_has_lod_textures_dds: false,
+                allow_detail: false,
+                ..R4CompileConfig::default()
+            },
+            &thm_tbl,
+        );
+        assert_eq!(lq_terrain.passes[0].ps, "deffer_terrain_mid_flat");
+        assert!(lq_terrain.passes[0]
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_lod_texture" && t.texture_name == "terrain\\default_lod_textures"));
+
+        let sh_terrain = plan_r4_blender_compile(
+            &bmmd,
+            &["terrain\\terrain_escape"],
+            &R4CompileConfig {
+                element: DefferElement::Shadow,
+                ssfx_terrain: true,
+                ..R4CompileConfig::default()
+            },
+            &thm_tbl,
+        );
+        assert_eq!(sh_terrain.passes[0].vs, "shadow_direct_terrain");
+
+        // 6. SSFX Tree Branches & ModelEbB Glass / HUD Rain
+        let tree_plan = plan_r4_blender_compile(
+            &R4BlenderSpec::Tree {
+                priority: 1,
+                strict_sorting: false,
+                base_texture: "$base0".to_string(),
+                alpha_blend: true,
+                not_an_tree: false,
+            },
+            &["trees\\leaf"],
+            &R4CompileConfig {
+                element: DefferElement::NormalHq,
+                ssfx_branches: true,
+                allow_detail: false,
+                ..R4CompileConfig::default()
+            },
+            &thm_tbl,
+        );
+        assert_eq!(tree_plan.passes[0].vs, "deffer_tree_branch_flat");
+        assert_eq!(tree_plan.passes[0].ps, "deffer_tree_branch_aref_flat");
+        assert!(tree_plan.passes[0]
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_waves" && t.texture_name == "fx\\wind_wave"));
+
+        let glass_plan = plan_r4_blender_compile(
+            &R4BlenderSpec::ModelEbB {
+                priority: 2,
+                strict_sorting: true,
+                base_texture: "$base0".to_string(),
+                env_texture: "sky\\cubemap".to_string(),
+                alpha_blend: true,
+            },
+            &["wpn\\scope_lens"],
+            &R4CompileConfig {
+                element: DefferElement::NormalHq,
+                ssfx_glass: true,
+                hud_element: false,
+                ..R4CompileConfig::default()
+            },
+            &thm_tbl,
+        );
+        assert_eq!(glass_plan.passes[0].vs, "ssfx_glass");
+        assert!(glass_plan.passes[0]
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_glass" && t.texture_name == "fx\\glass_normal"));
+
+        let hud_plan = plan_r4_blender_compile(
+            &R4BlenderSpec::DefferModel {
+                priority: 1,
+                strict_sorting: false,
+                base_texture: "$base0".to_string(),
+                alpha_blend: false,
+                alpha_ref: 32,
+                tessellation: TessMethod::NoTess,
+            },
+            &["wpn\\ak74"],
+            &R4CompileConfig {
+                element: DefferElement::NormalHq,
+                hud_element: true,
+                allow_detail: false,
+                ..R4CompileConfig::default()
+            },
+            &thm_tbl,
+        );
+        assert_eq!(hud_plan.passes[0].vs, "deffer_model_hud_flat");
+        assert_eq!(hud_plan.passes[0].ps, "deffer_base_hud_flat");
+        assert!(hud_plan.passes[0]
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_hud_rain" && t.texture_name == "fx\\hud_rain"));
+
+        // 7. Particle, ScreenSet & dxUIRender helpers
+        let part_plan = plan_r4_blender_compile(
+            &R4BlenderSpec::Particle {
+                priority: 1,
+                strict_sorting: false,
+                base_texture: "$base0".to_string(),
+                blend_mode: 1,
+                clamp: true,
+            },
+            &["pfx\\smoke"],
+            &R4CompileConfig::default(),
+            &thm_tbl,
+        );
+        assert_eq!(part_plan.passes[0].ps, "particle");
+        assert_eq!(part_plan.passes[0].samplers[0].address_mode, TexAddressMode::Clamp);
+        assert!(part_plan.passes[0].blend.enable);
+        assert!(!part_plan.passes[0].z_write);
+
+        let screen_plan = plan_r4_blender_compile(
+            &R4BlenderSpec::ScreenSet {
+                priority: 1,
+                strict_sorting: false,
+                base_texture: "$base0".to_string(),
+                blend_mode: 8,
+                clamp: true,
+                alpha_ref: 16,
+                z_test: false,
+                z_write: false,
+                lighting: false,
+                fog: false,
+            },
+            &["ui\\font"],
+            &R4CompileConfig::default(),
+            &thm_tbl,
+        );
+        assert_eq!(screen_plan.passes[0].vs, "stub_notransform_t_m2");
+        assert_eq!(screen_plan.passes[0].blend.alpha_ref, 16);
+
+        assert_eq!(BlenderClsid::from_u64(BlenderClsid::Default.to_u64()), Some(BlenderClsid::Default));
+        let raw_bmmd = BlenderShader {
+            desc: BlenderDesc {
+                clsid: BlenderClsid::BmmD.to_u64(),
+                clsid_str: "BmmDold".to_string(),
+                name: "levels\\l01_escape\\terrain".to_string(),
+                computer: String::new(),
+                time: 0,
+                version: 3,
+            },
+            priority: 1,
+            strict_sorting: false,
+            base_texture: "$base0".to_string(),
+            base_transform: "$null".to_string(),
+            properties: vec![
+                BlenderProperty {
+                    name: "Name".to_string(),
+                    value: BlenderPropertyValue::Texture("$base0".to_string()),
+                },
+                BlenderProperty {
+                    name: "Name".to_string(),
+                    value: BlenderPropertyValue::Texture("terrain\\escape_det".to_string()),
+                },
+                BlenderProperty {
+                    name: "R2-R".to_string(),
+                    value: BlenderPropertyValue::Texture("detail\\r_tex".to_string()),
+                },
+            ],
+            raw_tail: Vec::new(),
+        };
+        assert_eq!(
+            R4BlenderSpec::from_blender_shader(&raw_bmmd),
+            Some(R4BlenderSpec::BmmD {
+                priority: 1,
+                strict_sorting: false,
+                base_texture: "$base0".to_string(),
+                detail_texture: "terrain\\escape_det".to_string(),
+                r_detail: "detail\\r_tex".to_string(),
+                g_detail: "detail\\detail_grnd_asphalt".to_string(),
+                b_detail: "detail\\detail_grnd_earth".to_string(),
+                a_detail: "detail\\detail_grnd_yantar".to_string(),
+            })
+        );
+        assert_eq!(resolve_ui_shader_name(true, "hud\\default"), "hud\\movie");
+        assert_eq!(resolve_ui_shader_name(false, "hud\\default"), "hud\\default");
+        assert_eq!(ui_primitive_count(UiPrimitiveType::TriStrip, 6), 4);
+        assert_eq!(ui_primitive_count(UiPrimitiveType::TriList, 6), 2);
+        assert_eq!(ui_primitive_count(UiPrimitiveType::LineStrip, 5), 4);
+        assert_eq!(ui_primitive_count(UiPrimitiveType::LineList, 6), 3);
     }
 }

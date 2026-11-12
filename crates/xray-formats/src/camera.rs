@@ -10,7 +10,10 @@
 //!   matching `CCameraManager::UpdatePPEffectors` (`CameraManager.cpp:425-470`)
 
 use crate::envelopes::{ObjectMotion, ObjectMotionLibrary, PostprocessEffect, PostprocessState};
-use crate::ogf::{matrix_set_xyzi_translate, XRayMatrix, XRAY_IDENTITY_MATRIX};
+use crate::ogf::{
+    matrix_invert_43, matrix_mul_43, matrix_mul_44, matrix_set_xyzi_translate, XRayMatrix,
+    XRAY_IDENTITY_MATRIX,
+};
 use crate::weather::R_VIEWPORT_NEAR;
 
 pub const UI_3D_ICON_ORTHO_HEIGHT: f32 = 2.0;
@@ -201,6 +204,138 @@ impl PosDecompressParams {
             pos_decompression_params2: [w, h, 1.0 / w, 1.0 / h],
             parallax: [parallax_h, -parallax_h * 0.5, 1.0 / dtex, 1.0 / dtex],
         }
+    }
+}
+
+/// Active current + previous-frame world/view/projection transform stack with lazy inverse world
+/// matrix computation (`class R_xforms` in `R_Backend_xform.h` / `R_Backend_xform.cpp:6-126`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderXforms {
+    pub m_w: XRayMatrix,
+    pub m_invw: XRayMatrix,
+    pub m_v: XRayMatrix,
+    pub m_p: XRayMatrix,
+    pub m_wv: XRayMatrix,
+    pub m_vp: XRayMatrix,
+    pub m_wvp: XRayMatrix,
+    pub m_w_prev: XRayMatrix,
+    pub m_v_prev: XRayMatrix,
+    pub m_p_prev: XRayMatrix,
+    pub m_wv_prev: XRayMatrix,
+    pub m_vp_prev: XRayMatrix,
+    pub m_wvp_prev: XRayMatrix,
+    inv_w_valid: bool,
+}
+
+impl Default for RenderXforms {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RenderXforms {
+    /// Initialize all current and previous-frame matrices to identity (`R_xforms::R_xforms`).
+    pub fn new() -> Self {
+        Self {
+            m_w: XRAY_IDENTITY_MATRIX,
+            m_invw: XRAY_IDENTITY_MATRIX,
+            m_v: XRAY_IDENTITY_MATRIX,
+            m_p: XRAY_IDENTITY_MATRIX,
+            m_wv: XRAY_IDENTITY_MATRIX,
+            m_vp: XRAY_IDENTITY_MATRIX,
+            m_wvp: XRAY_IDENTITY_MATRIX,
+            m_w_prev: XRAY_IDENTITY_MATRIX,
+            m_v_prev: XRAY_IDENTITY_MATRIX,
+            m_p_prev: XRAY_IDENTITY_MATRIX,
+            m_wv_prev: XRAY_IDENTITY_MATRIX,
+            m_vp_prev: XRAY_IDENTITY_MATRIX,
+            m_wvp_prev: XRAY_IDENTITY_MATRIX,
+            inv_w_valid: true,
+        }
+    }
+
+    #[inline]
+    pub fn inv_w_valid(&self) -> bool {
+        self.inv_w_valid
+    }
+
+    /// Update world transform `m_w` and recompute `m_wv` / `m_wvp`, invalidating lazy `m_invw`
+    /// (`R_xforms::set_W`, `R_Backend_xform.cpp:6-17`).
+    #[inline]
+    pub fn set_w(&mut self, m: XRayMatrix) {
+        self.m_w = m;
+        self.m_wv = matrix_mul_43(&self.m_v, &self.m_w);
+        self.m_wvp = matrix_mul_44(&self.m_p, &self.m_wv);
+        self.inv_w_valid = false;
+    }
+
+    /// Update view transform `m_v` and recompute `m_wv`, `m_vp`, `m_wvp`
+    /// (`R_xforms::set_V`, `R_Backend_xform.cpp:19-30`).
+    #[inline]
+    pub fn set_v(&mut self, m: XRayMatrix) {
+        self.m_v = m;
+        self.m_wv = matrix_mul_43(&self.m_v, &self.m_w);
+        self.m_vp = matrix_mul_44(&self.m_p, &self.m_v);
+        self.m_wvp = matrix_mul_44(&self.m_p, &self.m_wv);
+    }
+
+    /// Update projection transform `m_p` and recompute `m_vp`, `m_wvp`
+    /// (`R_xforms::set_P`, `R_Backend_xform.cpp:32-42`).
+    #[inline]
+    pub fn set_p(&mut self, m: XRayMatrix) {
+        self.m_p = m;
+        self.m_vp = matrix_mul_44(&self.m_p, &self.m_v);
+        self.m_wvp = matrix_mul_44(&self.m_p, &self.m_wv);
+    }
+
+    /// Update previous-frame world transform `m_w_prev` and recompute `m_wv_prev` / `m_wvp_prev`
+    /// (`R_xforms::set_W_prev`, `R_Backend_xform.cpp:44-53`).
+    #[inline]
+    pub fn set_w_prev(&mut self, m: XRayMatrix) {
+        self.m_w_prev = m;
+        self.m_wv_prev = matrix_mul_43(&self.m_v_prev, &self.m_w_prev);
+        self.m_wvp_prev = matrix_mul_44(&self.m_p_prev, &self.m_wv_prev);
+    }
+
+    /// Update previous-frame view transform `m_v_prev` and recompute `m_wv_prev` / `m_vp_prev` / `m_wvp_prev`
+    /// (`R_xforms::set_V_prev`, `R_Backend_xform.cpp:54-65`).
+    #[inline]
+    pub fn set_v_prev(&mut self, m: XRayMatrix) {
+        self.m_v_prev = m;
+        self.m_wv_prev = matrix_mul_43(&self.m_v_prev, &self.m_w_prev);
+        self.m_vp_prev = matrix_mul_44(&self.m_p_prev, &self.m_v_prev);
+        self.m_wvp_prev = matrix_mul_44(&self.m_p_prev, &self.m_wv_prev);
+    }
+
+    /// Update previous-frame projection transform `m_p_prev` and recompute `m_vp_prev` / `m_wvp_prev`
+    /// (`R_xforms::set_P_prev`, `R_Backend_xform.cpp:66-74`).
+    #[inline]
+    pub fn set_p_prev(&mut self, m: XRayMatrix) {
+        self.m_p_prev = m;
+        self.m_vp_prev = matrix_mul_44(&self.m_p_prev, &self.m_v_prev);
+        self.m_wvp_prev = matrix_mul_44(&self.m_p_prev, &self.m_wv_prev);
+    }
+
+    /// Lazily invert `m_w` (`R_xforms::apply_invw`, `R_Backend_xform.cpp:76-87`), returning `None`
+    /// if the current world matrix is singular.
+    #[inline]
+    pub fn apply_inv_w(&mut self) -> Option<&XRayMatrix> {
+        if !self.inv_w_valid {
+            self.m_invw = matrix_invert_43(&self.m_w)?;
+            self.inv_w_valid = true;
+        }
+        Some(&self.m_invw)
+    }
+
+    /// Copy the current frame matrices into `*_prev` at end-of-frame.
+    #[inline]
+    pub fn snapshot_to_prev(&mut self) {
+        self.m_w_prev = self.m_w;
+        self.m_v_prev = self.m_v;
+        self.m_p_prev = self.m_p;
+        self.m_wv_prev = self.m_wv;
+        self.m_vp_prev = self.m_vp;
+        self.m_wvp_prev = self.m_wvp;
     }
 }
 
@@ -851,5 +986,54 @@ mod tests {
             [1920.0, 1080.0, 1.0 / 1920.0, 1.0 / 1080.0]
         );
         assert_eq!(pd.parallax, [0.02, -0.01, 0.02, 0.02]);
+    }
+
+    #[test]
+    fn render_xforms_maintains_current_prev_and_lazy_inv_w() {
+        use crate::ogf::{matrix_set_xyz_translate, matrix_transform_point, matrix_transform_projected};
+
+        let mut xf = RenderXforms::new();
+        assert!(xf.inv_w_valid());
+        assert_eq!(xf.m_wvp, XRAY_IDENTITY_MATRIX);
+
+        let w = matrix_set_xyz_translate([0.0, 0.4, 0.0], [3.0, 1.0, 8.0]);
+        let v = matrix_build_camera_dir([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]);
+        let p = matrix_build_projection(std::f32::consts::FRAC_PI_2, 1.0, 0.2, 100.0);
+
+        xf.set_p(p);
+        xf.set_v(v);
+        xf.set_w(w);
+        assert!(!xf.inv_w_valid());
+
+        let local_pt = [1.0, 2.0, 3.0];
+        let world_pt = matrix_transform_point(&xf.m_w, local_pt);
+        let view_pt = matrix_transform_point(&xf.m_v, world_pt);
+        let view_pt_wv = matrix_transform_point(&xf.m_wv, local_pt);
+        for k in 0..3 {
+            assert!((view_pt[k] - view_pt_wv[k]).abs() < 1e-5);
+        }
+
+        let ndc_seq = matrix_transform_projected(&xf.m_vp, world_pt).unwrap();
+        let ndc_wvp = matrix_transform_projected(&xf.m_wvp, local_pt).unwrap();
+        for k in 0..3 {
+            assert!((ndc_seq[k] - ndc_wvp[k]).abs() < 1e-5);
+        }
+
+        let inv_w = *xf.apply_inv_w().unwrap();
+        assert!(xf.inv_w_valid());
+        let round_trip = matrix_transform_point(&inv_w, world_pt);
+        for k in 0..3 {
+            assert!((round_trip[k] - local_pt[k]).abs() < 1e-5);
+        }
+
+        xf.snapshot_to_prev();
+        assert_eq!(xf.m_wvp_prev, xf.m_wvp);
+        let w2 = matrix_set_xyz_translate([0.0, 0.0, 0.0], [10.0, 0.0, 12.0]);
+        xf.set_w(w2);
+        assert_ne!(xf.m_wvp, xf.m_wvp_prev);
+        xf.set_w_prev(w2);
+        xf.set_v_prev(v);
+        xf.set_p_prev(p);
+        assert_eq!(xf.m_wvp_prev, xf.m_wvp);
     }
 }
