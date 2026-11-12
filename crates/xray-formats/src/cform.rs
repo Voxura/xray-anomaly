@@ -666,6 +666,207 @@ pub fn ray_triangle_test(
     ray_triangle_xray(origin, dir, p0, p1, p2, cull_backfaces)
 }
 
+/// Result of classifying a sphere against a triangle (`CDB::EST_Result` in `cl_intersect.h:670-675`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SphereTriResult {
+    None = 0,
+    Intersect = 1,
+    Inside = 2,
+}
+
+#[inline]
+fn point_edge_sqr_distance(point: [f32; 3], a: [f32; 3], b: [f32; 3]) -> f32 {
+    let ab = sub(b, a);
+    let len_sq = dot(ab, ab);
+    let ap = sub(point, a);
+    if len_sq <= 1e-12 {
+        return dot(ap, ap);
+    }
+    let t = (dot(ap, ab) / len_sq).clamp(0.0, 1.0);
+    let closest = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+    let diff = sub(point, closest);
+    dot(diff, diff)
+}
+
+/// Squared Euclidean distance from `point` to triangle `(orig, orig + e0, orig + e1)`
+/// matching `CDB::MgcSqrDistance` (`src/Layers/xrRender/cl_intersect.h:438-668`).
+fn mgc_sqr_distance(point: [f32; 3], orig: [f32; 3], e0: [f32; 3], e1: [f32; 3]) -> f32 {
+    #[inline]
+    fn min_edge_dist(a_len_sq: f32, b_dot: f32, c_sq: f32) -> f32 {
+        if b_dot >= 0.0 {
+            c_sq
+        } else if -b_dot >= a_len_sq || a_len_sq <= 1e-12 {
+            a_len_sq + 2.0 * b_dot + c_sq
+        } else {
+            let s = -b_dot / a_len_sq;
+            b_dot * s + c_sq
+        }
+    }
+
+    let k_diff = sub(orig, point);
+    let f_a00 = dot(e0, e0);
+    let f_a01 = dot(e0, e1);
+    let f_a11 = dot(e1, e1);
+    let f_b0 = dot(k_diff, e0);
+    let f_b1 = dot(k_diff, e1);
+    let f_c = dot(k_diff, k_diff);
+    let f_det = (f_a00 * f_a11 - f_a01 * f_a01).abs();
+    let f_s = f_a01 * f_b1 - f_a11 * f_b0;
+    let f_t = f_a01 * f_b0 - f_a00 * f_b1;
+
+    if f_det <= 1e-12 {
+        let p0 = orig;
+        let p1 = [orig[0] + e0[0], orig[1] + e0[1], orig[2] + e0[2]];
+        let p2 = [orig[0] + e1[0], orig[1] + e1[1], orig[2] + e1[2]];
+        return point_edge_sqr_distance(point, p0, p1)
+            .min(point_edge_sqr_distance(point, p0, p2))
+            .min(point_edge_sqr_distance(point, p1, p2));
+    }
+
+    let f_sqr_dist = if f_s + f_t <= f_det {
+        if f_s < 0.0 {
+            if f_t < 0.0 {
+                // Region 4
+                if f_b0 < 0.0 {
+                    min_edge_dist(f_a00, f_b0, f_c)
+                } else {
+                    min_edge_dist(f_a11, f_b1, f_c)
+                }
+            } else {
+                // Region 3
+                min_edge_dist(f_a11, f_b1, f_c)
+            }
+        } else if f_t < 0.0 {
+            // Region 5
+            min_edge_dist(f_a00, f_b0, f_c)
+        } else {
+            // Region 0 (interior)
+            let f_inv_det = 1.0 / f_det;
+            let s = f_s * f_inv_det;
+            let t = f_t * f_inv_det;
+            s * (f_a00 * s + f_a01 * t + 2.0 * f_b0)
+                + t * (f_a01 * s + f_a11 * t + 2.0 * f_b1)
+                + f_c
+        }
+    } else if f_s < 0.0 {
+        // Region 2
+        let f_tmp0 = f_a01 + f_b0;
+        let f_tmp1 = f_a11 + f_b1;
+        if f_tmp1 > f_tmp0 {
+            let f_numer = f_tmp1 - f_tmp0;
+            let f_denom = f_a00 - 2.0 * f_a01 + f_a11;
+            if f_numer >= f_denom || f_denom <= 1e-12 {
+                f_a00 + 2.0 * f_b0 + f_c
+            } else {
+                let s = f_numer / f_denom;
+                let t = 1.0 - s;
+                s * (f_a00 * s + f_a01 * t + 2.0 * f_b0)
+                    + t * (f_a01 * s + f_a11 * t + 2.0 * f_b1)
+                    + f_c
+            }
+        } else if f_tmp1 <= 0.0 {
+            f_a11 + 2.0 * f_b1 + f_c
+        } else {
+            min_edge_dist(f_a11, f_b1, f_c)
+        }
+    } else if f_t < 0.0 {
+        // Region 6
+        let f_tmp0 = f_a01 + f_b1;
+        let f_tmp1 = f_a00 + f_b0;
+        if f_tmp1 > f_tmp0 {
+            let f_numer = f_tmp1 - f_tmp0;
+            let f_denom = f_a00 - 2.0 * f_a01 + f_a11;
+            if f_numer >= f_denom || f_denom <= 1e-12 {
+                f_a11 + 2.0 * f_b1 + f_c
+            } else {
+                let t = f_numer / f_denom;
+                let s = 1.0 - t;
+                s * (f_a00 * s + f_a01 * t + 2.0 * f_b0)
+                    + t * (f_a01 * s + f_a11 * t + 2.0 * f_b1)
+                    + f_c
+            }
+        } else if f_tmp1 <= 0.0 {
+            f_a00 + 2.0 * f_b0 + f_c
+        } else {
+            min_edge_dist(f_a00, f_b0, f_c)
+        }
+    } else {
+        // Region 1
+        let f_numer = f_a11 + f_b1 - f_a01 - f_b0;
+        if f_numer <= 0.0 {
+            f_a11 + 2.0 * f_b1 + f_c
+        } else {
+            let f_denom = f_a00 - 2.0 * f_a01 + f_a11;
+            if f_numer >= f_denom || f_denom <= 1e-12 {
+                f_a00 + 2.0 * f_b0 + f_c
+            } else {
+                let s = f_numer / f_denom;
+                let t = 1.0 - s;
+                s * (f_a00 * s + f_a01 * t + 2.0 * f_b0)
+                    + t * (f_a01 * s + f_a11 * t + 2.0 * f_b1)
+                    + f_c
+            }
+        }
+    };
+
+    f_sqr_dist.abs()
+}
+
+/// Classify a sphere against triangle `(p0, p1, p2)` matching `CDB::TestSphereTri`
+/// (`src/Layers/xrRender/cl_intersect.h:677-723`).
+pub fn classify_sphere_triangle(
+    center: [f32; 3],
+    radius: f32,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+) -> SphereTriResult {
+    let f_r_sqr = radius * radius;
+    let e0 = sub(p1, p0);
+    let e1 = sub(p2, p0);
+    let k_v0mc = sub(p0, center);
+
+    let mut i_inside = 0u8;
+    if dot(k_v0mc, k_v0mc) <= f_r_sqr {
+        i_inside += 1;
+    }
+    let k_v1mc = [k_v0mc[0] + e0[0], k_v0mc[1] + e0[1], k_v0mc[2] + e0[2]];
+    if dot(k_v1mc, k_v1mc) <= f_r_sqr {
+        i_inside += 1;
+    }
+    let k_v2mc = [k_v0mc[0] + e1[0], k_v0mc[1] + e1[1], k_v0mc[2] + e1[2]];
+    if dot(k_v2mc, k_v2mc) <= f_r_sqr {
+        i_inside += 1;
+    }
+
+    if i_inside == 3 {
+        return SphereTriResult::Inside;
+    }
+    if i_inside > 0 {
+        return SphereTriResult::Intersect;
+    }
+
+    let f_sqr_dist = mgc_sqr_distance(center, p0, e0, e1);
+    if f_sqr_dist < f_r_sqr {
+        SphereTriResult::Intersect
+    } else {
+        SphereTriResult::None
+    }
+}
+
+/// Boolean sphere-vs-triangle overlap test (`classify_sphere_triangle(...) != SphereTriResult::None`).
+#[inline]
+pub fn sphere_triangle_test(
+    center: [f32; 3],
+    radius: f32,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+) -> bool {
+    classify_sphere_triangle(center, radius, p0, p1, p2) != SphereTriResult::None
+}
+
 /// Möller–Trumbore ray-triangle test matching `xrCDB_ray.cpp:275-318`.
 #[inline]
 fn ray_triangle_xray(
@@ -1013,5 +1214,42 @@ mod tests {
             ),
             Err(FormatError::InvalidValue(_))
         ));
+    }
+
+    #[test]
+    fn test_classify_sphere_triangle_all_cases_and_degenerate_safe() {
+        let p0 = [0.0, 0.0, 0.0];
+        let p1 = [10.0, 0.0, 0.0];
+        let p2 = [0.0, 10.0, 0.0];
+
+        // Inside all 3 vertices (large sphere covering unit tri)
+        assert_eq!(
+            classify_sphere_triangle([0.5, 0.5, 0.0], 2.0, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            SphereTriResult::Inside
+        );
+
+        // Single vertex inside -> Intersect
+        assert_eq!(
+            classify_sphere_triangle([0.5, 0.0, 0.0], 1.0, p0, p1, p2),
+            SphereTriResult::Intersect
+        );
+
+        // All 3 vertices outside, sphere intersecting face interior (Region 0)
+        assert!(sphere_triangle_test([2.5, 2.5, 0.4], 0.5, p0, p1, p2));
+        assert!(!sphere_triangle_test([2.5, 2.5, 0.6], 0.5, p0, p1, p2));
+
+        // All 3 vertices outside, sphere crossing hypotenuse (Region 1) at (5, 5, 0)
+        assert!(sphere_triangle_test([5.2, 5.2, 0.0], 0.5, p0, p1, p2));
+        assert!(!sphere_triangle_test([5.5, 5.5, 0.0], 0.5, p0, p1, p2));
+
+        // Outside e1 edge (Region 3) & corner Regions 2, 4, 5, 6
+        assert!(sphere_triangle_test([-0.3, 5.0, 0.0], 0.5, p0, p1, p2));
+        assert!(!sphere_triangle_test([-0.6, 5.0, 0.0], 0.5, p0, p1, p2));
+        assert!(sphere_triangle_test([5.0, -0.3, 0.0], 0.5, p0, p1, p2));
+        assert!(!sphere_triangle_test([5.0, -0.6, 0.0], 0.5, p0, p1, p2));
+
+        // Collinear/degenerate zero-area triangle must stay finite & accurate
+        assert!(sphere_triangle_test([1.0, 0.2, 0.0], 0.5, [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]));
+        assert!(!sphere_triangle_test([1.0, 0.8, 0.0], 0.5, [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]));
     }
 }

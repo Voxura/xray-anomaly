@@ -13,18 +13,25 @@
 //! projection against `level.cform` (respecting `CformTriangle::suppress_wm` / `GAMEMTL_SUPPRESS_WM`),
 //! configured by LTX sections referencing `effects\wallmark` textures.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::{FRAC_PI_2, PI};
 
 use xray_core::LtxDocument;
 use xray_core::ltx_loader::OwnedLtxDocument;
 
 use crate::camera::matrix_build_camera;
-use crate::cform::{CformBvh, CformModel};
+use crate::cform::{sphere_triangle_test, CformBvh, CformModel};
 use crate::chunk::{ByteCursor, ChunkReader, ChunkWriter, FormatError};
 use crate::hom::{frustum_planes, ClipFrustum};
 use crate::lanims::pack_argb;
-use crate::ogf::{matrix_mul_43, matrix_rotate_z, matrix_scale, matrix_transform_point, XRayMatrix};
+use crate::ogf::{
+    matrix_invert_43, matrix_mul_43, matrix_rotate_z, matrix_scale, matrix_transform_point,
+    XRayMatrix,
+};
+use crate::skinning::{
+    matrix_transform_dir, skin_position_with_links, skin_vertex_pos_and_influences, BoneMask,
+    BonePalette, SkeletonCollisionIndex,
+};
 
 pub const PS_VERSION: u16 = 0x0001;
 pub const PED_VERSION: u16 = 0x0001;
@@ -2204,6 +2211,431 @@ impl StaticWallmarkPool {
     }
 }
 
+/// Bind-pose skinned wallmark triangle (`CSkeletonWallmark::WMFace` in `SkeletonCustom.h`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkeletonWallmarkFace {
+    /// Original unskinned bind-pose vertex positions.
+    pub verts: [[f32; 3]; 3],
+    /// Sentinel-padded per-vertex bone indices (`SkeletonX.cpp:580-724`).
+    pub bone_ids: [[u16; 4]; 3],
+    /// Per-vertex blend weights (unused trailing entries zero-filled).
+    pub weights: [[f32; 3]; 3],
+    /// Explicit skinning link counts per corner (`0..=4`) preventing sentinel ambiguity on repeated bone IDs.
+    pub link_counts: [u8; 3],
+    /// Projected decal texture coordinates computed at impact pose.
+    pub uvs: [[f32; 2]; 3],
+}
+
+/// Parameters controlling skeletal decal projection (`CKinematics::AddWallmark`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkeletonWallmarkConfig {
+    /// Optional caller entity identifier isolating duplicate merge and pose lookup across multiple actors.
+    pub object_id: u64,
+    pub shader: String,
+    pub texture: String,
+    /// Decal sphere radius in meters (`sz`).
+    pub size: f32,
+    /// Lifetime in seconds: `0.0` uses `WALLMARK_DEFAULT_TTL` (50s, matching `ps_r__WallmarkTTL`),
+    /// `< 0.0` is infinite (`-1.0`).
+    pub ttl: f32,
+    /// Decal roll angle around projection normal in degrees (`Random[-20..20]` in C++).
+    pub rotation_deg: f32,
+    /// Creation timestamp (`Device.fTimeGlobal`).
+    pub time_now: f32,
+    /// Skip `WALLMARK_RANGE_SKELETON` (50m) distance cull when `true`.
+    pub ignore_range_opt: bool,
+    /// Optional camera world position for 50m distance optimization culling.
+    pub camera_pos: Option<[f32; 3]>,
+    /// Maximum ray distance for bone picking (`flt_max` in C++).
+    pub max_dist: f32,
+}
+
+impl Default for SkeletonWallmarkConfig {
+    fn default() -> Self {
+        Self {
+            object_id: 0,
+            shader: "effects\\wallmark".to_string(),
+            texture: String::new(),
+            size: 0.25,
+            ttl: 0.0,
+            rotation_deg: 0.0,
+            time_now: 0.0,
+            ignore_range_opt: false,
+            camera_pos: None,
+            max_dist: f32::MAX,
+        }
+    }
+}
+
+/// Active skeletal decal attached to a rigged model in bind pose (`CSkeletonWallmark`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkeletonWallmarkRecord {
+    pub object_id: u64,
+    /// Model-space contact sphere center (`m_LocalBounds.P`).
+    pub local_center: [f32; 3],
+    /// Model-space bounding sphere radius (`m_LocalBounds.R`, `size * 2.0`).
+    pub local_radius: f32,
+    pub shader: String,
+    pub texture: String,
+    pub time_start: f32,
+    pub time_end: f32,
+    pub faces: Vec<SkeletonWallmarkFace>,
+}
+
+impl SkeletonWallmarkRecord {
+    /// World-space bounding sphere `(m_Bounds.P, m_Bounds.R)` transformed by current `parent_xform`.
+    #[inline]
+    pub fn world_bounds(&self, parent_xform: &XRayMatrix) -> ([f32; 3], f32) {
+        (
+            matrix_transform_point(parent_xform, self.local_center),
+            self.local_radius,
+        )
+    }
+
+    /// True if this decal matches `(object_id, shader, texture)` and sits within `eps` per axis
+    /// of `cp` (`CSkeletonWallmark::Similar`, `SkeletonCustom.cpp:779`).
+    #[inline]
+    pub fn similar(
+        &self,
+        object_id: u64,
+        shader: &str,
+        texture: &str,
+        cp: [f32; 3],
+        eps: f32,
+    ) -> bool {
+        self.object_id == object_id
+            && self.shader == shader
+            && self.texture == texture
+            && (self.local_center[0] - cp[0]).abs() < eps
+            && (self.local_center[1] - cp[1]).abs() < eps
+            && (self.local_center[2] - cp[2]).abs() < eps
+    }
+}
+
+/// Pick and project a dynamic decal onto an animated skeletal model matching `CKinematics::AddWallmark`
+/// (`SkeletonCustom.cpp:714-813`) and `CSkeletonX::_FillVerticesSoft1W..4W` (`SkeletonX.cpp:568-743`).
+pub fn project_skeleton_wallmark(
+    index: &SkeletonCollisionIndex<'_>,
+    palette: &BonePalette,
+    parent_xform: &XRayMatrix,
+    visible_bones: &BoneMask,
+    start_world: [f32; 3],
+    dir_world: [f32; 3],
+    cfg: &SkeletonWallmarkConfig,
+) -> Option<SkeletonWallmarkRecord> {
+    if cfg.size <= 1e-4 {
+        return None;
+    }
+
+    if !cfg.ignore_range_opt
+        && let Some(cam) = cfg.camera_pos
+    {
+        let origin = [parent_xform[3][0], parent_xform[3][1], parent_xform[3][2]];
+        let d = vec3_sub(origin, cam);
+        if vec3_dot(d, d) > WALLMARK_RANGE_SKELETON * WALLMARK_RANGE_SKELETON {
+            return None;
+        }
+    }
+
+    let inv_parent = matrix_invert_43(parent_xform)?;
+    let s = matrix_transform_point(&inv_parent, start_world);
+    let d = matrix_transform_dir(&inv_parent, dir_world);
+
+    let (hit_opt, cache_obbs) =
+        index.pick_nearest_model_space_with_obbs(palette, visible_bones, cfg.max_dist, s, d);
+    let hit = hit_opt?;
+
+    // Contact point in model space: cp = S + D * dist
+    let cp = [
+        s[0] + d[0] * hit.dist,
+        s[1] + d[1] * hit.dist,
+        s[2] + d[2] * hit.dist,
+    ];
+
+    // Collect visible pickable bones whose animated OBB overlaps sphere(cp, size)
+    let mut test_bones = Vec::new();
+    for (k, obb) in cache_obbs.iter().enumerate() {
+        let bone_id = k as u16;
+        if visible_bones.is_visible(bone_id)
+            && index.is_bone_pickable(bone_id)
+            && obb.test_sphere(cp, cfg.size)
+        {
+            test_bones.push(bone_id);
+        }
+    }
+    if test_bones.is_empty() {
+        return None;
+    }
+
+    // Projection normal = normalize(hit_normal + normalize(-D)) matching SkeletonCustom.cpp:794-796
+    let neg_d = vec3_normalize_safe([-d[0], -d[1], -d[2]]);
+    let combined = [
+        hit.normal[0] + neg_d[0],
+        hit.normal[1] + neg_d[1],
+        hit.normal[2] + neg_d[2],
+    ];
+    let proj_normal = {
+        let n = vec3_normalize_safe(combined);
+        if vec3_len(n) <= 1e-6 {
+            hit.normal
+        } else {
+            n
+        }
+    };
+    if vec3_len(proj_normal) <= 1e-6 {
+        return None;
+    }
+
+    let m_view = build_wallmark_view_matrix(proj_normal, 0.9 * cfg.size, cp, cfg.rotation_deg);
+
+    let mut faces = Vec::new();
+    let mut seen_faces: HashSet<(usize, u32)> = HashSet::new();
+    for (leaf_idx, leaf) in index.leaves.iter().enumerate() {
+        for &bone_id in &test_bones {
+            let Some(bone_slots) = index.bone_child_faces.get(bone_id as usize) else {
+                continue;
+            };
+            let bone_faces = &bone_slots[leaf_idx];
+            for &face_u32 in bone_faces {
+                if !seen_faces.insert((leaf_idx, face_u32)) {
+                    continue;
+                }
+                let base = (face_u32 as usize) * 3;
+                let mut skinned_p = [[0.0f32; 3]; 3];
+                let mut bind_p = [[0.0f32; 3]; 3];
+                let mut bone_ids = [[0u16; 4]; 3];
+                let mut weights = [[0.0f32; 3]; 3];
+                let mut link_counts = [0u8; 3];
+                let mut ok = true;
+
+                for k in 0..3 {
+                    let vi = leaf.active_indices[base + k] as usize;
+                    match skin_vertex_pos_and_influences(
+                        leaf.vertices,
+                        vi,
+                        &palette.render_transforms,
+                    ) {
+                        Ok(inf) => {
+                            skinned_p[k] = inf.skinned_pos;
+                            bind_p[k] = inf.bind_pos;
+                            link_counts[k] = inf.link_count;
+                            bone_ids[k] = inf.sentinel_bones;
+                            weights[k] = inf.weights;
+                        }
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+
+                let test_normal = tri_mknormal(skinned_p[0], skinned_p[1], skinned_p[2]);
+                if vec3_dot(test_normal, proj_normal) < 1e-5 {
+                    continue;
+                }
+                if !sphere_triangle_test(cp, cfg.size, skinned_p[0], skinned_p[1], skinned_p[2]) {
+                    continue;
+                }
+
+                let mut uvs = [[0.0f32; 2]; 3];
+                for k in 0..3 {
+                    let uvw = matrix_transform_point(&m_view, skinned_p[k]);
+                    uvs[k] = [(1.0 + uvw[0]) * 0.5, (1.0 - uvw[1]) * 0.5];
+                }
+
+                faces.push(SkeletonWallmarkFace {
+                    verts: bind_p,
+                    bone_ids,
+                    weights,
+                    link_counts,
+                    uvs,
+                });
+            }
+        }
+    }
+
+    if faces.is_empty() {
+        return None;
+    }
+
+    let time_end = if cfg.ttl < 0.0 {
+        -1.0
+    } else if cfg.ttl == 0.0 {
+        WALLMARK_DEFAULT_TTL
+    } else {
+        cfg.ttl
+    };
+
+    Some(SkeletonWallmarkRecord {
+        object_id: cfg.object_id,
+        local_center: cp,
+        local_radius: cfg.size * 2.0,
+        shader: cfg.shader.clone(),
+        texture: cfg.texture.clone(),
+        time_start: cfg.time_now,
+        time_end,
+        faces,
+    })
+}
+
+/// Active skeletal decal pool managing per-object decals, `0.02m` duplicate replacement, TTL
+/// expiry, frustum culling, and live-pose re-skinning into `StaticWallmarkBatch` vertices.
+#[derive(Debug, Clone, Default)]
+pub struct SkeletonWallmarkPool {
+    items: Vec<SkeletonWallmarkRecord>,
+}
+
+impl SkeletonWallmarkPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    #[inline]
+    pub fn items(&self) -> &[SkeletonWallmarkRecord] {
+        &self.items
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    /// Add or replace an overlapping decal on the same `(object_id, shader, texture)` within
+    /// `WALLMARK_DUPLICATE_TOLERANCE` (`0.02m`, matching `SkeletonCustom.cpp:776-786`).
+    pub fn add(&mut self, record: SkeletonWallmarkRecord) {
+        for existing in &mut self.items {
+            if existing.similar(
+                record.object_id,
+                &record.shader,
+                &record.texture,
+                record.local_center,
+                WALLMARK_DUPLICATE_TOLERANCE,
+            ) {
+                *existing = record;
+                return;
+            }
+        }
+        self.items.push(record);
+    }
+
+    /// Remove all skeletal wallmarks owned by `object_id`, returning count removed.
+    pub fn remove_object(&mut self, object_id: u64) -> usize {
+        let before = self.items.len();
+        self.items.retain(|wm| wm.object_id != object_id);
+        before - self.items.len()
+    }
+
+    /// Remove finite-lifetime skeletal decals whose elapsed ratio reached `1.0`.
+    pub fn prune_expired(&mut self, time_now: f32) -> usize {
+        let before = self.items.len();
+        self.items.retain(|wm| {
+            if wm.time_end < 0.0 {
+                return true;
+            }
+            let w = (time_now - wm.time_start) / wm.time_end.max(1e-6);
+            w < 1.0
+        });
+        before - self.items.len()
+    }
+
+    /// Prune expired decals (`w >= 1.0`), frustum-cull live world bounds (`CKinematics::CalculateWallmarks`),
+    /// and re-skin visible faces with live `(parent_xform, palette)` (`CKinematics::RenderWallmark`).
+    ///
+    /// Matches `SkeletonCustom.cpp:829-930`: decals with `w >= 1.0` are pruned immediately without
+    /// rendering, while active decals emit `WallmarkVertex` triangles grouped by `(shader, texture)`.
+    pub fn collect_visible_batches<'a, F>(
+        &mut self,
+        time_now: f32,
+        frustum: &ClipFrustum,
+        mut resolve_pose: F,
+    ) -> Result<Vec<StaticWallmarkBatch>, FormatError>
+    where
+        F: FnMut(u64) -> Option<(&'a XRayMatrix, &'a BonePalette)>,
+    {
+        let mut batches: Vec<StaticWallmarkBatch> = Vec::new();
+        let mut idx = 0usize;
+
+        while idx < self.items.len() {
+            let expired = {
+                let wm = &self.items[idx];
+                if wm.time_end < 0.0 {
+                    false
+                } else {
+                    let w = (time_now - wm.time_start) / wm.time_end.max(1e-6);
+                    w >= 1.0
+                }
+            };
+            if expired {
+                self.items.swap_remove(idx);
+                continue;
+            }
+
+            let wm = &self.items[idx];
+            if let Some((parent_xform, palette)) = resolve_pose(wm.object_id) {
+                let (world_center, world_radius) = wm.world_bounds(parent_xform);
+                if frustum.test_sphere(world_center, world_radius) {
+                    let w = if wm.time_end < 0.0 {
+                        0.0
+                    } else {
+                        ((time_now - wm.time_start) / wm.time_end.max(1e-6)).clamp(0.0, 1.0)
+                    };
+                    let a_c = ((w * 255.0).floor() as i32).clamp(0, 255) as u8;
+                    let color = pack_argb(a_c, 128, 128, 128);
+
+                    let batch_idx = if let Some(pos) = batches
+                        .iter()
+                        .position(|b| b.shader == wm.shader && b.texture == wm.texture)
+                    {
+                        pos
+                    } else {
+                        batches.push(StaticWallmarkBatch {
+                            shader: wm.shader.clone(),
+                            texture: wm.texture.clone(),
+                            vertices: Vec::with_capacity(wm.faces.len() * 3),
+                        });
+                        batches.len() - 1
+                    };
+
+                    let out = &mut batches[batch_idx].vertices;
+                    for face in &wm.faces {
+                        for k in 0..3 {
+                            let model_pos = skin_position_with_links(
+                                face.verts[k],
+                                face.link_counts[k],
+                                face.bone_ids[k],
+                                face.weights[k],
+                                &palette.render_transforms,
+                            )?;
+                            let world_pos = matrix_transform_point(parent_xform, model_pos);
+                            out.push(WallmarkVertex {
+                                position: world_pos,
+                                color,
+                                uv: face.uvs[k],
+                            });
+                        }
+                    }
+                }
+            }
+
+            idx += 1;
+        }
+
+        Ok(batches)
+    }
+}
+
 // ============================================================================
 // Internal .pe EParticleAction -> CompiledParticleAction Compiler
 // ============================================================================
@@ -3092,6 +3524,311 @@ blood_drop_size = 0.1
         // At t=15.0, elapsed = 11.0 / 10.0 >= 1.0 -> rendered on frame of death & pruned
         let batches_end = pool.collect_visible_batches(15.0, [0.0, 0.0, -4.0], &frustum, 0.01);
         assert_eq!(batches_end.len(), 1);
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn test_skeleton_wallmark_projection_animated_deformation_and_pool() {
+        use crate::camera::{matrix_build_camera, matrix_build_projection};
+        use crate::chunk::ChunkWriter;
+        use crate::hom::{frustum_planes, ClipFrustum};
+        use crate::ogf::ogf_chunks::*;
+        use crate::ogf::{
+            matrix_mul_44, matrix_set_xyz_translate, skel_vert_type, BoneIkData, BoneIkSection,
+            BoneShape, BoneShapeType, JointLimit, OgfBone, OgfModel, OgfObb, OgfVertices,
+            OgfVisualType, VertBoned3W, XRAY_IDENTITY_MATRIX,
+        };
+        use crate::skinning::{BoneMask, BonePalette, SkeletonCollisionIndex};
+
+        fn wv3(out: &mut Vec<u8>, v: [f32; 3]) {
+            for c in v {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+
+        let mut ogf_w = ChunkWriter::new();
+        let mut hdr = vec![4u8, OgfVisualType::SkeletonAnim as u8, 0, 0];
+        hdr.extend_from_slice(&[0u8; 40]);
+        ogf_w.write_chunk(OGF_HEADER, &hdr);
+        let id_obb = OgfObb {
+            rotate: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translate: [0.0; 3],
+            halfsize: [1.5, 1.5, 1.5],
+        };
+        let mut bn = Vec::new();
+        bn.extend_from_slice(&2u32.to_le_bytes());
+        bn.extend_from_slice(b"root\0\0");
+        for r in id_obb.rotate {
+            wv3(&mut bn, r);
+        }
+        wv3(&mut bn, [0.0; 3]);
+        wv3(&mut bn, id_obb.halfsize);
+        bn.extend_from_slice(b"arm\0root\0");
+        for r in id_obb.rotate {
+            wv3(&mut bn, r);
+        }
+        wv3(&mut bn, [0.0; 3]);
+        wv3(&mut bn, id_obb.halfsize);
+        ogf_w.write_chunk(OGF_S_BONE_NAMES, &bn);
+
+        let mut ik = Vec::new();
+        for bt in [[0.0f32, 0.0, 0.0], [0.0, 2.0, 0.0]] {
+            ik.extend_from_slice(&1u32.to_le_bytes());
+            ik.extend_from_slice(b"default\0");
+            ik.extend_from_slice(&(BoneShapeType::Box as u16).to_le_bytes());
+            ik.extend_from_slice(&0u16.to_le_bytes());
+            for _ in 0..27 {
+                ik.extend_from_slice(&0.0f32.to_le_bytes());
+            }
+            ik.extend_from_slice(&0u32.to_le_bytes());
+            for _ in 0..3 {
+                ik.extend_from_slice(&[0u8; 16]);
+            }
+            ik.extend_from_slice(&[0u8; 24]);
+            wv3(&mut ik, [0.0; 3]);
+            wv3(&mut ik, bt);
+            ik.extend_from_slice(&5.0f32.to_le_bytes());
+            wv3(&mut ik, [0.0; 3]);
+        }
+        ogf_w.write_chunk(OGF_S_IKDATA, &ik);
+
+        let mut model = OgfModel::parse(&ogf_w.into_bytes()).unwrap();
+        let make_bone = |id: u16, name: &str, p: Option<u16>, bind: [f32; 3]| OgfBone {
+            id,
+            name: name.to_string(),
+            parent_name: if p.is_some() { "root".into() } else { String::new() },
+            parent_id: p,
+            children: if id == 0 { vec![1] } else { vec![] },
+            obb: id_obb,
+            ik: Some(BoneIkSection {
+                game_mtl_name: "default".into(),
+                shape: BoneShape {
+                    shape_type: BoneShapeType::Box as u16,
+                    flags: 0,
+                    box_obb: id_obb,
+                    sphere_center: [0.0; 3],
+                    sphere_radius: 0.0,
+                    cylinder_center: [0.0; 3],
+                    cylinder_direction: [0.0, 1.0, 0.0],
+                    cylinder_height: 0.0,
+                    cylinder_radius: 0.0,
+                },
+                ik_data: BoneIkData {
+                    version: 1,
+                    joint_type: 0,
+                    limits: [JointLimit {
+                        limit: [0.0, 0.0],
+                        spring_factor: 0.0,
+                        damping_factor: 0.0,
+                    }; 3],
+                    spring_factor: 0.0,
+                    damping_factor: 0.0,
+                    ik_flags: 0,
+                    break_force: 0.0,
+                    break_torque: 0.0,
+                    friction: 0.0,
+                },
+                bind_rotation_xyz: [0.0; 3],
+                bind_translation: bind,
+                mass: 1.0,
+                center_of_mass: [0.0; 3],
+            }),
+        };
+        model.skeleton.as_mut().unwrap().bones = vec![
+            make_bone(0, "root", None, [0.0, 0.0, 0.0]),
+            make_bone(1, "arm", Some(0), [0.0, 2.0, 0.0]),
+        ];
+
+        // Child 0 (1W): tri 0 front-facing (-Z) at (0, 2, 0) on bone 1; tri 1 backfacing (+Z); tri 2 outside sphere at y=10
+        let mut c0_w = ChunkWriter::new();
+        let mut chdr = vec![4u8, OgfVisualType::SkeletonGeomdefSt as u8, 0, 0];
+        chdr.extend_from_slice(&[0u8; 40]);
+        c0_w.write_chunk(OGF_HEADER, &chdr);
+        c0_w.write_chunk(OGF_TEXTURE, b"act\\stalker\0models\\model\0");
+        let verts_1w = [
+            // tri 0 (bone 1): front-facing -Z
+            (1u32, [-0.4f32, 1.8, 0.0]),
+            (1, [0.0, 2.4, 0.0]),
+            (1, [0.4, 1.8, 0.0]),
+            // tri 1 (bone 1): opposite winding (backfacing) at same coords
+            (1, [-0.4, 1.8, 0.0]),
+            (1, [0.4, 1.8, 0.0]),
+            (1, [0.0, 2.4, 0.0]),
+            // tri 2 (bone 1): far outside size=0.6 sphere
+            (1, [-0.4, 9.8, 0.0]),
+            (1, [0.0, 10.4, 0.0]),
+            (1, [0.4, 9.8, 0.0]),
+        ];
+        let mut vb0 = Vec::new();
+        vb0.extend_from_slice(&skel_vert_type::FVF_1L.to_le_bytes());
+        vb0.extend_from_slice(&(verts_1w.len() as u32).to_le_bytes());
+        for (b, pos) in verts_1w {
+            wv3(&mut vb0, pos);
+            wv3(&mut vb0, [0.0, 0.0, -1.0]);
+            wv3(&mut vb0, [1.0, 0.0, 0.0]);
+            wv3(&mut vb0, [0.0, 1.0, 0.0]);
+            vb0.extend_from_slice(&0.0f32.to_le_bytes());
+            vb0.extend_from_slice(&0.0f32.to_le_bytes());
+            vb0.extend_from_slice(&b.to_le_bytes());
+        }
+        c0_w.write_chunk(OGF_VERTICES, &vb0);
+        let mut ib0 = Vec::new();
+        ib0.extend_from_slice(&(9u32).to_le_bytes());
+        for i in 0u16..9 {
+            ib0.extend_from_slice(&i.to_le_bytes());
+        }
+        c0_w.write_chunk(OGF_INDICES, &ib0);
+        model.children.push(OgfModel::parse(&c0_w.into_bytes()).unwrap());
+
+        // Child 1 (3W repeated bone IDs [0, 1, 1]): tests both bone 0 & bone 1 dedup AND repeated-bone skinning accuracy!
+        let mut c1_w = ChunkWriter::new();
+        c1_w.write_chunk(OGF_HEADER, &chdr);
+        c1_w.write_chunk(OGF_TEXTURE, b"act\\stalker\0models\\model\0");
+        let mut c1_model = OgfModel::parse(&c1_w.into_bytes()).unwrap();
+        c1_model.vertices = Some(OgfVertices::Skinned3W(vec![
+            VertBoned3W {
+                matrices: [0, 1, 1],
+                position: [-0.2, 1.9, 0.0],
+                normal: [0.0, 0.0, -1.0],
+                tangent: [1.0, 0.0, 0.0],
+                binormal: [0.0, 1.0, 0.0],
+                weights: [0.25, 0.50], // bone 0 gets 0.25, bone 1 gets 0.75
+                u: 0.0,
+                v: 0.0,
+            },
+            VertBoned3W {
+                matrices: [0, 1, 1],
+                position: [0.0, 2.2, 0.0],
+                normal: [0.0, 0.0, -1.0],
+                tangent: [1.0, 0.0, 0.0],
+                binormal: [0.0, 1.0, 0.0],
+                weights: [0.25, 0.50],
+                u: 0.0,
+                v: 0.0,
+            },
+            VertBoned3W {
+                matrices: [0, 1, 1],
+                position: [0.2, 1.9, 0.0],
+                normal: [0.0, 0.0, -1.0],
+                tangent: [1.0, 0.0, 0.0],
+                binormal: [0.0, 1.0, 0.0],
+                weights: [0.25, 0.50],
+                u: 0.0,
+                v: 0.0,
+            },
+        ]));
+        c1_model.indices = vec![0, 1, 2];
+        model.children.push(c1_model);
+
+        let index = SkeletonCollisionIndex::from_ogf(&model).unwrap();
+        let bind_pal = BonePalette::bind_pose(index.skeleton).unwrap();
+        let all_vis = BoneMask::all(2);
+        let impact_xform = matrix_set_xyz_translate([0.0, 0.0, 0.0], [5.0, 0.0, 0.0]);
+
+        let mut cfg = SkeletonWallmarkConfig {
+            object_id: 42,
+            shader: "effects\\wallmark".to_string(),
+            texture: "wm\\wm_blood_1".to_string(),
+            size: 0.6,
+            ttl: 0.0, // defaults to WALLMARK_DEFAULT_TTL (50s)
+            rotation_deg: 0.0,
+            time_now: 1.0,
+            ignore_range_opt: false,
+            camera_pos: Some([5.0, 0.0, -4.0]),
+            max_dist: 100.0,
+        };
+        let wm = project_skeleton_wallmark(
+            &index,
+            &bind_pal,
+            &impact_xform,
+            &all_vis,
+            [5.0, 2.0, -5.0],
+            [0.0, 0.0, 1.0],
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(wm.time_end, WALLMARK_DEFAULT_TTL);
+        // Only tri 0 of child 0 + tri 0 of child 1 (deduped across bones 0 & 1) = 2 faces!
+        assert_eq!(wm.faces.len(), 2);
+        for f in &wm.faces {
+            for uv in &f.uvs {
+                assert!(uv[0] >= -1e-3 && uv[0] <= 1.001);
+                assert!(uv[1] >= -1e-3 && uv[1] <= 1.001);
+            }
+        }
+
+        // Range cull beyond WALLMARK_RANGE_SKELETON (50m)
+        cfg.camera_pos = Some([5.0, 0.0, -60.0]);
+        assert!(project_skeleton_wallmark(
+            &index,
+            &bind_pal,
+            &impact_xform,
+            &all_vis,
+            [5.0, 2.0, -5.0],
+            [0.0, 0.0, 1.0],
+            &cfg,
+        )
+        .is_none());
+
+        // Pool duplicate replacement (<0.02m) + separate object isolation
+        let mut pool = SkeletonWallmarkPool::new();
+        pool.add(wm.clone());
+        let mut near_dup = wm.clone();
+        near_dup.local_center[0] += 0.005;
+        near_dup.time_start = 2.0;
+        pool.add(near_dup);
+        assert_eq!(pool.len(), 1);
+        let mut other_obj = wm.clone();
+        other_obj.object_id = 99;
+        pool.add(other_obj);
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.remove_object(99), 1);
+        assert_eq!(pool.len(), 1);
+
+        // Animate pose (+3.0 X on arm bone 1) and move character to [8, 1, 0]
+        let moved_models = [
+            XRAY_IDENTITY_MATRIX,
+            matrix_set_xyz_translate([0.0, 0.0, 0.0], [3.0, 2.0, 0.0]),
+        ];
+        let moved_pal = BonePalette::from_model_transforms(index.skeleton, &moved_models).unwrap();
+        let live_xform = matrix_set_xyz_translate([0.0, 0.0, 0.0], [8.0, 1.0, 0.0]);
+
+        let view = matrix_build_camera([10.0, 3.0, -6.0], [10.0, 3.0, 0.0], [0.0, 1.0, 0.0]);
+        let proj = matrix_build_projection(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 50.0);
+        let full = matrix_mul_44(&proj, &view);
+        let frustum = ClipFrustum::from_view_proj(&full, frustum_planes::LRTB | frustum_planes::FAR);
+
+        // Elapsed (27.0 - 2.0) / 50.0 = 0.5 -> alpha ~ 127
+        let batches = pool
+            .collect_visible_batches(27.0, &frustum, |_| Some((&live_xform, &moved_pal)))
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].vertices.len(), 6);
+        let a_byte = (batches[0].vertices[0].color >> 24) & 0xFF;
+        assert!((126..=128).contains(&a_byte));
+
+        // 1W corner 1 of face 0 was bind (0.0, 2.4, 0.0) on bone 1 -> model (3.0, 2.4, 0.0) -> world (11.0, 3.4, 0.0)
+        assert!((batches[0].vertices[1].position[0] - 11.0).abs() < 1e-4);
+        assert!((batches[0].vertices[1].position[1] - 3.4).abs() < 1e-4);
+        // 3W corner 1 of face 1 had 0.75 weight on bone 1 -> model (2.25, 2.2, 0.0) -> world (10.25, 3.2, 0.0)
+        assert!((batches[0].vertices[4].position[0] - 10.25).abs() < 1e-4);
+        assert!((batches[0].vertices[4].position[1] - 3.2).abs() < 1e-4);
+
+        // Frustum looking away culls emission without removing the wallmark
+        let away_view = matrix_build_camera([10.0, 3.0, -6.0], [10.0, 3.0, -10.0], [0.0, 1.0, 0.0]);
+        let away_frustum =
+            ClipFrustum::from_view_proj(&matrix_mul_44(&proj, &away_view), frustum_planes::LRTB);
+        let culled = pool
+            .collect_visible_batches(27.0, &away_frustum, |_| Some((&live_xform, &moved_pal)))
+            .unwrap();
+        assert!(culled.is_empty());
+        assert_eq!(pool.len(), 1);
+
+        // Expiry at time >= time_start + time_end prunes immediately (SkeletonCustom.cpp:830)
+        let expired = pool
+            .collect_visible_batches(52.0, &frustum, |_| Some((&live_xform, &moved_pal)))
+            .unwrap();
+        assert!(expired.is_empty());
         assert_eq!(pool.len(), 0);
     }
 }

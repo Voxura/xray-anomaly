@@ -8,6 +8,7 @@
 //! - `PostprocessEffect` (`.ppe` v1/v2 `CPostprocessAnimator`) + `PostprocessState` (`SPPInfo::identity` / `lerp`)
 
 use crate::chunk::{ByteCursor, ChunkReader, ChunkWriter, FormatError};
+use crate::lanims::pack_argb;
 
 pub const EOBJ_OMOTION: u32 = 0x1100;
 pub const EOBJ_OMOTION_VERSION_V3: u16 = 0x0003;
@@ -996,7 +997,141 @@ impl PostprocessState {
             self.color_add[axis] -= ppi.color_add[axis];
         }
     }
+
+    /// True if color grading (`s_grad0`/`s_grad1`) lookup is active (`CRenderTarget::u_need_CM`).
+    #[inline]
+    pub fn uses_color_map(&self) -> bool {
+        self.cm_influence > 0.001
+    }
+
+    /// True if any full-screen PPE channel differs noticeably from `pp_identity`
+    /// matching `CRenderTarget::u_need_PP` (`r3_rendertarget_phase_PP.cpp:59-90`).
+    pub fn is_active(&self) -> bool {
+        #[inline]
+        fn quant_u8(v: f32) -> i32 {
+            (v * 255.0 + 0.5).floor().clamp(0.0, 255.0) as i32
+        }
+
+        let blur = self.blur > 0.001;
+        let gray = self.gray > 0.001;
+        let noise = self.noise_intensity > 0.001;
+        let dual = self.duality_h.abs() > 0.001 || self.duality_v.abs() > 0.001;
+
+        let cbase = (quant_u8(self.color_base[0]) - 0x7f).abs() > 2
+            || (quant_u8(self.color_base[1]) - 0x7f).abs() > 2
+            || (quant_u8(self.color_base[2]) - 0x7f).abs() > 2;
+
+        let cadd = ((self.color_add[0] * 255.0) as i32).abs() > 2
+            || ((self.color_add[1] * 255.0) as i32).abs() > 2
+            || ((self.color_add[2] * 255.0) as i32).abs() > 2;
+
+        blur || gray || noise || dual || cbase || cadd || self.uses_color_map()
+    }
+
+    /// Compute dual-tap screen UV rectangles `(right_uv, left_uv)` (`[u0, v0, u1, v1]`)
+    /// matching `CRenderTarget::u_calc_tc_duality_ss` (`r3_rendertarget_phase_PP.cpp:37-57`).
+    pub fn duality_uv_rects(
+        &self,
+        rt_width: u32,
+        rt_height: u32,
+        device_height: u32,
+    ) -> ([f32; 4], [f32; 4]) {
+        let tw = rt_width.max(1) as f32;
+        let th = rt_height.max(1) as f32;
+        let effective_blur = if rt_height != device_height {
+            1.0
+        } else {
+            self.blur
+        };
+        let shift_x = (0.5 / tw) * effective_blur;
+        let shift_y = (0.5 / th) * effective_blur;
+        let p0x = 0.5 / tw + shift_x;
+        let p0y = 0.5 / th + shift_y;
+        let p1x = (tw + 0.5) / tw + shift_x;
+        let p1y = (th + 0.5) / th + shift_y;
+
+        let shift_u = self.duality_h.abs() * 0.5;
+        let shift_v = self.duality_v.abs() * 0.5;
+        let right = [p0x, p0y, p1x - shift_u, p1y - shift_v];
+        let left = [p0x + shift_u, p0y + shift_v, p1x, p1y];
+        (right, left)
+    }
+
+    /// Pack shader constants matching `CRenderTarget::phase_pp` (`postprocess.ps` / `postprocess_cm.ps`).
+    pub fn to_gpu_params(&self) -> PostprocessGpuParams {
+        #[inline]
+        fn quant_u8(v: f32) -> u8 {
+            (v * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8
+        }
+
+        let gblend = ((1.0 - self.gray) * 255.0).floor().clamp(0.0, 255.0) as u8;
+        let nblend = ((1.0 - self.noise_intensity) * 255.0)
+            .floor()
+            .clamp(0.0, 255.0) as u8;
+
+        let base_r = quant_u8(self.color_base[0]);
+        let base_g = quant_u8(self.color_base[1]);
+        let base_b = quant_u8(self.color_base[2]);
+        let gray_r = quant_u8(self.color_gray[0]);
+        let gray_g = quant_u8(self.color_gray[1]);
+        let gray_b = quant_u8(self.color_gray[2]);
+
+        PostprocessGpuParams {
+            color_base: [
+                f32::from(base_r) / 255.0,
+                f32::from(base_g) / 255.0,
+                f32::from(base_b) / 255.0,
+                f32::from(nblend) / 255.0,
+            ],
+            color_gray: [
+                f32::from(gray_r) / 255.0,
+                f32::from(gray_g) / 255.0,
+                f32::from(gray_b) / 255.0,
+                f32::from(gblend) / 255.0,
+            ],
+            brightness: [
+                self.color_add[0],
+                self.color_add[1],
+                self.color_add[2],
+                0.0,
+            ],
+            colormap: [self.cm_influence, self.cm_interpolate, 0.0, 0.0],
+            duality_noise: [
+                self.duality_h.abs() * 0.5,
+                self.duality_v.abs() * 0.5,
+                self.noise_granularity,
+                self.noise_fps.abs() + 1e-5,
+            ],
+            color0_argb: pack_argb(nblend, base_r, base_g, base_b),
+            color1_argb: pack_argb(gblend, gray_r, gray_g, gray_b),
+            _pad: [0; 2],
+        }
+    }
 }
+
+/// 96-byte GPU constant/vertex summary packed for `postprocess.ps` / `postprocess_cm.ps`
+/// (`CRenderTarget::phase_pp` in `r3_rendertarget_phase_PP.cpp:133-170`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PostprocessGpuParams {
+    /// `(color_base.r, color_base.g, color_base.b, 1.0 - noise_intensity)` (`I.Color`).
+    pub color_base: [f32; 4],
+    /// `(color_gray.r, color_gray.g, color_gray.b, 1.0 - gray)` (`I.Gray`).
+    pub color_gray: [f32; 4],
+    /// `(color_add.r, color_add.g, color_add.b, 0.0)` (`c_brightness`).
+    pub brightness: [f32; 4],
+    /// `(cm_influence, cm_interpolate, 0.0, 0.0)` (`c_colormap`).
+    pub colormap: [f32; 4],
+    /// `(duality_h * 0.5, duality_v * 0.5, noise_granularity, noise_fps)`.
+    pub duality_noise: [f32; 4],
+    /// Quantized `TL_2c3uv::color0` ARGB (`subst_alpha(param_color_base, nblend)`).
+    pub color0_argb: u32,
+    /// Quantized `TL_2c3uv::color1` ARGB (`subst_alpha(param_color_gray, gblend)`).
+    pub color1_argb: u32,
+    pub _pad: [u32; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<PostprocessGpuParams>() == 96);
 
 /// Keyframed postprocess effect asset (`.ppe`, `CPostprocessAnimator`).
 #[derive(Debug, Clone, PartialEq)]
@@ -1335,5 +1470,17 @@ mod tests {
         let blended = PostprocessState::lerp(&PostprocessState::identity(), &st, 0.5);
         assert!((blended.gray - 0.2).abs() < 1e-5);
         assert!((blended.color_base[0] - 0.6).abs() < 1e-5);
+
+        assert!(!PostprocessState::identity().is_active());
+        assert!(!PostprocessState::identity().uses_color_map());
+        assert!(st.is_active());
+        assert!(st.uses_color_map());
+
+        let gpu = st.to_gpu_params();
+        assert!((gpu.colormap[0] - 0.6).abs() < 1e-5);
+        assert!((gpu.color_gray[3] - (153.0 / 255.0)).abs() < 1e-4);
+        assert_eq!(gpu.color0_argb >> 24, 255);
+        let (right_uv, left_uv) = st.duality_uv_rects(100, 100, 100);
+        assert!((left_uv[0] - right_uv[0] - 0.005).abs() < 1e-5);
     }
 }

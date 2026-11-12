@@ -4,10 +4,12 @@
 //! (`SkeletonRigid.cpp`, `SkeletonCustom.cpp`, `SkeletonX.cpp`, `xrSkin2W.cpp`) with
 //! deterministic pure-Rust `BonePalette` construction and `1W`/`2W`/`3W`/`4W` skinning.
 
+use crate::cform::ray_triangle_test;
 use crate::chunk::FormatError;
 use crate::ogf::{
-    matrix_mul_43, matrix_transform_point, BonePoseMatrices, OgfBBox, OgfModel, OgfSkeleton,
-    OgfTextureLink, OgfVertices, StaticVertex, XRayMatrix, XRAY_IDENTITY_MATRIX,
+    matrix_invert_43, matrix_mul_43, matrix_transform_point, BonePoseMatrices, OgfBBox, OgfModel,
+    OgfObb, OgfSkeleton, OgfTextureLink, OgfVertices, OgfVisualType, StaticVertex, XRayMatrix,
+    XRAY_IDENTITY_MATRIX,
 };
 use crate::omf::OmfMotions;
 
@@ -430,6 +432,640 @@ pub fn compute_skinned_aabb(vertices: &[SkinnedVertex]) -> Option<OgfBBox> {
     Some(OgfBBox { min, max })
 }
 
+#[inline]
+fn tri_mknormal_zero(p0: [f32; 3], p1: [f32; 3], p2: [f32; 3]) -> [f32; 3] {
+    let e0 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+    let e1 = [p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]];
+    let n = [
+        e0[1] * e1[2] - e0[2] * e1[1],
+        e0[2] * e1[0] - e0[0] * e1[2],
+        e0[0] * e1[1] - e0[1] * e1[0],
+    ];
+    let len_sq = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+    if len_sq <= 1e-12 {
+        return [0.0; 3];
+    }
+    let inv = 1.0 / len_sq.sqrt();
+    [n[0] * inv, n[1] * inv, n[2] * inv]
+}
+
+/// Per-bone visibility bitmask (`CKinematics::LL_GetBoneVisible` / `VisMask`).
+///
+/// Supports arbitrary bone counts (including skeletons with more than 64 bones).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BoneMask {
+    bone_count: usize,
+    bits: Vec<u64>,
+}
+
+impl BoneMask {
+    #[inline]
+    fn words_for(bone_count: usize) -> usize {
+        bone_count.div_ceil(64)
+    }
+
+    #[inline]
+    fn mask_tail(bits: &mut [u64], bone_count: usize) {
+        let rem = bone_count % 64;
+        if rem != 0 && let Some(last) = bits.last_mut() {
+            *last &= (1u64 << rem) - 1;
+        }
+    }
+
+    /// Mask with every bone `0..bone_count` marked visible.
+    pub fn all(bone_count: usize) -> Self {
+        let mut bits = vec![u64::MAX; Self::words_for(bone_count)];
+        Self::mask_tail(&mut bits, bone_count);
+        Self { bone_count, bits }
+    }
+
+    /// Mask with all bones hidden.
+    pub fn empty(bone_count: usize) -> Self {
+        Self {
+            bone_count,
+            bits: vec![0u64; Self::words_for(bone_count)],
+        }
+    }
+
+    /// Construct from a legacy `u64` X-Ray visibility mask (`bones <= 64` fill word 0).
+    pub fn from_u64(mask: u64, bone_count: usize) -> Self {
+        let words = Self::words_for(bone_count);
+        let mut bits = vec![0u64; words];
+        if let Some(first) = bits.first_mut() {
+            *first = mask;
+        }
+        Self::mask_tail(&mut bits, bone_count);
+        Self { bone_count, bits }
+    }
+
+    #[inline]
+    pub fn bone_count(&self) -> usize {
+        self.bone_count
+    }
+
+    #[inline]
+    pub fn is_visible(&self, bone_id: u16) -> bool {
+        let idx = bone_id as usize;
+        if idx >= self.bone_count {
+            return false;
+        }
+        let word = idx / 64;
+        let bit = idx % 64;
+        ((self.bits[word] >> bit) & 1) != 0
+    }
+
+    #[inline]
+    pub fn set_visible(&mut self, bone_id: u16, visible: bool) {
+        let idx = bone_id as usize;
+        if idx >= self.bone_count {
+            return;
+        }
+        let word = idx / 64;
+        let bit = idx % 64;
+        if visible {
+            self.bits[word] |= 1u64 << bit;
+        } else {
+            self.bits[word] &= !(1u64 << bit);
+        }
+    }
+
+    #[inline]
+    pub fn as_u64(&self) -> u64 {
+        self.bits.first().copied().unwrap_or(0)
+    }
+}
+
+/// Evaluate exact `0`/`1`/`2`/`3`/`4`-link position skinning using an explicit `link_count`
+/// (avoids C++ sentinel ambiguity when adjacent bone IDs repeat inside 3W/4W vertices).
+pub fn skin_position_with_links(
+    position: [f32; 3],
+    link_count: u8,
+    bone_ids: [u16; 4],
+    weights: [f32; 3],
+    render_transforms: &[XRayMatrix],
+) -> Result<[f32; 3], FormatError> {
+    let get_mat = |bone_id: u16| -> Result<&XRayMatrix, FormatError> {
+        render_transforms
+            .get(bone_id as usize)
+            .ok_or(FormatError::InvalidValue(
+                "wallmark vertex references bone index outside BonePalette",
+            ))
+    };
+
+    match link_count {
+        0 => Ok(position),
+        1 => Ok(matrix_transform_point(get_mat(bone_ids[0])?, position)),
+        2 => {
+            let p0 = matrix_transform_point(get_mat(bone_ids[0])?, position);
+            let p1 = matrix_transform_point(get_mat(bone_ids[1])?, position);
+            let w1 = weights[0];
+            let w0 = 1.0 - w1;
+            Ok([
+                p0[0] * w0 + p1[0] * w1,
+                p0[1] * w0 + p1[1] * w1,
+                p0[2] * w0 + p1[2] * w1,
+            ])
+        }
+        3 => {
+            let p0 = matrix_transform_point(get_mat(bone_ids[0])?, position);
+            let p1 = matrix_transform_point(get_mat(bone_ids[1])?, position);
+            let p2 = matrix_transform_point(get_mat(bone_ids[2])?, position);
+            let w0 = weights[0];
+            let w1 = weights[1];
+            let w2 = 1.0 - w0 - w1;
+            Ok([
+                p0[0] * w0 + p1[0] * w1 + p2[0] * w2,
+                p0[1] * w0 + p1[1] * w1 + p2[1] * w2,
+                p0[2] * w0 + p1[2] * w1 + p2[2] * w2,
+            ])
+        }
+        4 => {
+            let p0 = matrix_transform_point(get_mat(bone_ids[0])?, position);
+            let p1 = matrix_transform_point(get_mat(bone_ids[1])?, position);
+            let p2 = matrix_transform_point(get_mat(bone_ids[2])?, position);
+            let p3 = matrix_transform_point(get_mat(bone_ids[3])?, position);
+            let w0 = weights[0];
+            let w1 = weights[1];
+            let w2 = weights[2];
+            let w3 = 1.0 - w0 - w1 - w2;
+            Ok([
+                p0[0] * w0 + p1[0] * w1 + p2[0] * w2 + p3[0] * w3,
+                p0[1] * w0 + p1[1] * w1 + p2[1] * w2 + p3[1] * w3,
+                p0[2] * w0 + p1[2] * w1 + p2[2] * w2 + p3[2] * w3,
+            ])
+        }
+        _ => Err(FormatError::InvalidValue(
+            "invalid skeletal skinning link count",
+        )),
+    }
+}
+
+/// Evaluate `CKinematics::RenderWallmark` sentinel bone-equality skinning (`SkeletonCustom.cpp:868-924`).
+#[inline]
+pub fn skin_position_with_wm_sentinel(
+    position: [f32; 3],
+    bone_ids: [u16; 4],
+    weights: [f32; 3],
+    render_transforms: &[XRayMatrix],
+) -> Result<[f32; 3], FormatError> {
+    let links = if bone_ids[0] == bone_ids[1] {
+        1
+    } else if bone_ids[1] == bone_ids[2] {
+        2
+    } else if bone_ids[2] == bone_ids[3] {
+        3
+    } else {
+        4
+    };
+    skin_position_with_links(position, links, bone_ids, weights, render_transforms)
+}
+
+/// Result of evaluating a single vertex's posed position and raw skinning influences.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkinnedVertexInfluence {
+    pub skinned_pos: [f32; 3],
+    pub bind_pos: [f32; 3],
+    pub link_count: u8,
+    pub sentinel_bones: [u16; 4],
+    pub weights: [f32; 3],
+}
+
+/// Skin a single vertex position from `OgfVertices` and return its posed position plus bind-pose skinning influences.
+pub fn skin_vertex_pos_and_influences(
+    vertices: &OgfVertices,
+    vertex_idx: usize,
+    render_transforms: &[XRayMatrix],
+) -> Result<SkinnedVertexInfluence, FormatError> {
+    match vertices {
+        OgfVertices::Static { vertices, .. } => {
+            let v = vertices
+                .get(vertex_idx)
+                .ok_or(FormatError::InvalidValue("static vertex index out of bounds"))?;
+            Ok(SkinnedVertexInfluence {
+                skinned_pos: v.position,
+                bind_pos: v.position,
+                link_count: 0,
+                sentinel_bones: [0; 4],
+                weights: [0.0; 3],
+            })
+        }
+        OgfVertices::Skinned1W(verts) => {
+            let v = verts
+                .get(vertex_idx)
+                .ok_or(FormatError::InvalidValue("1W vertex index out of bounds"))?;
+            let b = v.matrix as u16;
+            let bone_ids = [b, b, b, b];
+            let weights = [0.0; 3];
+            let skinned =
+                skin_position_with_links(v.position, 1, bone_ids, weights, render_transforms)?;
+            Ok(SkinnedVertexInfluence {
+                skinned_pos: skinned,
+                bind_pos: v.position,
+                link_count: 1,
+                sentinel_bones: bone_ids,
+                weights,
+            })
+        }
+        OgfVertices::Skinned2W(verts) => {
+            let v = verts
+                .get(vertex_idx)
+                .ok_or(FormatError::InvalidValue("2W vertex index out of bounds"))?;
+            let bone_ids = [v.matrix0, v.matrix1, v.matrix1, v.matrix1];
+            let weights = [v.weight, 0.0, 0.0];
+            let skinned =
+                skin_position_with_links(v.position, 2, bone_ids, weights, render_transforms)?;
+            Ok(SkinnedVertexInfluence {
+                skinned_pos: skinned,
+                bind_pos: v.position,
+                link_count: 2,
+                sentinel_bones: bone_ids,
+                weights,
+            })
+        }
+        OgfVertices::Skinned3W(verts) => {
+            let v = verts
+                .get(vertex_idx)
+                .ok_or(FormatError::InvalidValue("3W vertex index out of bounds"))?;
+            let bone_ids = [v.matrices[0], v.matrices[1], v.matrices[2], v.matrices[2]];
+            let weights = [v.weights[0], v.weights[1], 0.0];
+            let skinned =
+                skin_position_with_links(v.position, 3, bone_ids, weights, render_transforms)?;
+            Ok(SkinnedVertexInfluence {
+                skinned_pos: skinned,
+                bind_pos: v.position,
+                link_count: 3,
+                sentinel_bones: bone_ids,
+                weights,
+            })
+        }
+        OgfVertices::Skinned4W(verts) => {
+            let v = verts
+                .get(vertex_idx)
+                .ok_or(FormatError::InvalidValue("4W vertex index out of bounds"))?;
+            let bone_ids = v.matrices;
+            let weights = v.weights;
+            let skinned =
+                skin_position_with_links(v.position, 4, bone_ids, weights, render_transforms)?;
+            Ok(SkinnedVertexInfluence {
+                skinned_pos: skinned,
+                bind_pos: v.position,
+                link_count: 4,
+                sentinel_bones: bone_ids,
+                weights,
+            })
+        }
+    }
+}
+
+/// Borrowed mesh surface inside an OGF hierarchy participating in skeletal picking / wallmarks.
+#[derive(Debug, Clone)]
+pub struct SkeletonLeafInfo<'a> {
+    pub child_index: Option<usize>,
+    pub model: &'a OgfModel,
+    pub vertices: &'a OgfVertices,
+    /// Active triangle index slice (`swi.windows[0]` max LOD for `SkeletonGeomdefPm` / `Progressive`).
+    pub active_indices: &'a [u16],
+    pub tri_count: usize,
+}
+
+/// Per-bone face index mapping (`CBoneData::child_faces` + `CSkeletonX::_CollectBoneFaces`).
+#[derive(Debug, Clone)]
+pub struct SkeletonCollisionIndex<'a> {
+    pub skeleton: &'a OgfSkeleton,
+    pub leaves: Vec<SkeletonLeafInfo<'a>>,
+    /// Indexed as `bone_child_faces[bone_id][leaf_idx] -> sorted unique face indices`.
+    pub bone_child_faces: Vec<Vec<Vec<u32>>>,
+}
+
+impl<'a> SkeletonCollisionIndex<'a> {
+    /// Collect all active mesh leaves and build per-bone face lists (`CSkeletonX_ST`/`PM::AfterLoad`).
+    pub fn from_ogf(root: &'a OgfModel) -> Result<Self, FormatError> {
+        let skeleton = root
+            .skeleton
+            .as_ref()
+            .ok_or(FormatError::MissingChunk(crate::ogf::ogf_chunks::OGF_S_BONE_NAMES))?;
+        let bone_count = skeleton.bones.len();
+
+        let mut leaves = Vec::new();
+        fn gather_leaves<'m>(
+            node: &'m OgfModel,
+            child_index: Option<usize>,
+            out: &mut Vec<SkeletonLeafInfo<'m>>,
+        ) {
+            if let Some(ref verts) = node.vertices
+                && !node.indices.is_empty()
+            {
+                let active_indices = if matches!(
+                    node.header.visual_type,
+                    OgfVisualType::SkeletonGeomdefPm | OgfVisualType::Progressive
+                ) && let Some(swi) = &node.swi
+                    && let Some(max_lod) = swi.windows.first()
+                {
+                    let start = max_lod.offset as usize;
+                    let count = (max_lod.num_tris as usize) * 3;
+                    let end = start.saturating_add(count).min(node.indices.len());
+                    if start <= end {
+                        let slice = &node.indices[start..end];
+                        let aligned = slice.len() - (slice.len() % 3);
+                        &slice[..aligned]
+                    } else {
+                        &[]
+                    }
+                } else {
+                    let aligned = node.indices.len() - (node.indices.len() % 3);
+                    &node.indices[..aligned]
+                };
+
+                let tri_count = active_indices.len() / 3;
+                if tri_count > 0 {
+                    out.push(SkeletonLeafInfo {
+                        child_index,
+                        model: node,
+                        vertices: verts,
+                        active_indices,
+                        tri_count,
+                    });
+                }
+            }
+            for (idx, child) in node.children.iter().enumerate() {
+                gather_leaves(child, Some(idx), out);
+            }
+        }
+        gather_leaves(root, None, &mut leaves);
+
+        let mut bone_child_faces = vec![vec![Vec::new(); leaves.len()]; bone_count];
+
+        for (leaf_idx, leaf) in leaves.iter().enumerate() {
+            let vcount = leaf.vertices.len();
+            for tri_idx in 0..leaf.tri_count {
+                let face_u32 = tri_idx as u32;
+                let base = tri_idx * 3;
+                for k in 0..3 {
+                    let vi = leaf.active_indices[base + k] as usize;
+                    if vi >= vcount {
+                        return Err(FormatError::InvalidValue(
+                            "skeletal index references out-of-bounds vertex",
+                        ));
+                    }
+                    match leaf.vertices {
+                        OgfVertices::Static { .. } => {
+                            if bone_count > 0 {
+                                bone_child_faces[0][leaf_idx].push(face_u32);
+                            }
+                        }
+                        OgfVertices::Skinned1W(verts) => {
+                            let b = verts[vi].matrix as usize;
+                            let slots = bone_child_faces.get_mut(b).ok_or(
+                                FormatError::InvalidValue(
+                                    "1W vertex references bone index outside OgfSkeleton",
+                                ),
+                            )?;
+                            slots[leaf_idx].push(face_u32);
+                        }
+                        OgfVertices::Skinned2W(verts) => {
+                            for b in [verts[vi].matrix0 as usize, verts[vi].matrix1 as usize] {
+                                let slots = bone_child_faces.get_mut(b).ok_or(
+                                    FormatError::InvalidValue(
+                                        "2W vertex references bone index outside OgfSkeleton",
+                                    ),
+                                )?;
+                                slots[leaf_idx].push(face_u32);
+                            }
+                        }
+                        OgfVertices::Skinned3W(verts) => {
+                            for &bm in &verts[vi].matrices {
+                                let slots = bone_child_faces.get_mut(bm as usize).ok_or(
+                                    FormatError::InvalidValue(
+                                        "3W vertex references bone index outside OgfSkeleton",
+                                    ),
+                                )?;
+                                slots[leaf_idx].push(face_u32);
+                            }
+                        }
+                        OgfVertices::Skinned4W(verts) => {
+                            for &bm in &verts[vi].matrices {
+                                let slots = bone_child_faces.get_mut(bm as usize).ok_or(
+                                    FormatError::InvalidValue(
+                                        "4W vertex references bone index outside OgfSkeleton",
+                                    ),
+                                )?;
+                                slots[leaf_idx].push(face_u32);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for bone_slots in &mut bone_child_faces {
+                let faces = &mut bone_slots[leaf_idx];
+                faces.sort_unstable();
+                faces.dedup();
+            }
+        }
+
+        Ok(Self {
+            skeleton,
+            leaves,
+            bone_child_faces,
+        })
+    }
+
+    /// True if `bone_id` exists and does not carry `SBoneShape::sfNoPickable`.
+    #[inline]
+    pub fn is_bone_pickable(&self, bone_id: u16) -> bool {
+        self.skeleton
+            .bones
+            .get(bone_id as usize)
+            .is_some_and(|bone| bone.ik.as_ref().map(|ik| ik.shape.is_pickable()).unwrap_or(true))
+    }
+
+    /// Build animated model-space OBBs (`BD.obb.transform(mTransform)`) for all bones.
+    pub fn build_cache_obbs(&self, palette: &BonePalette) -> Vec<OgfObb> {
+        self.skeleton
+            .bones
+            .iter()
+            .enumerate()
+            .map(|(idx, bone)| {
+                if let Some(m) = palette.model_transforms.get(idx) {
+                    bone.obb.transform(m)
+                } else {
+                    bone.obb
+                }
+            })
+            .collect()
+    }
+
+    /// Pick the nearest triangle owned by `bone_id` in model space (`CSkeletonX::PickBone`).
+    pub fn pick_single_bone_model_space(
+        &self,
+        palette: &BonePalette,
+        bone_id: u16,
+        max_dist: f32,
+        origin_model: [f32; 3],
+        dir_model: [f32; 3],
+    ) -> Option<BonePickHit> {
+        let bone_slots = self.bone_child_faces.get(bone_id as usize)?;
+        let mut best_dist = max_dist;
+        let mut best_hit: Option<BonePickHit> = None;
+
+        for (leaf_idx, leaf) in self.leaves.iter().enumerate() {
+            let faces = &bone_slots[leaf_idx];
+            if faces.is_empty() {
+                continue;
+            }
+
+            for &face_u32 in faces {
+                let face_idx = face_u32 as usize;
+                let base = face_idx * 3;
+                let mut tri = [[0.0f32; 3]; 3];
+                let mut ok = true;
+                for (k, slot) in tri.iter_mut().enumerate() {
+                    let vi = leaf.active_indices[base + k] as usize;
+                    match skin_vertex_pos_and_influences(
+                        leaf.vertices,
+                        vi,
+                        &palette.render_transforms,
+                    ) {
+                        Ok(inf) => *slot = inf.skinned_pos,
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+
+                if let Some((t, u, v)) =
+                    ray_triangle_test(origin_model, dir_model, tri[0], tri[1], tri[2], true)
+                    && t >= 0.0
+                    && t < best_dist
+                {
+                    let normal = tri_mknormal_zero(tri[0], tri[1], tri[2]);
+                    best_dist = t;
+                    best_hit = Some(BonePickHit {
+                        bone_id,
+                        leaf_index: leaf_idx,
+                        face_index: face_idx,
+                        dist: t,
+                        barycentric_uv: [u, v],
+                        normal,
+                        tri,
+                    });
+                }
+            }
+        }
+
+        best_hit
+    }
+
+    /// Prune visible pickable bones by animated OBB ray test and return the nearest triangle hit
+    /// together with the per-bone animated `cache_obbs` (`CKinematics::AddWallmark` lines 728-753).
+    pub fn pick_nearest_model_space_with_obbs(
+        &self,
+        palette: &BonePalette,
+        visible_bones: &BoneMask,
+        max_dist: f32,
+        origin_model: [f32; 3],
+        dir_model: [f32; 3],
+    ) -> (Option<BonePickHit>, Vec<OgfObb>) {
+        let mut cache_obbs = vec![OgfObb::default(); self.skeleton.bones.len()];
+        let mut best_dist = max_dist;
+        let mut best_hit: Option<BonePickHit> = None;
+
+        for (k, bone) in self.skeleton.bones.iter().enumerate() {
+            let bone_id = k as u16;
+            if !visible_bones.is_visible(bone_id) || !self.is_bone_pickable(bone_id) {
+                continue;
+            }
+            let Some(m) = palette.model_transforms.get(k) else {
+                continue;
+            };
+            let obb = bone.obb.transform(m);
+            cache_obbs[k] = obb;
+
+            if obb.test_ray(origin_model, dir_model)
+                && let Some(hit) = self.pick_single_bone_model_space(
+                    palette,
+                    bone_id,
+                    best_dist,
+                    origin_model,
+                    dir_model,
+                )
+                && hit.dist < best_dist
+            {
+                best_dist = hit.dist;
+                best_hit = Some(hit);
+            }
+        }
+
+        (best_hit, cache_obbs)
+    }
+}
+
+/// Ray-triangle pick hit against a skeleton (`IKinematics::pick_result`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BonePickHit {
+    pub bone_id: u16,
+    pub leaf_index: usize,
+    pub face_index: usize,
+    pub dist: f32,
+    pub barycentric_uv: [f32; 2],
+    pub normal: [f32; 3],
+    pub tri: [[f32; 3]; 3],
+}
+
+/// Transform a world-space ray into model space and test a specific bone (`CKinematics::PickBone`).
+pub fn pick_ogf_single_bone(
+    index: &SkeletonCollisionIndex<'_>,
+    palette: &BonePalette,
+    parent_xform: &XRayMatrix,
+    bone_id: u16,
+    max_dist: f32,
+    origin_world: [f32; 3],
+    dir_world: [f32; 3],
+) -> Option<BonePickHit> {
+    let inv_parent = matrix_invert_43(parent_xform)?;
+    let s = matrix_transform_point(&inv_parent, origin_world);
+    let d = matrix_transform_dir(&inv_parent, dir_world);
+
+    let mut hit = index.pick_single_bone_model_space(palette, bone_id, max_dist, s, d)?;
+    hit.tri = [
+        matrix_transform_point(parent_xform, hit.tri[0]),
+        matrix_transform_point(parent_xform, hit.tri[1]),
+        matrix_transform_point(parent_xform, hit.tri[2]),
+    ];
+    hit.normal = tri_mknormal_zero(hit.tri[0], hit.tri[1], hit.tri[2]);
+    Some(hit)
+}
+
+/// Find the nearest pickable skeletal hit in world space using OBB pruning across all visible bones.
+pub fn pick_ogf_bone(
+    index: &SkeletonCollisionIndex<'_>,
+    palette: &BonePalette,
+    parent_xform: &XRayMatrix,
+    visible_bones: &BoneMask,
+    max_dist: f32,
+    origin_world: [f32; 3],
+    dir_world: [f32; 3],
+) -> Option<BonePickHit> {
+    let inv_parent = matrix_invert_43(parent_xform)?;
+    let s = matrix_transform_point(&inv_parent, origin_world);
+    let d = matrix_transform_dir(&inv_parent, dir_world);
+
+    let (mut hit, _) = index.pick_nearest_model_space_with_obbs(palette, visible_bones, max_dist, s, d);
+    if let Some(ref mut h) = hit {
+        h.tri = [
+            matrix_transform_point(parent_xform, h.tri[0]),
+            matrix_transform_point(parent_xform, h.tri[1]),
+            matrix_transform_point(parent_xform, h.tri[2]),
+        ];
+        h.normal = tri_mknormal_zero(h.tri[0], h.tri[1], h.tri[2]);
+    }
+    hit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,5 +1325,283 @@ mod tests {
         let parts = skin_ogf_hierarchy(&child, &bind_pal).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].vertices[0].position, [0.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn test_bone_mask_arbitrary_counts_and_legacy_u64() {
+        let mut small = BoneMask::all(3);
+        assert!(small.is_visible(0) && small.is_visible(2) && !small.is_visible(3));
+        assert_eq!(small.as_u64(), 0b111);
+        small.set_visible(1, false);
+        assert!(!small.is_visible(1));
+        assert_eq!(small.as_u64(), 0b101);
+
+        let mut wide = BoneMask::all(70);
+        assert!(wide.is_visible(69) && !wide.is_visible(70));
+        wide.set_visible(67, false);
+        assert!(!wide.is_visible(67) && wide.is_visible(68));
+
+        let from_bits = BoneMask::from_u64(0x5, 4);
+        assert!(from_bits.is_visible(0) && !from_bits.is_visible(1) && from_bits.is_visible(2));
+        assert!(!BoneMask::empty(10).is_visible(0));
+    }
+
+    #[test]
+    fn test_skeleton_collision_index_picking_animated_obbs_flags_and_swi() {
+        use crate::ogf::{bone_shape_flags, matrix_set_xyz_translate, OgfBone, BoneIkData, BoneIkSection, BoneShape, BoneShapeType};
+
+        fn make_obb_bone(
+            id: u16,
+            name: &str,
+            parent_name: &str,
+            parent_id: Option<u16>,
+            bind_trans: [f32; 3],
+            obb_center_local: [f32; 3],
+            no_pickable: bool,
+        ) -> OgfBone {
+            let obb = OgfObb {
+                rotate: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                translate: obb_center_local,
+                halfsize: [0.8, 0.8, 0.8],
+            };
+            OgfBone {
+                id,
+                name: name.to_string(),
+                parent_name: parent_name.to_string(),
+                parent_id,
+                children: if id == 0 { vec![1] } else { Vec::new() },
+                obb,
+                ik: Some(BoneIkSection {
+                    game_mtl_name: "default".to_string(),
+                    shape: BoneShape {
+                        shape_type: BoneShapeType::Box as u16,
+                        flags: if no_pickable {
+                            bone_shape_flags::SF_NO_PICKABLE
+                        } else {
+                            0
+                        },
+                        box_obb: obb,
+                        sphere_center: [0.0; 3],
+                        sphere_radius: 0.0,
+                        cylinder_center: [0.0; 3],
+                        cylinder_direction: [0.0, 1.0, 0.0],
+                        cylinder_height: 0.0,
+                        cylinder_radius: 0.0,
+                    },
+                    ik_data: BoneIkData {
+                        version: 1,
+                        joint_type: 0,
+                        limits: [crate::ogf::JointLimit {
+                            limit: [0.0, 0.0],
+                            spring_factor: 0.0,
+                            damping_factor: 0.0,
+                        }; 3],
+                        spring_factor: 0.0,
+                        damping_factor: 0.0,
+                        ik_flags: 0,
+                        break_force: 0.0,
+                        break_torque: 0.0,
+                        friction: 0.0,
+                    },
+                    bind_rotation_xyz: [0.0; 3],
+                    bind_translation: bind_trans,
+                    mass: 1.0,
+                    center_of_mass: [0.0; 3],
+                }),
+            }
+        }
+
+        // Write a valid SkeletonAnim parent with child SkeletonGeomdefPm whose SWI max LOD cuts off tri #1
+        let mut ogf_w = ChunkWriter::new();
+        let mut hdr = vec![4u8, OgfVisualType::SkeletonAnim as u8, 0, 0];
+        hdr.extend_from_slice(&[0u8; 40]);
+        ogf_w.write_chunk(OGF_HEADER, &hdr);
+        let id_obb = OgfObb {
+            rotate: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translate: [0.0; 3],
+            halfsize: [0.8, 0.8, 0.8],
+        };
+        let mut bn = Vec::new();
+        bn.extend_from_slice(&2u32.to_le_bytes());
+        bn.extend_from_slice(b"root\0\0");
+        for r in id_obb.rotate {
+            write_vec3(&mut bn, r);
+        }
+        write_vec3(&mut bn, [0.0; 3]);
+        write_vec3(&mut bn, id_obb.halfsize);
+        bn.extend_from_slice(b"arm\0root\0");
+        for r in id_obb.rotate {
+            write_vec3(&mut bn, r);
+        }
+        write_vec3(&mut bn, [0.0; 3]);
+        write_vec3(&mut bn, id_obb.halfsize);
+        ogf_w.write_chunk(OGF_S_BONE_NAMES, &bn);
+        let mut ik = Vec::new();
+        write_ik_bone(&mut ik, [0.0, 0.0, 0.0]);
+        write_ik_bone(&mut ik, [0.0, 2.0, 0.0]);
+        ogf_w.write_chunk(OGF_S_IKDATA, &ik);
+
+        let mut model = OgfModel::parse(&ogf_w.into_bytes()).unwrap();
+        // Replace bones with explicit OBB extents covering their triangles
+        let skel = model.skeleton.as_mut().unwrap();
+        skel.bones[0] = make_obb_bone(0, "root", "", None, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], false);
+        skel.bones[1] = make_obb_bone(1, "arm", "root", Some(0), [0.0, 2.0, 0.0], [0.0, 0.0, 0.0], false);
+
+        // Child mesh with 3 triangles:
+        // tri 0 (bone 0, z=0 facing -Z): (-0.5, -0.5, 0), (0.0, 0.5, 0), (0.5, -0.5, 0)
+        // tri 1 (bone 1, z=0 facing -Z): (-0.5, 1.5, 0), (0.0, 2.5, 0), (0.5, 1.5, 0)
+        // tri 2 (bone 1, z=-1): outside SWI windows[0] -> must NEVER be picked!
+        let mut child_w = ChunkWriter::new();
+        let mut chdr = vec![4u8, OgfVisualType::SkeletonGeomdefPm as u8, 0, 0];
+        chdr.extend_from_slice(&[0u8; 40]);
+        child_w.write_chunk(OGF_HEADER, &chdr);
+        child_w.write_chunk(OGF_TEXTURE, b"act\\hero\0models\\model\0");
+        let tri_verts = [
+            // tri 0 -> bone 0
+            (0u32, [-0.5f32, -0.5, 0.0]),
+            (0, [0.0, 0.5, 0.0]),
+            (0, [0.5, -0.5, 0.0]),
+            // tri 1 -> bone 1
+            (1, [-0.5, 1.5, 0.0]),
+            (1, [0.0, 2.5, 0.0]),
+            (1, [0.5, 1.5, 0.0]),
+            // tri 2 -> bone 1 (outside SWI[0])
+            (1, [-0.5, 1.5, -1.0]),
+            (1, [0.0, 2.5, -1.0]),
+            (1, [0.5, 1.5, -1.0]),
+        ];
+        let mut vb = Vec::new();
+        vb.extend_from_slice(&skel_vert_type::FVF_1L.to_le_bytes());
+        vb.extend_from_slice(&(tri_verts.len() as u32).to_le_bytes());
+        for (b, pos) in tri_verts {
+            write_vec3(&mut vb, pos);
+            write_vec3(&mut vb, [0.0, 0.0, -1.0]);
+            write_vec3(&mut vb, [1.0, 0.0, 0.0]);
+            write_vec3(&mut vb, [0.0, 1.0, 0.0]);
+            vb.extend_from_slice(&0.0f32.to_le_bytes());
+            vb.extend_from_slice(&0.0f32.to_le_bytes());
+            vb.extend_from_slice(&b.to_le_bytes());
+        }
+        child_w.write_chunk(OGF_VERTICES, &vb);
+        let mut ib = Vec::new();
+        ib.extend_from_slice(&(9u32).to_le_bytes());
+        for i in 0u16..9 {
+            ib.extend_from_slice(&i.to_le_bytes());
+        }
+        child_w.write_chunk(OGF_INDICES, &ib);
+        let mut swi_b = Vec::new();
+        swi_b.extend_from_slice(&[0u8; 16]);
+        swi_b.extend_from_slice(&1u32.to_le_bytes()); // 1 window covering tri 0 & tri 1 (2 tris)
+        swi_b.extend_from_slice(&0u32.to_le_bytes());
+        swi_b.extend_from_slice(&2u16.to_le_bytes());
+        swi_b.extend_from_slice(&6u16.to_le_bytes());
+        child_w.write_chunk(OGF_SWIDATA, &swi_b);
+        let child = OgfModel::parse(&child_w.into_bytes()).unwrap();
+        model.children.push(child);
+
+        let index = SkeletonCollisionIndex::from_ogf(&model).unwrap();
+        assert_eq!(index.bone_child_faces[0][0], vec![0]);
+        assert_eq!(index.bone_child_faces[1][0], vec![1]);
+
+        let bind_pal = BonePalette::bind_pose(index.skeleton).unwrap();
+        let all_vis = BoneMask::all(2);
+        let parent_xform = matrix_set_xyz_translate([0.0, 0.0, 0.0], [10.0, 0.0, 0.0]);
+
+        // Hit bone 1 in world space at x=10, y=2
+        let hit = pick_ogf_bone(
+            &index,
+            &bind_pal,
+            &parent_xform,
+            &all_vis,
+            100.0,
+            [10.0, 2.0, -5.0],
+            [0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        assert_eq!(hit.bone_id, 1);
+        assert!((hit.dist - 5.0).abs() < 1e-4);
+        assert!((hit.normal[2] + 1.0).abs() < 1e-4);
+
+        // Hiding bone 1 in BoneMask makes `pick_ogf_bone` miss y=2
+        let mut only_root = BoneMask::all(2);
+        only_root.set_visible(1, false);
+        assert!(pick_ogf_bone(
+            &index,
+            &bind_pal,
+            &parent_xform,
+            &only_root,
+            100.0,
+            [10.0, 2.0, -5.0],
+            [0.0, 0.0, 1.0],
+        )
+        .is_none());
+
+        // Shifting bone 1 to X=+3 moves both bone 1's OBB and triangle from X=0 to X=3 (world X=13)
+        let moved_models = [
+            XRAY_IDENTITY_MATRIX,
+            matrix_set_xyz_translate([0.0, 0.0, 0.0], [3.0, 2.0, 0.0]),
+        ];
+        let moved_pal = BonePalette::from_model_transforms(index.skeleton, &moved_models).unwrap();
+        assert!(pick_ogf_bone(
+            &index,
+            &moved_pal,
+            &parent_xform,
+            &all_vis,
+            100.0,
+            [10.0, 2.0, -5.0],
+            [0.0, 0.0, 1.0],
+        )
+        .is_none());
+        let moved_hit = pick_ogf_bone(
+            &index,
+            &moved_pal,
+            &parent_xform,
+            &all_vis,
+            100.0,
+            [13.0, 2.0, -5.0],
+            [0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        assert_eq!(moved_hit.bone_id, 1);
+
+        // SF_NO_PICKABLE skips bone 1 in `pick_ogf_bone` while `pick_ogf_single_bone` still checks explicit bone
+        model.skeleton.as_mut().unwrap().bones[1]
+            .ik
+            .as_mut()
+            .unwrap()
+            .shape
+            .flags |= bone_shape_flags::SF_NO_PICKABLE;
+        let index_nopick = SkeletonCollisionIndex::from_ogf(&model).unwrap();
+        assert!(pick_ogf_bone(
+            &index_nopick,
+            &bind_pal,
+            &parent_xform,
+            &all_vis,
+            100.0,
+            [10.0, 2.0, -5.0],
+            [0.0, 0.0, 1.0],
+        )
+        .is_none());
+        assert!(pick_ogf_single_bone(
+            &index_nopick,
+            &bind_pal,
+            &parent_xform,
+            1,
+            100.0,
+            [10.0, 2.0, -5.0],
+            [0.0, 0.0, 1.0],
+        )
+        .is_some());
+
+        // Explicit `link_count` handles repeated consecutive bone IDs in 3W without C++ sentinel mis-dispatch
+        let p_links = skin_position_with_links(
+            [0.0, 2.0, 0.0],
+            3,
+            [0, 1, 1, 1],
+            [0.25, 0.5, 0.0],
+            &moved_pal.render_transforms,
+        )
+        .unwrap();
+        assert!((p_links[0] - 2.25).abs() < 1e-4);
     }
 }

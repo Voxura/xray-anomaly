@@ -881,7 +881,15 @@ pub fn load_bone_parts_ltx_from_vfs(
         "$game_meshes$/anomaly_weapons/hands/bone_parts.ltx".to_string()
     } else {
         let trimmed = model_or_ltx_path.trim();
-        let stem = strip_texture_extension(trimmed);
+        let stem = trimmed
+            .rfind('.')
+            .filter(|&dot| {
+                !trimmed[dot..].contains(['/', '\\'])
+                    && [".ogf", ".omf", ".ltx", ".object"]
+                        .iter()
+                        .any(|ext| trimmed[dot..].eq_ignore_ascii_case(ext))
+            })
+            .map_or(trimmed, |dot| &trimmed[..dot]);
         let with_ext = format!("{stem}.ltx");
         if with_ext.starts_with('$') {
             with_ext
@@ -1284,6 +1292,158 @@ mod tests {
             opt_bg.dds_vpath(),
             "textures\\ui\\ui_actor_options_background.dds"
         );
+    }
+
+    #[test]
+    fn test_real_gamedata_snd_env_bone_parts_materials_mods_and_shaders_over_vfs() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let gamedata_dir = repo_root.join("gamedata");
+        assert!(
+            gamedata_dir.is_dir(),
+            "repo gamedata directory must exist at {}",
+            gamedata_dir.display()
+        );
+
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_loose_dir(&gamedata_dir);
+
+        // 1. Discover & parse all 17 real `levels/*/level.snd_env` binary reverb-zone assets over VFS
+        let level_files = vfs.list_files("$game_levels$").unwrap();
+        let snd_env_files: Vec<String> = level_files
+            .into_iter()
+            .filter(|p| p.ends_with("\\level.snd_env"))
+            .collect();
+        assert_eq!(snd_env_files.len(), 17);
+        for vpath in &snd_env_files {
+            let sdef = load_level_sound_env_from_vfs(&vfs, vpath)
+                .unwrap_or_else(|e| panic!("failed parsing {vpath}: {e:?}"));
+            assert!(!sdef.env_names.is_empty(), "{vpath} env_names empty");
+            assert!(!sdef.env_pairs.is_empty(), "{vpath} env_pairs empty");
+            let _ = sdef.query_env_name_at([0.0, 500.0, 0.0]);
+        }
+        let bar_sdef = load_level_sound_env_from_vfs(&vfs, "$game_levels$/l05_bar").unwrap();
+        assert!(!bar_sdef.env_names.is_empty());
+
+        // 2. Load real hands bone partitions (`bone_parts.ltx` & `wpn_hand_00.ltx`) via VFS
+        let hands_parts = load_bone_parts_ltx_from_vfs(&vfs, "", true).unwrap();
+        let wpn0_parts =
+            load_bone_parts_ltx_from_vfs(&vfs, "anomaly_weapons/hands/wpn_hand_00.ogf", false)
+                .unwrap();
+        assert_eq!(hands_parts, wpn0_parts);
+        assert_eq!(hands_parts.parts.len(), 5);
+        assert_eq!(hands_parts.part_id("default"), Some(0));
+        assert_eq!(hands_parts.part_id("left_hand"), Some(1));
+        assert_eq!(hands_parts.part_id("right_hand"), Some(2));
+        assert_eq!(hands_parts.part(0).unwrap().bone_names, vec!["bip01"]);
+        assert!(hands_parts
+            .part(1)
+            .unwrap()
+            .bone_names
+            .iter()
+            .any(|b| b == "l_hand"));
+        assert!(hands_parts
+            .part(2)
+            .unwrap()
+            .bone_names
+            .iter()
+            .any(|b| b == "lead_gun"));
+
+        // 3. Load `materials/materials.ltx` & `materials/material_pairs.ltx` (with wildcard `#include`s)
+        let mtls_ltx =
+            load_ltx_tree_from_vfs(&vfs, "$game_data$/materials/materials.ltx", &[]).unwrap();
+        let pairs_ltx =
+            load_ltx_tree_from_vfs(&vfs, "$game_data$/materials/material_pairs.ltx", &[]).unwrap();
+        let mut mtl_lib = GameMaterialLibrary {
+            version: crate::gamemtl::GAMEMTL_CURRENT_VERSION,
+            material_index: 0,
+            material_pair_index: 0,
+            materials: Vec::new(),
+            material_pairs: Vec::new(),
+        };
+        mtl_lib.apply_materials_ltx(&mtls_ltx);
+        mtl_lib.apply_material_pairs_ltx(&pairs_ltx);
+        assert!(mtl_lib.materials.is_empty());
+        assert!(mtl_lib.material_pairs.is_empty());
+
+        // 4. Parse real `configs/environment/env_mods/_template.ltx` into LevelEnvModifiers
+        let env_mods_ltx = load_ltx_tree_from_vfs(
+            &vfs,
+            "$game_configs$/environment/env_mods/_template.ltx",
+            &[],
+        )
+        .unwrap();
+        let env_mods = LevelEnvModifiers::from_owned_ltx(&env_mods_ltx);
+        assert_eq!(env_mods.modifiers.len(), 1);
+        let example_mod = &env_mods.modifiers[0];
+        assert_eq!(example_mod.name.as_deref(), Some("modifier_example"));
+        assert_eq!(example_mod.radius, 50.0);
+        assert_eq!(example_mod.power, 100.0);
+        assert_eq!(example_mod.use_flags, 0x3F);
+        let accum = env_mods.evaluate_at([0.0, 0.0, 0.0]);
+        assert_eq!(accum.active_flags, 0x3F);
+        assert!((accum.total_power - 100.0).abs() < 1e-4);
+
+        // 5. Auto-discover and merge `spawn_overlays.ltx` + `mod_spawn_overlays_meadow.ltx`
+        let overlay_mods = discover_spawn_overlay_mods_from_vfs(&vfs).unwrap();
+        assert_eq!(overlay_mods, vec!["configs\\mod_spawn_overlays_meadow.ltx"]);
+        let overlays = load_spawn_overlays_from_vfs(&vfs, None).unwrap();
+        assert!((overlays.link_tolerance - 2.0).abs() < 1e-6);
+        assert!(overlays.sync_level_offsets);
+        assert_eq!(overlays.graph_links.len(), 2);
+        assert_eq!(overlays.graph_links[0].a.level_name, "l01_escape");
+        assert_eq!(overlays.graph_links[0].b.level_name, "y04_pole");
+        assert_eq!(overlays.graph_links[1].a.level_name, "l04_darkvalley");
+        assert_eq!(overlays.graph_links[1].b.level_name, "y04_pole");
+
+        // 6. Stream real `mod_system_*.ltx` DLTX fragments from VFS
+        let fixes =
+            load_ltx_tree_from_vfs(&vfs, "$game_configs$/mod_system_anomaly_fixes.ltx", &[])
+                .unwrap();
+        assert!((fixes.read_f32("ammo_base", "k_dist", 0.0) - 1.0).abs() < 1e-6);
+        assert!((fixes.read_f32("ammo_base", "k_ap", -1.0) - 0.0).abs() < 1e-6);
+
+        let base_hud =
+            load_ltx_tree_from_vfs(&vfs, "$game_configs$/mod_system_base_hud.ltx", &[]).unwrap();
+        assert_eq!(
+            base_hud.read_str("hud_base", "base_hud_offset_pos"),
+            Some("0,0,0")
+        );
+        assert_eq!(
+            base_hud.read_str("hud_base", "base_hud_offset_rot_16x9"),
+            Some("0,0,0")
+        );
+
+        let flashlight = load_ltx_tree_from_vfs(
+            &vfs,
+            "$game_configs$/mod_system_flashlight_definition.ltx",
+            &[],
+        )
+        .unwrap();
+        assert!(flashlight.read_bool("flashlight_definition", "hud_mode", false));
+
+        // 7. Stream real DX10/11 shader sources (`shaders/r3/*.ps/*.h`) over VFS
+        let shader_expectations = [
+            ("$game_shaders$/r3/postprocess.ps", "c_brightness"),
+            ("$game_shaders$/r3/postprocess_cm.ps", "c_colormap"),
+            ("$game_shaders$/r3/effects_sun.ps", "HDR10_SUN_INTENSITY"),
+            ("$game_shaders$/r3/hdr10_bloom.h", "hdr10_bloom_sparams"),
+            ("$game_shaders$/r3/hdr10_lens_flare.h", "hdr10_flare_sparams"),
+            ("$game_shaders$/r3/combine_2_naa.ps", "vignette_control"),
+        ];
+        for (vpath, needle) in shader_expectations {
+            let src = vfs
+                .read_to_string_lossy(vpath)
+                .unwrap_or_else(|e| panic!("failed streaming shader {vpath}: {e:?}"));
+            assert!(
+                src.contains(needle),
+                "shader {vpath} missing expected symbol {needle}"
+            );
+        }
     }
 
     #[test]

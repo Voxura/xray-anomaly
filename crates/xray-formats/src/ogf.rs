@@ -658,12 +658,170 @@ pub struct OgfGContainerRef {
     pub ib_count: u32,
 }
 
+/// Bone shape flags (`enum SBoneShape::EShapeFlags` in `src/xrEngine/bone.h`).
+pub mod bone_shape_flags {
+    pub const SF_NO_PICKABLE: u16 = 1 << 0;
+    pub const SF_REMOVE_AFTER_BREAK: u16 = 1 << 1;
+    pub const SF_NO_PHYSICS: u16 = 1 << 2;
+    pub const SF_NO_FOG_COLLIDER: u16 = 1 << 3;
+}
+
 /// Oriented bounding box (`_obb<float>`, 60 bytes).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OgfObb {
     pub rotate: [[f32; 3]; 3],
     pub translate: [f32; 3],
     pub halfsize: [f32; 3],
+}
+
+impl Default for OgfObb {
+    fn default() -> Self {
+        Self {
+            rotate: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translate: [0.0; 3],
+            halfsize: [0.0; 3],
+        }
+    }
+}
+
+impl OgfObb {
+    /// Convert this OBB's rotation and translation into a 4x4 affine transform matrix
+    /// (`_obb::xform_get` in `src/xrCore/_obb.h:73-83`).
+    #[inline]
+    pub fn xform_get(&self) -> XRayMatrix {
+        [
+            [self.rotate[0][0], self.rotate[0][1], self.rotate[0][2], 0.0],
+            [self.rotate[1][0], self.rotate[1][1], self.rotate[1][2], 0.0],
+            [self.rotate[2][0], self.rotate[2][1], self.rotate[2][2], 0.0],
+            [self.translate[0], self.translate[1], self.translate[2], 1.0],
+        ]
+    }
+
+    /// Construct an OBB from the 4x3 linear/translation columns of `m` and half-extents.
+    #[inline]
+    pub fn from_matrix_halfsize(m: &XRayMatrix, halfsize: [f32; 3]) -> Self {
+        Self {
+            rotate: [
+                [m[0][0], m[0][1], m[0][2]],
+                [m[1][0], m[1][1], m[1][2]],
+                [m[2][0], m[2][1], m[2][2]],
+            ],
+            translate: [m[3][0], m[3][1], m[3][2]],
+            halfsize,
+        }
+    }
+
+    /// Transform this OBB by `m` (`dest.transform(*this, m)` matching `_obb::transform`
+    /// in `src/xrCore/_obb.h:103-112`: `destR.mul_43(M, srcR)`).
+    #[inline]
+    pub fn transform(&self, m: &XRayMatrix) -> Self {
+        let src_r = self.xform_get();
+        let dest_r = matrix_mul_43(m, &src_r);
+        Self::from_matrix_halfsize(&dest_r, self.halfsize)
+    }
+
+    /// True if all half-extents are non-positive.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.halfsize[0] <= 0.0 && self.halfsize[1] <= 0.0 && self.halfsize[2] <= 0.0
+    }
+
+    /// Ray-vs-OBB separating axis intersection test matching `CDB::TestRayOBB`
+    /// (`src/Layers/xrRender/cl_intersect.h:817-864`).
+    ///
+    /// Tests the semi-infinite ray `origin + t * dir` (`t >= 0.0`).
+    pub fn test_ray(&self, origin: [f32; 3], dir: [f32; 3]) -> bool {
+        #[inline]
+        fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+            a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+        }
+
+        let k_diff = [
+            origin[0] - self.translate[0],
+            origin[1] - self.translate[1],
+            origin[2] - self.translate[2],
+        ];
+
+        let mut f_wdu = [0.0f32; 3];
+        let mut f_awdu = [0.0f32; 3];
+        for i in 0..3 {
+            f_wdu[i] = dot3(dir, self.rotate[i]);
+            f_awdu[i] = f_wdu[i].abs();
+            let f_ddu = dot3(k_diff, self.rotate[i]);
+            let f_addu = f_ddu.abs();
+            if f_addu > self.halfsize[i] && f_ddu * f_wdu[i] >= 0.0 {
+                return false;
+            }
+        }
+
+        let k_wxd = [
+            dir[1] * k_diff[2] - dir[2] * k_diff[1],
+            dir[2] * k_diff[0] - dir[0] * k_diff[2],
+            dir[0] * k_diff[1] - dir[1] * k_diff[0],
+        ];
+
+        let rhs0 = self.halfsize[1] * f_awdu[2] + self.halfsize[2] * f_awdu[1];
+        if dot3(k_wxd, self.rotate[0]).abs() > rhs0 {
+            return false;
+        }
+        let rhs1 = self.halfsize[0] * f_awdu[2] + self.halfsize[2] * f_awdu[0];
+        if dot3(k_wxd, self.rotate[1]).abs() > rhs1 {
+            return false;
+        }
+        let rhs2 = self.halfsize[0] * f_awdu[1] + self.halfsize[1] * f_awdu[0];
+        if dot3(k_wxd, self.rotate[2]).abs() > rhs2 {
+            return false;
+        }
+
+        true
+    }
+
+    /// Sphere-vs-OBB overlap test matching `CDB::TestSphereOBB`
+    /// (`src/Layers/xrRender/cl_intersect.h:734-814`).
+    pub fn test_sphere(&self, center: [f32; 3], radius: f32) -> bool {
+        #[inline]
+        fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+            a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+        }
+
+        let k_cdiff = [
+            center[0] - self.translate[0],
+            center[1] - self.translate[1],
+            center[2] - self.translate[2],
+        ];
+        let f_ax = dot3(k_cdiff, self.rotate[0]).abs();
+        let f_ay = dot3(k_cdiff, self.rotate[1]).abs();
+        let f_az = dot3(k_cdiff, self.rotate[2]).abs();
+
+        let f_dx = f_ax - self.halfsize[0];
+        let f_dy = f_ay - self.halfsize[1];
+        let f_dz = f_az - self.halfsize[2];
+        let f_r_sqr = radius * radius;
+
+        if f_ax <= self.halfsize[0] {
+            if f_ay <= self.halfsize[1] {
+                if f_az <= self.halfsize[2] {
+                    true
+                } else {
+                    f_dz <= radius
+                }
+            } else if f_az <= self.halfsize[2] {
+                f_dy <= radius
+            } else {
+                f_dy * f_dy + f_dz * f_dz <= f_r_sqr
+            }
+        } else if f_ay <= self.halfsize[1] {
+            if f_az <= self.halfsize[2] {
+                f_dx <= radius
+            } else {
+                f_dx * f_dx + f_dz * f_dz <= f_r_sqr
+            }
+        } else if f_az <= self.halfsize[2] {
+            f_dx * f_dx + f_dy * f_dy <= f_r_sqr
+        } else {
+            f_dx * f_dx + f_dy * f_dy + f_dz * f_dz <= f_r_sqr
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -686,6 +844,14 @@ pub struct BoneShape {
     pub cylinder_direction: [f32; 3],
     pub cylinder_height: f32,
     pub cylinder_radius: f32,
+}
+
+impl BoneShape {
+    /// True unless `SBoneShape::sfNoPickable` is set.
+    #[inline]
+    pub fn is_pickable(&self) -> bool {
+        (self.flags & bone_shape_flags::SF_NO_PICKABLE) == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2292,5 +2458,52 @@ mod tests {
         let origin_ndc = matrix_transform_projected(&full, [0.0, 0.0, 0.0]).unwrap();
         assert!(origin_ndc[0].abs() < 1e-6 && origin_ndc[1].abs() < 1e-6);
         assert!(origin_ndc[2] > 0.0 && origin_ndc[2] < 1.0);
+    }
+
+    #[test]
+    fn test_ogf_obb_transform_ray_sphere_and_bone_shape_flags() {
+        let base_obb = OgfObb {
+            rotate: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translate: [1.0, 0.0, 0.0],
+            halfsize: [0.5, 1.0, 0.25],
+        };
+        let mut xform = matrix_rotate_z(std::f32::consts::FRAC_PI_2);
+        xform[3] = [0.0, 3.0, 2.0, 1.0];
+        let world_obb = base_obb.transform(&xform);
+
+        // Local +X -> +Y after rotZ(+pi/2), so translate [1,0,0] becomes [0,4,2]
+        assert!((world_obb.translate[0] - 0.0).abs() < 1e-5);
+        assert!((world_obb.translate[1] - 4.0).abs() < 1e-5);
+        assert!((world_obb.translate[2] - 2.0).abs() < 1e-5);
+        assert_eq!(world_obb.halfsize, [0.5, 1.0, 0.25]);
+
+        // Rotated half-extents around [0,4,2]: +/-1.0 along world X, +/-0.5 along world Y, +/-0.25 along world Z.
+        // Ray toward center hits; ray pointing away misses; off-corner ray misses.
+        assert!(world_obb.test_ray([0.0, 4.0, 0.0], [0.0, 0.0, 1.0]));
+        assert!(world_obb.test_ray([0.8, 4.2, 0.0], [0.0, 0.0, 1.0]));
+        assert!(!world_obb.test_ray([0.0, 4.0, 0.0], [0.0, 0.0, -1.0]));
+        assert!(!world_obb.test_ray([1.2, 4.0, 0.0], [0.0, 0.0, 1.0]));
+
+        // Sphere touching face/edge/corner vs outside
+        assert!(world_obb.test_sphere([0.0, 4.0, 2.0], 0.1)); // inside
+        assert!(world_obb.test_sphere([1.4, 4.0, 2.0], 0.5)); // dX = 0.4 <= 0.5
+        assert!(!world_obb.test_sphere([1.6, 4.0, 2.0], 0.5)); // dX = 0.6 > 0.5
+        assert!(world_obb.test_sphere([1.2, 4.7, 2.0], 0.3)); // dX=0.2, dY=0.2 -> sqrt(0.08)=0.283 <= 0.3
+        assert!(!world_obb.test_sphere([1.3, 4.8, 2.0], 0.3)); // dX=0.3, dY=0.3 -> sqrt(0.18)=0.424 > 0.3
+
+        let mut bs = BoneShape {
+            shape_type: BoneShapeType::Box as u16,
+            flags: 0,
+            box_obb: base_obb,
+            sphere_center: [0.0; 3],
+            sphere_radius: 0.0,
+            cylinder_center: [0.0; 3],
+            cylinder_direction: [0.0, 1.0, 0.0],
+            cylinder_height: 0.0,
+            cylinder_radius: 0.0,
+        };
+        assert!(bs.is_pickable());
+        bs.flags |= bone_shape_flags::SF_NO_PICKABLE;
+        assert!(!bs.is_pickable());
     }
 }

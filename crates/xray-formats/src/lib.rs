@@ -68,8 +68,9 @@ pub use camera::{
     PostprocessPlayer,
 };
 pub use cform::{
-    ray_options, ray_triangle_test, BoxQueryHit, CformBvh, CformHeader, CformModel, CformTriangle,
-    RaycastHit, RaycastOptions, CFORM_CURRENT_VERSION,
+    classify_sphere_triangle, ray_options, ray_triangle_test, sphere_triangle_test, BoxQueryHit,
+    CformBvh, CformHeader, CformModel, CformTriangle, RaycastHit, RaycastOptions, SphereTriResult,
+    CFORM_CURRENT_VERSION,
 };
 pub use chunk::{ByteCursor, ChunkEntry, ChunkIter, ChunkReader, ChunkWriter, FormatError};
 pub use details::{
@@ -88,9 +89,9 @@ pub use details::{
 };
 pub use envelopes::{
     decode_q16, encode_q16, Envelope, EnvelopeBehavior, EnvelopeKey, EnvelopeShape, ObjectMotion,
-    ObjectMotionLibrary, PostprocessColorCurve, PostprocessEffect, PostprocessState, EOBJ_OMOTION,
-    EOBJ_OMOTION_VERSION, EOBJ_OMOTION_VERSION_V3, EOBJ_OMOTION_VERSION_V4,
-    POSTPROCESS_FILE_VERSION, POSTPROCESS_FILE_VERSION_V1,
+    ObjectMotionLibrary, PostprocessColorCurve, PostprocessEffect, PostprocessGpuParams,
+    PostprocessState, EOBJ_OMOTION, EOBJ_OMOTION_VERSION, EOBJ_OMOTION_VERSION_V3,
+    EOBJ_OMOTION_VERSION_V4, POSTPROCESS_FILE_VERSION, POSTPROCESS_FILE_VERSION_V1,
 };
 pub use fonts::{
     font_atlas_ini_vpath, font_flags, is_alpha_character, is_bad_end_character,
@@ -122,17 +123,17 @@ pub use level::{
     VertexDeclarator, VertexElement9, BUILD_LIGHT_RECORD_SIZE, LEVEL_GLOW_RECORD_SIZE,
 };
 pub use ogf::{
-    fvf_flags, matrix_forward_dir, matrix_invert_43, matrix_mul_43, matrix_mul_44, matrix_rotate_x,
-    matrix_rotate_y, matrix_rotate_z, matrix_scale, matrix_set_hpb, matrix_set_xyz_translate,
-    matrix_set_xyzi_translate, matrix_transform_point, matrix_transform_projected, ogf_chunks,
-    skel_vert_type, vector_generate_orthonormal_basis, BoneIkData, BoneIkSection,
-    BonePoseMatrices, BoneShape, BoneShapeType, LodImposterSample, OgfBBox, OgfBSphere, OgfBone,
-    OgfBufferRef, OgfDesc, OgfGContainerRef, OgfHeader, OgfLodDef, OgfLodFacet, OgfLodVertex,
-    OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows, OgfTextureLink, OgfTreeDef, OgfVertices,
-    OgfVisualType, SlideWindow, StaticVertex, StaticVertexLayout, TreeLightingColor,
-    UnifiedSkinnedVertex, VertBoned1W, VertBoned2W, VertBoned3W, VertBoned4W, XRayMatrix,
-    LOD_IMPOSTER_QUAD_ORDER, OGF_LODDEF2_SIZE, OGF_LOD_VERTEX_SIZE, OGF_TREEDEF2_SIZE,
-    XRAY_IDENTITY_MATRIX,
+    bone_shape_flags, fvf_flags, matrix_forward_dir, matrix_invert_43, matrix_mul_43,
+    matrix_mul_44, matrix_rotate_x, matrix_rotate_y, matrix_rotate_z, matrix_scale,
+    matrix_set_hpb, matrix_set_xyz_translate, matrix_set_xyzi_translate, matrix_transform_point,
+    matrix_transform_projected, ogf_chunks, skel_vert_type, vector_generate_orthonormal_basis,
+    BoneIkData, BoneIkSection, BonePoseMatrices, BoneShape, BoneShapeType, LodImposterSample,
+    OgfBBox, OgfBSphere, OgfBone, OgfBufferRef, OgfDesc, OgfGContainerRef, OgfHeader, OgfLodDef,
+    OgfLodFacet, OgfLodVertex, OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows, OgfTextureLink,
+    OgfTreeDef, OgfVertices, OgfVisualType, SlideWindow, StaticVertex, StaticVertexLayout,
+    TreeLightingColor, UnifiedSkinnedVertex, VertBoned1W, VertBoned2W, VertBoned3W, VertBoned4W,
+    XRayMatrix, LOD_IMPOSTER_QUAD_ORDER, OGF_LODDEF2_SIZE, OGF_LOD_VERTEX_SIZE,
+    OGF_TREEDEF2_SIZE, XRAY_IDENTITY_MATRIX,
 };
 pub use omf::{
     motion_def_flags, motion_key_flags, slerp_quat_xyzw, BoneKeyframe, BoneMotionTrack,
@@ -148,10 +149,11 @@ pub use particle_sim::{
 pub use particles::{
     build_wallmark_view_matrix, calc_triangle_adjacency, encode_compiled_action_list,
     pack_triangle_vertices, papi_flags, parse_compiled_action_list, ped_chunks, ped_flags,
-    pg_effect_flags, pgd_chunks, project_static_wallmark_from_tris,
+    pg_effect_flags, pgd_chunks, project_skeleton_wallmark, project_static_wallmark_from_tris,
     project_static_wallmark_on_cform, ps_chunks, BloodWallmarksConfig, CompiledParticleAction,
     GroupEffectItem, ParticleActionKind, ParticleCollisionParams, ParticleDomain,
     ParticleDomainType, ParticleEffectDef, ParticleGroupDef, ParticleSpriteFrame, ParticlesLibrary,
+    SkeletonWallmarkConfig, SkeletonWallmarkFace, SkeletonWallmarkPool, SkeletonWallmarkRecord,
     StaticWallmarkBatch, StaticWallmarkConfig, StaticWallmarkPool, StaticWallmarkRecord,
     WallmarkSlotConfig, WallmarkVertex, PARTICLE_DOMAIN_BINARY_SIZE, PED_VERSION, PGD_VERSION,
     PS_VERSION, WALLMARK_COS_88_DEG, WALLMARK_DEFAULT_TTL, WALLMARK_DUPLICATE_TOLERANCE,
@@ -172,8 +174,11 @@ pub use shaders_xr::{
     WaveFunction, CBLENDER_DESC_SIZE, SHADER_XRLC_ENTRY_SIZE,
 };
 pub use skinning::{
-    compute_skinned_aabb, matrix_transform_dir, normalize_vec3, skin_ogf_hierarchy,
-    skin_vertices, BoneMatrix4x3, BonePalette, SkinnedMeshPart, SkinnedVertex,
+    compute_skinned_aabb, matrix_transform_dir, normalize_vec3, pick_ogf_bone,
+    pick_ogf_single_bone, skin_ogf_hierarchy, skin_position_with_links,
+    skin_position_with_wm_sentinel, skin_vertex_pos_and_influences, skin_vertices, BoneMask,
+    BoneMatrix4x3, BonePalette, BonePickHit, SkeletonCollisionIndex, SkeletonLeafInfo,
+    SkinnedMeshPart, SkinnedVertex, SkinnedVertexInfluence,
 };
 pub use sound_env::{
     LevelSoundEnv, LevelStaticSounds, OggSoundMetadata, OggXRayParams, SomPolygon,
