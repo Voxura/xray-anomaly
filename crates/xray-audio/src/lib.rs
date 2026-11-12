@@ -16,8 +16,8 @@ pub mod spatial;
 
 pub use backend::{AudioOutputBackend, WasapiAudioOutput};
 pub use manager::{
-    classify_material_name, AudioEngineStats, AudioManager, AudioManagerConfig,
-    SurfaceMaterialCategory,
+    classify_material_name, resolve_surface_category, AudioEngineStats, AudioManager,
+    AudioManagerConfig, SurfaceMaterialCategory,
 };
 pub use mixer::{AudioCategory, SoundClip, SpatialAudioMixer, VoiceId, DEFAULT_MIXER_SAMPLE_RATE};
 pub use ogg_vorbis::{

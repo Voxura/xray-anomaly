@@ -521,6 +521,11 @@ fn test_full_dx12_7stage_render_graph_and_capsule_physics_loop() {
     assert!(stats.postprocess_executed, "expected filmic postprocess resolve");
     assert!(stats.sky_drawn, "expected sky dome draw");
     assert!(stats.clouds_drawn, "expected cloud dome draw");
+    assert!(
+        stats.hud_weapon_draws >= 3,
+        "expected first-person HUD weapon + hand draws, got {}",
+        stats.hud_weapon_draws
+    );
     assert!(stats.ui_elements_drawn >= 1, "expected UI HUD overlay draws");
 
     // Verify clean GPU fence sync

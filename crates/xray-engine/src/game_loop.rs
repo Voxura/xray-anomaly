@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::alife_manager::{AlifeManager, EntityRole};
 use crate::camera::FirstPersonCamera;
+use crate::hud_weapon::{HudWeaponController, WeaponState};
 use crate::input::{Action, EngineInput};
 use crate::physics::StalkerController;
 use crate::render_bridge::{HudOverlayState, RenderBridge, RenderBridgeConfig};
@@ -76,6 +77,7 @@ pub struct EngineRuntime {
     pub render_bridge: Option<RenderBridge>,
     pub audio: AudioManager,
     pub hud: HudOverlayState,
+    pub hud_weapon: HudWeaponController,
     pub network: Option<NetworkSession>,
     pub world: Option<LoadedWorld>,
     pub alife: Option<AlifeManager>,
@@ -123,6 +125,7 @@ impl EngineRuntime {
             render_bridge,
             audio,
             hud: HudOverlayState::default(),
+            hud_weapon: HudWeaponController::default(),
             network: None,
             world: None,
             alife: None,
@@ -323,6 +326,24 @@ impl EngineRuntime {
             }
         });
 
+        // Attach VFS asset cache to HUD viewmodels if already mounted
+        if let Some(vfs) = &self.vfs {
+            self.hud_weapon.ensure_active_ogfs_loaded(vfs);
+        }
+
+        // Step first-person weapon state machine, ADS zoom, ballistics, wallmarks, sparks & combat audio
+        let _shot = self.hud_weapon.step(
+            dt,
+            &self.input,
+            &mut self.camera,
+            self.physics.velocity,
+            self.elapsed_sec,
+            self.world.as_ref(),
+            self.alife.as_mut(),
+            Some(&mut self.audio),
+        );
+        self.hud.show_crosshair = self.hud_weapon.state != WeaponState::Aiming;
+
         // Keep host ALife actor orientation & 3D audio listener synced every frame
         if let Some(mgr) = &mut self.alife {
             mgr.set_host_camera_transform(
@@ -339,14 +360,6 @@ impl EngineRuntime {
             self.camera.right(),
             self.physics.velocity,
         ));
-
-        if self.input.is_action_just_pressed(Action::PrimaryFire) {
-            self.audio.trigger_weapon_sound(
-                "weapons\\ak74_shoot",
-                self.camera.position,
-                self.physics.velocity,
-            );
-        }
 
         if let Some(world) = &mut self.world {
             world.step_weather(
@@ -412,16 +425,17 @@ impl EngineRuntime {
             self.audio.retain_alife_emitters(&active_keys);
         }
 
-        // 6. Direct3D 12 7-stage render graph presentation
+        // 6. Direct3D 12 7-stage render graph presentation + first-person HUD weapon pass
         if let (Some(r), Some(rb)) = (&mut self.renderer, &mut self.render_bridge) {
             r.begin_frame()?;
-            rb.render_frame(
+            rb.render_frame_with_hud(
                 r,
                 &self.camera,
                 self.world.as_ref(),
                 self.alife.as_ref(),
                 self.vfs.as_deref(),
                 &self.hud,
+                Some(&mut self.hud_weapon),
                 dt,
                 self.elapsed_sec,
             )?;

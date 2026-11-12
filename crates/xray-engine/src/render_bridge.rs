@@ -26,6 +26,7 @@ use windows::core::Result as WinResult;
 
 use crate::alife_manager::{AlifeManager, EntityRole};
 use crate::camera::FirstPersonCamera;
+use crate::hud_weapon::{HudWeaponController, WeaponState};
 use crate::world_loader::{LoadedDynamicModel, LoadedWorld};
 use xray_formats::details::{LevelDetails, DETAIL_ID_EMPTY, DETAIL_SLOT_SIZE};
 use xray_formats::ogf::{
@@ -128,6 +129,7 @@ pub struct FrameRenderStats {
     pub wallmark_verts_drawn: u32,
     pub rain_drops_drawn: u32,
     pub particle_instances_drawn: u32,
+    pub hud_weapon_draws: u32,
     pub ui_elements_drawn: u32,
 }
 
@@ -177,6 +179,7 @@ pub struct RenderBridge {
     detail_meshes: Vec<Vec<GpuDetailVertex>>,
     detail_textures: Vec<Option<DescriptorIndex>>,
     dynamic_ogf_cache: BTreeMap<String, Vec<GpuOgfSubMesh>>,
+    hud_mesh_cache: BTreeMap<String, (MeshHandle, DescriptorIndex)>,
     default_cube_mesh: MeshHandle,
 }
 
@@ -218,6 +221,7 @@ impl RenderBridge {
             detail_meshes: Vec::new(),
             detail_textures: Vec::new(),
             dynamic_ogf_cache: BTreeMap::new(),
+            hud_mesh_cache: BTreeMap::new(),
             default_cube_mesh,
         })
     }
@@ -480,6 +484,23 @@ impl RenderBridge {
         dt: f32,
         elapsed_sec: f32,
     ) -> WinResult<FrameRenderStats> {
+        self.render_frame_with_hud(renderer, camera, world, alife, vfs, hud, None, dt, elapsed_sec)
+    }
+
+    /// Execute all 7 DX12 render graph passes plus optional first-person HUD weapon pass & combat FX.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frame_with_hud(
+        &mut self,
+        renderer: &mut Dx12Renderer,
+        camera: &FirstPersonCamera,
+        world: Option<&LoadedWorld>,
+        alife: Option<&AlifeManager>,
+        vfs: Option<&VirtualFileSystem>,
+        hud: &HudOverlayState,
+        mut hud_weapon: Option<&mut HudWeaponController>,
+        dt: f32,
+        elapsed_sec: f32,
+    ) -> WinResult<FrameRenderStats> {
         if let Some(w) = world
             && !self.world_synced
         {
@@ -610,7 +631,14 @@ impl RenderBridge {
         // ---------------------------------------------------------------------
         // Stage (d): Deferred Lighting Combine (CSM PCF + SSFX Volumetrics + Dynamic Lights)
         // ---------------------------------------------------------------------
-        let active_lights = gather_visible_lights(&self.world_lights, camera.position, MAX_ACTIVE_FRAME_LIGHTS);
+        let mut active_lights = gather_visible_lights(
+            &self.world_lights,
+            camera.position,
+            MAX_ACTIVE_FRAME_LIGHTS.saturating_sub(1),
+        );
+        if let Some(muzzle_lt) = hud_weapon.as_ref().and_then(|hw| hw.muzzle_flash_light()) {
+            active_lights.push(muzzle_lt);
+        }
         renderer.update_lights(&active_lights)?;
         stats.combine_light_count = active_lights.len() as u32;
         stats.combine_csm_active = self.csm_atlas.plan.is_some();
@@ -774,13 +802,18 @@ impl RenderBridge {
         }
 
         // e.4 Static Wallmark Decals
-        if !self.wallmark_vertices.is_empty() {
+        let mut combined_wallmarks = self.wallmark_vertices.clone();
+        if let Some(hw) = hud_weapon.as_deref_mut() {
+            let mut hw_wm = hw.gather_wallmark_vertices(camera, elapsed_sec);
+            combined_wallmarks.append(&mut hw_wm);
+        }
+        if !combined_wallmarks.is_empty() {
             let wm_push = WallmarkPushConstants {
                 texture_index: self.fallback_white.0,
                 ..Default::default()
             };
-            renderer.draw_wallmarks(&self.wallmark_vertices, &wm_push)?;
-            stats.wallmark_verts_drawn = self.wallmark_vertices.len() as u32;
+            renderer.draw_wallmarks(&combined_wallmarks, &wm_push)?;
+            stats.wallmark_verts_drawn = combined_wallmarks.len() as u32;
         }
 
         // e.5 Instanced Rain Streaks
@@ -800,11 +833,76 @@ impl RenderBridge {
             stats.rain_drops_drawn = active_rain;
         }
 
-        // e.6 Billboard Particles
+        // e.6 Billboard Particles (alpha debris + additive muzzle flash / metal sparks)
+        if let Some(hw) = hud_weapon.as_ref() {
+            self.frame_particles.extend(hw.active_gpu_particles());
+        }
         if !self.frame_particles.is_empty() {
-            renderer.draw_particles(&self.frame_particles, false)?;
-            stats.particle_instances_drawn = self.frame_particles.len() as u32;
-            self.frame_particles.clear();
+            let mut alpha_particles = Vec::new();
+            let mut additive_particles = Vec::new();
+            for p in self.frame_particles.drain(..) {
+                if p.blend_mode == 1 {
+                    additive_particles.push(p);
+                } else {
+                    alpha_particles.push(p);
+                }
+            }
+            if !alpha_particles.is_empty() {
+                renderer.draw_particles(&alpha_particles, false)?;
+                stats.particle_instances_drawn += alpha_particles.len() as u32;
+            }
+            if !additive_particles.is_empty() {
+                renderer.draw_particles(&additive_particles, true)?;
+                stats.particle_instances_drawn += additive_particles.len() as u32;
+            }
+        }
+
+        // e.7 First-Person HUD Weapon & Hand OGF Pass (`hud_projection_matrix` + depth-only clear)
+        let is_aiming_ads = hud_weapon
+            .as_ref()
+            .is_some_and(|hw| hw.state == WeaponState::Aiming);
+        if let Some(hw) = hud_weapon {
+            let hud_parts = hw.collect_hud_draw_parts(camera, vfs);
+            if !hud_parts.is_empty() {
+                renderer.clear_depth_stencil(1.0, 0);
+                let hud_cam = hw.build_hud_camera_constants(camera);
+                renderer.update_camera(&hud_cam)?;
+
+                let mut hud_matrices = Vec::with_capacity(hud_parts.len());
+                let mut draw_items = Vec::with_capacity(hud_parts.len());
+                for part in hud_parts {
+                    let tf_idx = hud_matrices.len() as u32;
+                    hud_matrices.push(part.world_transform);
+                    let tex_idx = part
+                        .texture_vpath
+                        .as_deref()
+                        .and_then(|vpath| {
+                            let dds = texture_stem_to_dds_vpath(vpath);
+                            try_load_vfs_texture(renderer, vfs, &dds)
+                                .or_else(|| try_load_vfs_texture(renderer, vfs, vpath))
+                        })
+                        .unwrap_or(self.fallback_albedo);
+                    let mesh_handle = if let Some((existing_mesh, _)) = self.hud_mesh_cache.get(&part.key) {
+                        *existing_mesh
+                    } else {
+                        let mh = renderer.create_mesh(&part.vertices, &part.indices)?;
+                        self.hud_mesh_cache.insert(part.key.clone(), (mh, tex_idx));
+                        mh
+                    };
+                    draw_items.push((mesh_handle, tex_idx, tf_idx));
+                }
+
+                renderer.update_transforms(&hud_matrices)?;
+                for (mesh_handle, tex_idx, tf_idx) in draw_items {
+                    renderer.draw_mesh_with_lights(
+                        mesh_handle,
+                        Some(tex_idx),
+                        tf_idx,
+                        active_lights.len() as u32,
+                    )?;
+                    stats.hud_weapon_draws += 1;
+                }
+            }
         }
 
         // ---------------------------------------------------------------------
@@ -813,7 +911,7 @@ impl RenderBridge {
         if self.config.render_hud {
             let fw = width as f32;
             let fh = height as f32;
-            if hud.show_crosshair {
+            if hud.show_crosshair && !is_aiming_ads {
                 renderer.ui_draw_crosshair(
                     [fw * 0.5, fh * 0.5],
                     10.0,

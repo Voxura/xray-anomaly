@@ -10,11 +10,13 @@
 //! - DirectX 12 render graph bridge (`render_bridge`)
 //! - Level world streaming, BVH collision & weather simulation (`world_loader`)
 //! - Live ALife entity spawn manager & `.scop`/`.scoc` co-op state sync (`alife_manager`)
+//! - First-person HUD weapons, skeletal viewmodel rig & ballistic combat (`hud_weapon`)
 //! - Pure-Rust 3D spatial audio subsystem (`xray_audio`)
 
 pub mod alife_manager;
 pub mod camera;
 pub mod game_loop;
+pub mod hud_weapon;
 pub mod input;
 pub mod physics;
 pub mod render_bridge;
@@ -28,6 +30,10 @@ pub use xray_audio::{AudioListener, AudioManager, AudioManagerConfig, SurfaceMat
 pub use alife_manager::{AlifeManager, EntityRole, LiveAlifeEntity, RemotePeerAvatar};
 pub use camera::{FirstPersonCamera, DEFAULT_FAR_Z, DEFAULT_FOV_DEG, DEFAULT_NEAR_Z};
 pub use game_loop::{EngineConfig, EngineRuntime, NetworkSession};
+pub use hud_weapon::{
+    hud_projection_matrix, BallisticImpact, HudDrawPart, HudWeaponController, ShotReport,
+    WeaponFireMode, WeaponSpec, WeaponState,
+};
 pub use input::{Action, EngineInput, MouseButton};
 pub use physics::{CapsuleConfig, StalkerController};
 pub use render_bridge::{FrameRenderStats, HudOverlayState, RenderBridge, RenderBridgeConfig};

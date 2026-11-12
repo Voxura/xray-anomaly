@@ -82,6 +82,41 @@ impl SurfaceMaterialCategory {
             ],
         }
     }
+
+    /// Standard X-Ray bullet impact `.ogg` candidates in `$game_sounds$/material/bullet/collide/`.
+    pub fn default_impact_paths(self) -> &'static [&'static str] {
+        match self {
+            Self::Dirt => &[
+                "material\\bullet\\collide\\dirt01hl",
+                "material\\bullet\\collide\\dirt02hl",
+                "material\\bullet\\collide\\earth01",
+            ],
+            Self::Grass => &[
+                "material\\bullet\\collide\\dirt01hl",
+                "material\\bullet\\collide\\grass01",
+            ],
+            Self::Gravel => &[
+                "material\\bullet\\collide\\gravel01",
+                "material\\bullet\\collide\\sand01hl",
+            ],
+            Self::Wood => &[
+                "material\\bullet\\collide\\wood01hl",
+                "material\\bullet\\collide\\wood02hl",
+            ],
+            Self::Metal => &[
+                "material\\bullet\\collide\\metall01hl",
+                "material\\bullet\\collide\\metal01",
+            ],
+            Self::Water => &[
+                "material\\bullet\\collide\\water01hl",
+                "material\\bullet\\collide\\water02hl",
+            ],
+            Self::Concrete => &[
+                "material\\bullet\\collide\\stone01hl",
+                "material\\bullet\\collide\\concrete01",
+            ],
+        }
+    }
 }
 
 /// Map an X-Ray material identifier (e.g. `"materials\\wood_solid"`, `"materials\\bush"`) to
@@ -183,6 +218,7 @@ pub struct AudioEngineStats {
     pub last_footstep_surface: Option<SurfaceMaterialCategory>,
     pub thunder_triggered: u64,
     pub weapon_sounds_triggered: u64,
+    pub bullet_impacts_triggered: u64,
     pub wind_gain: f32,
     pub rain_gain: f32,
     pub active_static_sounds: usize,
@@ -225,6 +261,7 @@ pub struct AudioManager {
     static_voices: BTreeMap<usize, VoiceId>,
     alife_emitters: BTreeMap<u64, AlifeEmitterState>,
     weapon_sounds_triggered: u64,
+    bullet_impacts_triggered: u64,
 }
 
 impl AudioManager {
@@ -259,6 +296,7 @@ impl AudioManager {
             static_voices: BTreeMap::new(),
             alife_emitters: BTreeMap::new(),
             weapon_sounds_triggered: 0,
+            bullet_impacts_triggered: 0,
         }
     }
 
@@ -328,6 +366,7 @@ impl AudioManager {
             last_footstep_surface: self.last_footstep_surface,
             thunder_triggered: self.thunder_triggered,
             weapon_sounds_triggered: self.weapon_sounds_triggered,
+            bullet_impacts_triggered: self.bullet_impacts_triggered,
             wind_gain: self.wind_gain,
             rain_gain: self.rain_gain,
             active_static_sounds: self.static_voices.len(),
@@ -750,6 +789,39 @@ impl AudioManager {
         self.weapon_sounds_triggered += 1;
         self.play_clip_internal(clip, AudioCategory::Weapon, emitter, false)
     }
+
+    /// Spatialized 3D weapon discharge entry point used by `hud_weapon` combat mechanics.
+    #[inline]
+    pub fn play_weapon_fire_3d(
+        &mut self,
+        sound_ref: &str,
+        muzzle_pos: [f32; 3],
+        velocity: [f32; 3],
+    ) -> VoiceId {
+        self.trigger_weapon_sound(sound_ref, muzzle_pos, velocity)
+    }
+
+    /// Trigger a spatialized 3D bullet impact / ricochet sound at `hit_pos`.
+    pub fn play_bullet_impact_3d(
+        &mut self,
+        surface: SurfaceMaterialCategory,
+        hit_pos: [f32; 3],
+        velocity: [f32; 3],
+    ) -> VoiceId {
+        let clip = self.resolve_or_synthesize(
+            surface.default_impact_paths(),
+            &format!("bullet_impact_{}", surface.key()),
+            || synthesize_bullet_impact(surface),
+        );
+        let mut emitter = AudioEmitter3D::from_xray_params(hit_pos, &clip.xray_params);
+        emitter.velocity = velocity;
+        emitter.min_dist = emitter.min_dist.max(1.5);
+        emitter.max_dist = emitter.max_dist.max(45.0);
+        emitter.gain = 0.85;
+
+        self.bullet_impacts_triggered += 1;
+        self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -899,6 +971,41 @@ fn synthesize_weapon_shot() -> SoundClip {
     }
 }
 
+fn synthesize_bullet_impact(surface: SurfaceMaterialCategory) -> SoundClip {
+    let sr = 24_000u32;
+    let len = 4_800usize; // 0.20s surface impact + ricochet ping
+    let mut samples = Vec::with_capacity(len);
+    for i in 0..len {
+        let t = i as f32 / sr as f32;
+        let env = (-t * 24.0).exp();
+        let n = hash_noise(surface as u32 + 707, i);
+        let sig = match surface {
+            SurfaceMaterialCategory::Metal => {
+                (t * 2150.0 * TAU).sin() * (-t * 14.0).exp() * 0.55 + n * 0.3
+            }
+            SurfaceMaterialCategory::Concrete => {
+                (t * 920.0 * TAU).sin() * 0.35 + n * 0.55
+            }
+            SurfaceMaterialCategory::Wood => (t * 290.0 * TAU).sin() * 0.5 + n * 0.4,
+            SurfaceMaterialCategory::Water => n * 0.45 * (t * 440.0 * TAU).cos() + (-t * 16.0).exp() * 0.25,
+            _ => (t * 170.0 * TAU).sin() * 0.35 + n * 0.5,
+        };
+        samples.push((sig * env).clamp(-1.0, 1.0));
+    }
+    SoundClip {
+        name: format!("synth_impact_{}", surface.key()),
+        sample_rate: sr,
+        channels: 1,
+        samples,
+        xray_params: OggXRayParams {
+            min_dist: 1.5,
+            max_dist: 45.0,
+            base_volume: 0.9,
+            ..Default::default()
+        },
+    }
+}
+
 fn synthesize_ambient_hum(name: &str) -> SoundClip {
     let sr = 24_000u32;
     let len = 12_000usize;
@@ -1022,13 +1129,16 @@ mod tests {
         let mut audio = AudioManager::new_headless();
         audio.update_listener(AudioListener::from_yaw_pitch([0.0, 1.65, 0.0], 0.0, 0.0, [0.0; 3]));
 
-        // Fire weapon to the LEFT (-X = -10m)
-        audio.trigger_weapon_sound("weapons\\ak74_shoot", [-10.0, 1.5, 0.0], [0.0; 3]);
+        // Fire weapon to the LEFT (-X = -10m) and trigger a bullet impact to the RIGHT (+X = 12m)
+        audio.play_weapon_fire_3d("weapons\\ak74_shoot", [-10.0, 1.5, 0.0], [0.0; 3]);
         assert_eq!(audio.stats().weapon_sounds_triggered, 1);
 
         let pcm = audio.mix_headless_frames(1024);
         let l_energy: f32 = pcm.iter().step_by(2).map(|x| x * x).sum();
         let r_energy: f32 = pcm.iter().skip(1).step_by(2).map(|x| x * x).sum();
         assert!(l_energy > r_energy * 8.0, "left gunshot must dominate L channel");
+
+        audio.play_bullet_impact_3d(SurfaceMaterialCategory::Metal, [12.0, 1.6, 0.0], [0.0; 3]);
+        assert_eq!(audio.stats().bullet_impacts_triggered, 1);
     }
 }

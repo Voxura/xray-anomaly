@@ -480,7 +480,12 @@ fn test_engine_spatial_audio_footsteps_weather_and_alife_integration() {
 
     let mut saw_wood = false;
     let mut saw_metal = false;
-    for _ in 0..95 {
+    for frame_idx in 0..95 {
+        if frame_idx == 1 {
+            runtime
+                .window
+                .push_synthetic_event(WindowEvent::MouseUp { button: MouseButton::Left });
+        }
         runtime.timer.simulate_elapsed(1.0 / 60.0);
         runtime.step_frame().unwrap();
         let st = runtime.audio.stats();
