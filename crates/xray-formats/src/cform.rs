@@ -928,6 +928,38 @@ fn aabb_aabb_overlap(amin: [f32; 3], amax: [f32; 3], bmin: [f32; 3], bmax: [f32;
         && amax[2] >= bmin[2]
 }
 
+/// Test whether triangle `(p0, p1, p2)` overlaps axis-aligned box `(box_center, half)`
+/// (`CDB::box_query` with `OPT_FULL_TEST`: coarse AABB overlap + Akenine-Möller SAT).
+pub fn triangle_aabb_overlap(
+    box_center: [f32; 3],
+    half: [f32; 3],
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+) -> bool {
+    let bmin = [
+        box_center[0] - half[0],
+        box_center[1] - half[1],
+        box_center[2] - half[2],
+    ];
+    let bmax = [
+        box_center[0] + half[0],
+        box_center[1] + half[1],
+        box_center[2] + half[2],
+    ];
+    let tmin = [
+        p0[0].min(p1[0]).min(p2[0]),
+        p0[1].min(p1[1]).min(p2[1]),
+        p0[2].min(p1[2]).min(p2[2]),
+    ];
+    let tmax = [
+        p0[0].max(p1[0]).max(p2[0]),
+        p0[1].max(p1[1]).max(p2[1]),
+        p0[2].max(p1[2]).max(p2[2]),
+    ];
+    aabb_aabb_overlap(bmin, bmax, tmin, tmax) && tri_aabb_sat(box_center, half, p0, p1, p2)
+}
+
 /// Exact Akenine-Möller separating axis theorem triangle-AABB overlap test (`OPT_FULL_TEST`).
 fn tri_aabb_sat(
     box_center: [f32; 3],
@@ -1251,5 +1283,10 @@ mod tests {
         // Collinear/degenerate zero-area triangle must stay finite & accurate
         assert!(sphere_triangle_test([1.0, 0.2, 0.0], 0.5, [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]));
         assert!(!sphere_triangle_test([1.0, 0.8, 0.0], 0.5, [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0]));
+
+        // Standalone triangle_aabb_overlap handles both world-axis separation and diagonal SAT
+        assert!(!triangle_aabb_overlap([9.0, 9.0, 0.0], [0.5, 0.5, 0.5], p0, p1, p2));
+        assert!(!triangle_aabb_overlap([-1.0, 2.0, 0.0], [0.4, 0.4, 0.4], p0, p1, p2));
+        assert!(triangle_aabb_overlap([2.0, 2.0, 0.2], [0.5, 0.5, 0.5], p0, p1, p2));
     }
 }

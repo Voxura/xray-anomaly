@@ -9,8 +9,9 @@
 
 use std::collections::HashMap;
 
+use crate::camera::matrix_build_camera_dir;
 use crate::chunk::{ByteCursor, ChunkReader, FormatError};
-use crate::ogf::{OgfBBox, XRayMatrix};
+use crate::ogf::{matrix_invert_43, matrix_transform_point, OgfBBox, XRayMatrix};
 
 /// On-disk size of `HOM_poly` (`#pragma pack(push,4)`: `3 * Fvector + u32 flags`).
 pub const HOM_POLY_SIZE: usize = 40;
@@ -115,7 +116,157 @@ pub struct ClipFrustum {
     pub planes: Vec<Plane>,
 }
 
+fn push_points_plane(planes: &mut Vec<Plane>, v0: [f32; 3], v1: [f32; 3], v2: [f32; 3]) {
+    let e1 = [v0[0] - v1[0], v0[1] - v1[1], v0[2] - v1[2]];
+    let e2 = [v0[0] - v2[0], v0[1] - v2[1], v0[2] - v2[2]];
+    let cx = e1[1] * e2[2] - e1[2] * e2[1];
+    let cy = e1[2] * e2[0] - e1[0] * e2[2];
+    let cz = e1[0] * e2[1] - e1[1] * e2[0];
+    let len_sq = cx * cx + cy * cy + cz * cz;
+    if len_sq > 1e-12 {
+        let inv = 1.0 / len_sq.sqrt();
+        let n = [cx * inv, cy * inv, cz * inv];
+        let d = -(n[0] * v0[0] + n[1] * v0[1] + n[2] * v0[2]);
+        planes.push(Plane { n, d });
+    }
+}
+
+/// Reduce a planar polygon with `> 6` vertices down to a 4-corner in-plane oriented AABB
+/// matching `CFrustum::SimplifyPoly_AABB` (`src/xrCDB/Frustum.cpp:245-283`).
+pub fn simplify_poly_aabb(poly: &[[f32; 3]], plane: &Plane) -> Vec<[f32; 3]> {
+    if poly.len() < 3 {
+        return poly.to_vec();
+    }
+    let from = poly[0];
+    let y = if plane.n[1].abs() > 0.99 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let right = [
+        y[1] * plane.n[2] - y[2] * plane.n[1],
+        y[2] * plane.n[0] - y[0] * plane.n[2],
+        y[0] * plane.n[1] - y[1] * plane.n[0],
+    ];
+    let up = [
+        plane.n[1] * right[2] - plane.n[2] * right[1],
+        plane.n[2] * right[0] - plane.n[0] * right[2],
+        plane.n[0] * right[1] - plane.n[1] * right[0],
+    ];
+    let m_view = matrix_build_camera_dir(from, plane.n, up);
+    let Some(m_inv) = matrix_invert_43(&m_view) else {
+        return poly.to_vec();
+    };
+
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &p in poly {
+        let tx = p[0] * m_view[0][0] + p[1] * m_view[1][0] + p[2] * m_view[2][0] + m_view[3][0];
+        let ty = p[0] * m_view[0][1] + p[1] * m_view[1][1] + p[2] * m_view[2][1] + m_view[3][1];
+        min_x = min_x.min(tx);
+        min_y = min_y.min(ty);
+        max_x = max_x.max(tx);
+        max_y = max_y.max(ty);
+    }
+
+    vec![
+        matrix_transform_point(&m_inv, [min_x, min_y, 0.0]),
+        matrix_transform_point(&m_inv, [min_x, max_y, 0.0]),
+        matrix_transform_point(&m_inv, [max_x, max_y, 0.0]),
+        matrix_transform_point(&m_inv, [max_x, min_y, 0.0]),
+    ]
+}
+
 impl ClipFrustum {
+    /// Build side planes from an ordered polygon winding and center of projection `eye`
+    /// (`CFrustum::CreateFromPoints`, `src/xrCDB/Frustum.cpp:177-186`).
+    pub fn from_points(points: &[[f32; 3]], eye: [f32; 3]) -> Self {
+        if points.len() < 3 {
+            return Self { planes: Vec::new() };
+        }
+        let mut planes = Vec::with_capacity(points.len());
+        for i in 1..points.len() {
+            push_points_plane(&mut planes, eye, points[i - 1], points[i]);
+        }
+        push_points_plane(&mut planes, eye, points[points.len() - 1], points[0]);
+        Self { planes }
+    }
+
+    /// Build a bounded portal frustum (side pyramid planes + near portal plane + far frustum plane)
+    /// matching `CFrustum::CreateFromPortal` (`src/xrCDB/Frustum.cpp:206-243`).
+    pub fn from_portal(
+        poly: &[[f32; 3]],
+        eye: [f32; 3],
+        full_transform: &XRayMatrix,
+    ) -> Option<Self> {
+        if poly.len() < 3 {
+            return None;
+        }
+        let mut work = poly.to_vec();
+        let mut near_plane = Plane::from_points(work[0], work[1], work[2]);
+        if work.len() > 6 {
+            work = simplify_poly_aabb(&work, &near_plane);
+            if work.len() < 3 {
+                return None;
+            }
+            near_plane = Plane::from_points(work[0], work[1], work[2]);
+        }
+        if near_plane.classify(eye) < 0.0 {
+            work.reverse();
+            near_plane = Plane::from_points(work[0], work[1], work[2]);
+        }
+
+        let mut frustum = Self::from_points(&work, eye);
+        frustum.planes.push(near_plane);
+
+        let far_plane = Plane {
+            n: [
+                -(full_transform[0][3] - full_transform[0][2]),
+                -(full_transform[1][3] - full_transform[1][2]),
+                -(full_transform[2][3] - full_transform[2][2]),
+            ],
+            d: -(full_transform[3][3] - full_transform[3][2]),
+        }
+        .normalize();
+        frustum.planes.push(far_plane);
+        Some(frustum)
+    }
+
+    /// Build an occluder pyramid frustum relative to `eye`, omitting side planes whose edges lie on
+    /// `clip` planes (`CFrustum::CreateOccluder`, `src/xrCDB/Frustum.cpp:285-327`).
+    pub fn from_occluder(points: &[[f32; 3]], eye: [f32; 3], clip: &ClipFrustum) -> Option<Self> {
+        if points.len() < 3 {
+            return None;
+        }
+        const EPS_L_OCC: f32 = 0.001;
+        let count = points.len();
+        let mut open_edge = vec![false; count];
+        let mut cls = vec![0.0f32; count];
+
+        for clip_plane in &clip.planes {
+            for (j, &p) in points.iter().enumerate() {
+                cls[j] = clip_plane.classify(p).abs();
+            }
+            for j in 0..count {
+                let next = (j + 1) % count;
+                if cls[j] < EPS_L_OCC && cls[next] < EPS_L_OCC {
+                    open_edge[j] = true;
+                }
+            }
+        }
+
+        let mut planes = Vec::with_capacity(count + 1);
+        push_points_plane(&mut planes, points[0], points[1], points[2]);
+        for i in 0..count {
+            if !open_edge[i] {
+                let next = (i + 1) % count;
+                push_points_plane(&mut planes, eye, points[i], points[next]);
+            }
+        }
+        (!planes.is_empty()).then_some(Self { planes })
+    }
     /// Extract frustum planes from an X-Ray row-vector `mFullTransform` (`CFrustum::CreateFromMatrix`).
     pub fn from_view_proj(m: &XRayMatrix, mask: u32) -> Self {
         let mut planes = Vec::with_capacity(6);
@@ -359,6 +510,25 @@ impl ClipFrustum {
         } else {
             None
         }
+    }
+
+    /// Returns `true` if the convex polygon remains non-empty after clipping (`CFrustum::testPolyInside`).
+    #[inline]
+    pub fn test_poly_inside(&self, poly: &[[f32; 3]]) -> bool {
+        self.clip_poly(poly).is_some()
+    }
+
+    /// Fast per-vertex polygon halfspace check matching `CFrustum::testPolyInside_dirty` (`Frustum.cpp:164-174`).
+    pub fn test_poly_inside_dirty(&self, poly: &[[f32; 3]]) -> bool {
+        if poly.is_empty() {
+            return false;
+        }
+        for plane in &self.planes {
+            if !poly.iter().any(|&v| plane.classify(v) <= 0.0) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -1079,46 +1249,22 @@ impl OccRasterizer {
             [aabb.max[0], aabb.max[1], aabb.min[2]],
         ];
 
-        let mut min_x = f32::INFINITY;
-        let mut max_x = f32::NEG_INFINITY;
-        let mut min_y = f32::INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
-        let mut min_z = f32::INFINITY;
+        let Some([min_x, min_y, max_x, max_y, min_z]) = project_points_01_bounds(&corners, &xform01) else {
+            return true;
+        };
+        self.test_rect(min_x, min_y, max_x, max_y, min_z)
+    }
 
-        for c in corners {
-            let cz = c[0] * xform01[0][2]
-                + c[1] * xform01[1][2]
-                + c[2] * xform01[2][2]
-                + xform01[3][2];
-            if cz < EPS {
-                return true;
-            }
-            let cw = c[0] * xform01[0][3]
-                + c[1] * xform01[1][3]
-                + c[2] * xform01[2][3]
-                + xform01[3][3];
-            if cw <= 1e-6 {
-                return true;
-            }
-            let iw = 1.0 / cw;
-            let sx = (c[0] * xform01[0][0]
-                + c[1] * xform01[1][0]
-                + c[2] * xform01[2][0]
-                + xform01[3][0])
-                * iw;
-            let sy = (c[0] * xform01[0][1]
-                + c[1] * xform01[1][1]
-                + c[2] * xform01[2][1]
-                + xform01[3][1])
-                * iw;
-            let sz = cz * iw;
-            min_x = min_x.min(sx);
-            max_x = max_x.max(sx);
-            min_y = min_y.min(sy);
-            max_y = max_y.max(sy);
-            min_z = min_z.min(sz);
+    /// Conservative convex polygon visibility test (`CHOM::visible(sPoly&)` in `HOM.cpp:364-376`):
+    /// returns `false` iff every projected vertex sits behind occluded texels in `depth_0`.
+    pub fn test_poly(&self, poly: &[[f32; 3]], full_transform: &XRayMatrix) -> bool {
+        if poly.is_empty() {
+            return false;
         }
-
+        let xform01 = mat_mul_row(full_transform, &viewport_matrix_01());
+        let Some([min_x, min_y, max_x, max_y, min_z]) = project_points_01_bounds(poly, &xform01) else {
+            return true;
+        };
         self.test_rect(min_x, min_y, max_x, max_y, min_z)
     }
 
@@ -1132,6 +1278,46 @@ impl OccRasterizer {
             _ => None,
         }
     }
+}
+
+fn project_points_01_bounds(points: &[[f32; 3]], xform01: &XRayMatrix) -> Option<[f32; 5]> {
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut min_z = f32::INFINITY;
+
+    for &c in points {
+        let cz =
+            c[0] * xform01[0][2] + c[1] * xform01[1][2] + c[2] * xform01[2][2] + xform01[3][2];
+        if cz < EPS || !cz.is_finite() {
+            return None;
+        }
+        let cw =
+            c[0] * xform01[0][3] + c[1] * xform01[1][3] + c[2] * xform01[2][3] + xform01[3][3];
+        if cw <= 1e-6 || !cw.is_finite() {
+            return None;
+        }
+        let iw = 1.0 / cw;
+        let sx = (c[0] * xform01[0][0]
+            + c[1] * xform01[1][0]
+            + c[2] * xform01[2][0]
+            + xform01[3][0])
+            * iw;
+        let sy = (c[0] * xform01[0][1]
+            + c[1] * xform01[1][1]
+            + c[2] * xform01[2][1]
+            + xform01[3][1])
+            * iw;
+        let sz = cz * iw;
+        min_x = min_x.min(sx);
+        max_x = max_x.max(sx);
+        min_y = min_y.min(sy);
+        max_y = max_y.max(sy);
+        min_z = min_z.min(sz);
+    }
+
+    Some([min_x, min_y, max_x, max_y, min_z])
 }
 
 #[cfg(test)]
@@ -1292,5 +1478,62 @@ mod tests {
             &proj,
             [0.0, 0.0, 0.0]
         ));
+    }
+
+    #[test]
+    fn clip_frustum_from_portal_occluder_and_test_poly() {
+        let data = build_synthetic_hom_wall();
+        let mesh = HomMesh::parse(&data).unwrap();
+        let proj = build_perspective_lh(std::f32::consts::FRAC_PI_2, 1.0, 0.2, 100.0);
+        let mut raster = OccRasterizer::new();
+        raster.render_mesh(&mesh, &proj, [0.0, 0.0, 0.0]);
+
+        // Polygon strictly behind the z=5 wall is occluded; polygon in front is visible.
+        let behind_poly = [
+            [-1.0, -1.0, 10.0],
+            [-1.0, 1.0, 10.0],
+            [1.0, 1.0, 10.0],
+            [1.0, -1.0, 10.0],
+        ];
+        assert!(!raster.test_poly(&behind_poly, &proj));
+        let front_poly = [
+            [-0.5, -0.5, 2.0],
+            [-0.5, 0.5, 2.0],
+            [0.5, 0.5, 2.0],
+            [0.5, -0.5, 2.0],
+        ];
+        assert!(raster.test_poly(&front_poly, &proj));
+
+        // 8-gon portal (>6 verts) triggers simplify_poly_aabb and reversed winding correction.
+        let octagon: Vec<[f32; 3]> = (0..8)
+            .map(|i| {
+                let a = -(i as f32) * std::f32::consts::TAU / 8.0;
+                [a.cos() * 2.0, a.sin() * 2.0, 5.0]
+            })
+            .collect();
+        let portal_frustum = ClipFrustum::from_portal(&octagon, [0.0, 0.0, 0.0], &proj).unwrap();
+        assert_eq!(portal_frustum.planes.len(), 6);
+        assert!(portal_frustum.test_sphere([0.0, 0.0, 10.0], 0.5));
+        assert!(!portal_frustum.test_sphere([0.0, 0.0, 2.0], 0.5));
+        assert!(!portal_frustum.test_sphere([10.0, 0.0, 10.0], 0.5));
+        assert!(portal_frustum.test_poly_inside(&behind_poly));
+        assert!(!portal_frustum.test_poly_inside(&front_poly));
+        assert!(portal_frustum.test_poly_inside_dirty(&behind_poly));
+        assert!(!portal_frustum.test_poly_inside_dirty(&front_poly));
+
+        // CreateOccluder marks an edge lying on clip_frustum's near plane as open (1+3 = 4 planes).
+        let clip_near = ClipFrustum {
+            planes: vec![Plane::from_point_normal([0.0, -1.0, 5.0], [0.0, -1.0, 0.0])],
+        };
+        let occ_quad = [
+            [-1.0, -1.0, 5.0],
+            [-1.0, 1.0, 5.0],
+            [1.0, 1.0, 5.0],
+            [1.0, -1.0, 5.0],
+        ];
+        let occ_frustum = ClipFrustum::from_occluder(&occ_quad, [0.0, 0.0, 0.0], &clip_near).unwrap();
+        assert_eq!(occ_frustum.planes.len(), 4);
+        assert!(occ_frustum.test_sphere([0.0, 0.0, 8.0], 0.5));
+        assert!(!occ_frustum.test_sphere([0.0, 0.0, 3.0], 0.5));
     }
 }

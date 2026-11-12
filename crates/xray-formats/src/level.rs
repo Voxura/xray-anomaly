@@ -4,9 +4,15 @@
 //! `src/Layers/xrRenderPC_R4/r4_loader.cpp`, `src/Layers/xrRender/r__sector.cpp`,
 //! `src/Layers/xrRender/FVisual.cpp`, and `src/Layers/xrRender/Light_DB.cpp`.
 
+use crate::cform::{ray_triangle_test, triangle_aabb_overlap, CformBvh};
 use crate::chunk::{ByteCursor, ChunkReader, FormatError};
+use crate::hom::{viewport_matrix_01, ClipFrustum, OccRasterizer};
 use crate::lanims::LightAnimItem;
-use crate::ogf::{OgfModel, OgfSlideWindows, SlideWindow, StaticVertex};
+use crate::ogf::{
+    compute_screen_lod_thresholds, matrix_mul_44, OgfModel, OgfSlideWindows, ScreenLodConfig,
+    ScreenLodThresholds, SlideWindow, StaticVertex, XRayMatrix,
+};
+use crate::weather::DEFAULT_VIEWPORT_NEAR;
 use xray_core::ltx_loader::OwnedLtxDocument;
 
 /// D3D9 `D3DLIGHTTYPE` constants used in `fsL_LIGHT_DYNAMIC` (`LevelLight::light_type`).
@@ -509,6 +515,159 @@ impl LevelPortal {
     pub fn sector_behind(&self, view_point: [f32; 3]) -> Option<u16> {
         self.signed_distance(view_point)
             .map(|sd| if sd > 0.0 { self.sector_back } else { self.sector_front })
+    }
+
+    /// Returns `true` if any triangle of this portal overlaps a camera-centered cube of half-extent
+    /// `viewport_near + 0.001` (`VIEWPORT_NEAR + EPS_L`) for dual-render crossing handling
+    /// (`CRender::Calculate`, `r2_R_calculate.cpp:42-54`).
+    pub fn is_near_camera(&self, camera_pos: [f32; 3], viewport_near: f32) -> bool {
+        if self.vertices.len() < 3 {
+            return false;
+        }
+        let eps = (viewport_near + 0.001).max(1e-4);
+        let half = [eps, eps, eps];
+        let v0 = self.vertices[0];
+        for i in 2..self.vertices.len() {
+            if triangle_aabb_overlap(camera_pos, half, v0, self.vertices[i - 1], self.vertices[i]) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Bitflags controlling portal graph traversal (`CPortalTraverser` enum in `r__sector.h:87-94`).
+pub mod portal_traversal_flags {
+    pub const VQ_HOM: u32 = 1 << 0;
+    pub const VQ_SSA: u32 = 1 << 1;
+    pub const VQ_SCISSOR: u32 = 1 << 2;
+    pub const VQ_FADE: u32 = 1 << 3;
+    pub const VQ_DEFAULT: u32 = VQ_HOM | VQ_SSA | VQ_SCISSOR | VQ_FADE;
+}
+
+/// Normalized `[0..1]` screen-space scissor bounds with minimum depth (`struct _scissor`, `r__sector.h:12-15`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PortalScissorRect {
+    pub min_x: f32,
+    pub min_y: f32,
+    pub max_x: f32,
+    pub max_y: f32,
+    pub depth: f32,
+}
+
+impl PortalScissorRect {
+    pub const FULL: Self = Self {
+        min_x: 0.0,
+        min_y: 0.0,
+        max_x: 1.0,
+        max_y: 1.0,
+        depth: 0.0,
+    };
+
+    pub const INVALID: Self = Self {
+        min_x: f32::INFINITY,
+        min_y: f32::INFINITY,
+        max_x: f32::NEG_INFINITY,
+        max_y: f32::NEG_INFINITY,
+        depth: f32::MAX,
+    };
+
+    #[inline]
+    pub fn is_non_empty(&self) -> bool {
+        self.min_x < self.max_x && self.min_y < self.max_y
+    }
+
+    #[inline]
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self {
+            min_x: self.min_x.max(other.min_x),
+            min_y: self.min_y.max(other.min_y),
+            max_x: self.max_x.min(other.max_x),
+            max_y: self.max_y.min(other.max_y),
+            depth: other.depth,
+        }
+    }
+
+    #[inline]
+    pub fn merge(&mut self, other: &Self) {
+        self.min_x = self.min_x.min(other.min_x);
+        self.min_y = self.min_y.min(other.min_y);
+        self.max_x = self.max_x.max(other.max_x);
+        self.max_y = self.max_y.max(other.max_y);
+        self.depth = self.depth.min(other.depth);
+    }
+}
+
+impl Default for PortalScissorRect {
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
+/// Options and SSA thresholds driving [`LevelData::traverse_portals`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PortalTraversalOptions {
+    pub flags: u32,
+    pub ssa_discard: f32,
+    pub ssa_lod_a: f32,
+    pub ssa_lod_b: f32,
+    pub viewport_near: f32,
+}
+
+impl PortalTraversalOptions {
+    #[inline]
+    pub fn from_screen_lods(flags: u32, viewport_near: f32, lods: &ScreenLodThresholds) -> Self {
+        Self {
+            flags,
+            ssa_discard: lods.r_ssa_discard,
+            ssa_lod_a: lods.r_ssa_lod_a,
+            ssa_lod_b: lods.r_ssa_lod_b,
+            viewport_near,
+        }
+    }
+}
+
+impl Default for PortalTraversalOptions {
+    fn default() -> Self {
+        let lods = compute_screen_lod_thresholds(1920, 1080, 90.0, &ScreenLodConfig::default());
+        Self::from_screen_lods(
+            portal_traversal_flags::VQ_DEFAULT,
+            DEFAULT_VIEWPORT_NEAR,
+            &lods,
+        )
+    }
+}
+
+/// Fading distant portal quad queued by [`portal_traversal_flags::VQ_FADE`]
+/// (`CPortalTraverser::f_portals` & `fade_render`, `r__sector_traversal.cpp:64-130`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PortalFadeEntry {
+    pub portal_index: usize,
+    pub ssa: f32,
+    pub distance_sq: f32,
+    pub alpha_u8: u8,
+}
+
+/// Per-sector frustum list & scissor bounds accumulated by [`LevelData::traverse_portals`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PortalSectorVisibility {
+    pub sector_id: u16,
+    pub frustums: Vec<ClipFrustum>,
+    pub scissors: Vec<PortalScissorRect>,
+    pub merged_scissor: PortalScissorRect,
+}
+
+/// Visible sectors & fade-curtain portals produced by [`LevelData::traverse_portals`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PortalTraversalResult {
+    pub sectors: Vec<PortalSectorVisibility>,
+    pub fade_portals: Vec<PortalFadeEntry>,
+}
+
+impl PortalTraversalResult {
+    #[inline]
+    pub fn get_sector(&self, sector_id: u16) -> Option<&PortalSectorVisibility> {
+        self.sectors.iter().find(|s| s.sector_id == sector_id)
     }
 }
 
@@ -1290,6 +1449,333 @@ impl LevelData {
             }
         }
         visited_sectors
+    }
+
+    /// Detect the sector containing `pos` along a specific probe ray `dir` (`CRender::detectSector`,
+    /// `r2_sector_detect.cpp:39-89`), racing two-sided portal hits against static `CformBvh` geometry.
+    pub fn detect_sector_dir(
+        &self,
+        pos: [f32; 3],
+        dir: [f32; 3],
+        cform: Option<&CformBvh<'_>>,
+    ) -> Option<u16> {
+        let len_sq = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+        if len_sq <= 1e-12 {
+            return None;
+        }
+        let inv = 1.0 / len_sq.sqrt();
+        let unit_dir = [dir[0] * inv, dir[1] * inv, dir[2] * inv];
+
+        let mut portal_hit: Option<(usize, f32)> = None;
+        let mut range1 = 500.0f32;
+        for (p_idx, portal) in self.portals.iter().enumerate() {
+            if portal.vertices.len() < 3 {
+                continue;
+            }
+            let v0 = portal.vertices[0];
+            for i in 2..portal.vertices.len() {
+                if let Some((t, _, _)) = ray_triangle_test(
+                    pos,
+                    unit_dir,
+                    v0,
+                    portal.vertices[i - 1],
+                    portal.vertices[i],
+                    false,
+                ) && (0.0..=range1).contains(&t)
+                {
+                    range1 = t;
+                    portal_hit = Some((p_idx, t));
+                }
+            }
+        }
+
+        let geom_hit = cform.and_then(|bvh| bvh.raycast_nearest(pos, unit_dir, range1, false));
+        match (portal_hit, geom_hit) {
+            (Some((p_idx, r1)), Some(g)) => {
+                if r1 <= g.range + 1e-5 {
+                    self.portals[p_idx]
+                        .sector_facing(pos)
+                        .or(Some(self.portals[p_idx].sector_front))
+                } else {
+                    Some(g.sector)
+                }
+            }
+            (Some((p_idx, _)), None) => self.portals[p_idx]
+                .sector_facing(pos)
+                .or(Some(self.portals[p_idx].sector_front)),
+            (None, Some(g)) => Some(g.sector),
+            (None, None) => None,
+        }
+    }
+
+    /// Detect the sector containing `pos` by probing downward `(0, -1, 0)` first and falling back to
+    /// upward `(0, 1, 0)` (`CRender::detectSector`, `r2_sector_detect.cpp:23-37`).
+    pub fn detect_sector(&self, pos: [f32; 3], cform: Option<&CformBvh<'_>>) -> Option<u16> {
+        self.detect_sector_dir(pos, [0.0, -1.0, 0.0], cform)
+            .or_else(|| self.detect_sector_dir(pos, [0.0, 1.0, 0.0], cform))
+    }
+
+    /// Traverse visible sectors recursively through portal polygons with optional SSA, HOM, screen
+    /// scissor, and distance-fade culling (`CPortalTraverser::traverse` + `CSector::traverse`,
+    /// `r__sector_traversal.cpp` & `r__sector.cpp`).
+    pub fn traverse_portals(
+        &self,
+        start_sector: u16,
+        frustum: &ClipFrustum,
+        camera_pos: [f32; 3],
+        full_transform: &XRayMatrix,
+        hom: Option<&OccRasterizer>,
+        options: &PortalTraversalOptions,
+    ) -> PortalTraversalResult {
+        let mut dual_render: Vec<bool> = self
+            .portals
+            .iter()
+            .map(|p| p.is_near_camera(camera_pos, options.viewport_near))
+            .collect();
+        let mut portal_visited = vec![false; self.portals.len()];
+        let xform_01 = matrix_mul_44(&viewport_matrix_01(), full_transform);
+        let mut result = PortalTraversalResult::default();
+        let mut sector_slots: std::collections::HashMap<u16, usize> =
+            std::collections::HashMap::new();
+
+        #[allow(clippy::too_many_arguments)]
+        fn visit_sector(
+            level: &LevelData,
+            sector_id: u16,
+            start_sector: u16,
+            frustum: &ClipFrustum,
+            scissor: PortalScissorRect,
+            camera_pos: [f32; 3],
+            full_transform: &XRayMatrix,
+            xform_01: &XRayMatrix,
+            hom: Option<&OccRasterizer>,
+            options: &PortalTraversalOptions,
+            portal_visited: &mut [bool],
+            dual_render: &mut [bool],
+            sector_slots: &mut std::collections::HashMap<u16, usize>,
+            result: &mut PortalTraversalResult,
+        ) {
+            if let Some(&slot) = sector_slots.get(&sector_id) {
+                result.sectors[slot].frustums.push(frustum.clone());
+                result.sectors[slot].scissors.push(scissor);
+            } else {
+                let slot = result.sectors.len();
+                sector_slots.insert(sector_id, slot);
+                result.sectors.push(PortalSectorVisibility {
+                    sector_id,
+                    frustums: vec![frustum.clone()],
+                    scissors: vec![scissor],
+                    merged_scissor: scissor,
+                });
+            }
+
+            let portal_indices = level.portals_for_sector(sector_id);
+            for portal_idx in portal_indices {
+                if portal_visited[portal_idx] {
+                    continue;
+                }
+                let portal = &level.portals[portal_idx];
+                let is_dual = dual_render[portal_idx];
+                let Some(next_sector) = (if is_dual {
+                    portal.opposite_sector(sector_id)
+                } else {
+                    portal
+                        .sector_behind(camera_pos)
+                        .filter(|&s| s != sector_id && s != start_sector)
+                }) else {
+                    continue;
+                };
+
+                let Some((pc, pr)) = portal.bounding_sphere() else {
+                    continue;
+                };
+                if !frustum.test_sphere(pc, pr) {
+                    continue;
+                }
+
+                if (options.flags & portal_traversal_flags::VQ_SSA) != 0 {
+                    let dx = pc[0] - camera_pos[0];
+                    let dy = pc[1] - camera_pos[1];
+                    let dz = pc[2] - camera_pos[2];
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    let ssa = if dist_sq > 1e-8 {
+                        let inv_d = 1.0 / dist_sq.sqrt();
+                        let dir = [dx * inv_d, dy * inv_d, dz * inv_d];
+                        let cos_n = portal
+                            .plane()
+                            .map(|(n, _)| (n[0] * dir[0] + n[1] * dir[1] + n[2] * dir[2]).abs())
+                            .unwrap_or(1.0);
+                        (pr * pr / dist_sq) * cos_n
+                    } else {
+                        f32::INFINITY
+                    };
+                    if ssa < options.ssa_discard {
+                        continue;
+                    }
+                    if (options.flags & portal_traversal_flags::VQ_FADE) != 0 {
+                        if ssa < options.ssa_lod_a {
+                            let ssa_range = options.ssa_lod_a - options.ssa_lod_b;
+                            let alpha_u8 = if ssa_range.abs() > 1e-12 {
+                                let scale = (ssa - options.ssa_lod_b) / ssa_range;
+                                ((1.0 - scale) * 255.5).floor().clamp(0.0, 255.0) as u8
+                            } else {
+                                255
+                            };
+                            result.fade_portals.push(PortalFadeEntry {
+                                portal_index: portal_idx,
+                                ssa,
+                                distance_sq: dist_sq,
+                                alpha_u8,
+                            });
+                        }
+                        if ssa < options.ssa_lod_b {
+                            continue;
+                        }
+                    }
+                }
+
+                let Some(clipped) = frustum.clip_poly(&portal.vertices) else {
+                    continue;
+                };
+
+                let child_scissor = if (options.flags & portal_traversal_flags::VQ_SCISSOR) != 0
+                    && !is_dual
+                {
+                    let mut bb = PortalScissorRect::INVALID;
+                    let mut depth = f32::MAX;
+                    let mut bad_w = false;
+                    for &v in &clipped {
+                        let tw = v[0] * xform_01[0][3]
+                            + v[1] * xform_01[1][3]
+                            + v[2] * xform_01[2][3]
+                            + xform_01[3][3];
+                        if tw <= 1e-6 || !tw.is_finite() {
+                            bad_w = true;
+                            break;
+                        }
+                        let iw = 1.0 / tw;
+                        let tx = (v[0] * xform_01[0][0]
+                            + v[1] * xform_01[1][0]
+                            + v[2] * xform_01[2][0]
+                            + xform_01[3][0])
+                            * iw;
+                        let ty = (v[0] * xform_01[0][1]
+                            + v[1] * xform_01[1][1]
+                            + v[2] * xform_01[2][1]
+                            + xform_01[3][1])
+                            * iw;
+                        let tz = (v[0] * xform_01[0][2]
+                            + v[1] * xform_01[1][2]
+                            + v[2] * xform_01[2][2]
+                            + xform_01[3][2])
+                            * iw;
+                        bb.min_x = bb.min_x.min(tx);
+                        bb.max_x = bb.max_x.max(tx);
+                        bb.min_y = bb.min_y.min(ty);
+                        bb.max_y = bb.max_y.max(ty);
+                        depth = depth.min(tz);
+                    }
+
+                    if bad_w || depth < 1e-5 {
+                        if (options.flags & portal_traversal_flags::VQ_HOM) != 0
+                            && let Some(occ) = hom
+                            && !occ.test_poly(&clipped, full_transform)
+                        {
+                            continue;
+                        }
+                        scissor
+                    } else {
+                        bb.depth = depth;
+                        let inter = scissor.intersect(&bb);
+                        if !inter.is_non_empty() {
+                            continue;
+                        }
+                        if (options.flags & portal_traversal_flags::VQ_HOM) != 0
+                            && let Some(occ) = hom
+                            && !occ.test_rect(
+                                inter.min_x,
+                                inter.min_y,
+                                inter.max_x,
+                                inter.max_y,
+                                depth,
+                            )
+                        {
+                            continue;
+                        }
+                        inter
+                    }
+                } else {
+                    if (options.flags & portal_traversal_flags::VQ_HOM) != 0
+                        && let Some(occ) = hom
+                        && !occ.test_poly(&clipped, full_transform)
+                    {
+                        continue;
+                    }
+                    scissor
+                };
+
+                let Some(child_frustum) =
+                    ClipFrustum::from_portal(&clipped, camera_pos, full_transform)
+                else {
+                    continue;
+                };
+
+                portal_visited[portal_idx] = true;
+                dual_render[portal_idx] = false;
+                visit_sector(
+                    level,
+                    next_sector,
+                    start_sector,
+                    &child_frustum,
+                    child_scissor,
+                    camera_pos,
+                    full_transform,
+                    xform_01,
+                    hom,
+                    options,
+                    portal_visited,
+                    dual_render,
+                    sector_slots,
+                    result,
+                );
+            }
+        }
+
+        visit_sector(
+            self,
+            start_sector,
+            start_sector,
+            frustum,
+            PortalScissorRect::FULL,
+            camera_pos,
+            full_transform,
+            &xform_01,
+            hom,
+            options,
+            &mut portal_visited,
+            &mut dual_render,
+            &mut sector_slots,
+            &mut result,
+        );
+
+        if (options.flags & portal_traversal_flags::VQ_SCISSOR) != 0 {
+            for sec in &mut result.sectors {
+                let mut merged = PortalScissorRect::INVALID;
+                for s in &sec.scissors {
+                    merged.merge(s);
+                }
+                sec.merged_scissor = merged;
+            }
+        }
+
+        if (options.flags & portal_traversal_flags::VQ_FADE) != 0 {
+            // Back-to-front descending distance sort (`r__sector_traversal.cpp:85` intent).
+            result
+                .fade_portals
+                .sort_by(|a, b| b.distance_sq.total_cmp(&a.distance_sq));
+        }
+
+        result
     }
 
     /// Resolve vertices & indices for any level visual (inline OGF, `OGF_GCONTAINER`,
@@ -2076,5 +2562,146 @@ volumetric_intensity = 0.25
         assert!(sr > 14.0 && sr < 25.0);
         let contrib = spot.evaluate_contribution_at([0.0, 2.0, 10.0], Some(&anim), 0.0, false);
         assert!(contrib[0] > 0.4 && contrib[2].abs() < 1e-6);
+
+        // 4. Sector detection + portal traversal (scissor, HOM occlusion, SSA/fade, dual_render)
+        let verts = vec![
+            [-20.0, 0.0, -20.0],
+            [-20.0, 0.0, 20.0],
+            [20.0, 0.0, 20.0],
+            [20.0, 0.0, -20.0],
+        ];
+        let cform = crate::cform::CformModel::from_parts(
+            verts,
+            vec![
+                crate::cform::CformTriangle {
+                    verts: [0, 1, 2],
+                    material: 0,
+                    suppress_shadows: false,
+                    suppress_wm: false,
+                    sector: 4,
+                },
+                crate::cform::CformTriangle {
+                    verts: [0, 2, 3],
+                    material: 0,
+                    suppress_shadows: false,
+                    suppress_wm: false,
+                    sector: 4,
+                },
+            ],
+        )
+        .unwrap();
+        let bvh = cform.build_bvh();
+        // Ray straight down from above cform hits geometry in sector 4; from below uses +Y fallback.
+        assert_eq!(level.detect_sector([0.0, 2.0, 0.0], Some(&bvh)), Some(4));
+        assert_eq!(level.detect_sector([0.0, -3.0, 0.0], Some(&bvh)), Some(4));
+        assert_eq!(level.detect_sector([100.0, 2.0, 0.0], Some(&bvh)), None);
+
+        // Build a 3-sector linear chain along +Z: portal 0 at z=5 (s0<->s1), portal 1 at z=15 (s1<->s2)
+        let p_level = LevelData {
+            xrlc_version: 14,
+            xrlc_quality: 0,
+            shaders: Vec::new(),
+            visuals: Vec::new(),
+            portals: vec![
+                LevelPortal {
+                    sector_front: 0,
+                    sector_back: 1,
+                    vertices: vec![
+                        [-1.0, -1.0, 5.0],
+                        [-1.0, 1.0, 5.0],
+                        [1.0, 1.0, 5.0],
+                        [1.0, -1.0, 5.0],
+                    ],
+                },
+                LevelPortal {
+                    sector_front: 1,
+                    sector_back: 2,
+                    vertices: vec![
+                        [-0.5, -0.5, 15.0],
+                        [-0.5, 0.5, 15.0],
+                        [0.5, 0.5, 15.0],
+                        [0.5, -0.5, 15.0],
+                    ],
+                },
+            ],
+            sectors: vec![
+                LevelSector {
+                    id: 0,
+                    portals: vec![0],
+                    root_visual_id: None,
+                },
+                LevelSector {
+                    id: 1,
+                    portals: vec![0, 1],
+                    root_visual_id: None,
+                },
+                LevelSector {
+                    id: 2,
+                    portals: vec![1],
+                    root_visual_id: None,
+                },
+            ],
+            lights: Vec::new(),
+            glows: Vec::new(),
+            glows_raw_len: 0,
+        };
+        let proj = crate::camera::matrix_build_projection(
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.2,
+            100.0,
+        );
+        let cam_frustum = ClipFrustum::from_view_proj_dx(&proj, crate::hom::frustum_planes::ALL);
+        let trav = p_level.traverse_portals(
+            0,
+            &cam_frustum,
+            [0.0, 0.0, 0.0],
+            &proj,
+            None,
+            &PortalTraversalOptions::default(),
+        );
+        assert_eq!(trav.sectors.len(), 3);
+        let sec1 = trav.get_sector(1).unwrap();
+        let sec2 = trav.get_sector(2).unwrap();
+        assert!(sec1.merged_scissor.is_non_empty());
+        assert!(
+            (sec2.merged_scissor.max_x - sec2.merged_scissor.min_x)
+                < (sec1.merged_scissor.max_x - sec1.merged_scissor.min_x)
+        );
+        assert!(p_level.portals[0].is_near_camera([0.0, 0.0, 4.9], 0.2));
+        assert!(!p_level.portals[0].is_near_camera([0.0, 0.0, 4.0], 0.2));
+
+        // HOM wall between z=5 and z=15 occludes portal 1 so sector 2 is culled.
+        let hom_wall = crate::hom::HomMesh::from_raw_triangles(&[
+            ([-3.0, -3.0, 10.0], [-3.0, 3.0, 10.0], [3.0, 3.0, 10.0], 1u32),
+            ([-3.0, -3.0, 10.0], [3.0, 3.0, 10.0], [3.0, -3.0, 10.0], 1u32),
+        ]);
+        let mut raster = OccRasterizer::new();
+        raster.render_mesh(&hom_wall, &proj, [0.0, 0.0, 0.0]);
+        let trav_occ = p_level.traverse_portals(
+            0,
+            &cam_frustum,
+            [0.0, 0.0, 0.0],
+            &proj,
+            Some(&raster),
+            &PortalTraversalOptions::default(),
+        );
+        assert!(trav_occ.get_sector(1).is_some());
+        assert!(trav_occ.get_sector(2).is_none());
+
+        // Fade band: SSA below ssa_lod_a records a fade entry; below ssa_lod_b stops traversal.
+        let fade_opts = PortalTraversalOptions {
+            flags: portal_traversal_flags::VQ_SSA | portal_traversal_flags::VQ_FADE,
+            ssa_discard: 0.001,
+            ssa_lod_a: 0.5,
+            ssa_lod_b: 0.02,
+            viewport_near: 0.2,
+        };
+        let trav_fade =
+            p_level.traverse_portals(0, &cam_frustum, [0.0, 0.0, 0.0], &proj, None, &fade_opts);
+        assert_eq!(trav_fade.sectors.len(), 2);
+        assert_eq!(trav_fade.fade_portals.len(), 2);
+        assert!(trav_fade.fade_portals[0].distance_sq >= trav_fade.fade_portals[1].distance_sq);
+        assert!(trav_fade.fade_portals.iter().any(|f| f.alpha_u8 == 255));
     }
 }

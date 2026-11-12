@@ -2009,6 +2009,26 @@ impl CrngLcg {
         (self.holdrand >> 16) & 0x7fff
     }
 
+    /// Generate pseudo-random integer in `[0, max)` (`CRandom::randI(max)`).
+    #[inline]
+    pub fn rand_i_max(&mut self, max: i32) -> i32 {
+        if max <= 0 {
+            0
+        } else {
+            self.rand_i() % max
+        }
+    }
+
+    /// Generate pseudo-random integer in `[min, max)` (`CRandom::randI(min, max)`).
+    #[inline]
+    pub fn rand_i_range(&mut self, min: i32, max: i32) -> i32 {
+        if max <= min {
+            min
+        } else {
+            min + self.rand_i_max(max - min)
+        }
+    }
+
     /// Generate pseudo-random float in `[0.0, max]` (`CRandom::randF(max)`).
     #[inline]
     pub fn rand_f(&mut self, max: f32) -> f32 {
@@ -2245,6 +2265,339 @@ pub fn build_reflected_lights(
     }
 
     out
+}
+
+// ============================================================================
+// Light & Shadow-Map Occlusion Visibility (`light_vis.cpp`, `light_smapvis.h/.cpp`, `r2_R_lights.cpp`)
+// ============================================================================
+
+/// Default frame-delay range when camera is inside a light volume (`light_vis.cpp:5-6`).
+pub const LIGHT_VIS_DELAY_SMALL_MIN: i32 = 1;
+pub const LIGHT_VIS_DELAY_SMALL_MAX: i32 = 3;
+/// Default frame-delay range when an occluded light proves visible (`light_vis.cpp:7-8`).
+pub const LIGHT_VIS_DELAY_LARGE_MIN: i32 = 10;
+pub const LIGHT_VIS_DELAY_LARGE_MAX: i32 = 20;
+/// Minimum fragment count threshold marking a tested light visible (`light_vis.cpp:9`).
+pub const LIGHT_VIS_CULL_FRAGMENTS: u64 = 4;
+/// Default `ps_r__LightSleepFrames` before `smapvis` starts pruning static shadow casters.
+pub const LIGHT_SLEEP_FRAMES_DEFAULT: u32 = 10;
+
+/// Compute the camera near-frustum corner safety radius (`safe_area` in `light_vis.cpp:23-31`)
+/// matching X-Ray's `(viewport_near, fov_deg, aspect = height / width)` parameters.
+#[inline]
+pub fn compute_light_vis_safe_area(viewport_near: f32, fov_deg: f32, aspect: f32) -> f32 {
+    let vp = viewport_near.max(0.0);
+    let a0 = (fov_deg * aspect * 0.5).to_radians().abs().min(std::f32::consts::FRAC_PI_2 - 1e-4);
+    let a1 = (fov_deg * 0.5).to_radians().abs().min(std::f32::consts::FRAC_PI_2 - 1e-4);
+    let x0 = vp / a0.cos().max(1e-4);
+    let x1 = vp / a1.cos().max(1e-4);
+    let c = (x0 * x0 + x1 * x1).sqrt();
+    vp.max(x0.max(x1)).max(c)
+}
+
+/// Console flags & thresholds driving [`LightVisState::prepare`]/[`LightVisState::finish_pending`]
+/// (`ps_r2_ls_flags` defaults in `xrRender_console.cpp:174`, `light_vis.cpp:9,35-38`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightVisConfig {
+    /// `R2FLAG_EXP_DONT_TEST_UNSHADOWED` (ON by default in Anomaly).
+    pub dont_test_unshadowed: bool,
+    /// `R2FLAG_EXP_DONT_TEST_SHADOWED` (OFF by default in Anomaly).
+    pub dont_test_shadowed: bool,
+    /// Minimum passing fragment count (`cullfragments = 4`).
+    pub cull_fragments: u64,
+}
+
+impl Default for LightVisConfig {
+    fn default() -> Self {
+        Self {
+            dont_test_unshadowed: true,
+            dont_test_shadowed: false,
+            cull_fragments: LIGHT_VIS_CULL_FRAGMENTS,
+        }
+    }
+}
+
+/// Action requested by [`LightVisState::prepare`] for the current frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LightVisDecision {
+    /// Light stays visible (camera inside safe sphere or test disabled); no occlusion query needed.
+    SkipOcclusionTest,
+    /// Light exited the camera sphere and is ready for GPU occlusion testing this frame.
+    IssueOcclusionQuery {
+        stencil_test: bool,
+        volumetric_spot: bool,
+    },
+}
+
+/// Per-light visibility cache & hardware occlusion scheduling state (`light::_vis`, `light.h:62-75`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LightVisState {
+    pub distance: f32,
+    pub visible: bool,
+    pub pending: bool,
+    pub frame2test: u32,
+    pub query_id: u32,
+    pub query_order: u32,
+}
+
+impl Default for LightVisState {
+    fn default() -> Self {
+        Self {
+            distance: 0.0,
+            visible: true,
+            pending: false,
+            frame2test: 0,
+            query_id: crate::postprocess::OCCQ_INVALID_HANDLE,
+            query_order: 0,
+        }
+    }
+}
+
+impl LightVisState {
+    /// Force next visibility test at `frame` (`light::vis_prepare` reset).
+    #[inline]
+    pub fn invalidate(&mut self, frame: u32) {
+        self.visible = true;
+        self.pending = false;
+        self.frame2test = frame;
+    }
+
+    /// Evaluate per-frame visibility test scheduling matching `light::vis_prepare` (`light_vis.cpp:11-65`).
+    ///
+    /// Returns `None` if re-testing is deferred until `self.frame2test` (keeping `self.visible`).
+    pub fn prepare(
+        &mut self,
+        frame: u32,
+        light: &DynamicLight,
+        camera_pos: [f32; 3],
+        safe_area: f32,
+        cfg: &LightVisConfig,
+        rng: &mut CrngLcg,
+    ) -> Option<LightVisDecision> {
+        if frame < self.frame2test {
+            return None;
+        }
+        let (sc, sr) = light.spatial_sphere();
+        let dx = camera_pos[0] - sc[0];
+        let dy = camera_pos[1] - sc[1];
+        let dz = camera_pos[2] - sc[2];
+        self.distance = (dx * dx + dy * dy + dz * dz).sqrt();
+
+        let skip_test = (cfg.dont_test_unshadowed && !light.is_shadowed)
+            || (cfg.dont_test_shadowed && light.is_shadowed);
+        if skip_test || self.distance <= sr * 1.01 + safe_area {
+            self.visible = true;
+            self.pending = false;
+            self.frame2test = frame.saturating_add(
+                rng.rand_i_range(LIGHT_VIS_DELAY_SMALL_MIN, LIGHT_VIS_DELAY_SMALL_MAX) as u32,
+            );
+            return Some(LightVisDecision::SkipOcclusionTest);
+        }
+
+        self.pending = true;
+        let volumetric_spot =
+            light.light_type == RenderLightType::Spot && light.is_shadowed && light.is_volumetric;
+        Some(LightVisDecision::IssueOcclusionQuery {
+            stencil_test: !volumetric_spot,
+            volumetric_spot,
+        })
+    }
+
+    /// Consume GPU occlusion query fragment count matching `light::vis_update` (`light_vis.cpp:67-90`).
+    pub fn finish_pending(&mut self, frame: u32, fragments: u64, rng: &mut CrngLcg, cfg: &LightVisConfig) -> bool {
+        if !self.pending {
+            return self.visible;
+        }
+        self.visible = fragments > cfg.cull_fragments;
+        self.pending = false;
+        self.frame2test = if self.visible {
+            frame.saturating_add(
+                rng.rand_i_range(LIGHT_VIS_DELAY_LARGE_MIN, LIGHT_VIS_DELAY_LARGE_MAX) as u32,
+            )
+        } else {
+            frame.saturating_add(1)
+        };
+        self.visible
+    }
+}
+
+/// Shadow-map static caster pruning stage (`smapvis::state` enum in `light_smapvis.h:6-11`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum SmapVisStage {
+    #[default]
+    Counting = 0,
+    Working = 1,
+    UsingTc = 3,
+}
+
+/// Per-light incremental static shadow-caster occlusion cache (`class smapvis`, `light_smapvis.h/.cpp`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmapVisSolver {
+    pub stage: SmapVisStage,
+    pub invisible: Vec<usize>,
+    pub frame_sleep: u32,
+    pub test_count: u32,
+    pub test_current: u32,
+    pub test_q_visual: Option<usize>,
+    pub test_q_id: u32,
+    pub test_q_frame: u32,
+}
+
+impl Default for SmapVisSolver {
+    fn default() -> Self {
+        Self {
+            stage: SmapVisStage::Counting,
+            invisible: Vec::new(),
+            frame_sleep: 0,
+            test_count: 0,
+            test_current: 0,
+            test_q_visual: None,
+            test_q_id: crate::postprocess::OCCQ_INVALID_HANDLE,
+            test_q_frame: 0,
+        }
+    }
+}
+
+impl SmapVisSolver {
+    /// Reset discovered invisible casters and postpone pruning for `sleep_frames` (`smapvis::invalidate`).
+    pub fn invalidate(&mut self, frame: u32, sleep_frames: u32) {
+        self.stage = SmapVisStage::Counting;
+        self.test_q_visual = None;
+        self.frame_sleep = frame.saturating_add(sleep_frames);
+        self.invisible.clear();
+    }
+
+    /// Returns `true` once the cooldown window has elapsed (`smapvis::sleep()` in `light_smapvis.h:33`).
+    #[inline]
+    pub fn is_awake(&self, frame: u32) -> bool {
+        frame > self.frame_sleep
+    }
+
+    #[inline]
+    pub fn is_culled(&self, visual_index: usize) -> bool {
+        self.invisible.contains(&visual_index)
+    }
+
+    /// Begin a shadow-map render pass (`smapvis::begin`, `light_smapvis.cpp:25-45`).
+    ///
+    /// Returns `Some(feedback_caster_index)` in [`SmapVisStage::Working`] so the caller captures the
+    /// Nth drawn static caster via [`Self::record_feedback`].
+    pub fn begin(&mut self) -> Option<u32> {
+        match self.stage {
+            SmapVisStage::Counting | SmapVisStage::UsingTc => None,
+            SmapVisStage::Working => {
+                self.test_q_visual = None;
+                self.test_q_id = crate::postprocess::OCCQ_INVALID_HANDLE;
+                Some(self.test_current)
+            }
+        }
+    }
+
+    /// Capture the static visual index hit at `test_current` (`smapvis::rfeedback_static`).
+    #[inline]
+    pub fn record_feedback(&mut self, visual_index: usize) {
+        self.test_q_visual = Some(visual_index);
+    }
+
+    /// End a shadow-map render pass (`smapvis::end`, `light_smapvis.cpp:47-83`).
+    ///
+    /// Returns `Some(visual_index)` when in [`SmapVisStage::Working`] and a caster was captured for
+    /// single-object GPU occlusion testing on `frame + 1`.
+    pub fn end(&mut self, frame: u32, total_static_casters: u32) -> Option<usize> {
+        match self.stage {
+            SmapVisStage::Counting => {
+                if self.is_awake(frame) {
+                    self.test_count = total_static_casters;
+                    self.test_current = 0;
+                    self.stage = if total_static_casters == 0 {
+                        SmapVisStage::UsingTc
+                    } else {
+                        SmapVisStage::Working
+                    };
+                }
+                None
+            }
+            SmapVisStage::Working => {
+                if let Some(vis_idx) = self.test_q_visual {
+                    self.test_q_frame = frame.saturating_add(1);
+                    Some(vis_idx)
+                } else {
+                    None
+                }
+            }
+            SmapVisStage::UsingTc => None,
+        }
+    }
+
+    /// Consume GPU occlusion fragments when `frame == test_q_frame` (`smapvis::flushoccq`,
+    /// `light_smapvis.cpp:85-111`). Returns `Some(was_marked_invisible)` if flushed.
+    pub fn flush_occq(&mut self, frame: u32, fragments: u64) -> Option<bool> {
+        if frame != self.test_q_frame || self.stage != SmapVisStage::Working {
+            return None;
+        }
+        let vis_idx = self.test_q_visual.take()?;
+        let marked_invisible = fragments == 0;
+        if marked_invisible {
+            self.invisible.push(vis_idx);
+            self.test_count = self.test_count.saturating_sub(1);
+        } else {
+            self.test_current = self.test_current.saturating_add(1);
+        }
+        if self.test_current >= self.test_count && self.stage == SmapVisStage::Working {
+            self.stage = SmapVisStage::UsingTc;
+        }
+        Some(marked_invisible)
+    }
+
+    /// Pull forward an in-flight `frame + 1` query if a light becomes hidden mid-frame
+    /// (`smapvis::resetoccq`, `light_smapvis.cpp:113-117`).
+    #[inline]
+    pub fn arm_reset_occq(&mut self, frame: u32) {
+        if self.test_q_frame == frame.saturating_add(1) {
+            self.test_q_frame = frame;
+        }
+    }
+}
+
+/// SSFX grass shadow configuration matching `ps_ssfx_grass_shadows` (`{0, 0.35, 30, 0}`,
+/// `xrRender_console.cpp:482`) and `rsGrassShadow`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GrassShadowConfig {
+    pub quality_level: f32,
+    pub intensity: f32,
+    pub shadow_distance: f32,
+    pub rs_grass_shadow: bool,
+}
+
+impl Default for GrassShadowConfig {
+    fn default() -> Self {
+        Self {
+            quality_level: 0.0,
+            intensity: 0.35,
+            shadow_distance: 30.0,
+            rs_grass_shadow: false,
+        }
+    }
+}
+
+/// Returns `true` if `light` should cast dynamic grass shadows (`check_grass_shadow` in
+/// `r2_R_lights.cpp:10-26`).
+pub fn check_grass_shadow_light(
+    light: &DynamicLight,
+    vis_distance: f32,
+    view_frustum: &ClipFrustum,
+    cfg: &GrassShadowConfig,
+) -> bool {
+    if cfg.quality_level < 3.0 || !cfg.rs_grass_shadow {
+        return false;
+    }
+    if vis_distance > cfg.shadow_distance {
+        return false;
+    }
+    let mut mask = 0xffu32;
+    view_frustum.test_sphere_masked(light.position, light.range * 0.6, &mut mask)
+        != crate::hom::FrustumVisibility::None
 }
 
 #[cfg(test)]
@@ -2681,5 +3034,74 @@ mod tests {
         );
         assert_eq!(ref_consts.direction_view[3], 0.0);
         assert!((ref_consts.dynamic_pos[3] - 1.0 / (reflected[0].light.range.powi(2))).abs() < 1e-6);
+
+        // LightVisState + compute_light_vis_safe_area + SmapVisSolver + GrassShadowConfig
+        let safe_area = compute_light_vis_safe_area(0.2, 67.5, 9.0 / 16.0);
+        assert!(safe_area > 0.25);
+        let vis_cfg = LightVisConfig {
+            dont_test_unshadowed: false,
+            dont_test_shadowed: false,
+            cull_fragments: 4,
+        };
+        let mut vis_rng = CrngLcg::new(77);
+        let mut vis = LightVisState::default();
+        assert_eq!(
+            vis.prepare(1, &gi_spot, [0.0, 0.0, 0.0], safe_area, &vis_cfg, &mut vis_rng),
+            Some(LightVisDecision::SkipOcclusionTest)
+        );
+        // Far frame while sleeping returns None
+        assert_eq!(
+            vis.prepare(1, &gi_spot, [0.0, 0.0, 50.0], safe_area, &vis_cfg, &mut vis_rng),
+            None
+        );
+        let next_f = vis.frame2test;
+        assert_eq!(
+            vis.prepare(next_f, &gi_spot, [0.0, 0.0, 50.0], safe_area, &vis_cfg, &mut vis_rng),
+            Some(LightVisDecision::IssueOcclusionQuery {
+                stencil_test: true,
+                volumetric_spot: false,
+            })
+        );
+        assert!(!vis.finish_pending(next_f + 1, 2, &mut vis_rng, &vis_cfg));
+        assert_eq!(vis.frame2test, next_f + 2);
+        assert_eq!(
+            vis.prepare(next_f + 2, &gi_spot, [0.0, 0.0, 50.0], safe_area, &vis_cfg, &mut vis_rng),
+            Some(LightVisDecision::IssueOcclusionQuery {
+                stencil_test: true,
+                volumetric_spot: false,
+            })
+        );
+        assert!(vis.finish_pending(next_f + 3, 16, &mut vis_rng, &vis_cfg));
+        assert!(vis.frame2test >= next_f + 3 + LIGHT_VIS_DELAY_LARGE_MIN as u32);
+
+        let mut smap = SmapVisSolver::default();
+        smap.invalidate(5, LIGHT_SLEEP_FRAMES_DEFAULT);
+        assert!(!smap.is_awake(15));
+        assert!(smap.is_awake(16));
+        assert_eq!(smap.end(10, 2), None);
+        assert_eq!(smap.end(16, 2), None);
+        assert_eq!(smap.stage, SmapVisStage::Working);
+        assert_eq!(smap.begin(), Some(0));
+        smap.record_feedback(10);
+        assert_eq!(smap.end(16, 2), Some(10));
+        assert_eq!(smap.flush_occq(17, 0), Some(true));
+        assert!(smap.is_culled(10));
+        assert_eq!(smap.begin(), Some(0));
+        smap.record_feedback(11);
+        assert_eq!(smap.end(17, 2), Some(11));
+        assert_eq!(smap.flush_occq(18, 25), Some(false));
+        assert_eq!(smap.stage, SmapVisStage::UsingTc);
+
+        let gs_light = DynamicLight {
+            position: [0.0, 0.0, 10.0],
+            range: 8.0,
+            ..DynamicLight::default()
+        };
+        let mut gs_cfg = GrassShadowConfig::default();
+        assert!(!check_grass_shadow_light(&gs_light, 10.0, &frustum, &gs_cfg));
+        gs_cfg.quality_level = 3.0;
+        gs_cfg.rs_grass_shadow = true;
+        assert!(check_grass_shadow_light(&gs_light, 10.0, &frustum, &gs_cfg));
+        assert!(!check_grass_shadow_light(&gs_light, 35.0, &frustum, &gs_cfg));
     }
 }

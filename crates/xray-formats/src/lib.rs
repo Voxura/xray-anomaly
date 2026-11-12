@@ -9,10 +9,10 @@
 //! - `envelopes`: LightWave `CEnvelope` splines (`TCB`/`Hermite`/`Bezier`/`Linear`/`Step`/`Bezier2D`), `.anm` `ObjectMotion` & `.ppe` `PostprocessEffect`
 //! - `fonts`: `CGameFont` resolution rung selector (`texture_h<N>` + `[string_table] font_prefix`), UI `.ini` glyph atlases, word-wrap & DX12 glyph quad emitter
 //! - `gamemtl`: X-Ray `gamemtl.xr` physical/surface material & interaction pair library parser
-//! - `hom`: `level.hom` Hierarchical Occlusion Mapping parser, `ClipFrustum` & 64x64->8 `OccRasterizer`
+//! - `hom`: `level.hom` Hierarchical Occlusion Mapping parser, `ClipFrustum` (frustum/portal/occluder/poly) & 64x64->8 `OccRasterizer`
 //! - `lanims`: `$game_data$/lanims.xr` keyframed `LightAnimItem` / `LightAnimLibrary` color anims
-//! - `level`: `level` & `level.geom`/`level.geomx` scene, visuals, sectors, portals, lights & `D3DVERTEXELEMENT9` VB/IB/SWIS decoders
-//! - `lighting`: Pure-Rust dynamic lights, `SMAP_Allocator`, `ComputeXFS`, spot/point accumulation matrices, volumetric proxies/spot params, canonical `du_*` meshes & `LightTrack` hemisphere/visibility cache
+//! - `level`: `level` & `level.geom`/`level.geomx` scene, visuals, sectors, portals, portal/HOM traversal, lights & `D3DVERTEXELEMENT9` VB/IB/SWIS decoders
+//! - `lighting`: Pure-Rust dynamic lights, `SMAP_Allocator`, `ComputeXFS`, spot/point/GI accumulation, `light_vis`/`smapvis`/grass shadows & `LightTrack` cache
 //! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, LOD (`ScreenLodThresholds`/`LodImposterHwVertex`), tree (`TreeWindState`), and skeletal mesh + bone/IK parser
 //! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
 //! - `particle_sim`: Pure-Rust PAPI runtime simulator, 3D Perlin noise, `ParticleGroupInstance` timeline & billboard emitter
@@ -74,9 +74,9 @@ pub use camera::{
     PostprocessPlayer,
 };
 pub use cform::{
-    classify_sphere_triangle, ray_options, ray_triangle_test, sphere_triangle_test, BoxQueryHit,
-    CformBvh, CformHeader, CformModel, CformTriangle, RaycastHit, RaycastOptions, SphereTriResult,
-    CFORM_CURRENT_VERSION,
+    classify_sphere_triangle, ray_options, ray_triangle_test, sphere_triangle_test,
+    triangle_aabb_overlap, BoxQueryHit, CformBvh, CformHeader, CformModel, CformTriangle,
+    RaycastHit, RaycastOptions, SphereTriResult, CFORM_CURRENT_VERSION,
 };
 pub use chunk::{ByteCursor, ChunkEntry, ChunkIter, ChunkReader, ChunkWriter, FormatError};
 pub use details::{
@@ -115,40 +115,46 @@ pub use gamemtl::{
     GAMEMTL_CURRENT_VERSION, GAMEMTL_NONE_ID,
 };
 pub use hom::{
-    frustum_planes, viewport_matrix_01, viewport_matrix_64, ClipFrustum, FrustumVisibility,
-    HomMesh, HomTriangle, OccRasterizer, Plane, RawHomTriangle, HOM_POLY_SIZE, OCC_BORDER,
-    OCC_DIM, OCC_DIM_0, OCC_DIM_1, OCC_DIM_2, OCC_DIM_3, OCC_Q_S32,
+    frustum_planes, simplify_poly_aabb, viewport_matrix_01, viewport_matrix_64, ClipFrustum,
+    FrustumVisibility, HomMesh, HomTriangle, OccRasterizer, Plane, RawHomTriangle, HOM_POLY_SIZE,
+    OCC_BORDER, OCC_DIM, OCC_DIM_0, OCC_DIM_1, OCC_DIM_2, OCC_DIM_3, OCC_Q_S32,
 };
 pub use lanims::{
     lanim_chunks, lanim_item_chunks, pack_argb, pack_rgba_f32, swap_rb_keep_ag, unpack_argb_f32,
     LightAnimItem, LightAnimLibrary, LANIM_VERSION,
 };
 pub use level::{
-    build_light_type, d3d_decl_type, d3d_decl_usage, d3d_light_type, level_chunks, sector_chunks,
-    BuildLightRecord, BuildLights, LevelData, LevelGeometry, LevelGlow, LevelLight, LevelPortal,
-    LevelSector, LevelShaderRef, LevelVertexBuffer, ResolvedLevelMesh, TorchLightConfig,
-    VertexDeclarator, VertexElement9, BUILD_LIGHT_RECORD_SIZE, LEVEL_GLOW_RECORD_SIZE,
+    build_light_type, d3d_decl_type, d3d_decl_usage, d3d_light_type, level_chunks,
+    portal_traversal_flags, sector_chunks, BuildLightRecord, BuildLights, LevelData, LevelGeometry,
+    LevelGlow, LevelLight, LevelPortal, LevelSector, LevelShaderRef, LevelVertexBuffer,
+    PortalFadeEntry, PortalScissorRect, PortalSectorVisibility, PortalTraversalOptions,
+    PortalTraversalResult, ResolvedLevelMesh, TorchLightConfig, VertexDeclarator, VertexElement9,
+    BUILD_LIGHT_RECORD_SIZE, LEVEL_GLOW_RECORD_SIZE,
 };
 pub use lighting::{
     accum_hemi_cube, build_reflected_lights, build_volumetric_slices_mesh,
-    compute_point_accum_constants, compute_r_ssa_glod_bounds, compute_reflected_accum_constants,
-    compute_spot_accum_constants, compute_texgen_jitter, compute_texgen_screen,
-    compute_u_diffuse2s, compute_volumetric_spot_params, encode_hemi_material_id,
-    generate_indirect_photons, generate_indirect_photons_cform, hemi_cube_faces,
-    near_plane_intersects_sphere, pack_smap_requests, sort_light_package_by_key,
-    transform_volumetric_clip_planes, AccumMaskElement, AccumShaderElement, CrngLcg, DynamicLight,
-    GiConfig, GlossConfig, HemiMaterialGpuParams, LightIndirectPhoton, LightPackageOrderKey,
-    LightSmapConfig, LightSmapXform, LightTrackConfig, ObjectLightTracker, OmnipartFaceLight,
-    PointAccumConstants, ReflectedAccumConstants, ReflectedLightInstance, RenderLightType,
-    SmapAllocator, SmapPackAssignment, SmapRect, SpotAccumConfig, SpotAccumConstants,
+    check_grass_shadow_light, compute_light_vis_safe_area, compute_point_accum_constants,
+    compute_r_ssa_glod_bounds, compute_reflected_accum_constants, compute_spot_accum_constants,
+    compute_texgen_jitter, compute_texgen_screen, compute_u_diffuse2s,
+    compute_volumetric_spot_params, encode_hemi_material_id, generate_indirect_photons,
+    generate_indirect_photons_cform, hemi_cube_faces, near_plane_intersects_sphere,
+    pack_smap_requests, sort_light_package_by_key, transform_volumetric_clip_planes,
+    AccumMaskElement, AccumShaderElement, CrngLcg, DynamicLight, GiConfig, GlossConfig,
+    GrassShadowConfig, HemiMaterialGpuParams, LightIndirectPhoton, LightPackageOrderKey,
+    LightSmapConfig, LightSmapXform, LightTrackConfig, LightVisConfig, LightVisDecision,
+    LightVisState, ObjectLightTracker, OmnipartFaceLight, PointAccumConstants,
+    ReflectedAccumConstants, ReflectedLightInstance, RenderLightType, SmapAllocator,
+    SmapPackAssignment, SmapRect, SmapVisSolver, SmapVisStage, SpotAccumConfig, SpotAccumConstants,
     TrackedLightEntry, VolumetricLightConfig, VolumetricSlicesMesh, VolumetricSpotParams,
     DU_BOX_INDICES, DU_BOX_NUMFACES, DU_BOX_NUMVERTEX, DU_BOX_NUMVERTEX2, DU_BOX_VERTICES,
     DU_BOX_VERTICES2, DU_CONE_INDICES, DU_CONE_NUMFACES, DU_CONE_NUMVERTEX, DU_CONE_VERTICES,
     DU_SPHERE_INDICES, DU_SPHERE_NUMFACES, DU_SPHERE_NUMVERTEX, DU_SPHERE_PART_INDICES,
     DU_SPHERE_PART_NUMFACES, DU_SPHERE_PART_NUMVERTEX, DU_SPHERE_PART_VERTICES, DU_SPHERE_VERTICES,
     GI_DEFAULT_CLIP, GI_DEFAULT_PHOTONS, GI_DEFAULT_REFL, GI_SEED, HEMI_SAMPLE_DIRS,
-    LIGHT_LS_SQUALITY_DEFAULT, LIGHT_SLIGHT_FADE_DEFAULT, LIGHT_SSA_GLOD_END_DEFAULT,
-    LIGHT_SSA_GLOD_START_DEFAULT, LT_DEC, LT_HEMISAMPLES, LT_INC, OMNIPART_CUBE_DIRS,
+    LIGHT_LS_SQUALITY_DEFAULT, LIGHT_SLEEP_FRAMES_DEFAULT, LIGHT_SLIGHT_FADE_DEFAULT,
+    LIGHT_SSA_GLOD_END_DEFAULT, LIGHT_SSA_GLOD_START_DEFAULT, LIGHT_VIS_CULL_FRAGMENTS,
+    LIGHT_VIS_DELAY_LARGE_MAX, LIGHT_VIS_DELAY_LARGE_MIN, LIGHT_VIS_DELAY_SMALL_MAX,
+    LIGHT_VIS_DELAY_SMALL_MIN, LT_DEC, LT_HEMISAMPLES, LT_INC, OMNIPART_CUBE_DIRS,
     OMNIPART_CUBE_UP_HINTS, SMAP_ADAPT_MAX, SMAP_ADAPT_MIN, SMAP_ADAPT_OPTIMAL, SMAP_NEAR_PLANE,
     TEX_JITTER_SIZE, VOLUMETRIC_SLICES,
 };

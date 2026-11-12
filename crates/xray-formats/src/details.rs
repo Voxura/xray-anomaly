@@ -1057,6 +1057,21 @@ pub struct DetailSlotItem {
 }
 
 impl DetailSlotItem {
+    /// Advance per-instance alpha dissolve toward `alpha_target` at `1.0 / sec`
+    /// (`GoToValue` in `dx10DetailManager_VS.cpp:39-52, 288`).
+    #[inline]
+    pub fn step_alpha(&mut self, dt_sec: f32) -> f32 {
+        let dt = dt_sec.max(0.0);
+        if (self.alpha - self.alpha_target).abs() <= dt {
+            self.alpha = self.alpha_target;
+        } else if self.alpha < self.alpha_target {
+            self.alpha += dt;
+        } else {
+            self.alpha -= dt;
+        }
+        self.alpha
+    }
+
     /// Pack matrix and lighting row for GPU instancing (`dx10DetailManager_VS.cpp:305-320`).
     pub fn to_gpu_instance(&self, effective_scale: f32) -> DetailGpuInstanceData {
         let m = &self.xform;
@@ -3120,5 +3135,24 @@ swing_fast_speed = 3.5
         anim_pool.update_animations(0.5, &cfg);
         anim_pool.update_animations(1.0, &cfg);
         assert!(anim_pool.slots[3].str >= 0.0 && anim_pool.slots[3].str.is_finite());
+
+        let mut fade_item = DetailSlotItem {
+            scale: 1.0,
+            scale_calculated: 1.0,
+            xform: crate::ogf::XRAY_IDENTITY_MATRIX,
+            vis_id: 0,
+            c_hemi: 1.0,
+            c_sun: 0.5,
+            c_rgb: [1.0; 3],
+            distance_sq: 1.0,
+            position: [0.0; 3],
+            normal: [0.0, 1.0, 0.0],
+            alpha: 0.0,
+            alpha_target: 1.0,
+        };
+        assert!((fade_item.step_alpha(0.4) - 0.4).abs() < 1e-6);
+        assert!((fade_item.step_alpha(0.8) - 1.0).abs() < 1e-6);
+        fade_item.alpha_target = 0.0;
+        assert!((fade_item.step_alpha(0.25) - 0.75).abs() < 1e-6);
     }
 }
