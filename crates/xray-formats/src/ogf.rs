@@ -619,6 +619,150 @@ impl OgfLodDef {
             shift,
         }
     }
+
+    /// Pack the 4 reordered hardware billboard vertices (`FLOD::_hw`, 76 bytes each) matching
+    /// `R_dsgraph_structure::r_dsgraph_render_lods` (`r__dsgraph_render_lods.cpp:58-105`).
+    pub fn build_imposter_quad(
+        &self,
+        camera_pos: [f32; 3],
+        bsphere: OgfBSphere,
+        ssa: f32,
+        thresholds: &ScreenLodThresholds,
+    ) -> [LodImposterHwVertex; 4] {
+        let sample = self.sample_imposter_pair(camera_pos, bsphere);
+        let u_a = thresholds.imposter_alpha(ssa);
+        let u_f = (sample.blend_factor * 255.5).floor().clamp(0.0, 255.0) as u8;
+        let fa = &self.facets[sample.best_facet_index];
+        let fb = &self.facets[sample.next_facet_index];
+
+        std::array::from_fn(|vit| {
+            let id = LOD_IMPOSTER_QUAD_ORDER[vit];
+            let vb = &fb.vertices[id];
+            let va = &fa.vertices[id];
+            // X-Ray `color_rgba(r, g, b, a)` = D3DCOLOR BGRA little-endian `(a<<24)|(r<<16)|(g<<8)|b`
+            let sun_af = ((u_f as u32) << 24)
+                | ((vb.sun as u32) << 16)
+                | ((va.sun as u32) << 8)
+                | (u_a as u32);
+            LodImposterHwVertex {
+                p0: [
+                    vb.position[0] + sample.shift[0],
+                    vb.position[1] + sample.shift[1],
+                    vb.position[2] + sample.shift[2],
+                ],
+                p1: [
+                    va.position[0] + sample.shift[0],
+                    va.position[1] + sample.shift[1],
+                    va.position[2] + sample.shift[2],
+                ],
+                n0: fb.normal,
+                n1: fa.normal,
+                sun_af,
+                t0: vb.uv,
+                t1: va.uv,
+                rgbh0: vb.rgb_hemi,
+                rgbh1: va.rgb_hemi,
+            }
+        })
+    }
+}
+
+/// 76-byte hardware vertex packed by `r_dsgraph_render_lods` (`FLOD::_hw` in `FLOD.h:22-33`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LodImposterHwVertex {
+    pub p0: [f32; 3],
+    pub p1: [f32; 3],
+    pub n0: [f32; 3],
+    pub n1: [f32; 3],
+    pub sun_af: u32,
+    pub t0: [f32; 2],
+    pub t1: [f32; 2],
+    pub rgbh0: u32,
+    pub rgbh1: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<LodImposterHwVertex>() == 76);
+
+/// Screen-space LOD console defaults (`xrRender_console.cpp:142-205`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenLodConfig {
+    pub r_lod: f32,
+    pub ssa_discard: f32,
+    pub ssa_dont_sort: f32,
+    pub ssa_lod_a: f32,
+    pub ssa_lod_b: f32,
+    pub ssa_glod_start: f32,
+    pub ssa_glod_end: f32,
+    pub ssa_hzb_vs_tex: f32,
+    pub parallax_range: f32,
+}
+
+impl Default for ScreenLodConfig {
+    fn default() -> Self {
+        Self {
+            r_lod: 0.75,
+            ssa_discard: 3.5,
+            ssa_dont_sort: 32.0,
+            ssa_lod_a: 64.0,
+            ssa_lod_b: 48.0,
+            ssa_glod_start: 256.0,
+            ssa_glod_end: 64.0,
+            ssa_hzb_vs_tex: 96.0,
+            parallax_range: 75.0,
+        }
+    }
+}
+
+/// Per-frame normalized SSA LOD thresholds computed in `CRender::Calculate`
+/// (`r2_R_calculate.cpp:17-27`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenLodThresholds {
+    pub g_f_screen: f32,
+    pub r_ssa_discard: f32,
+    pub r_ssa_dont_sort: f32,
+    pub r_ssa_lod_a: f32,
+    pub r_ssa_lod_b: f32,
+    pub r_ssa_glod_start: f32,
+    pub r_ssa_glod_end: f32,
+    pub r_ssa_hzb_vs_tex: f32,
+    pub r_dtex_range: f32,
+}
+
+impl ScreenLodThresholds {
+    /// Compute quantized 8-bit billboard imposter alpha `uA` matching `r__dsgraph_render_lods.cpp:59-62`.
+    #[inline]
+    pub fn imposter_alpha(&self, ssa: f32) -> u8 {
+        let ssa_range = (self.r_ssa_lod_a - self.r_ssa_lod_b).max(1e-7);
+        let ssa_diff = ssa - self.r_ssa_lod_b;
+        let scale = ssa_diff / ssa_range;
+        ((1.0 - scale) * 255.0).floor().clamp(0.0, 255.0) as u8
+    }
+}
+
+/// Compute normalized SSA thresholds and parallax detail range for `(screen_w, screen_h, fov_deg)`.
+pub fn compute_screen_lod_thresholds(
+    screen_w: u32,
+    screen_h: u32,
+    fov_deg: f32,
+    cfg: &ScreenLodConfig,
+) -> ScreenLodThresholds {
+    let fov_factor = (90.0 / fov_deg.clamp(5.0, 175.0)).powi(2);
+    let g_f_screen = ((screen_w.max(1) as f32 * screen_h.max(1) as f32)
+        * fov_factor
+        * (1e-7 + cfg.r_lod))
+        .max(1e-7);
+    ScreenLodThresholds {
+        g_f_screen,
+        r_ssa_discard: (cfg.ssa_discard * cfg.ssa_discard) / g_f_screen,
+        r_ssa_dont_sort: (cfg.ssa_dont_sort / 3.0).powi(2) / g_f_screen,
+        r_ssa_lod_a: (cfg.ssa_lod_a / 3.0).powi(2) / g_f_screen,
+        r_ssa_lod_b: (cfg.ssa_lod_b / 3.0).powi(2) / g_f_screen,
+        r_ssa_glod_start: (cfg.ssa_glod_start / 3.0).powi(2) / g_f_screen,
+        r_ssa_glod_end: (cfg.ssa_glod_end / 3.0).powi(2) / g_f_screen,
+        r_ssa_hzb_vs_tex: (cfg.ssa_hzb_vs_tex / 3.0).powi(2) / g_f_screen,
+        r_dtex_range: cfg.parallax_range * g_f_screen / (1024.0 * 768.0),
+    }
 }
 
 /// 5-channel vertex lighting scale/bias parameters from `OGF_TREEDEF2` (`FTreeVisual::_5color`).
@@ -2739,5 +2883,80 @@ mod tests {
         assert!((gpu.c_sun[0] - s * 0.4).abs() < 1e-5);
         assert!((gpu.c_sun[1] - s * 0.02).abs() < 1e-6);
         assert_eq!(gpu.m_xform_v[3], [10.0, 2.0, -2.0, 1.0]);
+    }
+
+    #[test]
+    fn screen_lod_thresholds_and_imposter_quad_builder() {
+        let cfg = ScreenLodConfig::default();
+        let t = compute_screen_lod_thresholds(1920, 1080, 90.0, &cfg);
+        let expected_g = 1920.0 * 1080.0 * (1e-7 + 0.75);
+        assert!((t.g_f_screen - expected_g).abs() < 1e-1);
+        assert!(t.r_ssa_glod_start > t.r_ssa_glod_end);
+        assert!(t.r_ssa_lod_a > t.r_ssa_lod_b);
+        assert!(t.r_ssa_lod_b > t.r_ssa_discard);
+        assert!((t.r_dtex_range - 75.0 * t.g_f_screen / (1024.0 * 768.0)).abs() < 1e-4);
+
+        assert_eq!(t.imposter_alpha(t.r_ssa_lod_b * 0.5), 255);
+        assert_eq!(t.imposter_alpha(t.r_ssa_lod_a * 2.0), 0);
+        let mid_alpha = t.imposter_alpha(0.5 * (t.r_ssa_lod_a + t.r_ssa_lod_b));
+        assert!((126..=128).contains(&mid_alpha));
+
+        let facets: [OgfLodFacet; 8] = std::array::from_fn(|s| {
+            let angle = (s as f32) * std::f32::consts::FRAC_PI_4;
+            let normal = [angle.cos(), 0.0, angle.sin()];
+            let vertices = std::array::from_fn(|v| OgfLodVertex {
+                position: [v as f32, s as f32, 0.0],
+                uv: [v as f32 * 0.25, s as f32 * 0.125],
+                rgb_hemi: 0x1020_3000 + (s as u32) * 16 + v as u32,
+                sun: (10 + s * 10 + v) as u8,
+            });
+            OgfLodFacet { vertices, normal }
+        });
+        let lod = OgfLodDef {
+            facets,
+            lod_factor: 1.0,
+        };
+        let bsphere = OgfBSphere {
+            center: [0.0, 0.0, 10.0],
+            radius: 2.0,
+        };
+        let cam_pos = [0.0, 0.0, 0.0];
+        let sample = lod.sample_imposter_pair(cam_pos, bsphere);
+        assert_eq!(sample.shift, [0.0, 0.0, -1.0]);
+
+        let quad = lod.build_imposter_quad(cam_pos, bsphere, t.r_ssa_lod_b, &t);
+        assert_eq!(std::mem::size_of::<LodImposterHwVertex>(), 76);
+        let fa = &facets[sample.best_facet_index];
+        let fb = &facets[sample.next_facet_index];
+        let expected_uf = (sample.blend_factor * 255.5).floor().clamp(0.0, 255.0) as u8;
+        for (vit, &id) in LOD_IMPOSTER_QUAD_ORDER.iter().enumerate() {
+            assert_eq!(
+                quad[vit].p0,
+                [
+                    fb.vertices[id].position[0],
+                    fb.vertices[id].position[1],
+                    fb.vertices[id].position[2] - 1.0,
+                ]
+            );
+            assert_eq!(
+                quad[vit].p1,
+                [
+                    fa.vertices[id].position[0],
+                    fa.vertices[id].position[1],
+                    fa.vertices[id].position[2] - 1.0,
+                ]
+            );
+            assert_eq!(quad[vit].n0, fb.normal);
+            assert_eq!(quad[vit].n1, fa.normal);
+            assert_eq!(quad[vit].t0, fb.vertices[id].uv);
+            assert_eq!(quad[vit].t1, fa.vertices[id].uv);
+            assert_eq!(quad[vit].rgbh0, fb.vertices[id].rgb_hemi);
+            assert_eq!(quad[vit].rgbh1, fa.vertices[id].rgb_hemi);
+            let expected_sun_af = ((expected_uf as u32) << 24)
+                | ((fb.vertices[id].sun as u32) << 16)
+                | ((fa.vertices[id].sun as u32) << 8)
+                | 255;
+            assert_eq!(quad[vit].sun_af, expected_sun_af);
+        }
     }
 }

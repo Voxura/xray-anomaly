@@ -2360,6 +2360,183 @@ impl Combine2MotionState {
     }
 }
 
+// ============================================================================
+// SSAO, HDAO Compute Dispatch, SMAA & SSFX TAA Schedules
+// ============================================================================
+
+/// Half-res SSAO noise tile & kernel parameters matching `CRenderTarget::phase_ssao` /
+/// `phase_downsamp` (`r4_rendertarget_phase_ssao.cpp:38-140`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsaoParams {
+    pub noise_tile_factor: f32,
+    pub kernel_size: f32,
+    pub half_width: f32,
+    pub half_height: f32,
+    pub resolution: [f32; 4],
+    pub jitter_scale: [f32; 2],
+    pub downsamp_size: [u32; 2],
+    pub downsamp_jitter_scale: [f32; 2],
+}
+
+/// Compute `phase_ssao` and `phase_downsamp` viewport & constant parameters.
+pub fn compute_ssao_params(
+    screen_w: u32,
+    screen_h: u32,
+    fov_deg: f32,
+    ssao_half_data: bool,
+) -> SsaoParams {
+    let base_tan = 67.5_f32.to_radians().tan();
+    let cur_tan = fov_deg.clamp(5.0, 89.0).to_radians().tan().max(1e-4);
+    let scale = base_tan / cur_tan;
+
+    let half_width = (screen_w.max(1) as f32 * 0.5).max(1.0);
+    let half_height = (screen_h.max(1) as f32 * 0.5).max(1.0);
+    let jitter_sz = TEX_JITTER_SIZE.max(1) as f32;
+
+    let downsamp_size = if ssao_half_data {
+        [(screen_w / 2).max(1), (screen_h / 2).max(1)]
+    } else {
+        [screen_w.max(1), screen_h.max(1)]
+    };
+
+    SsaoParams {
+        noise_tile_factor: 2.0 * scale,
+        kernel_size: 150.0 * scale,
+        half_width,
+        half_height,
+        resolution: [
+            half_width,
+            half_height,
+            1.0 / half_width,
+            1.0 / half_height,
+        ],
+        jitter_scale: [half_width / jitter_sz, half_height / jitter_sz],
+        downsamp_size,
+        downsamp_jitter_scale: [
+            downsamp_size[0] as f32 / jitter_sz,
+            downsamp_size[1] as f32 / jitter_sz,
+        ],
+    }
+}
+
+pub const HDAO_GROUP_TEXEL_DIMENSION: u32 = 56;
+pub const HDAO_GROUP_TEXEL_OVERLAP: u32 = 12;
+pub const HDAO_GROUP_TEXEL_STEP: u32 =
+    HDAO_GROUP_TEXEL_DIMENSION - 2 * HDAO_GROUP_TEXEL_OVERLAP;
+
+/// Compute shader threadgroup dispatch dimensions for `CRenderTarget::phase_hdao`
+/// (`r4_rendertarget_phase_hdao.cpp:3-39`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HdaoDispatch {
+    pub groups_x: u32,
+    pub groups_y: u32,
+    pub groups_z: u32,
+}
+
+#[inline]
+pub fn compute_hdao_dispatch(screen_w: u32, screen_h: u32) -> HdaoDispatch {
+    HdaoDispatch {
+        groups_x: screen_w.max(1).div_ceil(HDAO_GROUP_TEXEL_STEP),
+        groups_y: screen_h.max(1).div_ceil(HDAO_GROUP_TEXEL_STEP),
+        groups_z: 1,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmaaPassKind {
+    EdgeDetection,
+    BlendingWeights,
+    NeighborhoodBlending,
+}
+
+/// Single render pass descriptor emitted by [`smaa_schedule`] (`rendertarget_phase_smaa.cpp:4-101`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmaaPassDesc {
+    pub kind: SmaaPassKind,
+    pub element_index: u8,
+    pub clear_rt: bool,
+    pub stencil_enable: bool,
+    pub stencil_cmp_equal: bool,
+    pub dst_name: &'static str,
+    pub copy_to_name: Option<&'static str>,
+}
+
+/// Build the 3-pass SMAA schedule (`EdgeDetection -> BlendingWeights -> NeighborhoodBlending`).
+pub fn smaa_schedule(dx10_msaa: bool) -> [SmaaPassDesc; 3] {
+    let final_rt = if dx10_msaa { "rt_Generic" } else { "rt_Color" };
+    [
+        SmaaPassDesc {
+            kind: SmaaPassKind::EdgeDetection,
+            element_index: 0,
+            clear_rt: true,
+            stencil_enable: true,
+            stencil_cmp_equal: false,
+            dst_name: "rt_smaa_edgetex",
+            copy_to_name: None,
+        },
+        SmaaPassDesc {
+            kind: SmaaPassKind::BlendingWeights,
+            element_index: 1,
+            clear_rt: true,
+            stencil_enable: true,
+            stencil_cmp_equal: true,
+            dst_name: "rt_smaa_blendtex",
+            copy_to_name: None,
+        },
+        SmaaPassDesc {
+            kind: SmaaPassKind::NeighborhoodBlending,
+            element_index: 2,
+            clear_rt: false,
+            stencil_enable: false,
+            stencil_cmp_equal: false,
+            dst_name: final_rt,
+            copy_to_name: Some("rt_Generic_0"),
+        },
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsfxTaaPassKind {
+    PrepareMotionVectors,
+    TemporalResolve,
+    Sharpen,
+}
+
+/// Single render pass descriptor emitted by [`ssfx_taa_schedule`]
+/// (`rendertarget_phase_smaa.cpp:105-180`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SsfxTaaPassDesc {
+    pub kind: SsfxTaaPassKind,
+    pub element_index: u8,
+    pub dst_name: &'static str,
+    pub copy_to_name: Option<&'static str>,
+}
+
+/// Build the 3-pass SSFX TAA schedule (`PrepareMotionVectors -> TemporalResolve -> Sharpen`).
+pub fn ssfx_taa_schedule(dx10_msaa: bool) -> [SsfxTaaPassDesc; 3] {
+    let resolve_rt = if dx10_msaa { "rt_Generic" } else { "rt_Color" };
+    [
+        SsfxTaaPassDesc {
+            kind: SsfxTaaPassKind::PrepareMotionVectors,
+            element_index: 0,
+            dst_name: "rt_ssfx_accum",
+            copy_to_name: Some("rt_ssfx_taa"),
+        },
+        SsfxTaaPassDesc {
+            kind: SsfxTaaPassKind::TemporalResolve,
+            element_index: 1,
+            dst_name: resolve_rt,
+            copy_to_name: Some("rt_ssfx_prev_frame"),
+        },
+        SsfxTaaPassDesc {
+            kind: SsfxTaaPassKind::Sharpen,
+            element_index: 2,
+            dst_name: "rt_Generic_0",
+            copy_to_name: None,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2769,5 +2946,54 @@ mod tests {
                 assert!((c2.m_previous[r][c] - c2.m_current[r][c]).abs() < 1e-5);
             }
         }
+    }
+
+    #[test]
+    fn ssao_hdao_smaa_and_ssfx_taa_schedules() {
+        let ssao_half = compute_ssao_params(1920, 1080, 67.5, true);
+        assert!((ssao_half.noise_tile_factor - 2.0).abs() < 1e-5);
+        assert!((ssao_half.kernel_size - 150.0).abs() < 1e-4);
+        assert_eq!(ssao_half.half_width, 960.0);
+        assert_eq!(ssao_half.half_height, 540.0);
+        assert_eq!(
+            ssao_half.resolution,
+            [960.0, 540.0, 1.0 / 960.0, 1.0 / 540.0]
+        );
+        assert_eq!(ssao_half.downsamp_size, [960, 540]);
+        assert!((ssao_half.jitter_scale[0] - 15.0).abs() < 1e-5);
+
+        let ssao_full = compute_ssao_params(1920, 1080, 67.5, false);
+        assert_eq!(ssao_full.downsamp_size, [1920, 1080]);
+        assert!((ssao_full.downsamp_jitter_scale[0] - 30.0).abs() < 1e-5);
+
+        assert_eq!(HDAO_GROUP_TEXEL_STEP, 32);
+        let hdao = compute_hdao_dispatch(1920, 1080);
+        assert_eq!(
+            hdao,
+            HdaoDispatch {
+                groups_x: 60,
+                groups_y: 34,
+                groups_z: 1,
+            }
+        );
+
+        let smaa_no_msaa = smaa_schedule(false);
+        assert_eq!(smaa_no_msaa[0].kind, SmaaPassKind::EdgeDetection);
+        assert!(smaa_no_msaa[0].clear_rt && smaa_no_msaa[0].stencil_enable);
+        assert!(!smaa_no_msaa[0].stencil_cmp_equal);
+        assert!(smaa_no_msaa[1].stencil_cmp_equal);
+        assert_eq!(smaa_no_msaa[2].dst_name, "rt_Color");
+        assert_eq!(smaa_no_msaa[2].copy_to_name, Some("rt_Generic_0"));
+        assert_eq!(smaa_schedule(true)[2].dst_name, "rt_Generic");
+
+        let taa_no_msaa = ssfx_taa_schedule(false);
+        assert_eq!(taa_no_msaa[0].kind, SsfxTaaPassKind::PrepareMotionVectors);
+        assert_eq!(taa_no_msaa[0].dst_name, "rt_ssfx_accum");
+        assert_eq!(taa_no_msaa[0].copy_to_name, Some("rt_ssfx_taa"));
+        assert_eq!(taa_no_msaa[1].dst_name, "rt_Color");
+        assert_eq!(taa_no_msaa[1].copy_to_name, Some("rt_ssfx_prev_frame"));
+        assert_eq!(taa_no_msaa[2].kind, SsfxTaaPassKind::Sharpen);
+        assert_eq!(taa_no_msaa[2].dst_name, "rt_Generic_0");
+        assert_eq!(ssfx_taa_schedule(true)[1].dst_name, "rt_Generic");
     }
 }

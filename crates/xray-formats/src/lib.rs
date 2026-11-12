@@ -12,19 +12,19 @@
 //! - `hom`: `level.hom` Hierarchical Occlusion Mapping parser, `ClipFrustum` & 64x64->8 `OccRasterizer`
 //! - `lanims`: `$game_data$/lanims.xr` keyframed `LightAnimItem` / `LightAnimLibrary` color anims
 //! - `level`: `level` & `level.geom`/`level.geomx` scene, visuals, sectors, portals, lights & `D3DVERTEXELEMENT9` VB/IB/SWIS decoders
-//! - `lighting`: Pure-Rust dynamic lights, `SMAP_Allocator`, `ComputeXFS`, spot/point accumulation matrices & `LightTrack` hemisphere/visibility cache
-//! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, LOD, tree (`TreeWindState`), and skeletal mesh + bone/IK parser
+//! - `lighting`: Pure-Rust dynamic lights, `SMAP_Allocator`, `ComputeXFS`, spot/point accumulation matrices, volumetric proxies/spot params, canonical `du_*` meshes & `LightTrack` hemisphere/visibility cache
+//! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, LOD (`ScreenLodThresholds`/`LodImposterHwVertex`), tree (`TreeWindState`), and skeletal mesh + bone/IK parser
 //! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
 //! - `particle_sim`: Pure-Rust PAPI runtime simulator, 3D Perlin noise, `ParticleGroupInstance` timeline & billboard emitter
 //! - `particles`: `particles.xr` / loose `.pe` & `.pg` PAPI bytecode systems + LTX blood wallmark configs (no binary `level.wallmarks` in Anomaly/CoP)
-//! - `postprocess`: Phase-13+ PPE noise UVs, bloom/luminance adaptation, sunshafts/combine constants, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision, SSFX TAA & blur/SSS helpers
+//! - `postprocess`: Phase-13+ PPE noise UVs, bloom/luminance adaptation, sunshafts/combine constants, SSAO/HDAO/SMAA/SSFX TAA schedules, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision, SSFX blur/SSS helpers
 //! - `savegames`: Anomaly `.scop` LZO1X ALife savegame reader/writer (`GameDateTime`, spawn header, dynamic objects & 7 binary registries)
 //! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
 //! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, OMF pose evaluation & `1W`–`4W` CPU skinning
 //! - `sound_env`: `senvironment.xr` v4/v5, `level.som` BVH acoustic occlusion, `level.snd_env` & `level.snd_static`
 //! - `spawn_overlays`: Anomaly `spawn_overlays.ltx` / `mod_spawn_overlays_*.ltx` DLTX graph links/unlinks, patches & `level_cut` applicators
 //! - `spawns`: `level.game` (`RPoint`/`PatrolPath`), `patrol_paths.ltx`, `level.spawn`, `all.spawn` (`AlifeSpawnArchive`) & ALife `NET_Packet` entity/subclass codecs
-//! - `sun`: Pure-Rust Cascaded Sun Shadow Maps (CSM), `DumbConvexVolume`/`FixedConvexVolume` frustum-light hulls & texel snapping
+//! - `sun`: Pure-Rust Cascaded Sun Shadow Maps (CSM), dynamic rain wet-surface shadows, `DumbConvexVolume`/`FixedConvexVolume` frustum-light hulls & texel snapping
 //! - `thm`: X-Ray `.thm` / `.ltx` texture descriptor parser (`_bump` / `_bump#` / detail / material links)
 //! - `weather`: Weather cycles (`weathers\*.ltx`), weather effects, sun positions, ambients, lens flares, thunderbolts & atmospheric mixer
 //! - `world_maps`: `game_levels.ltx` (`GameLevelsConfig`), `game_maps_single.ltx` + `level.ltx` PDA/minimap bounds (`WorldMapsConfig`) & coordinate transforms
@@ -130,28 +130,36 @@ pub use level::{
     VertexDeclarator, VertexElement9, BUILD_LIGHT_RECORD_SIZE, LEVEL_GLOW_RECORD_SIZE,
 };
 pub use lighting::{
-    accum_hemi_cube, compute_r_ssa_glod_bounds, compute_spot_accum_constants,
-    compute_texgen_jitter, compute_texgen_screen, compute_u_diffuse2s, hemi_cube_faces,
-    near_plane_intersects_sphere, pack_smap_requests, DynamicLight, GlossConfig, LightSmapConfig,
-    LightSmapXform, LightTrackConfig, ObjectLightTracker, OmnipartFaceLight, RenderLightType,
-    SmapAllocator, SmapPackAssignment, SmapRect, SpotAccumConfig, SpotAccumConstants,
-    TrackedLightEntry, HEMI_SAMPLE_DIRS, LIGHT_LS_SQUALITY_DEFAULT, LIGHT_SLIGHT_FADE_DEFAULT,
-    LIGHT_SSA_GLOD_END_DEFAULT, LIGHT_SSA_GLOD_START_DEFAULT, LT_DEC, LT_HEMISAMPLES, LT_INC,
-    OMNIPART_CUBE_DIRS, OMNIPART_CUBE_UP_HINTS, SMAP_ADAPT_MAX, SMAP_ADAPT_MIN, SMAP_ADAPT_OPTIMAL,
-    SMAP_NEAR_PLANE, TEX_JITTER_SIZE,
+    accum_hemi_cube, build_volumetric_slices_mesh, compute_r_ssa_glod_bounds,
+    compute_spot_accum_constants, compute_texgen_jitter, compute_texgen_screen,
+    compute_u_diffuse2s, compute_volumetric_spot_params, encode_hemi_material_id,
+    hemi_cube_faces, near_plane_intersects_sphere, pack_smap_requests,
+    transform_volumetric_clip_planes, DynamicLight, GlossConfig, HemiMaterialGpuParams,
+    LightSmapConfig, LightSmapXform, LightTrackConfig, ObjectLightTracker, OmnipartFaceLight,
+    RenderLightType, SmapAllocator, SmapPackAssignment, SmapRect, SpotAccumConfig,
+    SpotAccumConstants, TrackedLightEntry, VolumetricLightConfig, VolumetricSlicesMesh,
+    VolumetricSpotParams, DU_BOX_INDICES, DU_BOX_NUMFACES, DU_BOX_NUMVERTEX, DU_BOX_NUMVERTEX2,
+    DU_BOX_VERTICES, DU_BOX_VERTICES2, DU_CONE_INDICES, DU_CONE_NUMFACES, DU_CONE_NUMVERTEX,
+    DU_CONE_VERTICES, DU_SPHERE_INDICES, DU_SPHERE_NUMFACES, DU_SPHERE_NUMVERTEX,
+    DU_SPHERE_PART_INDICES, DU_SPHERE_PART_NUMFACES, DU_SPHERE_PART_NUMVERTEX,
+    DU_SPHERE_PART_VERTICES, DU_SPHERE_VERTICES, HEMI_SAMPLE_DIRS, LIGHT_LS_SQUALITY_DEFAULT,
+    LIGHT_SLIGHT_FADE_DEFAULT, LIGHT_SSA_GLOD_END_DEFAULT, LIGHT_SSA_GLOD_START_DEFAULT, LT_DEC,
+    LT_HEMISAMPLES, LT_INC, OMNIPART_CUBE_DIRS, OMNIPART_CUBE_UP_HINTS, SMAP_ADAPT_MAX,
+    SMAP_ADAPT_MIN, SMAP_ADAPT_OPTIMAL, SMAP_NEAR_PLANE, TEX_JITTER_SIZE, VOLUMETRIC_SLICES,
 };
 pub use ogf::{
-    bone_shape_flags, fvf_flags, matrix_forward_dir, matrix_invert_43, matrix_mul_43,
-    matrix_mul_44, matrix_rotate_x, matrix_rotate_y, matrix_rotate_z, matrix_scale,
-    matrix_set_hpb, matrix_set_xyz_translate, matrix_set_xyzi_translate, matrix_transform_point,
-    matrix_transform_projected, ogf_chunks, skel_vert_type, vector_generate_orthonormal_basis,
-    BoneIkData, BoneIkSection, BonePoseMatrices, BoneShape, BoneShapeType, LodImposterSample,
-    OgfBBox, OgfBSphere, OgfBone, OgfBufferRef, OgfDesc, OgfGContainerRef, OgfHeader, OgfLodDef,
-    OgfLodFacet, OgfLodVertex, OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows, OgfTextureLink,
-    OgfTreeDef, OgfVertices, OgfVisualType, SlideWindow, StaticVertex, StaticVertexLayout,
-    TreeInstanceGpuConstants, TreeLightingColor, TreeWindConfig, TreeWindFrame, TreeWindState,
-    UnifiedSkinnedVertex, VertBoned1W, VertBoned2W, VertBoned3W, VertBoned4W, XRayMatrix,
-    FTREE_VISUAL_QUANT, FTREE_VISUAL_TILE, LOD_IMPOSTER_QUAD_ORDER, OGF_LODDEF2_SIZE,
+    bone_shape_flags, compute_screen_lod_thresholds, fvf_flags, matrix_forward_dir,
+    matrix_invert_43, matrix_mul_43, matrix_mul_44, matrix_rotate_x, matrix_rotate_y,
+    matrix_rotate_z, matrix_scale, matrix_set_hpb, matrix_set_xyz_translate,
+    matrix_set_xyzi_translate, matrix_transform_point, matrix_transform_projected, ogf_chunks,
+    skel_vert_type, vector_generate_orthonormal_basis, BoneIkData, BoneIkSection, BonePoseMatrices,
+    BoneShape, BoneShapeType, LodImposterHwVertex, LodImposterSample, OgfBBox, OgfBSphere, OgfBone,
+    OgfBufferRef, OgfDesc, OgfGContainerRef, OgfHeader, OgfLodDef, OgfLodFacet, OgfLodVertex,
+    OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows, OgfTextureLink, OgfTreeDef, OgfVertices,
+    OgfVisualType, ScreenLodConfig, ScreenLodThresholds, SlideWindow, StaticVertex,
+    StaticVertexLayout, TreeInstanceGpuConstants, TreeLightingColor, TreeWindConfig, TreeWindFrame,
+    TreeWindState, UnifiedSkinnedVertex, VertBoned1W, VertBoned2W, VertBoned3W, VertBoned4W,
+    XRayMatrix, FTREE_VISUAL_QUANT, FTREE_VISUAL_TILE, LOD_IMPOSTER_QUAD_ORDER, OGF_LODDEF2_SIZE,
     OGF_LOD_VERTEX_SIZE, OGF_TREEDEF2_SIZE, XRAY_IDENTITY_MATRIX,
 };
 pub use omf::{
@@ -181,20 +189,23 @@ pub use particles::{
 pub use postprocess::{
     apply_st2084_pq_rgb, apply_vignette_rgb, bloom_build_4tap_uvs, bloom_filter_taps_horizontal,
     bloom_filter_taps_vertical, calc_gauss_k7, calc_gauss_wave, combine2_aa_quad_uvs,
-    combine2_shader_element, compute_combine1_params, effects_sun_hdr_blend_factor,
-    luminance_filter_quad_uvs, luminance_filter_taps, luminance_pass0_uvs, phase_blur_schedule,
-    ssfx_ao_blur_schedule, ssfx_bloom_lens_blur_schedule, ssfx_il_blur_schedule,
+    combine2_shader_element, compute_combine1_params, compute_hdao_dispatch, compute_ssao_params,
+    effects_sun_hdr_blend_factor, luminance_filter_quad_uvs, luminance_filter_taps,
+    luminance_pass0_uvs, phase_blur_schedule, smaa_schedule, ssfx_ao_blur_schedule,
+    ssfx_bloom_lens_blur_schedule, ssfx_il_blur_schedule, ssfx_taa_schedule,
     ssfx_volumetric_blur_schedule, sunshafts_schedule, sunshafts_uv_bounds,
     uncharted2_tonemap_curve, BloomAdaptState, BloomConfig, BloomFilterGpuWeights, Combine1Config,
     Combine1GpuParams, Combine2AaCornerUvs, Combine2Config, Combine2GpuParams, Combine2MotionState,
-    DofConfig, DofGpuParams, GammaControlConfig, GasmaskConfig, GasmaskGpuParams, Hdr10Colorspace,
-    Hdr10Config, Hdr10GpuParams, Hdr10PassKind, Hdr10PingPongPass, Hdr10TonemapMode,
-    Hdr10Tonemapper, HeatVisionConfig, HeatVisionGpuParams, ImageCorrectionConfig,
-    ImageCorrectionGpuParams, LuminanceAdaptState, LuminanceConfig, NightVisionGen,
-    NightVisionProfile, PostprocessNoiseState, SsfxBloomGpuParams, SsfxBlurPassDesc,
-    SsfxLightingConfig, SsfxScreenConfig, SsfxSssCandidate, SsfxSssExtSlots, SsfxTaaConfig,
+    DofConfig, DofGpuParams, GammaControlConfig, GasmaskConfig, GasmaskGpuParams, HdaoDispatch,
+    Hdr10Colorspace, Hdr10Config, Hdr10GpuParams, Hdr10PassKind, Hdr10PingPongPass,
+    Hdr10TonemapMode, Hdr10Tonemapper, HeatVisionConfig, HeatVisionGpuParams,
+    ImageCorrectionConfig, ImageCorrectionGpuParams, LuminanceAdaptState, LuminanceConfig,
+    NightVisionGen, NightVisionProfile, PostprocessNoiseState, SmaaPassDesc, SmaaPassKind,
+    SsaoParams, SsfxBloomGpuParams, SsfxBlurPassDesc, SsfxLightingConfig, SsfxScreenConfig,
+    SsfxSssCandidate, SsfxSssExtSlots, SsfxTaaConfig, SsfxTaaPassDesc, SsfxTaaPassKind,
     SunshaftsConfig, SunshaftsPassDesc, SunshaftsPassKind, TonemapGpuParams, TonemapParams,
-    BLOOM_SIZE_X, BLOOM_SIZE_Y, SSFX_SSS_EXT_MAX_SLOTS,
+    BLOOM_SIZE_X, BLOOM_SIZE_Y, HDAO_GROUP_TEXEL_DIMENSION, HDAO_GROUP_TEXEL_OVERLAP,
+    HDAO_GROUP_TEXEL_STEP, SSFX_SSS_EXT_MAX_SLOTS,
 };
 pub use savegames::{
     compress_scop, decompress_scop, validate_scop_header, ActorStatDetail, ActorStatSection,
@@ -250,10 +261,11 @@ pub use spawns::{
     POINT_BASE, RPOINT_CHUNK, SPAWN_VERSION, WAYOBJECT_VERSION, WAY_BASE, WAY_PATROLPATH_CHUNK,
 };
 pub use sun::{
-    compute_sun_cascades, compute_sun_shadow_matrix, matrix_invert_44,
-    matrix_ortho_off_center_lh, matrix_translate, snap_sun_cascade_to_texels, CloudsShadowState,
-    DumbConvexVolume, FixedConvexVolume, SunCascadeBiasConfig, SunCascadeConfig, SunCascadeResult,
-    SunCascadeSpec, SunRay, SUN_FRUSTUM_CORNERS, SUN_FRUSTUM_FACETABLE,
+    compute_rain_shadow_setup, compute_sun_cascades, compute_sun_shadow_matrix, matrix_invert_44,
+    matrix_ortho_off_center_lh, matrix_translate, snap_sun_cascade_to_texels,
+    ssfx_rain_pass_viewport, CloudsShadowState, DumbConvexVolume, FixedConvexVolume,
+    RainShadowResult, RainWetSurfConfig, SsfxRainConfig, SunCascadeBiasConfig, SunCascadeConfig,
+    SunCascadeResult, SunCascadeSpec, SunRay, SUN_FRUSTUM_CORNERS, SUN_FRUSTUM_FACETABLE,
 };
 pub use thm::{
     dds_caps2, strip_texture_extension, texture_flags, texture_stem_to_dds_vpath,

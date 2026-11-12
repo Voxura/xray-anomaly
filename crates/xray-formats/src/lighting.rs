@@ -11,6 +11,7 @@
 use std::f32::consts::FRAC_1_SQRT_2;
 
 use crate::camera::{matrix_build_camera_dir, matrix_build_projection, matrix_build_projection_ortho};
+use crate::hom::{frustum_planes, ClipFrustum};
 use crate::level::{d3d_light_type, LevelLight};
 use crate::ogf::{
     matrix_mul_43, matrix_mul_44, matrix_scale, matrix_transform_point, XRayMatrix,
@@ -1128,6 +1129,610 @@ impl ObjectLightTracker {
                 self.hemi_cube[i] * l_f + self.hemi_cube_smooth[i] * l_i;
         }
     }
+
+    /// Pack smoothed hemisphere irradiance and scalar material properties for `R_hemi`
+    /// (`r4.h:259-301`, `R_Backend_hemi.cpp`).
+    pub fn to_hemi_gpu_params(
+        &self,
+        material_id: f32,
+        hotness: [f32; 4],
+        glowing: [f32; 4],
+    ) -> HemiMaterialGpuParams {
+        use hemi_cube_faces::*;
+        HemiMaterialGpuParams {
+            pos_faces: [
+                self.hemi_cube_smooth[POS_X],
+                self.hemi_cube_smooth[POS_Y],
+                self.hemi_cube_smooth[POS_Z],
+                0.0,
+            ],
+            neg_faces: [
+                self.hemi_cube_smooth[NEG_X],
+                self.hemi_cube_smooth[NEG_Y],
+                self.hemi_cube_smooth[NEG_Z],
+                0.0,
+            ],
+            material: [
+                0.75 * self.hemi_smooth,
+                0.75 * self.sun_smooth,
+                0.0,
+                encode_hemi_material_id(material_id),
+            ],
+            hotness,
+            glowing,
+        }
+    }
+}
+
+// ============================================================================
+// Canonical Deferred Light Volumes (`du_sphere`, `du_cone`, `du_sphere_part`, `du_box`)
+// ============================================================================
+
+pub const DU_SPHERE_NUMVERTEX: usize = 92;
+pub const DU_SPHERE_NUMFACES: usize = 180;
+
+/// Unit sphere vertices used by point & reflected light volume passes (`du_sphere.cpp:8-101`).
+pub const DU_SPHERE_VERTICES: [[f32; 3]; DU_SPHERE_NUMVERTEX] = [
+    [0.0000, 1.0000, 0.0000],
+    [0.8944, 0.4472, 0.0000],
+    [0.2764, 0.4472, 0.8507],
+    [-0.7236, 0.4472, 0.5257],
+    [-0.7236, 0.4472, -0.5257],
+    [0.2764, 0.4472, -0.8507],
+    [0.7236, -0.4472, 0.5257],
+    [-0.2764, -0.4472, 0.8507],
+    [-0.8944, -0.4472, -0.0000],
+    [-0.2764, -0.4472, -0.8507],
+    [0.7236, -0.4472, -0.5257],
+    [0.0000, -1.0000, 0.0000],
+    [0.3607, 0.9327, 0.0000],
+    [0.6729, 0.7397, 0.0000],
+    [0.1115, 0.9327, 0.3431],
+    [0.2079, 0.7397, 0.6399],
+    [-0.2918, 0.9327, 0.2120],
+    [-0.5444, 0.7397, 0.3955],
+    [-0.2918, 0.9327, -0.2120],
+    [-0.5444, 0.7397, -0.3955],
+    [0.1115, 0.9327, -0.3431],
+    [0.2079, 0.7397, -0.6399],
+    [0.7844, 0.5168, 0.3431],
+    [0.5687, 0.5168, 0.6399],
+    [-0.0839, 0.5168, 0.8520],
+    [-0.4329, 0.5168, 0.7386],
+    [-0.8362, 0.5168, 0.1835],
+    [-0.8362, 0.5168, -0.1835],
+    [-0.4329, 0.5168, -0.7386],
+    [-0.0839, 0.5168, -0.8520],
+    [0.5687, 0.5168, -0.6399],
+    [0.7844, 0.5168, -0.3431],
+    [0.9647, 0.1561, 0.2120],
+    [0.9051, -0.1561, 0.3955],
+    [0.0965, 0.1561, 0.9830],
+    [-0.0965, -0.1561, 0.9830],
+    [-0.9051, 0.1561, 0.3955],
+    [-0.9647, -0.1561, 0.2120],
+    [-0.6558, 0.1561, -0.7386],
+    [-0.4998, -0.1561, -0.8520],
+    [0.4998, 0.1561, -0.8520],
+    [0.6558, -0.1561, -0.7386],
+    [0.9647, 0.1561, -0.2120],
+    [0.9051, -0.1561, -0.3955],
+    [0.4998, 0.1561, 0.8520],
+    [0.6558, -0.1561, 0.7386],
+    [-0.6558, 0.1561, 0.7386],
+    [-0.4998, -0.1561, 0.8520],
+    [-0.9051, 0.1561, -0.3955],
+    [-0.9647, -0.1561, -0.2120],
+    [0.0965, 0.1561, -0.9830],
+    [-0.0965, -0.1561, -0.9830],
+    [0.4329, -0.5168, 0.7386],
+    [0.0839, -0.5168, 0.8520],
+    [-0.5687, -0.5168, 0.6399],
+    [-0.7844, -0.5168, 0.3431],
+    [-0.7844, -0.5168, -0.3431],
+    [-0.5687, -0.5168, -0.6399],
+    [0.0839, -0.5168, -0.8520],
+    [0.4329, -0.5168, -0.7386],
+    [0.8362, -0.5168, -0.1835],
+    [0.8362, -0.5168, 0.1835],
+    [0.2918, -0.9327, 0.2120],
+    [0.5444, -0.7397, 0.3955],
+    [-0.1115, -0.9327, 0.3431],
+    [-0.2079, -0.7397, 0.6399],
+    [-0.3607, -0.9327, -0.0000],
+    [-0.6729, -0.7397, -0.0000],
+    [-0.1115, -0.9327, -0.3431],
+    [-0.2079, -0.7397, -0.6399],
+    [0.2918, -0.9327, -0.2120],
+    [0.5444, -0.7397, -0.3955],
+    [0.4795, 0.8054, 0.3484],
+    [-0.1832, 0.8054, 0.5637],
+    [-0.5927, 0.8054, -0.0000],
+    [-0.1832, 0.8054, -0.5637],
+    [0.4795, 0.8054, -0.3484],
+    [0.9855, -0.1699, 0.0000],
+    [0.3045, -0.1699, 0.9372],
+    [-0.7973, -0.1699, 0.5792],
+    [-0.7973, -0.1699, -0.5792],
+    [0.3045, -0.1699, -0.9372],
+    [0.7973, 0.1699, 0.5792],
+    [-0.3045, 0.1699, 0.9372],
+    [-0.9855, 0.1699, -0.0000],
+    [-0.3045, 0.1699, -0.9372],
+    [0.7973, 0.1699, -0.5792],
+    [0.1832, -0.8054, 0.5637],
+    [-0.4795, -0.8054, 0.3484],
+    [-0.4795, -0.8054, -0.3484],
+    [0.1832, -0.8054, -0.5637],
+    [0.5927, -0.8054, 0.0000],
+];
+
+/// Unit sphere triangle index list (`du_sphere_faces`, 180 triangles / 540 indices).
+pub const DU_SPHERE_INDICES: [u16; DU_SPHERE_NUMFACES * 3] = [
+    14, 12, 0, 72, 13, 12, 14, 72, 12, 15, 72, 14, 22, 1, 13, 72, 22, 13, 23, 22, 72, 15, 23, 72,
+    2, 23, 15, 16, 14, 0, 73, 15, 14, 16, 73, 14, 17, 73, 16, 24, 2, 15, 73, 24, 15, 25, 24, 73,
+    17, 25, 73, 3, 25, 17, 18, 16, 0, 74, 17, 16, 18, 74, 16, 19, 74, 18, 26, 3, 17, 74, 26, 17,
+    27, 26, 74, 19, 27, 74, 4, 27, 19, 20, 18, 0, 75, 19, 18, 20, 75, 18, 21, 75, 20, 28, 4, 19,
+    75, 28, 19, 29, 28, 75, 21, 29, 75, 5, 29, 21, 12, 20, 0, 76, 21, 20, 12, 76, 20, 13, 76, 12,
+    30, 5, 21, 76, 30, 21, 31, 30, 76, 13, 31, 76, 1, 31, 13, 32, 42, 1, 77, 43, 42, 32, 77, 42,
+    33, 77, 32, 60, 10, 43, 77, 60, 43, 61, 60, 77, 33, 61, 77, 6, 61, 33, 34, 44, 2, 78, 45, 44,
+    34, 78, 44, 35, 78, 34, 52, 6, 45, 78, 52, 45, 53, 52, 78, 35, 53, 78, 7, 53, 35, 36, 46, 3,
+    79, 47, 46, 36, 79, 46, 37, 79, 36, 54, 7, 47, 79, 54, 47, 55, 54, 79, 37, 55, 79, 8, 55, 37,
+    38, 48, 4, 80, 49, 48, 38, 80, 48, 39, 80, 38, 56, 8, 49, 80, 56, 49, 57, 56, 80, 39, 57, 80,
+    9, 57, 39, 40, 50, 5, 81, 51, 50, 40, 81, 50, 41, 81, 40, 58, 9, 51, 81, 58, 51, 59, 58, 81,
+    41, 59, 81, 10, 59, 41, 33, 45, 6, 82, 44, 45, 33, 82, 45, 32, 82, 33, 23, 2, 44, 82, 23, 44,
+    22, 23, 82, 32, 22, 82, 1, 22, 32, 35, 47, 7, 83, 46, 47, 35, 83, 47, 34, 83, 35, 25, 3, 46,
+    83, 25, 46, 24, 25, 83, 34, 24, 83, 2, 24, 34, 37, 49, 8, 84, 48, 49, 37, 84, 49, 36, 84, 37,
+    27, 4, 48, 84, 27, 48, 26, 27, 84, 36, 26, 84, 3, 26, 36, 39, 51, 9, 85, 50, 51, 39, 85, 51,
+    38, 85, 39, 29, 5, 50, 85, 29, 50, 28, 29, 85, 38, 28, 85, 4, 28, 38, 41, 43, 10, 86, 42, 43,
+    41, 86, 43, 40, 86, 41, 31, 1, 42, 86, 31, 42, 30, 31, 86, 40, 30, 86, 5, 30, 40, 62, 64, 11,
+    87, 65, 64, 62, 87, 64, 63, 87, 62, 53, 7, 65, 87, 53, 65, 52, 53, 87, 63, 52, 87, 6, 52, 63,
+    64, 66, 11, 88, 67, 66, 64, 88, 66, 65, 88, 64, 55, 8, 67, 88, 55, 67, 54, 55, 88, 65, 54, 88,
+    7, 54, 65, 66, 68, 11, 89, 69, 68, 66, 89, 68, 67, 89, 66, 57, 9, 69, 89, 57, 69, 56, 57, 89,
+    67, 56, 89, 8, 56, 67, 68, 70, 11, 90, 71, 70, 68, 90, 70, 69, 90, 68, 59, 10, 71, 90, 59, 71,
+    58, 59, 90, 69, 58, 90, 9, 58, 69, 70, 62, 11, 91, 63, 62, 70, 91, 62, 71, 91, 70, 61, 6, 63,
+    91, 61, 63, 60, 61, 91, 71, 60, 91, 10, 60, 71,
+];
+
+pub const DU_CONE_NUMVERTEX: usize = 18;
+pub const DU_CONE_NUMFACES: usize = 32;
+
+/// Unit spotlight cone vertices (`z in [0, 1]`, rim radius `0.5`, `du_cone.cpp:8-28`).
+pub const DU_CONE_VERTICES: [[f32; 3]; DU_CONE_NUMVERTEX] = [
+    [0.0000, 0.0000, 0.0000],
+    [0.5000, 0.0000, 1.0000],
+    [0.4619, 0.1913, 1.0000],
+    [0.3536, 0.3536, 1.0000],
+    [0.1913, 0.4619, 1.0000],
+    [-0.0000, 0.5000, 1.0000],
+    [-0.1913, 0.4619, 1.0000],
+    [-0.3536, 0.3536, 1.0000],
+    [-0.4619, 0.1913, 1.0000],
+    [-0.5000, -0.0000, 1.0000],
+    [-0.4619, -0.1913, 1.0000],
+    [-0.3536, -0.3536, 1.0000],
+    [-0.1913, -0.4619, 1.0000],
+    [0.0000, -0.5000, 1.0000],
+    [0.1913, -0.4619, 1.0000],
+    [0.3536, -0.3536, 1.0000],
+    [0.4619, -0.1913, 1.0000],
+    [0.0000, 0.0000, 1.0000],
+];
+
+/// Unit spotlight cone triangle index list (`du_cone_faces`, 32 triangles / 96 indices).
+pub const DU_CONE_INDICES: [u16; DU_CONE_NUMFACES * 3] = [
+    0, 2, 1, 0, 3, 2, 0, 4, 3, 0, 5, 4, 0, 6, 5, 0, 7, 6, 0, 8, 7, 0, 9, 8, 0, 10, 9, 0, 11, 10,
+    0, 12, 11, 0, 13, 12, 0, 14, 13, 0, 15, 14, 0, 16, 15, 0, 1, 16, 17, 1, 2, 17, 2, 3, 17, 3, 4,
+    17, 4, 5, 17, 5, 6, 17, 6, 7, 17, 7, 8, 17, 8, 9, 17, 9, 10, 17, 10, 11, 17, 11, 12, 17, 12,
+    13, 17, 13, 14, 17, 14, 15, 17, 15, 16, 17, 16, 1,
+];
+
+pub const DU_SPHERE_PART_NUMVERTEX: usize = 82;
+pub const DU_SPHERE_PART_NUMFACES: usize = 160;
+
+/// Omnipart cubemap face frustum-cap pyramid+sphere-sector vertices (`du_sphere_part.cpp:8-92`).
+pub const DU_SPHERE_PART_VERTICES: [[f32; 3]; DU_SPHERE_PART_NUMVERTEX] = [
+    [-0.288675, -0.288675, 0.288675],
+    [0.288675, -0.288675, 0.288675],
+    [-0.288675, 0.288675, 0.288675],
+    [0.288675, 0.288675, 0.288675],
+    [0.000000, 0.000000, 0.500000],
+    [0.000000, -0.353553, 0.353553],
+    [0.353553, 0.000000, 0.353553],
+    [0.000000, 0.353553, 0.353553],
+    [-0.353553, 0.000000, 0.353553],
+    [-0.204124, -0.204124, 0.408248],
+    [0.204124, -0.204124, 0.408248],
+    [0.204124, 0.204124, 0.408248],
+    [-0.204124, 0.204124, 0.408248],
+    [-0.166667, -0.333333, 0.333333],
+    [0.000000, -0.223607, 0.447214],
+    [-0.223607, 0.000000, 0.447214],
+    [-0.333333, -0.166667, 0.333333],
+    [0.333333, -0.166667, 0.333333],
+    [0.223607, 0.000000, 0.447214],
+    [0.166667, -0.333333, 0.333333],
+    [0.166667, 0.333333, 0.333333],
+    [0.000000, 0.223607, 0.447214],
+    [0.333333, 0.166667, 0.333333],
+    [-0.333333, 0.166667, 0.333333],
+    [-0.166667, 0.333333, 0.333333],
+    [-0.257248, -0.257248, 0.342997],
+    [-0.098058, -0.294174, 0.392232],
+    [-0.117851, -0.117851, 0.471405],
+    [-0.294174, -0.098058, 0.392232],
+    [0.257248, -0.257248, 0.342997],
+    [0.294174, -0.098058, 0.392232],
+    [0.117851, -0.117851, 0.471405],
+    [0.098058, -0.294174, 0.392232],
+    [0.257248, 0.257248, 0.342997],
+    [0.098058, 0.294174, 0.392232],
+    [0.117851, 0.117851, 0.471405],
+    [0.294174, 0.098058, 0.392232],
+    [-0.257248, 0.257248, 0.342997],
+    [-0.294174, 0.098058, 0.392232],
+    [-0.117851, 0.117851, 0.471405],
+    [-0.098058, 0.294174, 0.392232],
+    [-0.234261, -0.312348, 0.312348],
+    [-0.185695, -0.278543, 0.371391],
+    [-0.278543, -0.185695, 0.371391],
+    [-0.312348, -0.234261, 0.312348],
+    [0.000000, -0.300000, 0.400000],
+    [-0.109109, -0.218218, 0.436436],
+    [-0.087039, -0.348155, 0.348155],
+    [-0.121268, 0.000000, 0.485071],
+    [-0.218218, -0.109109, 0.436436],
+    [0.000000, -0.121268, 0.485071],
+    [-0.348155, -0.087039, 0.348155],
+    [-0.300000, 0.000000, 0.400000],
+    [0.312348, -0.234261, 0.312348],
+    [0.278543, -0.185695, 0.371391],
+    [0.185695, -0.278543, 0.371391],
+    [0.234261, -0.312348, 0.312348],
+    [0.300000, 0.000000, 0.400000],
+    [0.218218, -0.109109, 0.436436],
+    [0.348155, -0.087039, 0.348155],
+    [0.109109, -0.218218, 0.436436],
+    [0.121268, 0.000000, 0.485071],
+    [0.087039, -0.348155, 0.348155],
+    [0.234261, 0.312348, 0.312348],
+    [0.185695, 0.278543, 0.371391],
+    [0.278543, 0.185695, 0.371391],
+    [0.312348, 0.234261, 0.312348],
+    [0.000000, 0.300000, 0.400000],
+    [0.109109, 0.218218, 0.436436],
+    [0.087039, 0.348155, 0.348155],
+    [0.218218, 0.109109, 0.436436],
+    [0.000000, 0.121268, 0.485071],
+    [0.348155, 0.087039, 0.348155],
+    [-0.312348, 0.234261, 0.312348],
+    [-0.278543, 0.185695, 0.371391],
+    [-0.185695, 0.278543, 0.371391],
+    [-0.234261, 0.312348, 0.312348],
+    [-0.218218, 0.109109, 0.436436],
+    [-0.348155, 0.087039, 0.348155],
+    [-0.109109, 0.218218, 0.436436],
+    [-0.087039, 0.348155, 0.348155],
+    [0.000000, 0.000000, 0.000000],
+];
+
+/// Omnipart frustum-cap triangle indices (`du_sphere_part_faces`, 160 triangles / 480 indices).
+pub const DU_SPHERE_PART_INDICES: [u16; DU_SPHERE_PART_NUMFACES * 3] = [
+    0, 41, 25, 25, 44, 0, 13, 42, 25, 25, 41, 13, 9, 43, 25, 25, 42, 9, 16, 44, 25, 25, 43, 16,
+    5, 45, 26, 26, 47, 5, 14, 46, 26, 26, 45, 14, 9, 42, 26, 26, 46, 9, 13, 47, 26, 26, 42, 13,
+    4, 48, 27, 27, 50, 4, 15, 49, 27, 27, 48, 15, 9, 46, 27, 27, 49, 9, 14, 50, 27, 27, 46, 14,
+    8, 51, 28, 28, 52, 8, 16, 43, 28, 28, 51, 16, 9, 49, 28, 28, 43, 9, 15, 52, 28, 28, 49, 15,
+    1, 53, 29, 29, 56, 1, 17, 54, 29, 29, 53, 17, 10, 55, 29, 29, 54, 10, 19, 56, 29, 29, 55, 19,
+    6, 57, 30, 30, 59, 6, 18, 58, 30, 30, 57, 18, 10, 54, 30, 30, 58, 10, 17, 59, 30, 30, 54, 17,
+    4, 50, 31, 31, 61, 4, 14, 60, 31, 31, 50, 14, 10, 58, 31, 31, 60, 10, 18, 61, 31, 31, 58, 18,
+    5, 62, 32, 32, 45, 5, 19, 55, 32, 32, 62, 19, 10, 60, 32, 32, 55, 10, 14, 45, 32, 32, 60, 14,
+    3, 63, 33, 33, 66, 3, 20, 64, 33, 33, 63, 20, 11, 65, 33, 33, 64, 11, 22, 66, 33, 33, 65, 22,
+    7, 67, 34, 34, 69, 7, 21, 68, 34, 34, 67, 21, 11, 64, 34, 34, 68, 11, 20, 69, 34, 34, 64, 20,
+    4, 61, 35, 35, 71, 4, 18, 70, 35, 35, 61, 18, 11, 68, 35, 35, 70, 11, 21, 71, 35, 35, 68, 21,
+    6, 72, 36, 36, 57, 6, 22, 65, 36, 36, 72, 22, 11, 70, 36, 36, 65, 11, 18, 57, 36, 36, 70, 18,
+    2, 73, 37, 37, 76, 2, 23, 74, 37, 37, 73, 23, 12, 75, 37, 37, 74, 12, 24, 76, 37, 37, 75, 24,
+    8, 52, 38, 38, 78, 8, 15, 77, 38, 38, 52, 15, 12, 74, 38, 38, 77, 12, 23, 78, 38, 38, 74, 23,
+    4, 71, 39, 39, 48, 4, 21, 79, 39, 39, 71, 21, 12, 77, 39, 39, 79, 12, 15, 48, 39, 39, 77, 15,
+    7, 80, 40, 40, 67, 7, 24, 75, 40, 40, 80, 24, 12, 79, 40, 40, 75, 12, 21, 67, 40, 40, 79, 21,
+    41, 0, 81, 0, 44, 81, 13, 41, 81, 44, 16, 81, 5, 47, 81, 47, 13, 81, 51, 8, 81, 16, 51, 81,
+    53, 1, 81, 1, 56, 81, 17, 53, 81, 56, 19, 81, 6, 59, 81, 59, 17, 81, 62, 5, 81, 19, 62, 81,
+    63, 3, 81, 3, 66, 81, 20, 63, 81, 66, 22, 81, 7, 69, 81, 69, 20, 81, 72, 6, 81, 22, 72, 81,
+    73, 2, 81, 2, 76, 81, 23, 73, 81, 76, 24, 81, 8, 78, 81, 78, 23, 81, 80, 7, 81, 24, 80, 81,
+];
+
+pub const DU_BOX_NUMVERTEX: usize = 8;
+pub const DU_BOX_NUMFACES: usize = 12;
+pub const DU_BOX_NUMVERTEX2: usize = 36;
+
+/// Unit cube indexed corner vertices (`[-0.5, +0.5]^3`, `du_box.cpp:23-32`).
+pub const DU_BOX_VERTICES: [[f32; 3]; DU_BOX_NUMVERTEX] = [
+    [-0.5, -0.5, -0.5],
+    [-0.5, 0.5, -0.5],
+    [0.5, 0.5, -0.5],
+    [0.5, -0.5, -0.5],
+    [-0.5, 0.5, 0.5],
+    [-0.5, -0.5, 0.5],
+    [0.5, 0.5, 0.5],
+    [0.5, -0.5, 0.5],
+];
+
+/// Unit cube indexed triangle list (`du_box_faces`, 12 triangles / 36 indices).
+pub const DU_BOX_INDICES: [u16; DU_BOX_NUMFACES * 3] = [
+    0, 1, 2, 2, 3, 0, 3, 2, 6, 6, 7, 3, 6, 4, 5, 6, 5, 7, 4, 1, 5, 1, 0, 5, 3, 5, 0, 3, 7, 5, 1, 4,
+    6, 1, 6, 2,
+];
+
+/// Unit cube unindexed 36-vertex triangle list (`du_box_vertices2`, `du_box.cpp:8-21`).
+pub const DU_BOX_VERTICES2: [[f32; 3]; DU_BOX_NUMVERTEX2] = [
+    [-0.5, -0.5, -0.5],
+    [-0.5, 0.5, -0.5],
+    [0.5, 0.5, -0.5],
+    [0.5, 0.5, -0.5],
+    [0.5, -0.5, -0.5],
+    [-0.5, -0.5, -0.5],
+    [0.5, -0.5, -0.5],
+    [0.5, 0.5, -0.5],
+    [0.5, 0.5, 0.5],
+    [0.5, 0.5, 0.5],
+    [0.5, -0.5, 0.5],
+    [0.5, -0.5, -0.5],
+    [0.5, 0.5, 0.5],
+    [-0.5, 0.5, 0.5],
+    [-0.5, -0.5, 0.5],
+    [0.5, 0.5, 0.5],
+    [-0.5, -0.5, 0.5],
+    [0.5, -0.5, 0.5],
+    [-0.5, 0.5, 0.5],
+    [-0.5, 0.5, -0.5],
+    [-0.5, -0.5, 0.5],
+    [-0.5, 0.5, -0.5],
+    [-0.5, -0.5, -0.5],
+    [-0.5, -0.5, 0.5],
+    [0.5, -0.5, -0.5],
+    [-0.5, -0.5, 0.5],
+    [-0.5, -0.5, -0.5],
+    [0.5, -0.5, -0.5],
+    [0.5, -0.5, 0.5],
+    [-0.5, -0.5, 0.5],
+    [-0.5, 0.5, -0.5],
+    [-0.5, 0.5, 0.5],
+    [0.5, 0.5, 0.5],
+    [-0.5, 0.5, -0.5],
+    [0.5, 0.5, 0.5],
+    [0.5, 0.5, -0.5],
+];
+
+/// Canonical slice count for volumetric spotlight proxy stack (`r4_rendertarget.h:12`).
+pub const VOLUMETRIC_SLICES: usize = 100;
+
+/// Volumetric spotlight slice quad mesh (`400` vertices, `600` indices).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VolumetricSlicesMesh {
+    pub vertices: Vec<[f32; 3]>,
+    pub indices: Vec<u16>,
+}
+
+/// Build the 100-slice `[0..1, 0..1, t]` quad stack matching
+/// `CRenderTarget::accum_volumetric_geom_create` (`r4_rendertarget_accum_spot_geom.cpp:119-203`).
+pub fn build_volumetric_slices_mesh() -> VolumetricSlicesMesh {
+    let mut vertices = Vec::with_capacity(VOLUMETRIC_SLICES * 4);
+    let mut indices = Vec::with_capacity(VOLUMETRIC_SLICES * 6);
+    let mut t = 0.0f32;
+    let dt = 1.0f32 / (VOLUMETRIC_SLICES - 1) as f32;
+    for i in 0..VOLUMETRIC_SLICES {
+        vertices.push([0.0, 0.0, t]);
+        vertices.push([0.0, 1.0, t]);
+        vertices.push([1.0, 0.0, t]);
+        vertices.push([1.0, 1.0, t]);
+        t += dt;
+
+        let base = (i * 4) as u16;
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 1, base + 3]);
+    }
+    VolumetricSlicesMesh { vertices, indices }
+}
+
+/// Encode scalar material ID for `L_material.w` matching `CRender::apply_lmaterial` (`r4.h:295`).
+#[inline]
+pub fn encode_hemi_material_id(mtl: f32) -> f32 {
+    if mtl < 5.0 {
+        (mtl + 0.5) / 4.0
+    } else {
+        mtl
+    }
+}
+
+/// GPU constant payload matching `R_hemi` (`R_Backend_hemi.cpp`, `r4.h:291-301`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HemiMaterialGpuParams {
+    pub pos_faces: [f32; 4],
+    pub neg_faces: [f32; 4],
+    pub material: [f32; 4],
+    pub hotness: [f32; 4],
+    pub glowing: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<HemiMaterialGpuParams>() == 80);
+
+/// Configuration for `CRenderTarget::accum_volumetric` (`r4_rendertarget_accum_spot.cpp:415-489`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumetricLightConfig {
+    pub volumetric_distance: f32,
+    pub volumetric_quality: f32,
+    pub volumetric_intensity: f32,
+    /// `ps_ssfx_volumetric`: `(force_enable, intensity, quality, reserved)`.
+    pub ssfx_volumetric: [f32; 4],
+    pub is_player_light: bool,
+    pub spot_accum: SpotAccumConfig,
+}
+
+impl Default for VolumetricLightConfig {
+    fn default() -> Self {
+        Self {
+            volumetric_distance: 1.0,
+            volumetric_quality: 1.0,
+            volumetric_intensity: 1.0,
+            ssfx_volumetric: [1.0, 1.0, 3.0, 1.0],
+            is_player_light: false,
+            spot_accum: SpotAccumConfig::default(),
+        }
+    }
+}
+
+/// GPU shader constants and draw slice counts for `accum_volumetric`
+/// (`r4_rendertarget_accum_spot.cpp:386-626`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumetricSpotParams {
+    pub m_shadow: XRayMatrix,
+    pub m_lmap_rows: [[f32; 4]; 2],
+    /// `[view_x, view_y, view_z, att_factor]` (`Ldynamic_pos`).
+    pub dynamic_pos: [f32; 4],
+    /// `[r, g, b, spec]` (`Ldynamic_color`).
+    pub dynamic_color: [f32; 4],
+    /// View-space AABB minimum `[x1, y1, z1, 0.0]` (`vMinBounds`).
+    pub v_min_bounds: [f32; 4],
+    /// View-space AABB maximum `[x2, y2, z1 + (z2 - z1) / quality_normalized, 0.0]` (`vMaxBounds`).
+    pub v_max_bounds: [f32; 4],
+    /// 6 camera clip-space user clip planes `FrustumClipPlane[0..6]`.
+    pub frustum_clip_planes: [[f32; 4]; 6],
+    pub num_slices: u32,
+    pub vertex_count: u32,
+    pub primitive_count: u32,
+    pub quality_normalized: f32,
+}
+
+/// Transform world-space frustum clip planes to negated camera clip space matching
+/// `r4_rendertarget_accum_spot.cpp:564-576` (`PlaneTransform = transpose(mInvFullTransform)`).
+pub fn transform_volumetric_clip_planes(
+    inv_full_transform: &XRayMatrix,
+    planes: &[crate::hom::Plane],
+) -> [[f32; 4]; 6] {
+    let mut out = [[0.0f32, 0.0, 0.0, 1.0]; 6];
+    // Transpose(inv_full_transform) * row_vec(plane): out[col] = sum_row plane[row] * inv[col][row]
+    for (i, plane) in planes.iter().take(6).enumerate() {
+        let p = [plane.n[0], plane.n[1], plane.n[2], plane.d];
+        for col in 0..4 {
+            let v = p[0] * inv_full_transform[col][0]
+                + p[1] * inv_full_transform[col][1]
+                + p[2] * inv_full_transform[col][2]
+                + p[3] * inv_full_transform[col][3];
+            out[i][col] = -v;
+        }
+    }
+    out
+}
+
+/// Compute all volumetric spotlight shader inputs (`vMinBounds`, `vMaxBounds`, `FrustumClipPlane`,
+/// slice counts & attenuated intensity) matching `r4_rendertarget_accum_spot.cpp:386-626`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_volumetric_spot_params(
+    light: &DynamicLight,
+    smap_xform: &LightSmapXform,
+    atlas_rect: SmapRect,
+    camera_pos: [f32; 3],
+    view_matrix: &XRayMatrix,
+    inv_view_matrix: &XRayMatrix,
+    inv_full_transform: &XRayMatrix,
+    vol_cfg: &VolumetricLightConfig,
+) -> VolumetricSpotParams {
+    let spot = compute_spot_accum_constants(
+        light,
+        smap_xform,
+        atlas_rect,
+        camera_pos,
+        view_matrix,
+        inv_view_matrix,
+        &vol_cfg.spot_accum,
+    );
+
+    let mut frustum = ClipFrustum::from_view_proj(&smap_xform.combine, frustum_planes::ALL);
+    if frustum.planes.len() >= 6 {
+        let far_d = frustum.planes[4].d;
+        let near_d = frustum.planes[5].d;
+        frustum.planes[4].d -= (far_d + near_d) * (1.0 - vol_cfg.volumetric_distance);
+    }
+    let frustum_clip_planes = transform_volumetric_clip_planes(inv_full_transform, &frustum.planes);
+
+    let (sp_center, sp_radius) = light.spatial_sphere();
+    let scaled_radius = sp_radius * vol_cfg.volumetric_distance;
+    let pt_world = [
+        (sp_center[0] - light.position[0]) * vol_cfg.volumetric_distance + light.position[0],
+        (sp_center[1] - light.position[1]) * vol_cfg.volumetric_distance + light.position[1],
+        (sp_center[2] - light.position[2]) * vol_cfg.volumetric_distance + light.position[2],
+    ];
+    let pt_view = matrix_transform_point(view_matrix, pt_world);
+    let aabb_min = [
+        pt_view[0] - scaled_radius,
+        pt_view[1] - scaled_radius,
+        pt_view[2] - scaled_radius,
+    ];
+    let aabb_max = [
+        pt_view[0] + scaled_radius,
+        pt_view[1] + scaled_radius,
+        pt_view[2] + scaled_radius,
+    ];
+
+    let lod = light.compute_lod(
+        camera_pos,
+        vol_cfg.spot_accum.slight_fade,
+        vol_cfg.spot_accum.r_ssa_glod_start,
+        vol_cfg.spot_accum.r_ssa_glod_end,
+    );
+    let mut clr = [
+        light.color_rgb[0] * vol_cfg.volumetric_distance,
+        light.color_rgb[1] * vol_cfg.volumetric_distance,
+        light.color_rgb[2] * vol_cfg.volumetric_distance,
+    ];
+
+    let (num_slices, quality_normalized) = if vol_cfg.ssfx_volumetric[0] <= 0.0 {
+        let slices = ((VOLUMETRIC_SLICES as f32 * vol_cfg.volumetric_quality) as i32).max(10) as u32;
+        let q = (slices as f32 / VOLUMETRIC_SLICES as f32).max(1e-4);
+        let scale = (vol_cfg.volumetric_intensity / q) * lod;
+        clr[0] *= scale;
+        clr[1] *= scale;
+        clr[2] *= scale;
+        (slices, q)
+    } else {
+        let q_raw = vol_cfg.ssfx_volumetric[2].max(1e-4);
+        let slices = ((24.0 * q_raw) as i32).max(1) as u32;
+        let intensity_mod =
+            if light.light_type == RenderLightType::Omnipart || vol_cfg.is_player_light {
+                0.2
+            } else {
+                1.0
+            };
+        let scale = ((vol_cfg.volumetric_intensity * intensity_mod) / q_raw) * lod;
+        clr[0] *= scale;
+        clr[1] *= scale;
+        clr[2] *= scale;
+        (slices, (slices as f32 / 120.0).max(1e-4))
+    };
+
+    let draw_slices = num_slices.min(VOLUMETRIC_SLICES as u32);
+    let l_spec = compute_u_diffuse2s(clr, &vol_cfg.spot_accum.gloss);
+    let l_pos = matrix_transform_point(view_matrix, light.position);
+    let att_r = (vol_cfg.volumetric_distance * light.range * 0.95).max(1e-4);
+    let att_factor = 1.0 / (att_r * att_r);
+
+    VolumetricSpotParams {
+        m_shadow: spot.m_shadow,
+        m_lmap_rows: spot.m_lmap_rows,
+        dynamic_pos: [l_pos[0], l_pos[1], l_pos[2], att_factor],
+        dynamic_color: [clr[0], clr[1], clr[2], l_spec],
+        v_min_bounds: [aabb_min[0], aabb_min[1], aabb_min[2], 0.0],
+        v_max_bounds: [
+            aabb_max[0],
+            aabb_max[1],
+            aabb_min[2] + (aabb_max[2] - aabb_min[2]) / quality_normalized,
+            0.0,
+        ],
+        frustum_clip_planes,
+        num_slices,
+        vertex_count: draw_slices * 4,
+        primitive_count: draw_slices * 2,
+        quality_normalized,
+    }
 }
 
 #[cfg(test)]
@@ -1273,5 +1878,146 @@ mod tests {
         assert!(tracker.hemi_cube[hemi_cube_faces::POS_X] > tracker.hemi_cube[hemi_cube_faces::NEG_X]);
         assert!(tracker.luminosity() > 0.1);
         assert!(tracker.tracked_lights[0].energy > 0.5);
+    }
+
+    #[test]
+    fn canonical_volume_meshes_hemi_gpu_params_and_volumetric_spot() {
+        assert_eq!(DU_SPHERE_VERTICES.len(), DU_SPHERE_NUMVERTEX);
+        assert_eq!(DU_SPHERE_INDICES.len(), DU_SPHERE_NUMFACES * 3);
+        assert!(DU_SPHERE_INDICES.iter().all(|&i| (i as usize) < DU_SPHERE_NUMVERTEX));
+        for &v in &DU_SPHERE_VERTICES {
+            let norm = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            assert!((norm - 1.0).abs() < 1e-3);
+        }
+
+        assert_eq!(DU_CONE_VERTICES.len(), DU_CONE_NUMVERTEX);
+        assert_eq!(DU_CONE_INDICES.len(), DU_CONE_NUMFACES * 3);
+        assert!(DU_CONE_INDICES.iter().all(|&i| (i as usize) < DU_CONE_NUMVERTEX));
+
+        assert_eq!(DU_SPHERE_PART_VERTICES.len(), DU_SPHERE_PART_NUMVERTEX);
+        assert_eq!(DU_SPHERE_PART_INDICES.len(), DU_SPHERE_PART_NUMFACES * 3);
+        assert!(DU_SPHERE_PART_INDICES.iter().all(|&i| (i as usize) < DU_SPHERE_PART_NUMVERTEX));
+
+        assert_eq!(DU_BOX_VERTICES.len(), DU_BOX_NUMVERTEX);
+        assert_eq!(DU_BOX_INDICES.len(), DU_BOX_NUMFACES * 3);
+        assert!(DU_BOX_INDICES.iter().all(|&i| (i as usize) < DU_BOX_NUMVERTEX));
+        assert_eq!(DU_BOX_VERTICES2.len(), DU_BOX_NUMVERTEX2);
+
+        let slices = build_volumetric_slices_mesh();
+        assert_eq!(slices.vertices.len(), VOLUMETRIC_SLICES * 4);
+        assert_eq!(slices.indices.len(), VOLUMETRIC_SLICES * 6);
+        assert!(slices.indices.iter().all(|&i| (i as usize) < slices.vertices.len()));
+        assert_eq!(slices.vertices[0], [0.0, 0.0, 0.0]);
+        assert!((slices.vertices[slices.vertices.len() - 1][2] - 1.0).abs() < 1e-4);
+
+        assert!((encode_hemi_material_id(0.0) - 0.125).abs() < 1e-6);
+        assert!((encode_hemi_material_id(1.0) - 0.375).abs() < 1e-6);
+        assert_eq!(encode_hemi_material_id(5.0), 5.0);
+
+        let mut tracker = ObjectLightTracker::new();
+        tracker.hemi_smooth = 0.8;
+        tracker.sun_smooth = 0.4;
+        tracker.hemi_cube_smooth = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let hemi = tracker.to_hemi_gpu_params(1.0, [0.25, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 0.5]);
+        assert_eq!(hemi.pos_faces, [0.1, 0.2, 0.3, 0.0]);
+        assert_eq!(hemi.neg_faces, [0.4, 0.5, 0.6, 0.0]);
+        assert!((hemi.material[0] - 0.6).abs() < 1e-6);
+        assert!((hemi.material[1] - 0.3).abs() < 1e-6);
+        assert!((hemi.material[3] - 0.375).abs() < 1e-6);
+        assert_eq!(hemi.hotness, [0.25, 0.0, 0.0, 1.0]);
+        assert_eq!(hemi.glowing, [1.0, 0.0, 0.0, 0.5]);
+
+        let spot = DynamicLight {
+            light_type: RenderLightType::Spot,
+            position: [0.0, 2.0, 0.0],
+            direction: [0.0, 0.0, 1.0],
+            range: 10.0,
+            cone_rad: 60.0f32.to_radians(),
+            is_shadowed: true,
+            color_rgb: [1.0, 0.8, 0.6],
+            ..DynamicLight::default()
+        };
+        let xf = spot.compute_smap_xform([0.0, 2.0, -5.0], &LightSmapConfig::default());
+        let rect = SmapRect::setup([0, 0], xf.size);
+        let cam_view = matrix_build_camera_dir([0.0, 2.0, -5.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]);
+        let inv_view = matrix_invert_44(&cam_view).unwrap();
+        let proj = matrix_build_projection(67.5f32.to_radians(), 9.0 / 16.0, 0.2, 200.0);
+        let full = matrix_mul_44(&proj, &cam_view);
+        let inv_full = matrix_invert_44(&full).unwrap();
+
+        let vanilla_cfg = VolumetricLightConfig {
+            ssfx_volumetric: [0.0, 1.0, 3.0, 1.0],
+            ..VolumetricLightConfig::default()
+        };
+        let v_params = compute_volumetric_spot_params(
+            &spot,
+            &xf,
+            rect,
+            [0.0, 2.0, -5.0],
+            &cam_view,
+            &inv_view,
+            &inv_full,
+            &vanilla_cfg,
+        );
+        assert_eq!(v_params.num_slices, 100);
+        assert_eq!(v_params.vertex_count, 400);
+        assert_eq!(v_params.primitive_count, 200);
+        assert_eq!(v_params.quality_normalized, 1.0);
+        assert!(v_params
+            .frustum_clip_planes
+            .iter()
+            .flatten()
+            .all(|x| x.is_finite()));
+
+        // A world point inside the spotlight cone maps to clip coordinates where every
+        // transformed clip plane evaluates non-negative.
+        let pt_world = [0.0f32, 2.0, 3.0];
+        let pt_clip = [
+            pt_world[0] * full[0][0] + pt_world[1] * full[1][0] + pt_world[2] * full[2][0] + full[3][0],
+            pt_world[0] * full[0][1] + pt_world[1] * full[1][1] + pt_world[2] * full[2][1] + full[3][1],
+            pt_world[0] * full[0][2] + pt_world[1] * full[1][2] + pt_world[2] * full[2][2] + full[3][2],
+            pt_world[0] * full[0][3] + pt_world[1] * full[1][3] + pt_world[2] * full[2][3] + full[3][3],
+        ];
+        for cp in &v_params.frustum_clip_planes {
+            let signed = pt_clip[0] * cp[0] + pt_clip[1] * cp[1] + pt_clip[2] * cp[2] + pt_clip[3] * cp[3];
+            assert!(signed >= -1e-4, "expected interior clip point >= 0, got {signed}");
+        }
+
+        let ssfx_cfg = VolumetricLightConfig::default();
+        let s_params = compute_volumetric_spot_params(
+            &spot,
+            &xf,
+            rect,
+            [0.0, 2.0, -5.0],
+            &cam_view,
+            &inv_view,
+            &inv_full,
+            &ssfx_cfg,
+        );
+        assert_eq!(s_params.num_slices, 72);
+        assert_eq!(s_params.vertex_count, 288);
+        assert_eq!(s_params.primitive_count, 144);
+        assert!((s_params.quality_normalized - 72.0 / 120.0).abs() < 1e-6);
+        assert!(s_params.v_max_bounds[2] > s_params.v_min_bounds[2]);
+
+        let max_ssfx_cfg = VolumetricLightConfig {
+            ssfx_volumetric: [1.0, 1.0, 5.0, 1.0],
+            is_player_light: true,
+            ..VolumetricLightConfig::default()
+        };
+        let p_params = compute_volumetric_spot_params(
+            &spot,
+            &xf,
+            rect,
+            [0.0, 2.0, -5.0],
+            &cam_view,
+            &inv_view,
+            &inv_full,
+            &max_ssfx_cfg,
+        );
+        assert_eq!(p_params.num_slices, 120);
+        assert_eq!(p_params.vertex_count, (VOLUMETRIC_SLICES * 4) as u32);
+        assert_eq!(p_params.primitive_count, (VOLUMETRIC_SLICES * 2) as u32);
+        assert!(p_params.dynamic_color[0] < s_params.dynamic_color[0]);
     }
 }

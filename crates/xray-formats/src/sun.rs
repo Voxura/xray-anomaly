@@ -5,10 +5,11 @@
 //! - `src/Layers/xrRenderPC_R3/r3_R_sun_support.h` (`FixedConvexVolume`, `DumbConvexVolume`)
 //! - `src/xrCore/_matrix.h` (4x4 multiplication, `mulA_44` / `mulB_44`, affine/full inverses)
 
-use crate::camera::matrix_build_camera_dir;
+use crate::camera::{matrix_build_camera_dir, matrix_build_projection};
 use crate::hom::{ClipFrustum, Plane};
 use crate::ogf::{
-    matrix_mul_44, matrix_scale, matrix_transform_projected, XRayMatrix, XRAY_IDENTITY_MATRIX,
+    matrix_mul_44, matrix_scale, matrix_transform_point, matrix_transform_projected, XRayMatrix,
+    XRAY_IDENTITY_MATRIX,
 };
 use crate::skinning::matrix_transform_dir;
 use crate::weather::dir_from_hp;
@@ -969,6 +970,257 @@ impl CloudsShadowState {
     }
 }
 
+/// Dynamic wet-surface rain shadow settings (`xrRender_console.cpp:466, 496-498`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RainWetSurfConfig {
+    pub near: f32,
+    pub far: f32,
+    pub sm_res: u32,
+    pub ssfx_gloss_method: i32,
+    pub smap_size: u32,
+}
+
+impl Default for RainWetSurfConfig {
+    fn default() -> Self {
+        Self {
+            near: 10.0,
+            far: 30.0,
+            sm_res: 256,
+            ssfx_gloss_method: 0,
+            smap_size: 2048,
+        }
+    }
+}
+
+/// SSFX rain streak & splash parameters (`ps_ssfx_rain_*`, `xrRender_console.cpp:476-479`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsfxRainConfig {
+    pub rain_1: [f32; 4],
+    pub rain_2: [f32; 4],
+    pub rain_3: [f32; 4],
+    pub drops_setup: [f32; 4],
+}
+
+impl Default for SsfxRainConfig {
+    fn default() -> Self {
+        Self {
+            rain_1: [2.0, 0.1, 0.6, 2.0],
+            rain_2: [0.5, 0.1, 1.0, 0.5],
+            rain_3: [0.5, 1.0, 0.0, 0.0],
+            drops_setup: [2500.0, 15.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// Viewport dimensions `[w / 8.0, h / 8.0]` for `phase_ssfx_rain` (`r4_rendertarget_phase_rain.cpp:22`).
+#[inline]
+pub fn ssfx_rain_pass_viewport(screen_w: u32, screen_h: u32) -> [f32; 2] {
+    [screen_w.max(1) as f32 / 8.0, screen_h.max(1) as f32 / 8.0]
+}
+
+/// Dynamic rain shadow frustum, pixel-snapped SMAP transform, and `draw_rain` GPU parameters
+/// (`r4_R_rain.cpp:30-245`, `r4_rendertarget_draw_rain.cpp:18-170, 253-259`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RainShadowResult {
+    pub rain_factor: f32,
+    pub bounding_sphere_radius: f32,
+    pub cull_frustum: ClipFrustum,
+    pub cull_cop: [f32; 3],
+    pub cull_xform: XRayMatrix,
+    pub smap_viewport_limit: u32,
+    pub m_shadow: XRayMatrix,
+    pub m_sunmask: XRayMatrix,
+    pub l_dynamic_dir: [f32; 4],
+    pub world_x: [f32; 4],
+    pub world_z: [f32; 4],
+    pub rain_falloff: [f32; 4],
+    pub clip_d_z: f32,
+}
+
+/// Compute dynamic wet-surface rain shadow setup & accumulation shader inputs matching
+/// `CRender::render_rain` and `CRenderTarget::draw_rain`. Returns `None` if `rain_factor < EPS_L`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_rain_shadow_setup(
+    rain_density: f32,
+    wetness_factor: f32,
+    cam_pos: [f32; 3],
+    cam_dir: [f32; 3],
+    fov_deg: f32,
+    aspect: f32,
+    viewport_near: f32,
+    view: &XRayMatrix,
+    inv_view: &XRayMatrix,
+    full_transform: &XRayMatrix,
+    cfg: &RainWetSurfConfig,
+) -> Option<RainShadowResult> {
+    const SOURCE_OFFSET: f32 = 10_000.0;
+    const TWEAK_RAIN_COP_OFFS: f32 = 1200.0;
+    const TWEAK_RAIN_ORTHO_OFFS: f32 = 1000.0;
+
+    let rain_factor = if cfg.ssfx_gloss_method == 0 {
+        rain_density
+    } else {
+        wetness_factor
+    };
+    if !rain_factor.is_finite() || rain_factor < EPS_L {
+        return None;
+    }
+
+    let rain_far = cfg.far.max(viewport_near + 0.1);
+    let cam_dir_norm = normalize3_or(cam_dir, [0.0, 0.0, 1.0]);
+    let rain_dir = [0.0f32, -1.0, 0.0];
+    let rain_pos = [cam_pos[0], cam_pos[1] + SOURCE_OFFSET, cam_pos[2]];
+
+    let ex_project = matrix_build_projection(fov_deg.to_radians(), aspect, viewport_near, rain_far);
+    let ex_full = matrix_mul_44(&ex_project, view);
+    let ex_full_inv = matrix_invert_44(&ex_full)?;
+
+    let a = (fov_deg.to_radians() * 0.5).tan();
+    let c = ((fov_deg * aspect).to_radians() * 0.5).tan();
+    let b_2 = rain_far * rain_far * (1.0 + a * a + c * c);
+    let bounding_sphere_radius = b_2 / (2.0 * rain_far);
+
+    let mut hull = DumbConvexVolume::from_frustum_inv(&ex_full_inv);
+    let base_points: [[f32; 3]; 8] = std::array::from_fn(|i| hull.points[i]);
+    let cull_planes = hull.compute_caster_model(rain_dir);
+    let cull_frustum = ClipFrustum {
+        planes: cull_planes,
+    };
+
+    let cull_cop = [
+        cam_pos[0] - rain_dir[0] * TWEAK_RAIN_COP_OFFS + bounding_sphere_radius * cam_dir_norm[0],
+        cam_pos[1] - rain_dir[1] * TWEAK_RAIN_COP_OFFS,
+        cam_pos[2] - rain_dir[2] * TWEAK_RAIN_COP_OFFS + bounding_sphere_radius * cam_dir_norm[2],
+    ];
+
+    let l_right = [1.0f32, 0.0, 0.0];
+    let l_up = normalize3_or(cross3(rain_dir, l_right), [0.0, 0.0, 1.0]);
+    let mdir_view = matrix_build_camera_dir(rain_pos, rain_dir, l_up);
+
+    let mut min_z = f32::INFINITY;
+    let mut max_z = f32::NEG_INFINITY;
+    for &p in &base_points {
+        let xf = matrix_transform_point(&mdir_view, p);
+        min_z = min_z.min(xf[2]);
+        max_z = max_z.max(xf[2]);
+    }
+    min_z -= EPS_L;
+    let _ = max_z + EPS_L;
+
+    let v_rect_x = bounding_sphere_radius * cam_dir_norm[0];
+    let v_rect_z = bounding_sphere_radius * cam_dir_norm[2];
+    let min_x = -bounding_sphere_radius + v_rect_x;
+    let max_x = bounding_sphere_radius + v_rect_x;
+    let min_y = -bounding_sphere_radius + v_rect_z;
+    let max_y = bounding_sphere_radius + v_rect_z;
+
+    let mdir_project = matrix_ortho_off_center_lh(
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+        min_z - TWEAK_RAIN_ORTHO_OFFS,
+        min_z + 2.0 * TWEAK_RAIN_ORTHO_OFFS,
+    );
+    let mut cull_xform = matrix_mul_44(&mdir_project, &mdir_view);
+
+    let limit = cfg.smap_size.min(cfg.sm_res).max(1);
+    let smap_size_f = cfg.smap_size.max(1) as f32;
+    let view_dim = limit as f32;
+    let f_texel_offs = 0.5 / smap_size_f;
+    let m_viewport: XRayMatrix = [
+        [view_dim * 0.5, 0.0, 0.0, 0.0],
+        [0.0, -view_dim * 0.5, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [
+            view_dim * 0.5 + f_texel_offs,
+            view_dim * 0.5 + f_texel_offs,
+            0.0,
+            1.0,
+        ],
+    ];
+    let m_viewport_inv = matrix_invert_44(&m_viewport).unwrap_or(XRAY_IDENTITY_MATRIX);
+
+    let cam_proj = matrix_transform_projected(&cull_xform, [0.0, 0.0, 0.0]).unwrap_or([0.0; 3]);
+    let mut cam_pixel =
+        matrix_transform_projected(&m_viewport, cam_proj).unwrap_or([0.0, 0.0, 0.0]);
+    cam_pixel[0] = cam_pixel[0].floor();
+    cam_pixel[1] = cam_pixel[1].floor();
+    let cam_snapped = matrix_transform_projected(&m_viewport_inv, cam_pixel).unwrap_or(cam_proj);
+    let diff = [
+        cam_snapped[0] - cam_proj[0],
+        cam_snapped[1] - cam_proj[1],
+        cam_snapped[2] - cam_proj[2],
+    ];
+    let adjust = matrix_translate(diff);
+    cull_xform = matrix_mul_44(&adjust, &cull_xform);
+
+    // draw_rain shadow transform
+    let f_bias = -0.0001f32;
+    let view_dim_norm = limit as f32 / smap_size_f;
+    let m_texel_adjust: XRayMatrix = [
+        [view_dim_norm * 0.5, 0.0, 0.0, 0.0],
+        [0.0, -view_dim_norm * 0.5, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [
+            view_dim_norm * 0.5 + f_texel_offs,
+            view_dim_norm * 0.5 + f_texel_offs,
+            f_bias,
+            1.0,
+        ],
+    ];
+    let xf_project = matrix_mul_44(&m_texel_adjust, &cull_xform);
+    let m_shadow = matrix_mul_44(&xf_project, inv_view);
+
+    // draw_rain clouds shadow matrix (`m_xform = identity`, `w_shift = 0`, `scale(1,1,1)`)
+    let normal = dir_from_hp(1.0, 0.0);
+    let m_xform = XRAY_IDENTITY_MATRIX;
+    let local_normal = normalize3_or(matrix_transform_dir(&m_xform, normal), [0.0, 1.0, 0.0]);
+    let mut m_sunmask = matrix_mul_44(&m_xform, inv_view);
+    let m_s = matrix_scale(1.0, 1.0, 1.0);
+    m_sunmask = matrix_mul_44(&m_s, &m_sunmask);
+    let m_t = matrix_translate([
+        local_normal[0] * 0.0,
+        local_normal[1] * 0.0,
+        local_normal[2] * 0.0,
+    ]);
+    m_sunmask = matrix_mul_44(&m_t, &m_sunmask);
+
+    let draw_rain_far = if cfg.ssfx_gloss_method == 0 {
+        cfg.far
+    } else {
+        250.0
+    };
+    let center_pt = [
+        cam_pos[0] + cam_dir_norm[0] * draw_rain_far,
+        cam_pos[1] + cam_dir_norm[1] * draw_rain_far,
+        cam_pos[2] + cam_dir_norm[2] * draw_rain_far,
+    ];
+    let clip_d_z = matrix_transform_projected(full_transform, center_pt)
+        .map(|p| p[2])
+        .unwrap_or(1.0);
+
+    let l_dir_v = normalize3_or(matrix_transform_dir(view, rain_dir), [0.0, -1.0, 0.0]);
+    let wx_v = normalize3_or(matrix_transform_dir(view, [1.0, 0.0, 0.0]), [1.0, 0.0, 0.0]);
+    let wz_v = normalize3_or(matrix_transform_dir(view, [0.0, 0.0, 1.0]), [0.0, 0.0, 1.0]);
+
+    Some(RainShadowResult {
+        rain_factor,
+        bounding_sphere_radius,
+        cull_frustum,
+        cull_cop,
+        cull_xform,
+        smap_viewport_limit: limit,
+        m_shadow,
+        m_sunmask,
+        l_dynamic_dir: [l_dir_v[0], l_dir_v[1], l_dir_v[2], 0.0],
+        world_x: [wx_v[0], wx_v[1], wx_v[2], 0.0],
+        world_z: [wz_v[0], wz_v[1], wz_v[2], 0.0],
+        rain_falloff: [cfg.near, cfg.far, 0.0, 0.0],
+        clip_d_z,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,5 +1316,97 @@ mod tests {
         let c1 = clouds.step_and_matrix(2.0, sun_dir, 0.5, 500.0, &inv_view);
         assert!((clouds.w_shift - (-0.0005 - 0.005 * 0.5 * 2.0)).abs() < 1e-6);
         assert_ne!(c0[3][1], c1[3][1]);
+    }
+
+    #[test]
+    fn rain_shadow_setup_and_ssfx_rain_defaults() {
+        let view = matrix_build_camera_dir([10.0, 2.0, -5.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]);
+        let inv_view = matrix_invert_44(&view).unwrap();
+        let proj = matrix_build_projection(67.5f32.to_radians(), 9.0 / 16.0, 0.2, 200.0);
+        let full = matrix_mul_44(&proj, &view);
+
+        let cfg = RainWetSurfConfig::default();
+        assert!(compute_rain_shadow_setup(
+            0.0,
+            0.8,
+            [10.0, 2.0, -5.0],
+            [0.0, 0.0, 1.0],
+            67.5,
+            9.0 / 16.0,
+            0.2,
+            &view,
+            &inv_view,
+            &full,
+            &cfg,
+        )
+        .is_none());
+
+        let rain = compute_rain_shadow_setup(
+            0.65,
+            0.2,
+            [10.0, 2.0, -5.0],
+            [0.0, 0.0, 1.0],
+            67.5,
+            9.0 / 16.0,
+            0.2,
+            &view,
+            &inv_view,
+            &full,
+            &cfg,
+        )
+        .expect("rain density active");
+        assert!((rain.rain_factor - 0.65).abs() < 1e-6);
+        assert_eq!(rain.smap_viewport_limit, 256);
+        assert_eq!(rain.rain_falloff, [10.0, 30.0, 0.0, 0.0]);
+        assert!(rain.bounding_sphere_radius > 15.0);
+        assert!(!rain.cull_frustum.planes.is_empty());
+        assert!(rain.m_shadow.iter().flatten().all(|v| v.is_finite()));
+        assert!(rain.m_sunmask.iter().flatten().all(|v| v.is_finite()));
+
+        // Verify origin pixel snap lands cleanly on integer texel boundaries.
+        let view_dim = rain.smap_viewport_limit as f32;
+        let texel_offs = 0.5 / cfg.smap_size as f32;
+        let m_viewport: XRayMatrix = [
+            [view_dim * 0.5, 0.0, 0.0, 0.0],
+            [0.0, -view_dim * 0.5, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [
+                view_dim * 0.5 + texel_offs,
+                view_dim * 0.5 + texel_offs,
+                0.0,
+                1.0,
+            ],
+        ];
+        let origin_proj = matrix_transform_projected(&rain.cull_xform, [0.0, 0.0, 0.0]).unwrap();
+        let origin_px = matrix_transform_projected(&m_viewport, origin_proj).unwrap();
+        assert!((origin_px[0] - origin_px[0].round()).abs() < 1e-3);
+        assert!((origin_px[1] - origin_px[1].round()).abs() < 1e-3);
+
+        // SSFX gloss method switches activation signal to `wetness_factor` and `draw_rain` clip to 250m.
+        let ssfx_cfg = RainWetSurfConfig {
+            ssfx_gloss_method: 1,
+            ..cfg
+        };
+        let wet = compute_rain_shadow_setup(
+            0.0,
+            0.75,
+            [10.0, 2.0, -5.0],
+            [0.0, 0.0, 1.0],
+            67.5,
+            9.0 / 16.0,
+            0.2,
+            &view,
+            &inv_view,
+            &full,
+            &ssfx_cfg,
+        )
+        .expect("wetness factor active");
+        assert!((wet.rain_factor - 0.75).abs() < 1e-6);
+        assert!(wet.clip_d_z > rain.clip_d_z);
+
+        let ssfx_rain = SsfxRainConfig::default();
+        assert_eq!(ssfx_rain.rain_1, [2.0, 0.1, 0.6, 2.0]);
+        assert_eq!(ssfx_rain.drops_setup, [2500.0, 15.0, 0.0, 0.0]);
+        assert_eq!(ssfx_rain_pass_viewport(1920, 1080), [240.0, 135.0]);
     }
 }
