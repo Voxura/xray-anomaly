@@ -8,8 +8,11 @@
 //! - `src/Layers/xrRenderPC_R4/r4_rendertarget_phase_combine.cpp` (`combine_1`, `combine_2`, `tnmp_*`, `vignette_control`)
 //! - `src/Layers/xrRender/xr_effgamma.cpp` (`CGammaControl::GenLUT`)
 //! - `src/Layers/xrRender/Blender_Recorder_StandartBinding.cpp` (`hdr10_parameters1..10`)
+//! - `src/Layers/xrRender/rendertarget_phase_lut.cpp` & `src/Layers/xrRenderPC_R4/blender_lut.cpp`
+//! - `src/Layers/xrRender/r__occlusion.h` & `r__occlusion.cpp` (`R_occlusion`)
 //! - `gamedata/shaders/r3/{hdr10.h,combine_2_naa.ps,effects_sun.ps}`
 
+use crate::envelopes::{PostprocessGpuParams, PostprocessState};
 use crate::lighting::{compute_u_diffuse2s, GlossConfig, TEX_JITTER_SIZE};
 use crate::ogf::{matrix_mul_44, matrix_transform_point, XRayMatrix, XRAY_IDENTITY_MATRIX};
 use crate::particle_sim::ParticleRng;
@@ -2537,6 +2540,243 @@ pub fn ssfx_taa_schedule(dx10_msaa: bool) -> [SsfxTaaPassDesc; 3] {
     ]
 }
 
+// ============================================================================
+// Screen PPE Bridge, LUT Phase & Hardware Occlusion Pool
+// ============================================================================
+
+/// Prepared full-screen PPE pass outputs bridging [`PostprocessState`] and [`PostprocessNoiseState`]
+/// (`CRenderTarget::phase_pp`, `r4_rendertarget_phase_PP.cpp:114-172`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PostprocessPassPlan {
+    pub active: bool,
+    pub uses_color_map: bool,
+    /// Shader element index: `4` when color-grading LUT blending is active, else `0`.
+    pub shader_element: u32,
+    pub gpu_params: PostprocessGpuParams,
+    /// `[u0, v0, u1, v1]` (`u_calc_tc_duality_ss`).
+    pub right_uv: [f32; 4],
+    /// `[u0, v0, u1, v1]` (`u_calc_tc_duality_ss`).
+    pub left_uv: [f32; 4],
+    /// `[u0, v0, u1, v1]` (`u_calc_tc_noise`, zeroed when `active == false`).
+    pub noise_uv: [f32; 4],
+}
+
+/// Evaluate runtime PPE pass parameters and advance grain noise only when `state.is_active()`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_postprocess_pass_plan(
+    state: &PostprocessState,
+    noise_state: &mut PostprocessNoiseState,
+    dt_sec: f32,
+    noise_tex_w: u32,
+    noise_tex_h: u32,
+    rt_width: u32,
+    rt_height: u32,
+    device_width: u32,
+    device_height: u32,
+    noise_scale: f32,
+) -> PostprocessPassPlan {
+    let active = state.is_active();
+    let uses_color_map = state.uses_color_map();
+    let (right_uv, left_uv) = state.duality_uv_rects(rt_width, rt_height, device_height);
+    let noise_uv = if active {
+        noise_state.step_uv_rect(
+            dt_sec,
+            noise_tex_w,
+            noise_tex_h,
+            device_width,
+            device_height,
+            noise_scale,
+            state.noise_fps,
+        )
+    } else {
+        [0.0; 4]
+    };
+    PostprocessPassPlan {
+        active,
+        uses_color_map,
+        shader_element: if uses_color_map { 4 } else { 0 },
+        gpu_params: state.to_gpu_params(),
+        right_uv,
+        left_uv,
+        noise_uv,
+    }
+}
+
+pub const LUT_SHADER_NAME: &str = "pp_lut";
+pub const LUT_NOISE_TEXTURE: &str = "fx\\blue_noise";
+pub const LUT_ATLAS_TEXTURE: &str = "shaders\\lut_atlas";
+
+/// SSFX color-grading LUT console uniform `ps_ssfx_lut` (`xrRender_console.cpp:454`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SsfxLutConfig {
+    pub setup: [f32; 4],
+}
+
+/// Render-target and resource bindings for `CRenderTarget::phase_lut`
+/// (`rendertarget_phase_lut.cpp:25-52`, `blender_lut.cpp:15-27`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LutPassDesc {
+    pub dst_name: &'static str,
+    pub copy_to_name: &'static str,
+    pub shader_name: &'static str,
+    pub src_image_name: &'static str,
+    pub noise_texture: &'static str,
+    pub lut_atlas_texture: &'static str,
+    pub element_index: u8,
+}
+
+/// Build the DX11 render-target/resource descriptor for `CRenderTarget::phase_lut`.
+#[inline]
+pub fn lut_pass_desc(dx10_msaa: bool) -> LutPassDesc {
+    LutPassDesc {
+        dst_name: if dx10_msaa { "rt_Generic" } else { "rt_Color" },
+        copy_to_name: "rt_Generic_0",
+        shader_name: LUT_SHADER_NAME,
+        src_image_name: "rt_Generic_0",
+        noise_texture: LUT_NOISE_TEXTURE,
+        lut_atlas_texture: LUT_ATLAS_TEXTURE,
+        element_index: 0,
+    }
+}
+
+/// Default hardware occlusion query pool size (`occq_size = 2 * 768` in `r__occlusion.h:3`).
+pub const OCCQ_DEFAULT_LIMIT: u32 = 2 * 768;
+/// Sentinel handle matching `R_occlusion::iInvalidHandle` (`r__occlusion.h:24`).
+pub const OCCQ_INVALID_HANDLE: u32 = u32::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OcclusionQueryEntry {
+    order: u32,
+    slot: u32,
+}
+
+/// Active occlusion query allocation returned by [`OcclusionQueryPool::begin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OcclusionQueryAllocation {
+    pub handle: u32,
+    pub order: u32,
+    pub slot: u32,
+}
+
+/// Pure-Rust query heap slot & priority order manager matching `R_occlusion`
+/// (`src/Layers/xrRender/r__occlusion.h`, `r__occlusion.cpp`).
+#[derive(Debug, Clone)]
+pub struct OcclusionQueryPool {
+    enabled: bool,
+    capacity: u32,
+    pool: Vec<OcclusionQueryEntry>,
+    used: Vec<Option<OcclusionQueryEntry>>,
+    free_ids: Vec<u32>,
+}
+
+impl Default for OcclusionQueryPool {
+    fn default() -> Self {
+        Self::new(OCCQ_DEFAULT_LIMIT, true)
+    }
+}
+
+impl OcclusionQueryPool {
+    /// Allocate a pool of `limit` ordered query slots (`R_occlusion::occq_create`).
+    pub fn new(limit: u32, enabled: bool) -> Self {
+        let mut pool = Vec::with_capacity(limit as usize);
+        for it in 0..limit {
+            pool.push(OcclusionQueryEntry { order: it, slot: it });
+        }
+        // Keep highest `order` at index 0 and lowest `order` at `.last()` for O(1) pop().
+        pool.reverse();
+        Self {
+            enabled,
+            capacity: limit,
+            pool,
+            used: Vec::with_capacity(limit as usize),
+            free_ids: Vec::with_capacity(limit as usize),
+        }
+    }
+
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[inline]
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    #[inline]
+    pub fn available_count(&self) -> usize {
+        self.pool.len()
+    }
+
+    #[inline]
+    pub fn in_flight_count(&self) -> usize {
+        (self.capacity as usize).saturating_sub(self.pool.len())
+    }
+
+    /// Look up backend query slot index for an in-flight `handle`.
+    #[inline]
+    pub fn slot_for_handle(&self, handle: u32) -> Option<u32> {
+        if handle == OCCQ_INVALID_HANDLE {
+            return None;
+        }
+        self.used.get(handle as usize).and_then(|e| e.map(|q| q.slot))
+    }
+
+    /// Acquire the lowest-order free query slot matching `R_occlusion::occq_begin`.
+    pub fn begin(&mut self) -> Option<OcclusionQueryAllocation> {
+        if !self.enabled {
+            return None;
+        }
+        let q = self.pool.pop()?;
+        let handle = if let Some(id) = self.free_ids.pop() {
+            self.used[id as usize] = Some(q);
+            id
+        } else {
+            let id = self.used.len() as u32;
+            self.used.push(Some(q));
+            id
+        };
+        Some(OcclusionQueryAllocation {
+            handle,
+            order: q.order,
+            slot: q.slot,
+        })
+    }
+
+    /// Release `handle` back into the descending-order free pool (`R_occlusion::occq_get`).
+    pub fn complete(&mut self, handle: u32) -> Option<u32> {
+        if !self.enabled || handle == OCCQ_INVALID_HANDLE {
+            return None;
+        }
+        let entry = self.used.get_mut(handle as usize)?;
+        let q = entry.take()?;
+
+        let mut pos = self.pool.len();
+        while pos > 0 && self.pool[pos - 1].order < q.order {
+            pos -= 1;
+        }
+        self.pool.insert(pos, q);
+        self.free_ids.push(handle);
+        Some(q.slot)
+    }
+
+    /// Reset all queries to unused descending order (`0..capacity`).
+    pub fn reset(&mut self) {
+        self.pool.clear();
+        for it in 0..self.capacity {
+            self.pool.push(OcclusionQueryEntry { order: it, slot: it });
+        }
+        self.pool.reverse();
+        self.used.clear();
+        self.free_ids.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2995,5 +3235,84 @@ mod tests {
         assert_eq!(taa_no_msaa[2].kind, SsfxTaaPassKind::Sharpen);
         assert_eq!(taa_no_msaa[2].dst_name, "rt_Generic_0");
         assert_eq!(ssfx_taa_schedule(true)[1].dst_name, "rt_Generic");
+    }
+
+    #[test]
+    fn postprocess_pass_plan_lut_and_occlusion_pool() {
+        let mut noise = PostprocessNoiseState::new(7);
+        let idle = PostprocessState::identity();
+        let idle_plan = build_postprocess_pass_plan(
+            &idle,
+            &mut noise,
+            0.05,
+            64,
+            64,
+            1920,
+            1080,
+            1920,
+            1080,
+            1.0,
+        );
+        assert!(!idle_plan.active);
+        assert!(!idle_plan.uses_color_map);
+        assert_eq!(idle_plan.shader_element, 0);
+        assert_eq!(idle_plan.noise_uv, [0.0; 4]);
+
+        let active_cm = PostprocessState {
+            cm_influence: 0.75,
+            cm_interpolate: 0.25,
+            noise_intensity: 0.4,
+            noise_fps: 24.0,
+            duality_h: 0.02,
+            ..PostprocessState::identity()
+        };
+        let cm_plan = build_postprocess_pass_plan(
+            &active_cm,
+            &mut noise,
+            0.05,
+            64,
+            64,
+            1920,
+            1080,
+            1920,
+            1080,
+            1.0,
+        );
+        assert!(cm_plan.active && cm_plan.uses_color_map);
+        assert_eq!(cm_plan.shader_element, 4);
+        assert!(cm_plan.noise_uv[2] > cm_plan.noise_uv[0]);
+        assert!(cm_plan.right_uv[2] < cm_plan.left_uv[2]);
+
+        let lut_std = lut_pass_desc(false);
+        assert_eq!(lut_std.dst_name, "rt_Color");
+        assert_eq!(lut_std.copy_to_name, "rt_Generic_0");
+        assert_eq!(lut_std.shader_name, LUT_SHADER_NAME);
+        assert_eq!(lut_std.noise_texture, LUT_NOISE_TEXTURE);
+        assert_eq!(lut_std.lut_atlas_texture, LUT_ATLAS_TEXTURE);
+        assert_eq!(lut_pass_desc(true).dst_name, "rt_Generic");
+        assert_eq!(SsfxLutConfig::default().setup, [0.0; 4]);
+
+        assert_eq!(OCCQ_DEFAULT_LIMIT, 1536);
+        let mut pool = OcclusionQueryPool::new(3, true);
+        let q0 = pool.begin().unwrap();
+        let q1 = pool.begin().unwrap();
+        let q2 = pool.begin().unwrap();
+        assert_eq!((q0.order, q1.order, q2.order), (0, 1, 2));
+        assert!(pool.begin().is_none());
+        assert_eq!(pool.in_flight_count(), 3);
+        assert_eq!(pool.slot_for_handle(q1.handle), Some(q1.slot));
+
+        // Release higher-order q1 before q0: pool keeps descending order so q0 pops first next.
+        assert_eq!(pool.complete(q1.handle), Some(q1.slot));
+        assert_eq!(pool.complete(q0.handle), Some(q0.slot));
+        assert!(pool.complete(q0.handle).is_none());
+        assert!(pool.complete(OCCQ_INVALID_HANDLE).is_none());
+
+        let next = pool.begin().unwrap();
+        assert_eq!(next.order, 0);
+        assert_eq!(pool.begin().unwrap().order, 1);
+
+        pool.set_enabled(false);
+        assert!(pool.begin().is_none());
     }
 }

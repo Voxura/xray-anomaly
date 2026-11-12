@@ -5,18 +5,22 @@
 //! - `src/Layers/xrRenderPC_R4/SMAP_Allocator.h` & `r2_R_lights.cpp`
 //! - `src/Layers/xrRenderPC_R4/Light_Render_Direct_ComputeXFS.cpp`
 //! - `src/Layers/xrRender/light.cpp` & `src/Layers/xrRenderPC_R4/r2_types.h` (`u_diffuse2s`)
-//! - `src/Layers/xrRenderPC_R4/r4_rendertarget_accum_spot.cpp` & `r4_rendertarget_enable_scissor.cpp`
+//! - `src/Layers/xrRenderPC_R4/r4_rendertarget_accum_spot.cpp`, `accum_point.cpp`, `accum_reflected.cpp`, & `enable_scissor.cpp`
+//! - `src/Layers/xrRender/Light_Package.h` & `Light_Package.cpp`
+//! - `src/Layers/xrRenderPC_R4/light_GI.cpp` & `r2_R_lights.cpp` (`render_indirect`)
 //! - `src/Layers/xrRender/LightTrack.h` & `LightTrack.cpp`
 
 use std::f32::consts::FRAC_1_SQRT_2;
 
 use crate::camera::{matrix_build_camera_dir, matrix_build_projection, matrix_build_projection_ortho};
-use crate::hom::{frustum_planes, ClipFrustum};
+use crate::cform::{CformBvh, RaycastOptions};
+use crate::hom::{frustum_planes, ClipFrustum, FrustumVisibility};
 use crate::level::{d3d_light_type, LevelLight};
 use crate::ogf::{
-    matrix_mul_43, matrix_mul_44, matrix_scale, matrix_transform_point, XRayMatrix,
-    XRAY_IDENTITY_MATRIX,
+    matrix_mul_43, matrix_mul_44, matrix_scale, matrix_transform_point,
+    matrix_transform_projected, XRayMatrix, XRAY_IDENTITY_MATRIX,
 };
+use crate::skinning::matrix_transform_dir;
 
 pub const SMAP_NEAR_PLANE: f32 = 0.1;
 pub const SMAP_ADAPT_MIN: u32 = 768;
@@ -686,6 +690,86 @@ impl DynamicLight {
             combine,
         }
     }
+
+    /// Select deferred accumulation shader element index matching `accum_point` / `accum_spot`
+    /// (`SE_L_*`, `r4_rendertarget_accum_point.cpp:84-95`, `r2_types.h:151-155`).
+    #[inline]
+    pub fn accum_shader_element(
+        &self,
+        is_translucent: bool,
+        smap_size: u32,
+        atlas_size: u32,
+    ) -> AccumShaderElement {
+        if !self.is_shadowed {
+            AccumShaderElement::Unshadowed
+        } else if is_translucent {
+            AccumShaderElement::Translucent
+        } else if smap_size == atlas_size {
+            AccumShaderElement::Fullsize
+        } else {
+            AccumShaderElement::Normal
+        }
+    }
+
+    /// Compute projected NDC depth bounds `[z_min, z_max]` for `NVDBT` / depth-bounds testing
+    /// when the enclosing light sphere (`R * 1.01`) is completely inside `frustum`
+    /// (`CRenderTarget::enable_dbt_bounds`, `r4_rendertarget_enable_scissor.cpp:13-38`).
+    pub fn compute_depth_bounds(
+        &self,
+        full_transform: &XRayMatrix,
+        frustum: &ClipFrustum,
+    ) -> Option<[f32; 2]> {
+        let (sp_center, sp_radius) = self.spatial_sphere();
+        if frustum.test_sphere_visibility(sp_center, sp_radius * 1.01) != FrustumVisibility::Fully {
+            return None;
+        }
+        let min = [
+            sp_center[0] - sp_radius,
+            sp_center[1] - sp_radius,
+            sp_center[2] - sp_radius,
+        ];
+        let max = [
+            sp_center[0] + sp_radius,
+            sp_center[1] + sp_radius,
+            sp_center[2] + sp_radius,
+        ];
+        let mut z_min = f32::INFINITY;
+        let mut z_max = f32::NEG_INFINITY;
+        for mask in 0u8..8 {
+            let corner = [
+                if (mask & 1) != 0 { max[0] } else { min[0] },
+                if (mask & 2) != 0 { max[1] } else { min[1] },
+                if (mask & 4) != 0 { max[2] } else { min[2] },
+            ];
+            let p = matrix_transform_projected(full_transform, corner)?;
+            z_min = z_min.min(p[2]);
+            z_max = z_max.max(p[2]);
+        }
+        Some([z_min, z_max])
+    }
+}
+
+/// Accumulation pass shader element index (`SE_L_*`, `src/Layers/xrRenderPC_R4/r2_types.h:150-155`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum AccumShaderElement {
+    Fill = 0,
+    Unshadowed = 1,
+    Normal = 2,
+    Fullsize = 3,
+    Translucent = 4,
+}
+
+/// Stencil-mask pass shader element index (`SE_MASK_*`, `src/Layers/xrRenderPC_R4/r2_types.h:157-163`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum AccumMaskElement {
+    Spot = 0,
+    Point = 1,
+    Direct = 2,
+    AccumVol = 3,
+    Accum2D = 4,
+    Albedo = 5,
 }
 
 /// 2D screen-space texgen transform (`CRenderTarget::u_compute_texgen_screen`, `r4_rendertarget.cpp:223-239`).
@@ -856,6 +940,151 @@ pub fn compute_spot_accum_constants(
         dynamic_color: [clr[0], clr[1], clr[2], l_spec],
         is_full_smap: smap_xform.size == cfg.atlas_size,
     }
+}
+
+/// GPU shader inputs computed for a single `CRenderTarget::accum_point` pass
+/// (`r4_rendertarget_accum_point.cpp:17-107`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointAccumConstants {
+    pub shader_element: AccumShaderElement,
+    pub m_texgen: XRayMatrix,
+    /// `[view_x, view_y, view_z, 1 / (att_r * att_r)]` with `att_r = range * 0.95` (`Ldynamic_pos`).
+    pub dynamic_pos: [f32; 4],
+    /// `[r, g, b, u_diffuse2s(rgb)]` (`Ldynamic_color`).
+    pub dynamic_color: [f32; 4],
+    /// Screen-space shadow ID (`L->sss_id`, or `-1` during dual-viewport/SVP frames).
+    pub sss_id: i32,
+    pub is_full_smap: bool,
+    pub cull_backfaces: bool,
+}
+
+/// Build `accum_point` view-space position, attenuation, specular, `m_texgen`, `sss_id`, and
+/// shader element matching `CRenderTarget::accum_point` (`r4_rendertarget_accum_point.cpp:17-107`).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_point_accum_constants(
+    light: &DynamicLight,
+    smap_size: u32,
+    atlas_size: u32,
+    is_translucent: bool,
+    is_svp_frame: bool,
+    light_sss_id: i32,
+    view_matrix: &XRayMatrix,
+    full_transform: &XRayMatrix,
+    gloss: &GlossConfig,
+) -> PointAccumConstants {
+    let wvp = matrix_mul_44(full_transform, &light.volume_world_xform());
+    let m_texgen = compute_texgen_screen(&wvp);
+    let l_pos = matrix_transform_point(view_matrix, light.position);
+    let att_r = (light.range * 0.95).max(1e-4);
+    let l_spec = compute_u_diffuse2s(light.color_rgb, gloss);
+    PointAccumConstants {
+        shader_element: light.accum_shader_element(is_translucent, smap_size, atlas_size),
+        m_texgen,
+        dynamic_pos: [l_pos[0], l_pos[1], l_pos[2], 1.0 / (att_r * att_r)],
+        dynamic_color: [
+            light.color_rgb[0],
+            light.color_rgb[1],
+            light.color_rgb[2],
+            l_spec,
+        ],
+        sss_id: if is_svp_frame { -1 } else { light_sss_id },
+        is_full_smap: smap_size == atlas_size,
+        cull_backfaces: true,
+    }
+}
+
+/// GPU shader inputs computed for a single `CRenderTarget::accum_reflected` pass
+/// (`r4_rendertarget_accum_reflected.cpp:13-62`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReflectedAccumConstants {
+    pub m_texgen: XRayMatrix,
+    /// `[view_x, view_y, view_z, 1 / (range * range)]` (`Ldynamic_pos`).
+    pub dynamic_pos: [f32; 4],
+    /// `[r, g, b, u_diffuse2s(rgb)]` (`Ldynamic_color`).
+    pub dynamic_color: [f32; 4],
+    /// Unit view-space reflected bounce direction `[dx, dy, dz, 0.0]` (`direction`).
+    pub direction_view: [f32; 4],
+    /// True when the light's bounding sphere intersects the near plane (`CULL_CW` vs `CULL_CCW`).
+    pub cull_backfaces: bool,
+}
+
+/// Build `accum_reflected` constants matching `CRenderTarget::accum_reflected`
+/// (`r4_rendertarget_accum_reflected.cpp:18-61`).
+///
+/// Set `apply_half_texel_offset = false` for DX10/11 canonical texgen matching
+/// [`compute_texgen_screen`], or `true` for the legacy half-texel offset in the C++ source.
+pub fn compute_reflected_accum_constants(
+    light: &DynamicLight,
+    view_matrix: &XRayMatrix,
+    full_transform: &XRayMatrix,
+    viewport_width: u32,
+    viewport_height: u32,
+    apply_half_texel_offset: bool,
+    gloss: &GlossConfig,
+) -> ReflectedAccumConstants {
+    let wvp = matrix_mul_44(full_transform, &light.volume_world_xform());
+    let m_texgen = if apply_half_texel_offset {
+        let ow = 0.5 / viewport_width.max(1) as f32;
+        let oh = 0.5 / viewport_height.max(1) as f32;
+        let m_texel_adjust: XRayMatrix = [
+            [0.5, 0.0, 0.0, 0.0],
+            [0.0, -0.5, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.5 + ow, 0.5 + oh, 0.0, 1.0],
+        ];
+        matrix_mul_44(&m_texel_adjust, &wvp)
+    } else {
+        compute_texgen_screen(&wvp)
+    };
+
+    let (sp_center, sp_radius) = light.spatial_sphere();
+    let cull_backfaces = near_plane_intersects_sphere(full_transform, sp_center, sp_radius);
+
+    let l_pos = matrix_transform_point(view_matrix, light.position);
+    let raw_dir = matrix_transform_dir(view_matrix, light.direction);
+    let l_dir = normalize3_or(raw_dir, [0.0, 0.0, 1.0]);
+    let range = light.range.max(1e-4);
+    let l_spec = compute_u_diffuse2s(light.color_rgb, gloss);
+
+    ReflectedAccumConstants {
+        m_texgen,
+        dynamic_pos: [l_pos[0], l_pos[1], l_pos[2], 1.0 / (range * range)],
+        dynamic_color: [
+            light.color_rgb[0],
+            light.color_rgb[1],
+            light.color_rgb[2],
+            l_spec,
+        ],
+        direction_view: [l_dir[0], l_dir[1], l_dir[2], 0.0],
+        cull_backfaces,
+    }
+}
+
+/// Visibility/range sort key matching `pred_light_cmp` (`Light_Package.cpp:12-24`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LightPackageOrderKey {
+    pub pending: bool,
+    pub query_order: u32,
+    pub range: f32,
+}
+
+/// Stable-sort light queue entries matching `light_Package::sort` (`Light_Package.cpp:12-32`):
+/// completed queries precede pending ones; pending entries sort descending by `query_order`,
+/// and completed entries sort descending by `range`.
+pub fn sort_light_package_by_key<T, F>(items: &mut [T], mut key_fn: F)
+where
+    F: FnMut(&T) -> LightPackageOrderKey,
+{
+    items.sort_by(|lhs, rhs| {
+        let a = key_fn(lhs);
+        let b = key_fn(rhs);
+        match (a.pending, b.pending) {
+            (true, true) => b.query_order.cmp(&a.query_order),
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => b.range.total_cmp(&a.range),
+        }
+    });
 }
 
 /// Accumulate a directional sample `(dir, scale)` into X-Ray's 6-face `hemi_cube`
@@ -1735,6 +1964,289 @@ pub fn compute_volumetric_spot_params(
     }
 }
 
+// ============================================================================
+// Virtual Point-Light GI Bounce Generation (`light_GI.cpp` & `r2_R_lights.cpp`)
+// ============================================================================
+
+/// Fixed deterministic seed used by `light::gi_generate` (`light_GI.cpp:28`).
+pub const GI_SEED: u32 = 0x1207_1980;
+pub const GI_DEFAULT_PHOTONS: u32 = 16;
+pub const GI_DEFAULT_CLIP: f32 = 0.001;
+pub const GI_DEFAULT_REFL: f32 = 0.9;
+
+/// X-Ray MSVCRT-style 31-bit LCG RNG (`class CRandom` in `src/xrCore/_random.h:21-56`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrngLcg {
+    holdrand: i32,
+}
+
+impl Default for CrngLcg {
+    fn default() -> Self {
+        Self { holdrand: 1 }
+    }
+}
+
+impl CrngLcg {
+    #[inline]
+    pub fn new(seed: u32) -> Self {
+        Self {
+            holdrand: seed as i32,
+        }
+    }
+
+    #[inline]
+    pub fn seed(&mut self, seed: u32) {
+        self.holdrand = seed as i32;
+    }
+
+    /// Generate pseudo-random integer in `[0, 32767]` (`CRandom::randI`).
+    #[inline]
+    pub fn rand_i(&mut self) -> i32 {
+        self.holdrand = self
+            .holdrand
+            .wrapping_mul(214_013)
+            .wrapping_add(2_531_011);
+        (self.holdrand >> 16) & 0x7fff
+    }
+
+    /// Generate pseudo-random float in `[0.0, max]` (`CRandom::randF(max)`).
+    #[inline]
+    pub fn rand_f(&mut self, max: f32) -> f32 {
+        (self.rand_i() as f32 / 32767.0) * max
+    }
+
+    /// Sample a unit vector using X-Ray's `_vector3::random_dir(CRandom&)` (`_vector3d.h:459-470`).
+    #[inline]
+    pub fn random_dir_sphere(&mut self) -> [f32; 3] {
+        let z = self.rand_f(std::f32::consts::PI).cos();
+        let a = self.rand_f(std::f32::consts::TAU);
+        let r = (1.0 - z * z).max(0.0).sqrt();
+        let (sa, ca) = a.sin_cos();
+        [r * ca, r * sa, z]
+    }
+
+    /// Sample a unit vector around `cone_axis` using `_vector3::random_dir(axis, angle, CRandom&)`
+    /// (`_vector3d.h:471-478`).
+    #[inline]
+    pub fn random_dir_cone(&mut self, cone_axis: [f32; 3], cone_angle_rad: f32) -> [f32; 3] {
+        let rnd = self.random_dir_sphere();
+        let scale = self.rand_f(cone_angle_rad.tan());
+        normalize3_or(
+            [
+                cone_axis[0] + rnd[0] * scale,
+                cone_axis[1] + rnd[1] * scale,
+                cone_axis[2] + rnd[2] * scale,
+            ],
+            cone_axis,
+        )
+    }
+}
+
+/// Console configuration controlling GI virtual bounce generation (`xrRender_console.cpp:222-225`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GiConfig {
+    pub enabled: bool,
+    pub photons: u32,
+    pub clip: f32,
+    pub refl: f32,
+}
+
+impl Default for GiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            photons: GI_DEFAULT_PHOTONS,
+            clip: GI_DEFAULT_CLIP,
+            refl: GI_DEFAULT_REFL,
+        }
+    }
+}
+
+/// Reflected virtual point-light sample produced by `light::gi_generate` (`struct light_indirect`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LightIndirectPhoton {
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub energy: f32,
+    pub sector_id: u16,
+}
+
+/// Generate reflected virtual GI bounce photons using caller-supplied nearest-hit raycasting
+/// `(origin, dir, range) -> Option<(hit_dist, unit_face_normal)>` matching `light::gi_generate`
+/// (`light_GI.cpp:22-96`).
+pub fn generate_indirect_photons<F>(
+    light: &DynamicLight,
+    sector_id: u16,
+    cfg: &GiConfig,
+    mut raycast_nearest: F,
+) -> Vec<LightIndirectPhoton>
+where
+    F: FnMut([f32; 3], [f32; 3], f32) -> Option<(f32, [f32; 3])>,
+{
+    if !cfg.enabled || cfg.photons == 0 || light.range <= 1e-6 {
+        return Vec::new();
+    }
+
+    let mut rng = CrngLcg::new(GI_SEED);
+    let ray_count = cfg.photons.saturating_mul(8);
+    let light_dir = normalize3_or(light.direction, [0.0, 0.0, 1.0]);
+    let mut indirect = Vec::new();
+
+    for _ in 0..ray_count {
+        let dir_raw = match light.light_type {
+            RenderLightType::Point => rng.random_dir_sphere(),
+            RenderLightType::Spot | RenderLightType::Omnipart => {
+                rng.random_dir_cone(light_dir, light.cone_rad)
+            }
+            RenderLightType::Direct | RenderLightType::Reflected => light_dir,
+        };
+        let dir = normalize3_or(dir_raw, light_dir);
+
+        let Some((dist, tri_normal_raw)) = raycast_nearest(light.position, dir, light.range) else {
+            continue;
+        };
+        let tri_normal = normalize3_or(tri_normal_raw, [0.0, 1.0, 0.0]);
+        let cos_inc = -dot3(tri_normal, dir);
+        let energy = cos_inc * (1.0 - dist / light.range);
+        if energy < cfg.clip {
+            continue;
+        }
+
+        let position = [
+            light.position[0] + dir[0] * dist,
+            light.position[1] + dir[1] * dist,
+            light.position[2] + dir[2] * dist,
+        ];
+        // Fvector::reflect(dir, TN) = dir - 2 * dot(dir, TN) * TN
+        let k = -2.0 * dot3(dir, tri_normal);
+        let reflected = [
+            dir[0] + k * tri_normal[0],
+            dir[1] + k * tri_normal[1],
+            dir[2] + k * tri_normal[2],
+        ];
+        indirect.push(LightIndirectPhoton {
+            position,
+            direction: reflected,
+            energy,
+            sector_id,
+        });
+    }
+
+    indirect.sort_by(|a, b| b.energy.total_cmp(&a.energy));
+    indirect.truncate(cfg.photons as usize);
+
+    if !indirect.is_empty() {
+        let total_e: f32 = indirect.iter().map(|p| p.energy).sum();
+        if total_e > 1e-12 {
+            let scale_e = cfg.refl / total_e;
+            for p in &mut indirect {
+                p.energy *= scale_e;
+            }
+        }
+    }
+
+    indirect
+}
+
+/// Generate GI bounce photons directly against a static world [`CformBvh`]
+/// using `OPT_CULL | OPT_ONLYNEAREST` (`light_GI.cpp:30-69`).
+pub fn generate_indirect_photons_cform(
+    light: &DynamicLight,
+    cform: &CformBvh<'_>,
+    sector_id: u16,
+    cfg: &GiConfig,
+) -> Vec<LightIndirectPhoton> {
+    let opts = RaycastOptions {
+        cull_backfaces: true,
+        only_first: false,
+        only_nearest: true,
+    };
+    generate_indirect_photons(light, sector_id, cfg, |origin, dir, range| {
+        let hit = cform.raycast(origin, dir, range, opts).into_iter().next()?;
+        let v01 = [
+            hit.verts[1][0] - hit.verts[0][0],
+            hit.verts[1][1] - hit.verts[0][1],
+            hit.verts[1][2] - hit.verts[0][2],
+        ];
+        let v12 = [
+            hit.verts[2][0] - hit.verts[1][0],
+            hit.verts[2][1] - hit.verts[1][1],
+            hit.verts[2][2] - hit.verts[1][2],
+        ];
+        let norm = normalize3_or(cross3(v01, v12), [0.0, 1.0, 0.0]);
+        Some((hit.range, norm))
+    })
+}
+
+/// Emitted reflected bounce light ready for [`compute_reflected_accum_constants`]
+/// (`CRender::render_indirect`, `r2_R_lights.cpp:273-316`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReflectedLightInstance {
+    pub light: DynamicLight,
+    pub sector_id: u16,
+}
+
+/// Convert cached [`LightIndirectPhoton`] samples into unshadowed [`RenderLightType::Reflected`]
+/// lights matching `CRender::render_indirect` (`r2_R_lights.cpp:273-316`).
+pub fn build_reflected_lights(
+    parent: &DynamicLight,
+    photons: &[LightIndirectPhoton],
+    cfg: &GiConfig,
+) -> Vec<ReflectedLightInstance> {
+    if !cfg.enabled || photons.is_empty() {
+        return Vec::new();
+    }
+    let le = (parent.color_rgb[0] + parent.color_rgb[1] + parent.color_rgb[2]) / 3.0;
+    let e_min = 1.0f32 / 255.0f32;
+    let mut out = Vec::with_capacity(photons.len());
+
+    for photon in photons {
+        let lie = le * photon.energy;
+        if lie < cfg.clip {
+            continue;
+        }
+        let range = (lie - e_min) / e_min;
+        if range < 0.1 {
+            continue;
+        }
+        let l_up = if photon.direction[1].abs() > 0.99 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let l_right = normalize3_or(cross3(l_up, photon.direction), [1.0, 0.0, 0.0]);
+        out.push(ReflectedLightInstance {
+            light: DynamicLight {
+                light_type: RenderLightType::Reflected,
+                is_static: parent.is_static,
+                is_active: true,
+                is_shadowed: false,
+                is_volumetric: false,
+                is_ortho: false,
+                position: photon.position,
+                direction: photon.direction,
+                right: l_right,
+                range,
+                cone_rad: std::f32::consts::PI,
+                virtual_size: parent.virtual_size,
+                color_rgb: [
+                    parent.color_rgb[0] * photon.energy,
+                    parent.color_rgb[1] * photon.energy,
+                    parent.color_rgb[2] * photon.energy,
+                ],
+                attenuation0: parent.attenuation0,
+                attenuation1: parent.attenuation1,
+                attenuation2: parent.attenuation2,
+                falloff: parent.falloff,
+                cached_smap_size: parent.cached_smap_size,
+            },
+            sector_id: photon.sector_id,
+        });
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2019,5 +2531,155 @@ mod tests {
         assert_eq!(p_params.vertex_count, (VOLUMETRIC_SLICES * 4) as u32);
         assert_eq!(p_params.primitive_count, (VOLUMETRIC_SLICES * 2) as u32);
         assert!(p_params.dynamic_color[0] < s_params.dynamic_color[0]);
+    }
+
+    #[test]
+    fn point_reflected_depth_bounds_light_package_sort_and_gi_photons() {
+        let cam_view = matrix_build_camera_dir([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]);
+        let proj = matrix_build_projection(std::f32::consts::FRAC_PI_2, 1.0, 0.2, 100.0);
+        let full = matrix_mul_44(&proj, &cam_view);
+        let frustum = ClipFrustum::from_view_proj(&full, frustum_planes::ALL);
+
+        let inside_pt = DynamicLight {
+            light_type: RenderLightType::Point,
+            position: [0.0, 0.0, 20.0],
+            range: 2.0,
+            is_shadowed: true,
+            ..DynamicLight::default()
+        };
+        let bounds = inside_pt.compute_depth_bounds(&full, &frustum).unwrap();
+        assert!(bounds[0] >= 0.0 && bounds[1] <= 1.0 && bounds[0] < bounds[1]);
+
+        let edge_pt = DynamicLight {
+            position: [0.0, 0.0, 0.5],
+            range: 2.0,
+            ..inside_pt
+        };
+        assert!(edge_pt.compute_depth_bounds(&full, &frustum).is_none());
+
+        assert_eq!(
+            inside_pt.accum_shader_element(false, 2048, 2048),
+            AccumShaderElement::Fullsize
+        );
+        assert_eq!(
+            inside_pt.accum_shader_element(false, 768, 2048),
+            AccumShaderElement::Normal
+        );
+        assert_eq!(
+            inside_pt.accum_shader_element(true, 768, 2048),
+            AccumShaderElement::Translucent
+        );
+        let unshadowed = DynamicLight {
+            is_shadowed: false,
+            ..inside_pt
+        };
+        assert_eq!(
+            unshadowed.accum_shader_element(true, 2048, 2048),
+            AccumShaderElement::Unshadowed
+        );
+
+        let pt_consts = compute_point_accum_constants(
+            &inside_pt,
+            768,
+            2048,
+            false,
+            false,
+            3,
+            &cam_view,
+            &full,
+            &GlossConfig::default(),
+        );
+        assert_eq!(pt_consts.shader_element, AccumShaderElement::Normal);
+        assert_eq!(pt_consts.sss_id, 3);
+        assert!(pt_consts.cull_backfaces);
+        assert!((pt_consts.dynamic_pos[3] - 1.0 / (1.9 * 1.9)).abs() < 1e-6);
+
+        let pt_svp = compute_point_accum_constants(
+            &inside_pt,
+            768,
+            2048,
+            false,
+            true,
+            3,
+            &cam_view,
+            &full,
+            &GlossConfig::default(),
+        );
+        assert_eq!(pt_svp.sss_id, -1);
+
+        let mut pkg = vec![
+            (1u32, LightPackageOrderKey { pending: true, query_order: 2, range: 50.0 }),
+            (2u32, LightPackageOrderKey { pending: false, query_order: 0, range: 5.0 }),
+            (3u32, LightPackageOrderKey { pending: false, query_order: 0, range: 20.0 }),
+            (4u32, LightPackageOrderKey { pending: true, query_order: 10, range: 1.0 }),
+        ];
+        sort_light_package_by_key(&mut pkg, |entry| entry.1);
+        let ordered_ids: Vec<u32> = pkg.into_iter().map(|e| e.0).collect();
+        assert_eq!(ordered_ids, vec![3, 2, 4, 1]);
+
+        let mut rng_a = CrngLcg::new(GI_SEED);
+        let mut rng_b = CrngLcg::new(GI_SEED);
+        assert_eq!(rng_a.rand_i(), rng_b.rand_i());
+        let cone_dir = rng_a.random_dir_cone([0.0, 0.0, 1.0], 0.5);
+        assert!((dot3(cone_dir, cone_dir) - 1.0).abs() < 1e-5);
+
+        let verts = vec![
+            [-20.0, -20.0, 5.0],
+            [-20.0, 20.0, 5.0],
+            [20.0, 20.0, 5.0],
+            [20.0, -20.0, 5.0],
+        ];
+        let tris = vec![
+            crate::cform::CformTriangle {
+                verts: [0, 1, 2],
+                material: 0,
+                suppress_shadows: false,
+                suppress_wm: false,
+                sector: 2,
+            },
+            crate::cform::CformTriangle {
+                verts: [0, 2, 3],
+                material: 0,
+                suppress_shadows: false,
+                suppress_wm: false,
+                sector: 2,
+            },
+        ];
+        let model = crate::cform::CformModel::from_parts(verts, tris).unwrap();
+        let bvh = model.build_bvh();
+        let gi_spot = DynamicLight {
+            light_type: RenderLightType::Spot,
+            position: [0.0, 0.0, 0.0],
+            direction: [0.0, 0.0, 1.0],
+            range: 20.0,
+            cone_rad: 60.0f32.to_radians(),
+            color_rgb: [2.0, 1.5, 1.0],
+            ..DynamicLight::default()
+        };
+        let gi_cfg = GiConfig {
+            enabled: true,
+            photons: 8,
+            ..GiConfig::default()
+        };
+        let photons = generate_indirect_photons_cform(&gi_spot, &bvh, 2, &gi_cfg);
+        assert!(!photons.is_empty() && photons.len() <= 8);
+        let sum_e: f32 = photons.iter().map(|p| p.energy).sum();
+        assert!((sum_e - gi_cfg.refl).abs() < 1e-4);
+        assert!(photons.iter().all(|p| (p.position[2] - 5.0).abs() < 1e-3 && p.direction[2] < 0.0));
+
+        let reflected = build_reflected_lights(&gi_spot, &photons, &gi_cfg);
+        assert!(!reflected.is_empty());
+        assert_eq!(reflected[0].light.light_type, RenderLightType::Reflected);
+        let ref_consts = compute_reflected_accum_constants(
+            &reflected[0].light,
+            &cam_view,
+            &full,
+            1920,
+            1080,
+            true,
+            &GlossConfig::default(),
+        );
+        assert_eq!(ref_consts.direction_view[3], 0.0);
+        assert!((ref_consts.dynamic_pos[3] - 1.0 / (reflected[0].light.range.powi(2))).abs() < 1e-6);
     }
 }

@@ -100,6 +100,15 @@ impl Plane {
     }
 }
 
+/// Three-state frustum visibility result (`EFC_Visible`, `src/xrCDB/Frustum.h:16-22`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum FrustumVisibility {
+    None = 0,
+    Partial = 1,
+    Fully = 2,
+}
+
 /// View frustum with outward-facing unit planes (`CFrustum`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClipFrustum {
@@ -216,6 +225,87 @@ impl ClipFrustum {
             }
         }
         true
+    }
+
+    /// Three-state sphere visibility with hierarchical plane mask propagation
+    /// matching `CFrustum::testSphere` (`src/xrCDB/Frustum.cpp:73-90`).
+    ///
+    /// Clears any bit in `test_mask` whose plane completely contains the sphere (`abs(cls) >= radius`)
+    /// and zeroes `*test_mask` when returning [`FrustumVisibility::None`].
+    pub fn test_sphere_masked(
+        &self,
+        center: [f32; 3],
+        radius: f32,
+        test_mask: &mut u32,
+    ) -> FrustumVisibility {
+        let mut bit = 1u32;
+        for plane in self.planes.iter().take(32) {
+            if (*test_mask & bit) != 0 {
+                let cls = plane.classify(center);
+                if cls > radius {
+                    *test_mask = 0;
+                    return FrustumVisibility::None;
+                }
+                if cls.abs() >= radius {
+                    *test_mask &= !bit;
+                }
+            }
+            bit = bit.wrapping_shl(1);
+        }
+        if *test_mask != 0 {
+            FrustumVisibility::Partial
+        } else {
+            FrustumVisibility::Fully
+        }
+    }
+
+    /// Three-state sphere visibility across all planes in the frustum
+    /// (`FrustumVisibility::None`, `Partial`, or `Fully`).
+    pub fn test_sphere_visibility(&self, center: [f32; 3], radius: f32) -> FrustumVisibility {
+        let mut partial = false;
+        for plane in &self.planes {
+            let cls = plane.classify(center);
+            if cls > radius {
+                return FrustumVisibility::None;
+            }
+            if cls.abs() < radius {
+                partial = true;
+            }
+        }
+        if partial {
+            FrustumVisibility::Partial
+        } else {
+            FrustumVisibility::Fully
+        }
+    }
+
+    /// Three-state AABB visibility matching `CFrustum::testAABB` / `AABB_OverlapPlane`
+    /// (`src/xrCDB/Frustum.h:53-67`, `Frustum.cpp:114-133`).
+    pub fn test_aabb_visibility(&self, aabb: &OgfBBox) -> FrustumVisibility {
+        let mut partial = false;
+        for plane in &self.planes {
+            let neg = [
+                if plane.n[0] >= 0.0 { aabb.min[0] } else { aabb.max[0] },
+                if plane.n[1] >= 0.0 { aabb.min[1] } else { aabb.max[1] },
+                if plane.n[2] >= 0.0 { aabb.min[2] } else { aabb.max[2] },
+            ];
+            if plane.classify(neg) > 0.0 {
+                return FrustumVisibility::None;
+            }
+            let pos = [
+                if plane.n[0] >= 0.0 { aabb.max[0] } else { aabb.min[0] },
+                if plane.n[1] >= 0.0 { aabb.max[1] } else { aabb.min[1] },
+                if plane.n[2] >= 0.0 { aabb.max[2] } else { aabb.min[2] },
+            ];
+            if plane.classify(pos) > 0.0 {
+                partial = true;
+            }
+        }
+        if partial {
+            FrustumVisibility::Partial
+        } else {
+            FrustumVisibility::Fully
+        }
     }
 
     /// Clip a convex polygon against all frustum planes (`CFrustum::ClipPoly`).
@@ -1137,6 +1227,53 @@ mod tests {
             max: [55.0, 55.0, 6.0],
         }));
         assert!(!frustum.test_sphere([0.0, 0.0, -10.0], 1.0));
+        assert_eq!(
+            frustum.test_sphere_visibility([0.0, 0.0, 10.0], 1.0),
+            FrustumVisibility::Fully
+        );
+        assert_eq!(
+            frustum.test_sphere_visibility([0.0, 0.0, 0.5], 0.5),
+            FrustumVisibility::Partial
+        );
+        assert_eq!(
+            frustum.test_sphere_visibility([0.0, 0.0, -10.0], 1.0),
+            FrustumVisibility::None
+        );
+
+        let mut mask = frustum_planes::ALL;
+        assert_eq!(
+            frustum.test_sphere_masked([0.0, 0.0, 10.0], 1.0, &mut mask),
+            FrustumVisibility::Fully
+        );
+        assert_eq!(mask, 0);
+
+        let mut mask_part = frustum_planes::ALL;
+        assert_eq!(
+            frustum.test_sphere_masked([0.0, 0.0, 0.5], 0.5, &mut mask_part),
+            FrustumVisibility::Partial
+        );
+        assert_ne!(mask_part, 0);
+        assert_eq!(
+            frustum.test_aabb_visibility(&OgfBBox {
+                min: [-0.5, -0.5, 10.0],
+                max: [0.5, 0.5, 11.0],
+            }),
+            FrustumVisibility::Fully
+        );
+        assert_eq!(
+            frustum.test_aabb_visibility(&OgfBBox {
+                min: [-0.5, -0.5, 0.2],
+                max: [0.5, 0.5, 1.0],
+            }),
+            FrustumVisibility::Partial
+        );
+        assert_eq!(
+            frustum.test_aabb_visibility(&OgfBBox {
+                min: [-0.5, -0.5, -5.0],
+                max: [0.5, 0.5, -2.0],
+            }),
+            FrustumVisibility::None
+        );
 
         // Single-sided triangle facing away from camera should not occlude.
         let backface = HomMesh::from_raw_triangles(&[(

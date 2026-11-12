@@ -18,8 +18,8 @@ use crate::chunk::FormatError;
 use crate::details::{DetailMesh, DetailMeshVertexOut};
 use crate::lanims::{unpack_argb_f32, LightAnimItem, LightAnimLibrary};
 use crate::ogf::{
-    matrix_mul_43, matrix_rotate_y, matrix_set_xyzi_translate, matrix_transform_point,
-    matrix_transform_projected, XRayMatrix, XRAY_IDENTITY_MATRIX,
+    matrix_mul_43, matrix_mul_44, matrix_rotate_y, matrix_set_xyzi_translate,
+    matrix_transform_point, matrix_transform_projected, XRayMatrix, XRAY_IDENTITY_MATRIX,
 };
 use crate::particle_sim::ParticleRng;
 use crate::shaders_xr::{env_mod_flags, EnvModAccum, LevelEnvModifiers};
@@ -28,6 +28,14 @@ use crate::thm::texture_stem_to_dds_vpath;
 
 pub const DAY_LENGTH: f32 = 86_400.0;
 pub const WFX_TRANS_TIME: f32 = 5.0;
+/// Seconds to wet or dry surfaces at multiplier `1.0` (`WETNESS_CHANGE_TIME`, `Environment_misc.cpp:20`).
+pub const WETNESS_CHANGE_TIME: f32 = 166.0;
+/// Default world camera near clip plane (`VIEWPORT_NEAR`, `device.h:21, 110`).
+pub const DEFAULT_VIEWPORT_NEAR: f32 = 0.2;
+/// HUD / camera-attached near clip plane (`R_VIEWPORT_NEAR`, `device.h:22`).
+pub const R_VIEWPORT_NEAR: f32 = 0.005;
+/// Default `[wet_mult, dry_mult]` console multipliers (`ssfx_wetness_multiplier`, `xr_ioc_cmd.cpp:1050`).
+pub const DEFAULT_WETNESS_MULTIPLIERS: [f32; 2] = [1.0, 0.3];
 
 // ============================================================================
 // Skybox Half-Box, Clouds Hemisphere, Wind & Rain Render Constants
@@ -1288,6 +1296,212 @@ pub struct EnvBoost {
     pub sun_color: f32,
     pub rain_color: f32,
     pub fog_color: f32,
+}
+
+/// Persistent surface wetness accumulator matching `CEnvironment::wetness_factor`
+/// (`src/xrEngine/Environment_misc.cpp:526-531`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct WetnessState {
+    pub factor: f32,
+}
+
+impl WetnessState {
+    pub fn new(initial_factor: f32) -> Self {
+        Self {
+            factor: initial_factor.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Advance surface wetness by `dt_sec` using current `rain_density` and
+    /// `[wet_mult, dry_mult]` (`DEFAULT_WETNESS_MULTIPLIERS`).
+    pub fn step(&mut self, dt_sec: f32, rain_density: f32, wet_mult: f32, dry_mult: f32) -> f32 {
+        let dt = if dt_sec.is_finite() && dt_sec > 0.0 {
+            dt_sec
+        } else {
+            0.0
+        };
+        if rain_density > 0.0 {
+            self.factor += rain_density * wet_mult * dt / WETNESS_CHANGE_TIME;
+        } else {
+            self.factor -= dry_mult * dt / WETNESS_CHANGE_TIME;
+        }
+        self.factor = self.factor.clamp(0.0, 1.0);
+        self.factor
+    }
+}
+
+/// Packed 368-byte standard per-frame global shader constants matching
+/// `Blender_Recorder_StandartBinding.cpp:107-324, 506-760`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StandardFrameUniforms {
+    /// Linear fog view-plane vector (`dot(w_pos, fog_plane)` in `common_functions.h:54`).
+    pub fog_plane: [f32; 4],
+    /// `(-fog_near * r, fog_near, fog_far, r)` where `r = 1 / (fog_far - fog_near)`.
+    pub fog_params: [f32; 4],
+    /// `(fog_color.r, fog_color.g, fog_color.b, fog_density)`.
+    pub fog_color: [f32; 4],
+    /// `(wind_direction_rad, wind_velocity, 0, 0)`.
+    pub wind_params: [f32; 4],
+    /// `(time_global, time_global * 10, time_global / 10, sin(time_global))`.
+    pub timers: [f32; 4],
+    /// `(game_time, game_time / DAY_LENGTH, game_time / 3600, floor(game_time / 3600))`.
+    pub timers_game: [f32; 4],
+    /// `(width, height, 1 / width, 1 / height)`.
+    pub screen_res: [f32; 4],
+    /// `(fov_deg, aspect, tan(deg2rad(fov_deg) / 2), far_plane * 0.75)`.
+    pub ogse_c_screen: [f32; 4],
+    /// `(viewport_near, far_plane, 0, 0)`.
+    pub near_far_plane: [f32; 4],
+    /// `(rain_density, wetness_factor, 0, 0)`.
+    pub rain_params: [f32; 4],
+    /// `(cam_pos.xyz, 1.0)`.
+    pub eye_position: [f32; 4],
+    /// `(cam_dir.xyz, 0.0)`.
+    pub eye_direction: [f32; 4],
+    /// `(cam_top.xyz, 0.0)`.
+    pub eye_normal: [f32; 4],
+    /// `(sun_color.rgb, 0.0)`.
+    pub l_sun_color: [f32; 4],
+    /// `(sun_dir_world.xyz, 0.0)`.
+    pub l_sun_dir_w: [f32; 4],
+    /// `(normalize(mul_dir(mView, sun_dir)).xyz, 0.0)`.
+    pub l_sun_dir_e: [f32; 4],
+    /// `hemi_color` RGBA (`CEnvDescriptor::hemi_color`).
+    pub l_hemi_color: [f32; 4],
+    /// `(ambient.rgb, mixer_weight)`.
+    pub l_ambient: [f32; 4],
+    /// `(sky_color.rgb, sky_rotation)`.
+    pub sky_color: [f32; 4],
+    /// DX11 texel-adjusted view-projection texgen (`mVPTexgen`).
+    pub m_vp_texgen: XRayMatrix,
+}
+
+const _: () = assert!(std::mem::size_of::<StandardFrameUniforms>() == 368);
+
+impl StandardFrameUniforms {
+    /// Compute all standard per-frame global bindings from the active [`MixedEnvironment`],
+    /// camera basis/matrices, frame resolution, and global/game clocks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute(
+        env: &MixedEnvironment,
+        view: &XRayMatrix,
+        full_transform: &XRayMatrix,
+        camera_pos: [f32; 3],
+        camera_dir: [f32; 3],
+        camera_top: [f32; 3],
+        fov_deg: f32,
+        aspect: f32,
+        viewport_near: f32,
+        screen_w: u32,
+        screen_h: u32,
+        time_global_sec: f32,
+        game_time_sec: f32,
+        wetness_factor: f32,
+    ) -> Self {
+        let px = -(full_transform[0][3] + full_transform[0][2]);
+        let py = -(full_transform[1][3] + full_transform[1][2]);
+        let pz = -(full_transform[2][3] + full_transform[2][2]);
+        let pw = -(full_transform[3][3] + full_transform[3][2]);
+        let len = (px * px + py * py + pz * pz).sqrt();
+        let plane = if len > 1e-12 && len.is_finite() {
+            let denom = -1.0 / len;
+            [px * denom, py * denom, pz * denom, pw * denom]
+        } else {
+            [0.0, 0.0, 1.0, 0.0]
+        };
+
+        let fog_span = env.fog_far - env.fog_near;
+        let b = if fog_span.abs() > 1e-6 {
+            1.0 / fog_span
+        } else {
+            0.0
+        };
+        let fog_plane = [
+            -plane[0] * b,
+            -plane[1] * b,
+            -plane[2] * b,
+            1.0 - (plane[3] - env.fog_near) * b,
+        ];
+        let fog_params = [-env.fog_near * b, env.fog_near, env.fog_far, b];
+
+        let w = screen_w.max(1) as f32;
+        let h = screen_h.max(1) as f32;
+        let hour_len = DAY_LENGTH / 24.0;
+
+        let sun_dir_view_raw = matrix_transform_dir(view, env.sun_dir);
+        let sun_dir_view = normalize_vec3(sun_dir_view_raw);
+        let sun_dir_e = if sun_dir_view[0] * sun_dir_view[0]
+            + sun_dir_view[1] * sun_dir_view[1]
+            + sun_dir_view[2] * sun_dir_view[2]
+            > 1e-12
+        {
+            sun_dir_view
+        } else {
+            [0.0, -1.0, 0.0]
+        };
+
+        let m_texel_adjust: XRayMatrix = [
+            [0.5, 0.0, 0.0, 0.0],
+            [0.0, -0.5, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.5, 0.5, 0.0, 1.0],
+        ];
+        let m_vp_texgen = matrix_mul_44(&m_texel_adjust, full_transform);
+
+        Self {
+            fog_plane,
+            fog_params,
+            fog_color: [
+                env.fog_color[0],
+                env.fog_color[1],
+                env.fog_color[2],
+                env.fog_density,
+            ],
+            wind_params: [env.wind_direction, env.wind_velocity, 0.0, 0.0],
+            timers: [
+                time_global_sec,
+                time_global_sec * 10.0,
+                time_global_sec / 10.0,
+                time_global_sec.sin(),
+            ],
+            timers_game: [
+                game_time_sec,
+                game_time_sec / DAY_LENGTH,
+                game_time_sec / hour_len,
+                (game_time_sec / hour_len).floor(),
+            ],
+            screen_res: [w, h, 1.0 / w, 1.0 / h],
+            ogse_c_screen: [
+                fov_deg,
+                aspect,
+                (fov_deg.to_radians() * 0.5).tan(),
+                env.far_plane * 0.75,
+            ],
+            near_far_plane: [viewport_near, env.far_plane, 0.0, 0.0],
+            rain_params: [env.rain_density, wetness_factor, 0.0, 0.0],
+            eye_position: [camera_pos[0], camera_pos[1], camera_pos[2], 1.0],
+            eye_direction: [camera_dir[0], camera_dir[1], camera_dir[2], 0.0],
+            eye_normal: [camera_top[0], camera_top[1], camera_top[2], 0.0],
+            l_sun_color: [env.sun_color[0], env.sun_color[1], env.sun_color[2], 0.0],
+            l_sun_dir_w: [env.sun_dir[0], env.sun_dir[1], env.sun_dir[2], 0.0],
+            l_sun_dir_e: [sun_dir_e[0], sun_dir_e[1], sun_dir_e[2], 0.0],
+            l_hemi_color: env.hemi_color,
+            l_ambient: [
+                env.ambient_color[0],
+                env.ambient_color[1],
+                env.ambient_color[2],
+                env.weight,
+            ],
+            sky_color: [
+                env.sky_color[0],
+                env.sky_color[1],
+                env.sky_color[2],
+                env.sky_rotation,
+            ],
+            m_vp_texgen,
+        }
+    }
 }
 
 /// Blended atmospheric state output by `lerp_descriptors` (`CEnvDescriptorMixer`).
@@ -3754,6 +3968,63 @@ wind_direction = 45.0
         assert!(!dry_out.active);
         assert_eq!(dry_out.audio_volume, 0.0);
         assert!(dry_out.streak_vertices.is_empty());
+
+        let mut wetness = WetnessState::default();
+        assert_eq!(
+            wetness.step(
+                WETNESS_CHANGE_TIME * 0.5,
+                1.0,
+                DEFAULT_WETNESS_MULTIPLIERS[0],
+                DEFAULT_WETNESS_MULTIPLIERS[1]
+            ),
+            0.5
+        );
+        let dried = wetness.step(
+            WETNESS_CHANGE_TIME * 0.5,
+            0.0,
+            DEFAULT_WETNESS_MULTIPLIERS[0],
+            DEFAULT_WETNESS_MULTIPLIERS[1],
+        );
+        assert!((dried - 0.35).abs() < 1e-6);
+
+        let proj = crate::camera::matrix_build_projection(
+            std::f32::consts::FRAC_PI_2,
+            9.0 / 16.0,
+            DEFAULT_VIEWPORT_NEAR,
+            env.far_plane,
+        );
+        let view = crate::camera::matrix_build_camera_dir(cam_pos, cam_dir, [0.0, 1.0, 0.0]);
+        let full = matrix_mul_44(&proj, &view);
+        let uni = StandardFrameUniforms::compute(
+            &env,
+            &view,
+            &full,
+            cam_pos,
+            cam_dir,
+            [0.0, 1.0, 0.0],
+            90.0,
+            9.0 / 16.0,
+            DEFAULT_VIEWPORT_NEAR,
+            1920,
+            1080,
+            12.5,
+            3.5 * 3600.0,
+            dried,
+        );
+        assert_eq!(uni.screen_res, [1920.0, 1080.0, 1.0 / 1920.0, 1.0 / 1080.0]);
+        assert!((uni.ogse_c_screen[2] - 1.0).abs() < 1e-5);
+        assert_eq!(uni.near_far_plane, [DEFAULT_VIEWPORT_NEAR, env.far_plane, 0.0, 0.0]);
+        assert!((uni.rain_params[1] - dried).abs() < 1e-6);
+        assert_eq!(uni.timers_game[3], 3.0);
+        let fog_at_near = uni.fog_plane[0] * 0.0
+            + uni.fog_plane[1] * 2.0
+            + uni.fog_plane[2] * env.fog_near
+            + uni.fog_plane[3];
+        let fog_at_far = uni.fog_plane[0] * 0.0
+            + uni.fog_plane[1] * 2.0
+            + uni.fog_plane[2] * env.fog_far
+            + uni.fog_plane[3];
+        assert!(fog_at_near > fog_at_far + 0.9);
     }
 
     #[test]
