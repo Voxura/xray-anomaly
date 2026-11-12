@@ -493,6 +493,10 @@ impl GeometryState {
         device: &ID3D12Device,
         matrices: &[[[f32; 4]; 4]],
     ) -> WinResult<()> {
+        if matrices.is_empty() {
+            self.transforms = None;
+            return Ok(());
+        }
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 matrices.as_ptr().cast::<u8>(),
@@ -509,6 +513,10 @@ impl GeometryState {
         device: &ID3D12Device,
         lights: &[crate::lighting::GpuLight],
     ) -> WinResult<()> {
+        if lights.is_empty() {
+            self.lights = None;
+            return Ok(());
+        }
         let bytes = crate::lighting::GpuLight::as_bytes(lights);
         self.lights = Some(UploadBuffer::new(device, bytes)?);
         Ok(())

@@ -219,6 +219,8 @@ pub struct AudioEngineStats {
     pub thunder_triggered: u64,
     pub weapon_sounds_triggered: u64,
     pub bullet_impacts_triggered: u64,
+    pub ui_sounds_triggered: u64,
+    pub item_sounds_triggered: u64,
     pub wind_gain: f32,
     pub rain_gain: f32,
     pub active_static_sounds: usize,
@@ -262,6 +264,8 @@ pub struct AudioManager {
     alife_emitters: BTreeMap<u64, AlifeEmitterState>,
     weapon_sounds_triggered: u64,
     bullet_impacts_triggered: u64,
+    ui_sounds_triggered: u64,
+    item_sounds_triggered: u64,
 }
 
 impl AudioManager {
@@ -297,6 +301,8 @@ impl AudioManager {
             alife_emitters: BTreeMap::new(),
             weapon_sounds_triggered: 0,
             bullet_impacts_triggered: 0,
+            ui_sounds_triggered: 0,
+            item_sounds_triggered: 0,
         }
     }
 
@@ -367,6 +373,8 @@ impl AudioManager {
             thunder_triggered: self.thunder_triggered,
             weapon_sounds_triggered: self.weapon_sounds_triggered,
             bullet_impacts_triggered: self.bullet_impacts_triggered,
+            ui_sounds_triggered: self.ui_sounds_triggered,
+            item_sounds_triggered: self.item_sounds_triggered,
             wind_gain: self.wind_gain,
             rain_gain: self.rain_gain,
             active_static_sounds: self.static_voices.len(),
@@ -822,6 +830,108 @@ impl AudioManager {
         self.bullet_impacts_triggered += 1;
         self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
     }
+
+    /// Play interface open sound (inventory, PDA, or dialogue screen).
+    pub fn play_ui_open(&mut self) -> VoiceId {
+        let clip = self.resolve_or_synthesize(
+            &["interface\\inv_open", "interface\\pda_open", "interface\\screen_open"],
+            "ui_open",
+            || synthesize_ui_tone(true),
+        );
+        let emitter = AudioEmitter3D {
+            gain: 0.75,
+            spatialized: false,
+            occlusion_enabled: false,
+            attenuation: AttenuationModel::None,
+            ..Default::default()
+        };
+        self.ui_sounds_triggered += 1;
+        self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
+    }
+
+    /// Play interface close sound.
+    pub fn play_ui_close(&mut self) -> VoiceId {
+        let clip = self.resolve_or_synthesize(
+            &["interface\\inv_close", "interface\\pda_close", "interface\\screen_close"],
+            "ui_close",
+            || synthesize_ui_tone(false),
+        );
+        let emitter = AudioEmitter3D {
+            gain: 0.70,
+            spatialized: false,
+            occlusion_enabled: false,
+            attenuation: AttenuationModel::None,
+            ..Default::default()
+        };
+        self.ui_sounds_triggered += 1;
+        self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
+    }
+
+    /// Play a crisp PDA / UI interaction click sound.
+    pub fn play_ui_click(&mut self, sound_ref: &str) -> VoiceId {
+        let clip = self.resolve_or_synthesize(
+            &[sound_ref, "interface\\pda_task", "interface\\inv_slot"],
+            &format!("ui_click_{sound_ref}"),
+            || synthesize_ui_click(sound_ref),
+        );
+        let emitter = AudioEmitter3D {
+            gain: 0.70,
+            spatialized: false,
+            occlusion_enabled: false,
+            attenuation: AttenuationModel::None,
+            ..Default::default()
+        };
+        self.ui_sounds_triggered += 1;
+        self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
+    }
+
+    /// Play inventory / world item pickup sound.
+    pub fn play_item_pickup(&mut self) -> VoiceId {
+        let clip = self.resolve_or_synthesize(
+            &["interface\\inv_slot", "interface\\take_item", "interface\\inv_take"],
+            "item_pickup",
+            || synthesize_item_sfx("pickup"),
+        );
+        let emitter = AudioEmitter3D {
+            gain: 0.80,
+            spatialized: false,
+            occlusion_enabled: false,
+            attenuation: AttenuationModel::None,
+            ..Default::default()
+        };
+        self.item_sounds_triggered += 1;
+        self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
+    }
+
+    /// Play consumable / gear use sound matching X-Ray section (`medkit`, `bandage`, `drink`, `equip`).
+    pub fn play_item_use(&mut self, section: &str) -> VoiceId {
+        let lower = section.to_ascii_lowercase();
+        let candidates: &[&str] = if lower.contains("medkit") || lower.contains("stim") || lower.contains("antirad") {
+            &["interface\\inv_medkit", "interface\\inv_pills", "interface\\inv_slot"]
+        } else if lower.contains("bandage") {
+            &["interface\\inv_bandage", "interface\\inv_slot"]
+        } else if lower.contains("drink") || lower.contains("water") || lower.contains("vodka") {
+            &["interface\\inv_softdrink", "interface\\inv_drink", "interface\\inv_slot"]
+        } else if lower.contains("wpn_") || lower.contains("outfit") || lower.contains("helm") || lower.contains("ammo") {
+            &["interface\\inv_attach_addon", "interface\\inv_slot"]
+        } else {
+            &["interface\\inv_slot"]
+        };
+        let clip = self.resolve_or_synthesize(
+            candidates,
+            &format!("item_use_{lower}"),
+            || synthesize_item_sfx(&lower),
+        );
+        let emitter = AudioEmitter3D {
+            gain: 0.85,
+            spatialized: false,
+            occlusion_enabled: false,
+            attenuation: AttenuationModel::None,
+            ..Default::default()
+        };
+        self.item_sounds_triggered += 1;
+        self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,6 +1145,74 @@ fn synthesize_generic_sfx(name: &str) -> SoundClip {
         .collect();
     SoundClip {
         name: name.to_string(),
+        sample_rate: sr,
+        channels: 1,
+        samples,
+        xray_params: OggXRayParams::default(),
+    }
+}
+
+fn synthesize_ui_tone(opening: bool) -> SoundClip {
+    let sr = 24_000u32;
+    let len = 3_600usize;
+    let (f0, f1) = if opening { (540.0f32, 820.0f32) } else { (680.0f32, 410.0f32) };
+    let samples: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / sr as f32;
+            let frac = (i as f32) / (len as f32);
+            let freq = f0 + (f1 - f0) * frac;
+            (t * freq * TAU).sin() * (-t * 18.0).exp() * 0.45
+        })
+        .collect();
+    SoundClip {
+        name: if opening { "synth_ui_open" } else { "synth_ui_close" }.to_string(),
+        sample_rate: sr,
+        channels: 1,
+        samples,
+        xray_params: OggXRayParams::default(),
+    }
+}
+
+fn synthesize_ui_click(label: &str) -> SoundClip {
+    let sr = 24_000u32;
+    let len = 1_800usize;
+    let base_freq = if label.contains("task") { 1120.0f32 } else { 880.0f32 };
+    let samples: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / sr as f32;
+            (t * base_freq * TAU).sin() * (-t * 40.0).exp() * 0.5
+        })
+        .collect();
+    SoundClip {
+        name: format!("synth_ui_click_{label}"),
+        sample_rate: sr,
+        channels: 1,
+        samples,
+        xray_params: OggXRayParams::default(),
+    }
+}
+
+fn synthesize_item_sfx(section: &str) -> SoundClip {
+    let sr = 24_000u32;
+    let len = 4_800usize;
+    let base = if section.contains("medkit") {
+        380.0f32
+    } else if section.contains("bandage") {
+        620.0f32
+    } else if section.contains("drink") {
+        760.0f32
+    } else {
+        480.0f32
+    };
+    let samples: Vec<f32> = (0..len)
+        .map(|i| {
+            let t = i as f32 / sr as f32;
+            let noise = hash_noise(section.len() as u32 + 53, i) * 0.22;
+            ((t * base * TAU).sin() * 0.4 + noise) * (-t * 16.0).exp()
+        })
+        .collect();
+    SoundClip {
+        name: format!("synth_item_{section}"),
         sample_rate: sr,
         channels: 1,
         samples,

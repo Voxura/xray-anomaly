@@ -14,10 +14,13 @@ use crate::input::{Action, EngineInput};
 use crate::physics::StalkerController;
 use crate::render_bridge::{HudOverlayState, RenderBridge, RenderBridgeConfig};
 use crate::timer::EngineTimer;
+use crate::ui_inventory::InventoryManager;
+use crate::ui_pda::PdaManager;
 use crate::window::{EngineWindow, WindowConfig};
 use crate::world_loader::{LevelLoadConfig, LoadedWorld, WorldLoader};
 use xray_audio::{AudioListener, AudioManager, AudioManagerConfig};
 use xray_formats::cform::CformBvh;
+use xray_formats::scoc::ScocFile;
 use xray_net::{ClientSession, EntityDelta, HostSession};
 use xray_render_dx12::Dx12Renderer;
 use xray_vfs::VirtualFileSystem;
@@ -78,6 +81,8 @@ pub struct EngineRuntime {
     pub audio: AudioManager,
     pub hud: HudOverlayState,
     pub hud_weapon: HudWeaponController,
+    pub inventory: InventoryManager,
+    pub pda: PdaManager,
     pub network: Option<NetworkSession>,
     pub world: Option<LoadedWorld>,
     pub alife: Option<AlifeManager>,
@@ -126,6 +131,8 @@ impl EngineRuntime {
             audio,
             hud: HudOverlayState::default(),
             hud_weapon: HudWeaponController::default(),
+            inventory: InventoryManager::new_starter(),
+            pda: PdaManager::new(),
             network: None,
             world: None,
             alife: None,
@@ -138,7 +145,15 @@ impl EngineRuntime {
     /// Attach a shared [`VirtualFileSystem`] for on-demand dynamic model/texture/audio streaming.
     pub fn attach_vfs(&mut self, vfs: Arc<VirtualFileSystem>) {
         self.audio.attach_vfs(Arc::clone(&vfs));
+        self.pda.invalidate_map_cache();
+        self.pda.ensure_world_maps_loaded(&vfs);
         self.vfs = Some(vfs);
+    }
+
+    /// Hydrate player inventory & `item_remaining_uses` from a host/player `.scoc` file.
+    pub fn attach_host_scoc(&mut self, scoc: &ScocFile) {
+        self.inventory.load_from_scoc(scoc);
+        self.inventory.sync_hud_weapon(&mut self.hud_weapon);
     }
 
     /// Attach a peer-to-peer co-op multiplayer session.
@@ -159,15 +174,18 @@ impl EngineRuntime {
         self.world = Some(world);
     }
 
-    /// Attach an ALife simulation manager and synchronize camera, physics & weather initial state.
+    /// Attach an ALife simulation manager and synchronize camera, physics, inventory & weather initial state.
     pub fn attach_alife(&mut self, alife: AlifeManager) {
+        self.inventory.actor_stats = alife.actor_stats.clone();
         if let Some(actor) = alife.host_actor() {
             self.camera.position = actor.position;
             self.camera.pitch = actor.angle[0];
             self.camera.yaw = actor.angle[1];
             self.physics.sync_from_eye(self.camera.position);
-            self.hud.health = actor.health.clamp(0.0, 1.0);
+            self.inventory.actor_stats.health = actor.health.clamp(0.0, 1.0);
         }
+        self.hud.health = self.inventory.actor_stats.health.clamp(0.0, 1.0);
+        self.hud.stamina = self.inventory.actor_stats.stamina.clamp(0.0, 1.0);
         if let Some(world) = &mut self.world {
             world.weather.apply_scop_weather(&alife.weather_snapshot);
         }
@@ -218,10 +236,45 @@ impl EngineRuntime {
 
         // 1. Process OS window messages
         let active = self.window.poll_events(&mut self.input);
-        if !active || self.input.is_action_just_pressed(Action::Menu) {
+        if !active {
             self.running = false;
             return Ok(false);
         }
+
+        // Toggle Inventory (`Tab` / `I`), PDA (`P`), or handle `Esc` closing active UI modal
+        if self.input.is_action_just_pressed(Action::Menu) {
+            if self.inventory.dialogue.is_some() {
+                self.inventory.dialogue = None;
+                self.audio.play_ui_close();
+            } else if self.inventory.open {
+                self.inventory.set_open(false, Some(&mut self.audio));
+            } else if self.pda.open {
+                self.pda.set_open(false, Some(&mut self.audio));
+            } else {
+                self.running = false;
+                return Ok(false);
+            }
+        }
+        if self.input.is_action_just_pressed(Action::Inventory) {
+            if self.inventory.dialogue.is_some() {
+                self.inventory.dialogue = None;
+            }
+            if !self.inventory.open && self.pda.open {
+                self.pda.open = false;
+            }
+            self.inventory.toggle(Some(&mut self.audio));
+        }
+        if self.input.is_action_just_pressed(Action::Pda) {
+            if !self.pda.open && (self.inventory.open || self.inventory.dialogue.is_some()) {
+                self.inventory.open = false;
+                self.inventory.dialogue = None;
+                self.inventory.drag = None;
+            }
+            self.pda.toggle(Some(&mut self.audio));
+        }
+
+        let modal_open = self.inventory.is_modal_open() || self.pda.open;
+        self.input.set_cursor_locked(!modal_open);
 
         // 2. Handle window resize
         if self.camera.aspect != (self.window.height() as f32 / self.window.width() as f32) {
@@ -236,17 +289,40 @@ impl EngineRuntime {
         self.elapsed_sec += dt;
 
         // 4. Update camera orientation from mouse delta & compute world-space XZ wish vector
-        if self.input.is_cursor_locked() {
+        if !modal_open && self.input.is_cursor_locked() {
             let (dx, dy) = self.input.mouse_delta();
             if dx != 0.0 || dy != 0.0 {
                 self.camera.rotate(dx, dy, self.input.sensitivity());
             }
         }
 
-        let intent = self.input.movement_intent();
-        let crouch_held = self.input.is_action_down(Action::Crouch);
+        let intent = if modal_open {
+            [0.0, 0.0]
+        } else {
+            self.input.movement_intent()
+        };
+        let crouch_held = !modal_open && self.input.is_action_down(Action::Crouch);
+        let moving_intent = intent[0].abs() > 0.01 || intent[1].abs() > 0.01;
+        let sprinting = !modal_open
+            && self.input.is_action_down(Action::Sprint)
+            && !crouch_held
+            && moving_intent
+            && self.inventory.actor_stats.stamina > 0.05;
+        if sprinting {
+            self.inventory.actor_stats.stamina =
+                (self.inventory.actor_stats.stamina - 0.18 * dt).clamp(0.0, 1.0);
+        } else {
+            self.inventory.actor_stats.stamina =
+                (self.inventory.actor_stats.stamina + 0.14 * dt).clamp(0.0, 1.0);
+        }
+        if self.inventory.actor_stats.bleeding > 0.001 {
+            self.inventory.actor_stats.health = (self.inventory.actor_stats.health
+                - self.inventory.actor_stats.bleeding * 0.02 * dt)
+                .clamp(0.0, 1.0);
+        }
+
         let mut speed = self.config.move_speed;
-        if self.input.is_action_down(Action::Sprint) && !crouch_held {
+        if sprinting {
             speed = self.config.sprint_speed;
         } else if crouch_held {
             speed = self.config.crouch_speed;
@@ -258,7 +334,7 @@ impl EngineRuntime {
             right_full[0] * intent[0] + forward_horiz[0] * intent[1],
             right_full[2] * intent[0] + forward_horiz[1] * intent[1],
         ];
-        let mut jump_pending = self.input.is_action_just_pressed(Action::Jump);
+        let mut jump_pending = !modal_open && self.input.is_action_just_pressed(Action::Jump);
 
         // Build BVH acceleration structure for `level.cform` if loaded
         let cform_bvh = self
@@ -326,15 +402,25 @@ impl EngineRuntime {
             }
         });
 
+        // Sync any pending weapon loadout edits from Inventory into HudWeaponController
+        if self.inventory.hud_sync_dirty {
+            self.inventory.sync_hud_weapon(&mut self.hud_weapon);
+        }
+
         // Attach VFS asset cache to HUD viewmodels if already mounted
         if let Some(vfs) = &self.vfs {
             self.hud_weapon.ensure_active_ogfs_loaded(vfs);
         }
 
-        // Step first-person weapon state machine, ADS zoom, ballistics, wallmarks, sparks & combat audio
+        // Step first-person weapon state machine (suppress firing/ADS/swaps when a modal UI is open)
+        let weapon_input = if modal_open {
+            self.input.without_combat_inputs()
+        } else {
+            self.input.clone()
+        };
         let _shot = self.hud_weapon.step(
             dt,
-            &self.input,
+            &weapon_input,
             &mut self.camera,
             self.physics.velocity,
             self.elapsed_sec,
@@ -342,7 +428,78 @@ impl EngineRuntime {
             self.alife.as_mut(),
             Some(&mut self.audio),
         );
-        self.hud.show_crosshair = self.hud_weapon.state != WeaponState::Aiming;
+
+        // Proximity `'E'` (`Action::Use`) NPC/Trader dialogue & ground item pickup, plus modal UI input
+        if !self.inventory.is_modal_open() && !self.pda.open {
+            self.inventory.scan_use_target(
+                self.camera.position,
+                self.camera.forward(),
+                self.alife.as_ref(),
+            );
+        }
+        if self.input.is_action_just_pressed(Action::Use) && !self.inventory.open && !self.pda.open {
+            let _ = self
+                .inventory
+                .interact_with_target(self.alife.as_mut(), Some(&mut self.audio));
+        }
+
+        let vw = self.window.width();
+        let vh = self.window.height();
+        if self.inventory.is_modal_open() {
+            self.inventory.handle_input(
+                &self.input,
+                vw,
+                vh,
+                Some(&mut self.hud_weapon),
+                self.alife.as_mut(),
+                Some(&mut self.audio),
+            );
+        }
+
+        // Keep PDA minimap blips & quest tracker synced while open (and pre-warm VFS maps if attached)
+        if let Some(vfs) = &self.vfs {
+            self.pda.ensure_world_maps_loaded(vfs);
+        }
+        if self.pda.open {
+            let level_name = self
+                .alife
+                .as_ref()
+                .map(|a| a.level_name.as_str())
+                .or_else(|| self.world.as_ref().map(|w| w.level_dir.as_str()))
+                .unwrap_or("l01_escape");
+            self.pda.sync_from_world_state(
+                level_name,
+                self.camera.position,
+                self.camera.yaw,
+                self.alife.as_ref(),
+            );
+            self.pda.handle_input(
+                &self.input,
+                vw,
+                vh,
+                self.alife.as_mut(),
+                Some(&mut self.audio),
+            );
+        }
+
+        // Keep HUD health/stamina synced cleanly with inventory vital stats & ALife actor
+        if let Some(mgr) = self.alife.as_mut() {
+            mgr.actor_stats.health = self.inventory.actor_stats.health;
+            mgr.actor_stats.stamina = self.inventory.actor_stats.stamina;
+            mgr.actor_stats.bleeding = self.inventory.actor_stats.bleeding;
+            mgr.actor_stats.radiation = self.inventory.actor_stats.radiation;
+            if let Some(actor_id) = mgr.host_actor_id
+                && let Some(actor_ent) = mgr.entities.get_mut(&actor_id)
+            {
+                actor_ent.health = self.inventory.actor_stats.health;
+            }
+        }
+        self.hud.health = self.inventory.actor_stats.health.clamp(0.0, 1.0);
+        self.hud.stamina = self.inventory.actor_stats.stamina.clamp(0.0, 1.0);
+        let ui_open_after = self.inventory.is_modal_open() || self.pda.open;
+        self.input.set_cursor_locked(!ui_open_after);
+        self.hud.show_crosshair =
+            !ui_open_after && self.hud_weapon.state != WeaponState::Aiming;
 
         // Keep host ALife actor orientation & 3D audio listener synced every frame
         if let Some(mgr) = &mut self.alife {
@@ -425,10 +582,10 @@ impl EngineRuntime {
             self.audio.retain_alife_emitters(&active_keys);
         }
 
-        // 6. Direct3D 12 7-stage render graph presentation + first-person HUD weapon pass
+        // 6. Direct3D 12 7-stage render graph presentation + first-person HUD weapon + UI Canvas pass
         if let (Some(r), Some(rb)) = (&mut self.renderer, &mut self.render_bridge) {
             r.begin_frame()?;
-            rb.render_frame_with_hud(
+            rb.render_frame_with_ui(
                 r,
                 &self.camera,
                 self.world.as_ref(),
@@ -436,6 +593,8 @@ impl EngineRuntime {
                 self.vfs.as_deref(),
                 &self.hud,
                 Some(&mut self.hud_weapon),
+                Some(&self.inventory),
+                Some(&mut self.pda),
                 dt,
                 self.elapsed_sec,
             )?;

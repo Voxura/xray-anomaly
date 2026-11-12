@@ -27,6 +27,8 @@ use windows::core::Result as WinResult;
 use crate::alife_manager::{AlifeManager, EntityRole};
 use crate::camera::FirstPersonCamera;
 use crate::hud_weapon::{HudWeaponController, WeaponState};
+use crate::ui_inventory::{InventoryManager, UiFontResource};
+use crate::ui_pda::PdaManager;
 use crate::world_loader::{LoadedDynamicModel, LoadedWorld};
 use xray_formats::details::{LevelDetails, DETAIL_ID_EMPTY, DETAIL_SLOT_SIZE};
 use xray_formats::ogf::{
@@ -35,6 +37,7 @@ use xray_formats::ogf::{
 };
 use xray_formats::sun::{build_3split_csm_atlas, CsmAtlasPacking, SunCascadeConfig};
 use xray_formats::thm::{texture_stem_to_dds_vpath, ResolvedTextureLinks};
+use xray_formats::vfs_bridge::{load_font_from_vfs, load_ltx_tree_from_vfs};
 use xray_formats::weather::MixedEnvironment;
 use xray_render_dx12::bindless::DescriptorIndex;
 use xray_render_dx12::clouds::{CloudSimulation, CloudsPushConstants};
@@ -181,6 +184,8 @@ pub struct RenderBridge {
     dynamic_ogf_cache: BTreeMap<String, Vec<GpuOgfSubMesh>>,
     hud_mesh_cache: BTreeMap<String, (MeshHandle, DescriptorIndex)>,
     default_cube_mesh: MeshHandle,
+    ui_font: Option<UiFontResource>,
+    ui_font_attempted: bool,
 }
 
 impl RenderBridge {
@@ -223,6 +228,8 @@ impl RenderBridge {
             dynamic_ogf_cache: BTreeMap::new(),
             hud_mesh_cache: BTreeMap::new(),
             default_cube_mesh,
+            ui_font: None,
+            ui_font_attempted: false,
         })
     }
 
@@ -497,7 +504,38 @@ impl RenderBridge {
         alife: Option<&AlifeManager>,
         vfs: Option<&VirtualFileSystem>,
         hud: &HudOverlayState,
+        hud_weapon: Option<&mut HudWeaponController>,
+        dt: f32,
+        elapsed_sec: f32,
+    ) -> WinResult<FrameRenderStats> {
+        self.render_frame_with_ui(
+            renderer,
+            camera,
+            world,
+            alife,
+            vfs,
+            hud,
+            hud_weapon,
+            None,
+            None,
+            dt,
+            elapsed_sec,
+        )
+    }
+
+    /// Execute all 7 DX12 render graph passes plus first-person HUD weapon, Inventory, PDA, and Dialogue UI.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frame_with_ui(
+        &mut self,
+        renderer: &mut Dx12Renderer,
+        camera: &FirstPersonCamera,
+        world: Option<&LoadedWorld>,
+        alife: Option<&AlifeManager>,
+        vfs: Option<&VirtualFileSystem>,
+        hud: &HudOverlayState,
         mut hud_weapon: Option<&mut HudWeaponController>,
+        inventory: Option<&InventoryManager>,
+        pda: Option<&mut PdaManager>,
         dt: f32,
         elapsed_sec: f32,
     ) -> WinResult<FrameRenderStats> {
@@ -861,7 +899,7 @@ impl RenderBridge {
         let is_aiming_ads = hud_weapon
             .as_ref()
             .is_some_and(|hw| hw.state == WeaponState::Aiming);
-        if let Some(hw) = hud_weapon {
+        if let Some(hw) = hud_weapon.as_deref_mut() {
             let hud_parts = hw.collect_hud_draw_parts(camera, vfs);
             if !hud_parts.is_empty() {
                 renderer.clear_depth_stencil(1.0, 0);
@@ -906,38 +944,68 @@ impl RenderBridge {
         }
 
         // ---------------------------------------------------------------------
-        // Stage (g): UI Canvas Overlay (Crosshair + Stalker HUD)
+        // Stage (g): UI Canvas Overlay (Crosshair, Stalker HUD, Inventory & PDA)
         // ---------------------------------------------------------------------
         if self.config.render_hud {
-            let fw = width as f32;
-            let fh = height as f32;
-            if hud.show_crosshair && !is_aiming_ads {
-                renderer.ui_draw_crosshair(
-                    [fw * 0.5, fh * 0.5],
-                    10.0,
-                    4.0,
-                    2.0,
-                    [0.95, 0.95, 0.95, 0.85],
+            if !self.ui_font_attempted
+                && let Some(vfs_ref) = vfs
+            {
+                self.ui_font_attempted = true;
+                self.ui_font = try_load_ui_font(renderer, vfs_ref, height);
+            }
+            let font_ref = self.ui_font.as_ref();
+
+            if let Some(inv) = inventory {
+                let draw_crosshair = hud.show_crosshair && !is_aiming_ads;
+                let hw_ref = hud_weapon.as_deref();
+                stats.ui_elements_drawn += inv.render_ui(
+                    renderer,
+                    hw_ref,
+                    width,
+                    height,
+                    draw_crosshair,
+                    hud.stamina,
+                    font_ref,
+                );
+                if let Some(pda_mgr) = pda {
+                    let level_name = alife
+                        .map(|a| a.level_name.as_str())
+                        .or_else(|| world.map(|w| w.level_dir.as_str()))
+                        .unwrap_or("l01_escape");
+                    stats.ui_elements_drawn +=
+                        pda_mgr.render_ui(renderer, vfs, width, height, level_name, font_ref);
+                }
+            } else {
+                let fw = width as f32;
+                let fh = height as f32;
+                if hud.show_crosshair && !is_aiming_ads {
+                    renderer.ui_draw_crosshair(
+                        [fw * 0.5, fh * 0.5],
+                        10.0,
+                        4.0,
+                        2.0,
+                        [0.95, 0.95, 0.95, 0.85],
+                    );
+                    stats.ui_elements_drawn += 4;
+                }
+                // Bottom-left Stalker health & stamina bars
+                let bar_w = (fw * 0.18).clamp(80.0, 260.0);
+                let bar_h = (fh * 0.016).clamp(6.0, 14.0);
+                let margin = 16.0;
+                renderer.ui_draw_meter_bar(
+                    [margin, fh - margin - bar_h * 2.5, bar_w, bar_h],
+                    hud.health.clamp(0.0, 1.0),
+                    [0.08, 0.08, 0.08, 0.75],
+                    [0.82, 0.16, 0.16, 0.95],
+                );
+                renderer.ui_draw_meter_bar(
+                    [margin, fh - margin - bar_h, bar_w, bar_h * 0.75],
+                    hud.stamina.clamp(0.0, 1.0),
+                    [0.08, 0.08, 0.08, 0.75],
+                    [0.2, 0.68, 0.92, 0.95],
                 );
                 stats.ui_elements_drawn += 4;
             }
-            // Bottom-left Stalker health & stamina bars
-            let bar_w = (fw * 0.18).clamp(80.0, 260.0);
-            let bar_h = (fh * 0.016).clamp(6.0, 14.0);
-            let margin = 16.0;
-            renderer.ui_draw_meter_bar(
-                [margin, fh - margin - bar_h * 2.5, bar_w, bar_h],
-                hud.health.clamp(0.0, 1.0),
-                [0.08, 0.08, 0.08, 0.75],
-                [0.82, 0.16, 0.16, 0.95],
-            );
-            renderer.ui_draw_meter_bar(
-                [margin, fh - margin - bar_h, bar_w, bar_h * 0.75],
-                hud.stamina.clamp(0.0, 1.0),
-                [0.08, 0.08, 0.08, 0.75],
-                [0.2, 0.68, 0.92, 0.95],
-            );
-            stats.ui_elements_drawn += 4;
             renderer.ui_flush(width, height)?;
         }
 
@@ -1100,6 +1168,35 @@ fn try_load_vfs_texture(
     let vfs = vfs?;
     let bytes = vfs.read_bytes(vpath).ok()?;
     renderer.load_texture_from_dds(vpath, &bytes).ok()
+}
+
+fn try_load_ui_font(
+    renderer: &mut Dx12Renderer,
+    vfs: &VirtualFileSystem,
+    screen_height: u32,
+) -> Option<UiFontResource> {
+    let fonts_doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/fonts.ltx", &[]).ok()?;
+    for section in [
+        "ui_font_letterica16_russian",
+        "ui_font_arial_14",
+        "ui_font_letterica18_russian",
+        "hud_font_medium",
+    ] {
+        if let Ok((cfg, atlas)) = load_font_from_vfs(vfs, &fonts_doc, section, screen_height)
+            && let Some(tex_idx) = try_load_vfs_texture(renderer, Some(vfs), &cfg.texture_dds_vpath)
+        {
+            let size = renderer
+                .get_texture_by_index(tex_idx)
+                .map(|t| [t.width.max(1), t.height.max(1)])
+                .unwrap_or([512, 256]);
+            return Some(UiFontResource {
+                atlas,
+                texture_index: tex_idx,
+                texture_size: size,
+            });
+        }
+    }
+    None
 }
 
 fn load_solid_dds(

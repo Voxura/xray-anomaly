@@ -11,6 +11,8 @@
 //! - Level world streaming, BVH collision & weather simulation (`world_loader`)
 //! - Live ALife entity spawn manager & `.scop`/`.scoc` co-op state sync (`alife_manager`)
 //! - First-person HUD weapons, skeletal viewmodel rig & ballistic combat (`hud_weapon`)
+//! - Interactive 2D grid Inventory, Equipment & NPC/Trader dialogue (`ui_inventory`)
+//! - Interactive PDA level map, co-op peer radar & story quest tracker (`ui_pda`)
 //! - Pure-Rust 3D spatial audio subsystem (`xray_audio`)
 
 pub mod alife_manager;
@@ -21,6 +23,8 @@ pub mod input;
 pub mod physics;
 pub mod render_bridge;
 pub mod timer;
+pub mod ui_inventory;
+pub mod ui_pda;
 pub mod window;
 pub mod world_loader;
 
@@ -38,6 +42,11 @@ pub use input::{Action, EngineInput, MouseButton};
 pub use physics::{CapsuleConfig, StalkerController};
 pub use render_bridge::{FrameRenderStats, HudOverlayState, RenderBridge, RenderBridgeConfig};
 pub use timer::EngineTimer;
+pub use ui_inventory::{
+    DialoguePromptState, DragState, EquipmentSlot, InventoryItem, InventoryLayout,
+    InventoryManager, ItemCategory, ItemUseEffect, UiFontResource, UseTarget,
+};
+pub use ui_pda::{MapBlip, MapBlipKind, PdaLayout, PdaManager, PdaTab, QuestTrackerEntry};
 pub use window::{EngineWindow, WindowConfig, WindowEvent};
 pub use world_loader::{
     LevelLoadConfig, LoadedDynamicModel, LoadedVisualMesh, LoadedWorld, WorldLoadError,

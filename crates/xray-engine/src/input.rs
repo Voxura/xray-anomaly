@@ -15,6 +15,7 @@ pub enum Action {
     Use,
     Reload,
     Inventory,
+    Pda,
     Menu,
     Slot1,
     Slot2,
@@ -72,6 +73,8 @@ impl EngineInput {
     pub const VK_KEY_A: usize = 0x41;
     pub const VK_KEY_D: usize = 0x44;
     pub const VK_KEY_E: usize = 0x45;
+    pub const VK_KEY_I: usize = 0x49;
+    pub const VK_KEY_P: usize = 0x50;
     pub const VK_KEY_R: usize = 0x52;
     pub const VK_KEY_S: usize = 0x53;
     pub const VK_KEY_W: usize = 0x57;
@@ -211,6 +214,39 @@ impl EngineInput {
         self.mouse_just_pressed[button as usize]
     }
 
+    /// Check if mouse button was released this frame
+    #[inline]
+    pub fn is_mouse_just_released(&self, button: MouseButton) -> bool {
+        self.mouse_just_released[button as usize]
+    }
+
+    /// Current pointer coordinates in client pixels `[x, y]`
+    #[inline]
+    pub fn mouse_position(&self) -> (f32, f32) {
+        self.mouse_pos
+    }
+
+    /// Return a cloned input snapshot with weapon firing / aiming / slot keys cleared while modal UI is active.
+    pub fn without_combat_inputs(&self) -> Self {
+        let mut copy = self.clone();
+        copy.mouse_down = [false; 3];
+        copy.mouse_just_pressed = [false; 3];
+        copy.mouse_just_released = [false; 3];
+        for vk in [
+            Self::VK_KEY_1,
+            Self::VK_KEY_2,
+            Self::VK_KEY_3,
+            Self::VK_KEY_4,
+            Self::VK_KEY_5,
+            Self::VK_KEY_6,
+            Self::VK_KEY_R,
+        ] {
+            copy.key_down[vk] = false;
+            copy.key_just_pressed[vk] = false;
+        }
+        copy
+    }
+
     /// Check if action is currently active
     pub fn is_action_down(&self, action: Action) -> bool {
         match action {
@@ -223,7 +259,8 @@ impl EngineInput {
             Action::Crouch => self.is_key_down(Self::VK_CONTROL),
             Action::Use => self.is_key_down(Self::VK_KEY_E),
             Action::Reload => self.is_key_down(Self::VK_KEY_R),
-            Action::Inventory => self.is_key_down(Self::VK_TAB),
+            Action::Inventory => self.is_key_down(Self::VK_TAB) || self.is_key_down(Self::VK_KEY_I),
+            Action::Pda => self.is_key_down(Self::VK_KEY_P),
             Action::Menu => self.is_key_down(Self::VK_ESCAPE),
             Action::Slot1 => self.is_key_down(Self::VK_KEY_1),
             Action::Slot2 => self.is_key_down(Self::VK_KEY_2),
@@ -248,7 +285,10 @@ impl EngineInput {
             Action::Crouch => self.is_key_just_pressed(Self::VK_CONTROL),
             Action::Use => self.is_key_just_pressed(Self::VK_KEY_E),
             Action::Reload => self.is_key_just_pressed(Self::VK_KEY_R),
-            Action::Inventory => self.is_key_just_pressed(Self::VK_TAB),
+            Action::Inventory => {
+                self.is_key_just_pressed(Self::VK_TAB) || self.is_key_just_pressed(Self::VK_KEY_I)
+            }
+            Action::Pda => self.is_key_just_pressed(Self::VK_KEY_P),
             Action::Menu => self.is_key_just_pressed(Self::VK_ESCAPE),
             Action::Slot1 => self.is_key_just_pressed(Self::VK_KEY_1),
             Action::Slot2 => self.is_key_just_pressed(Self::VK_KEY_2),
