@@ -22,6 +22,7 @@ use crate::particles::{
 };
 use crate::savegames::SavegameFile;
 use crate::scoc::ScocFile;
+use crate::scop::ScopSaveFile;
 use crate::shaders_xr::{
     EngineShaderLibrary, LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles,
     ShaderXrlcLibrary,
@@ -635,6 +636,15 @@ pub fn load_scop_from_vfs(
 ) -> Result<SavegameFile, AssetLoadError> {
     let bytes = vfs.read_bytes(virtual_path)?;
     Ok(SavegameFile::parse(&bytes)?)
+}
+
+/// Stream a `.scop` ALife world savegame archive from `VirtualFileSystem` into typed [`ScopSaveFile`].
+pub fn load_scop_save_from_vfs(
+    vfs: &VirtualFileSystem,
+    virtual_path: &str,
+) -> Result<ScopSaveFile, AssetLoadError> {
+    let bytes = vfs.read_bytes(virtual_path)?;
+    Ok(ScopSaveFile::parse(&bytes)?)
 }
 
 /// Stream a CoC / Anomaly / xrRazom `.scoc` binary Lua marshal savegame from `VirtualFileSystem`.
@@ -3650,5 +3660,81 @@ use_flags = 0x02
                 .unwrap(),
             &[0x83; 8]
         );
+    }
+
+    #[test]
+    fn test_load_scop_save_from_vfs_both_formats() {
+        use crate::savegames::{GameDateTime, SaveGameTime};
+        use crate::scop::{
+            ScopActorStats, ScopHeader, ScopSaveFile, ScopWeatherState, SCOP_ALIFE_VERSION,
+            SCOP_FORMAT_VERSION,
+        };
+
+        let mut scop = ScopSaveFile {
+            header: ScopHeader {
+                alife_version: SCOP_ALIFE_VERSION,
+                format_version: SCOP_FORMAT_VERSION,
+                spawn_name: "all".to_string(),
+                spawn_guid: [0x17; 16],
+                level_id: Some(2),
+                level_name: "zaton".to_string(),
+                game_time: SaveGameTime {
+                    game_time_ms: GameDateTime {
+                        year: 2018,
+                        month: 8,
+                        day: 1,
+                        hour: 11,
+                        minute: 20,
+                        second: 0,
+                        millisecond: 0,
+                    }
+                    .to_game_time_ms(),
+                    time_factor: 10.0,
+                    normal_time_factor: 10.0,
+                },
+                actor_stats: ScopActorStats {
+                    actor_name: "Zilla".to_string(),
+                    money: 15000,
+                    ..Default::default()
+                },
+            },
+            weather: ScopWeatherState {
+                current_weather: "w_clear2".to_string(),
+                rain_wetness: 0.15,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        scop.graph_and_quests.set_active_quest("zat_coop_host");
+
+        let structured_bytes = scop.to_bytes().unwrap();
+        let canonical_bytes = scop.to_anomaly_scop_bytes().unwrap();
+
+        let entries = vec![
+            (
+                "savedgames\\host_structured.scop",
+                structured_bytes.clone(),
+                structured_bytes,
+            ),
+            (
+                "savedgames\\host_canonical.scop",
+                canonical_bytes.clone(),
+                canonical_bytes,
+            ),
+        ];
+
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_bytes("saves.db0", pack_synthetic_db(entries))
+            .unwrap();
+
+        let loaded_struct =
+            load_scop_save_from_vfs(&vfs, "savedgames\\host_structured.scop").unwrap();
+        assert_eq!(loaded_struct, scop);
+
+        let loaded_canon =
+            load_scop_save_from_vfs(&vfs, "savedgames\\host_canonical.scop").unwrap();
+        assert_eq!(loaded_canon.header.level_name, "zaton");
+        assert_eq!(loaded_canon.weather, scop.weather);
+        assert_eq!(loaded_canon.graph_and_quests.active_quest_id, "zat_coop_host");
     }
 }

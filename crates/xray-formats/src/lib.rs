@@ -20,6 +20,7 @@
 //! - `postprocess`: Phase-13/15 PPE noise/quads, bloom/luminance adaptation + bloom/combine quads, R4 RT catalog & phase specs, SSAO/HDAO/SMAA/SSFX TAA & volumetric shafts plans, screen TL/TL2uv quads, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision, SSFX blur/SSS helpers
 //! - `savegames`: Anomaly `.scop` LZO1X ALife savegame reader/writer (`GameDateTime`, spawn header, dynamic objects & 7 binary registries)
 //! - `scoc`: CoC / Anomaly / xrRazom `.scoc` `lmarshal.c` binary Lua marshal codec & typed peer state (`ScocInventoryItem`, `item_remaining_uses`, `visited_levels`, `skills_levels`, `psy_table`, `head_tbl`, `visited_campfires`)
+//! - `scop`: Host ALife & world `.scop` savegame codec (`ScopSaveFile`, `ScopHeader`, `ScopActorStats`, typed `ScopAlifeEntity`/`ScopAlifePayload`, game graph mappings, `ScopStoryQuest`, `ScopWeatherState`)
 //! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `uber_deffer`, R4/internal blender compilers, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
 //! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, multi-channel `AnimatedBlendMixer`, OMF pose evaluation & `1W`–`4W` CPU skinning
 //! - `sound_env`: `senvironment.xr` v4/v5, `level.som` BVH acoustic occlusion, `level.snd_env` & `level.snd_static`
@@ -51,6 +52,7 @@ pub mod particles;
 pub mod postprocess;
 pub mod savegames;
 pub mod scoc;
+pub mod scop;
 pub mod shaders_xr;
 pub mod skinning;
 pub mod sound_env;
@@ -293,6 +295,14 @@ pub use scoc::{
     LUA_TUSERDATA, MAR_TREF, MAR_TUSR, MAR_TVAL, SCOC_EXTENSION, SCOC_MAGIC,
     SCOC_MAX_RECURSION_DEPTH,
 };
+pub use scop::{
+    classify_alife_section, ScopActorStats, ScopAlifeEntity, ScopAlifeKind, ScopAlifePayload,
+    ScopGraphAndQuests, ScopGraphMapping, ScopHeader, ScopQuestStatus, ScopSaveFile,
+    ScopSmartTerrainState, ScopStoryQuest, ScopWeatherState, SCOP_ALIFE_VERSION,
+    SCOP_CANONICAL_WEATHER_CHUNK, SCOP_CHUNK_ALIFE_OBJECTS, SCOP_CHUNK_GRAPH_QUESTS,
+    SCOP_CHUNK_HEADER, SCOP_CHUNK_WEATHER_ENV, SCOP_EXTENSION, SCOP_FORMAT_VERSION,
+    SCOP_HEADER_SIGNATURE, SCOP_MAGIC,
+};
 pub use shaders_xr::{
     clsid_to_string, env_mod_flags, fix_texture_name, matrix_mode, plan_r4_blender_compile,
     plan_r4_internal_blender, plan_uber_deffer, plan_uber_shadow, resolve_ui_shader_name,
@@ -379,7 +389,8 @@ pub use vfs_bridge::{
     load_level_sound_env_from_vfs, load_level_spawn_from_vfs, load_localization_table_from_vfs,
     load_ltx_tree_from_vfs, load_ogg_sound_metadata_from_vfs, load_ogf_from_vfs, load_omf_from_vfs,
     load_particles_from_vfs, load_patrol_paths_ltx_from_vfs, load_ppe_from_vfs,
-    load_ps_static_from_vfs, load_scoc_from_vfs, load_scop_from_vfs, load_shaders_xr_from_vfs,
+    load_ps_static_from_vfs, load_scoc_from_vfs, load_scop_from_vfs, load_scop_save_from_vfs,
+    load_shaders_xr_from_vfs,
     load_shaders_xrlc_from_vfs, load_som_from_vfs, load_sound_environments_from_vfs,
     load_spawn_overlays_from_vfs, load_static_sounds_from_vfs, load_thm_from_vfs,
     load_torch_light_config_from_vfs, load_ui_texture_atlases_from_vfs,
