@@ -757,6 +757,21 @@ pub fn matrix_set_hpb(h: f32, p: f32, b: f32) -> XRayMatrix {
     ]
 }
 
+/// Compute `Fmatrix::setXYZ(x, y, z)` (`setHPB(y, x, z)`) with translation `t` (`_matrix.h:880`).
+pub fn matrix_set_xyz_translate(xyz: [f32; 3], t: [f32; 3]) -> XRayMatrix {
+    let mut m = matrix_set_hpb(xyz[1], xyz[0], xyz[2]);
+    m[3][0] = t[0];
+    m[3][1] = t[1];
+    m[3][2] = t[2];
+    m
+}
+
+/// Extract the forward (`+Z`, `Fmatrix::k`) basis vector from `m`.
+#[inline]
+pub fn matrix_forward_dir(m: &XRayMatrix) -> [f32; 3] {
+    [m[2][0], m[2][1], m[2][2]]
+}
+
 /// Compute `Fmatrix::setXYZi(x, y, z)` (`setHPB(-y, -x, -z)`) with translation `t`.
 pub fn matrix_set_xyzi_translate(xyz: [f32; 3], t: [f32; 3]) -> XRayMatrix {
     let mut m = matrix_set_hpb(-xyz[1], -xyz[0], -xyz[2]);

@@ -5,7 +5,29 @@
 //! `src/Layers/xrRender/FVisual.cpp`, and `src/Layers/xrRender/Light_DB.cpp`.
 
 use crate::chunk::{ByteCursor, ChunkReader, FormatError};
+use crate::lanims::LightAnimItem;
 use crate::ogf::{OgfModel, OgfSlideWindows, SlideWindow, StaticVertex};
+use xray_core::ltx_loader::OwnedLtxDocument;
+
+/// D3D9 `D3DLIGHTTYPE` constants used in `fsL_LIGHT_DYNAMIC` (`LevelLight::light_type`).
+pub mod d3d_light_type {
+    pub const POINT: u32 = 1;
+    pub const SPOT: u32 = 2;
+    pub const DIRECTIONAL: u32 = 3;
+}
+
+/// Compiler `R_Light::type` constants used in `$level$\build.lights` (`R_light.h`).
+pub mod build_light_type {
+    pub const DIRECT: u16 = 0;
+    pub const POINT: u16 = 1;
+    pub const SECONDARY: u16 = 2;
+}
+
+/// Wire byte stride of each static glow entry inside `fsL_GLOWS` (`CGlowManager::Load`).
+pub const LEVEL_GLOW_RECORD_SIZE: usize = 18;
+
+/// Wire byte stride of each `R_Light` entry inside `build.lights` (`sizeof(R_Light)`).
+pub const BUILD_LIGHT_RECORD_SIZE: usize = 104;
 
 /// Top-level chunks inside `level` and `level.geom`/`level.geomx` (`enum fsL_Chunks`).
 pub mod level_chunks {
@@ -389,12 +411,142 @@ pub struct LevelPortal {
     pub vertices: Vec<[f32; 3]>,
 }
 
+impl LevelPortal {
+    /// Compute the portal's enclosing sphere `(center, radius)` (`CPortal::Setup`).
+    pub fn bounding_sphere(&self) -> Option<([f32; 3], f32)> {
+        if self.vertices.is_empty() {
+            return None;
+        }
+        let mut min = self.vertices[0];
+        let mut max = self.vertices[0];
+        for v in &self.vertices[1..] {
+            for i in 0..3 {
+                min[i] = min[i].min(v[i]);
+                max[i] = max[i].max(v[i]);
+            }
+        }
+        let center = [
+            0.5 * (min[0] + max[0]),
+            0.5 * (min[1] + max[1]),
+            0.5 * (min[2] + max[2]),
+        ];
+        let mut max_r2 = 0.0f32;
+        for v in &self.vertices {
+            let dx = v[0] - center[0];
+            let dy = v[1] - center[1];
+            let dz = v[2] - center[2];
+            max_r2 = max_r2.max(dx * dx + dy * dy + dz * dz);
+        }
+        Some((center, max_r2.sqrt()))
+    }
+
+    /// Compute the portal's averaged unit normal and signed plane distance `(normal, d)`
+    /// such that `dot(normal, p) + d = signed_distance` (`CPortal::Setup`).
+    pub fn plane(&self) -> Option<([f32; 3], f32)> {
+        if self.vertices.len() < 3 {
+            return None;
+        }
+        let v0 = self.vertices[0];
+        let mut accum = [0.0f32; 3];
+        let mut count = 0u32;
+        for i in 2..self.vertices.len() {
+            let v1 = self.vertices[i - 1];
+            let v2 = self.vertices[i];
+            let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+            let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+            let n = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if len > 1e-6 {
+                accum[0] += n[0] / len;
+                accum[1] += n[1] / len;
+                accum[2] += n[2] / len;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return None;
+        }
+        let mag = (accum[0] * accum[0] + accum[1] * accum[1] + accum[2] * accum[2]).sqrt();
+        if mag <= 1e-6 {
+            return None;
+        }
+        let normal = [accum[0] / mag, accum[1] / mag, accum[2] / mag];
+        let d = -(normal[0] * v0[0] + normal[1] * v0[1] + normal[2] * v0[2]);
+        Some((normal, d))
+    }
+
+    /// Signed distance from `point` to the portal plane (positive = front side).
+    pub fn signed_distance(&self, point: [f32; 3]) -> Option<f32> {
+        let (n, d) = self.plane()?;
+        Some(n[0] * point[0] + n[1] * point[1] + n[2] * point[2] + d)
+    }
+
+    /// Sector on the opposite side of this portal from `from_sector`.
+    #[inline]
+    pub fn opposite_sector(&self, from_sector: u16) -> Option<u16> {
+        if from_sector == self.sector_front {
+            Some(self.sector_back)
+        } else if from_sector == self.sector_back {
+            Some(self.sector_front)
+        } else {
+            None
+        }
+    }
+
+    /// Sector facing `view_point` (`CPortal::getSectorFacing`), or `None` if plane degenerate.
+    #[inline]
+    pub fn sector_facing(&self, view_point: [f32; 3]) -> Option<u16> {
+        self.signed_distance(view_point)
+            .map(|sd| if sd > 0.0 { self.sector_front } else { self.sector_back })
+    }
+
+    /// Sector behind the portal relative to `view_point` (`CPortal::getSectorBack`).
+    #[inline]
+    pub fn sector_behind(&self, view_point: [f32; 3]) -> Option<u16> {
+        self.signed_distance(view_point)
+            .map(|sd| if sd > 0.0 { self.sector_back } else { self.sector_front })
+    }
+}
+
 /// Occlusion sector from `level` chunk `fsL_SECTORS` (`CSector`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LevelSector {
     pub id: u32,
     pub portals: Vec<u16>,
     pub root_visual_id: Option<u32>,
+}
+
+/// Static glow corona record (`18` bytes in `fsL_GLOWS`, `CGlowManager::Load`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LevelGlow {
+    pub position: [f32; 3],
+    pub radius: f32,
+    pub shader_id: u16,
+}
+
+impl LevelGlow {
+    /// Parse all `18`-byte glow entries inside `fsL_GLOWS`.
+    pub fn parse_list(bytes: &[u8]) -> Result<Vec<Self>, FormatError> {
+        if !bytes.len().is_multiple_of(LEVEL_GLOW_RECORD_SIZE) {
+            return Err(FormatError::InvalidValue(
+                "fsL_GLOWS size must be a multiple of 18 bytes",
+            ));
+        }
+        let mut out = Vec::with_capacity(bytes.len() / LEVEL_GLOW_RECORD_SIZE);
+        for rec in bytes.as_chunks::<LEVEL_GLOW_RECORD_SIZE>().0 {
+            let mut c = ByteCursor::new(rec);
+            out.push(Self {
+                position: c.read_f32_3()?,
+                radius: c.read_f32()?,
+                shader_id: c.read_u16()?,
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// Static/dynamic level light record (`u32 controller + Flight`, 108 bytes in `fsL_LIGHT_DYNAMIC`).
@@ -412,6 +564,434 @@ pub struct LevelLight {
     pub attenuation: [f32; 3],
     pub theta: f32,
     pub phi: f32,
+}
+
+impl LevelLight {
+    #[inline]
+    pub fn is_point(&self) -> bool {
+        self.light_type == d3d_light_type::POINT
+    }
+
+    #[inline]
+    pub fn is_spot(&self) -> bool {
+        self.light_type == d3d_light_type::SPOT
+    }
+
+    #[inline]
+    pub fn is_directional(&self) -> bool {
+        self.light_type == d3d_light_type::DIRECTIONAL
+    }
+
+    /// Safe unit direction vector (falls back to `(0, -1, 0)` when zero-length).
+    #[inline]
+    pub fn normalized_direction(&self) -> [f32; 3] {
+        let len_sq = self.direction[0] * self.direction[0]
+            + self.direction[1] * self.direction[1]
+            + self.direction[2] * self.direction[2];
+        if len_sq <= 1e-12 {
+            return [0.0, -1.0, 0.0];
+        }
+        let inv = 1.0 / len_sq.sqrt();
+        [
+            self.direction[0] * inv,
+            self.direction[1] * inv,
+            self.direction[2] * inv,
+        ]
+    }
+
+    /// Minimal enclosing sphere `(center, radius)` matching `light::spatial_move()` (`light.cpp:205-230`).
+    pub fn bounding_sphere(&self) -> ([f32; 3], f32) {
+        let r = self.range.max(0.0);
+        if self.is_spot() {
+            let dir = self.normalized_direction();
+            let cone = self.phi.max(self.theta).clamp(0.0, 120.0f32.to_radians());
+            if cone >= std::f32::consts::FRAC_PI_2 {
+                (
+                    [
+                        self.position[0] + dir[0] * r,
+                        self.position[1] + dir[1] * r,
+                        self.position[2] + dir[2] * r,
+                    ],
+                    r * (0.5 * cone).tan(),
+                )
+            } else {
+                let half_cos = (0.5 * cone).cos().max(1e-4);
+                let sr = r / (2.0 * half_cos * half_cos);
+                (
+                    [
+                        self.position[0] + dir[0] * sr,
+                        self.position[1] + dir[1] * sr,
+                        self.position[2] + dir[2] * sr,
+                    ],
+                    sr,
+                )
+            }
+        } else {
+            (self.position, r)
+        }
+    }
+
+    /// Distance attenuation factor matching `LightTrack.cpp:238` (`1 / (a0 + a1*d + a2*d^2) - d*falloff`),
+    /// with smooth linear `(1 - d/range)` fallback when D3D attenuation constants are all zero.
+    pub fn evaluate_attenuation(&self, distance: f32) -> f32 {
+        if self.is_directional() {
+            return 1.0;
+        }
+        if distance < 0.0 {
+            return 0.0;
+        }
+        if self.range > 0.0 && distance >= self.range {
+            return 0.0;
+        }
+        let denom = self.attenuation[0]
+            + self.attenuation[1] * distance
+            + self.attenuation[2] * distance * distance;
+        if denom > 1e-6 {
+            (1.0 / denom - distance * self.falloff).max(0.0)
+        } else if self.range > 1e-6 {
+            (1.0 - distance / self.range).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Inner/outer spot cone half-angle cosines `[cos(theta / 2), cos(phi / 2)]`
+    /// matching D3D9 / GPU `spot_params`.
+    #[inline]
+    pub fn spot_cos_half_angles(&self) -> [f32; 2] {
+        let outer = self.phi.max(self.theta).clamp(0.0, std::f32::consts::PI);
+        let inner = self.theta.min(outer).max(0.0);
+        [(0.5 * inner).cos(), (0.5 * outer).cos()]
+    }
+
+    /// Direct3D9 spot-cone factor evaluated at `world_pos` (`theta` inner, `phi` outer, `falloff`).
+    pub fn evaluate_spot_factor(&self, world_pos: [f32; 3]) -> f32 {
+        if !self.is_spot() {
+            return 1.0;
+        }
+        let to_pt = [
+            world_pos[0] - self.position[0],
+            world_pos[1] - self.position[1],
+            world_pos[2] - self.position[2],
+        ];
+        let dist_sq = to_pt[0] * to_pt[0] + to_pt[1] * to_pt[1] + to_pt[2] * to_pt[2];
+        if dist_sq <= 1e-12 {
+            return 1.0;
+        }
+        let inv = 1.0 / dist_sq.sqrt();
+        let dir = self.normalized_direction();
+        let cos_alpha =
+            (to_pt[0] * dir[0] + to_pt[1] * dir[1] + to_pt[2] * dir[2]) * inv;
+        let [cos_inner, cos_outer] = self.spot_cos_half_angles();
+        if cos_alpha <= cos_outer {
+            0.0
+        } else if cos_alpha >= cos_inner || (cos_inner - cos_outer).abs() <= 1e-6 {
+            1.0
+        } else {
+            let t = ((cos_alpha - cos_outer) / (cos_inner - cos_outer)).clamp(0.0, 1.0);
+            t.powf(self.falloff.max(0.0))
+        }
+    }
+
+    /// Evaluate animated diffuse RGBA by modulating `self.diffuse` with an optional `LightAnimItem` (`lanims.xr`).
+    pub fn evaluate_diffuse_with_anim(
+        &self,
+        anim: Option<&LightAnimItem>,
+        t_sec: f32,
+        smooth: bool,
+    ) -> [f32; 4] {
+        match anim {
+            Some(item) => {
+                let c = item.sample_rgba_f32(t_sec, smooth);
+                [
+                    self.diffuse[0] * c[0],
+                    self.diffuse[1] * c[1],
+                    self.diffuse[2] * c[2],
+                    self.diffuse[3] * c[3],
+                ]
+            }
+            None => self.diffuse,
+        }
+    }
+
+    /// Combined scalar attenuation × spot factor × animated diffuse RGBA at `world_pos`.
+    pub fn evaluate_contribution_at(
+        &self,
+        world_pos: [f32; 3],
+        anim: Option<&LightAnimItem>,
+        t_sec: f32,
+        smooth: bool,
+    ) -> [f32; 4] {
+        let att = if self.is_directional() {
+            1.0
+        } else {
+            let dx = world_pos[0] - self.position[0];
+            let dy = world_pos[1] - self.position[1];
+            let dz = world_pos[2] - self.position[2];
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+            self.evaluate_attenuation(dist) * self.evaluate_spot_factor(world_pos)
+        };
+        if att <= 0.0 {
+            return [0.0; 4];
+        }
+        let col = self.evaluate_diffuse_with_anim(anim, t_sec, smooth);
+        [col[0] * att, col[1] * att, col[2] * att, col[3]]
+    }
+}
+
+/// Compiler `R_Light` record inside `$level$\build.lights` (`104` bytes, `R_light.h:7-30`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BuildLightRecord {
+    pub type_id: u16,
+    pub gi_level: u16,
+    pub diffuse: [f32; 3],
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub range: f32,
+    pub range_sq: f32,
+    pub falloff: f32,
+    pub attenuation: [f32; 3],
+    pub energy: f32,
+    pub tri: [[f32; 3]; 3],
+}
+
+impl BuildLightRecord {
+    /// Convert this static/hemi compiler light into a runtime [`LevelLight`] (`Light_DB.cpp:128-149`).
+    pub fn to_level_light(&self) -> LevelLight {
+        let light_type = match self.type_id {
+            build_light_type::DIRECT => d3d_light_type::DIRECTIONAL,
+            _ => d3d_light_type::POINT,
+        };
+        LevelLight {
+            controller_id: u32::MAX,
+            light_type,
+            diffuse: [self.diffuse[0], self.diffuse[1], self.diffuse[2], 1.0],
+            specular: [0.0, 0.0, 0.0, 1.0],
+            ambient: [0.0, 0.0, 0.0, 1.0],
+            position: self.position,
+            direction: self.direction,
+            range: self.range,
+            falloff: self.falloff,
+            attenuation: self.attenuation,
+            theta: 0.0,
+            phi: 0.0,
+        }
+    }
+}
+
+/// Parsed `$level$\build.lights` direct & hemispheric light tables (`CLight_DB::LoadHemi`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BuildLights {
+    pub direct: Vec<BuildLightRecord>,
+    pub hemi: Vec<BuildLightRecord>,
+}
+
+impl BuildLights {
+    fn parse_records(bytes: &[u8]) -> Result<Vec<BuildLightRecord>, FormatError> {
+        if !bytes.len().is_multiple_of(BUILD_LIGHT_RECORD_SIZE) {
+            return Err(FormatError::InvalidValue(
+                "build.lights chunk size must be a multiple of 104 bytes",
+            ));
+        }
+        let mut out = Vec::with_capacity(bytes.len() / BUILD_LIGHT_RECORD_SIZE);
+        for rec in bytes.as_chunks::<BUILD_LIGHT_RECORD_SIZE>().0 {
+            let mut c = ByteCursor::new(rec);
+            out.push(BuildLightRecord {
+                type_id: c.read_u16()?,
+                gi_level: c.read_u16()?,
+                diffuse: c.read_f32_3()?,
+                position: c.read_f32_3()?,
+                direction: c.read_f32_3()?,
+                range: c.read_f32()?,
+                range_sq: c.read_f32()?,
+                falloff: c.read_f32()?,
+                attenuation: c.read_f32_3()?,
+                energy: c.read_f32()?,
+                tri: [c.read_f32_3()?, c.read_f32_3()?, c.read_f32_3()?],
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
+        let reader = ChunkReader::new(data);
+        let direct = match reader.open_chunk(0)? {
+            Some(bytes) => Self::parse_records(&bytes)?,
+            None => Vec::new(),
+        };
+        let hemi = match reader.open_chunk(1)? {
+            Some(bytes) => Self::parse_records(&bytes)?,
+            None => Vec::new(),
+        };
+        Ok(Self { direct, hemi })
+    }
+}
+
+/// Parsed `[torch_definition]` LTX lighting parameters (`CTorch::LoadLightParams`, `Torch.cpp:202-262`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TorchLightConfig {
+    pub section: String,
+    pub light_type: u32,
+    pub omni_type: u32,
+    pub color: [f32; 4],
+    pub range: f32,
+    pub omni_color: [f32; 4],
+    pub omni_range: f32,
+    pub spot_angle_deg: f32,
+    pub spot_texture: Option<String>,
+    pub color_animator: String,
+    pub guide_bone: String,
+    pub glow_texture: String,
+    pub glow_radius: f32,
+    pub volumetric: bool,
+    pub volumetric_quality: f32,
+    pub volumetric_intensity: f32,
+    pub volumetric_distance: f32,
+}
+
+impl Default for TorchLightConfig {
+    fn default() -> Self {
+        Self {
+            section: "torch_definition".to_string(),
+            light_type: d3d_light_type::SPOT,
+            omni_type: d3d_light_type::POINT,
+            color: [0.6, 0.55, 0.55, 0.8],
+            range: 25.0,
+            omni_color: [0.25, 0.25, 0.25, 0.3],
+            omni_range: 1.5,
+            spot_angle_deg: 60.0,
+            spot_texture: None,
+            color_animator: String::new(),
+            guide_bone: "lights_bone".to_string(),
+            glow_texture: String::new(),
+            glow_radius: 0.3,
+            volumetric: false,
+            volumetric_quality: 1.0,
+            volumetric_intensity: 1.0,
+            volumetric_distance: 1.0,
+        }
+    }
+}
+
+fn parse_ltx_fcolor(raw: Option<&str>, default: [f32; 4]) -> [f32; 4] {
+    let Some(raw) = raw else {
+        return default;
+    };
+    let mut out = default;
+    for (idx, tok) in raw.split(',').take(4).enumerate() {
+        if let Ok(val) = tok.trim().parse::<f32>() {
+            out[idx] = val;
+        }
+    }
+    out
+}
+
+impl TorchLightConfig {
+    pub fn from_ltx(
+        doc: &OwnedLtxDocument,
+        section: &str,
+        prefer_r2: bool,
+    ) -> Result<Self, FormatError> {
+        if !doc.sections.contains_key(section) {
+            return Err(FormatError::InvalidValue("missing torch definition LTX section"));
+        }
+        let color_key = if prefer_r2 && doc.read_str(section, "color_r2").is_some() {
+            "color_r2"
+        } else {
+            "color"
+        };
+        let range_key = if prefer_r2 && doc.read_str(section, "range_r2").is_some() {
+            "range_r2"
+        } else {
+            "range"
+        };
+        let omni_color_key = if prefer_r2 && doc.read_str(section, "omni_color_r2").is_some() {
+            "omni_color_r2"
+        } else {
+            "omni_color"
+        };
+        let omni_range_key = if prefer_r2 && doc.read_str(section, "omni_range_r2").is_some() {
+            "omni_range_r2"
+        } else {
+            "omni_range"
+        };
+        let def = Self::default();
+        Ok(Self {
+            section: section.to_string(),
+            light_type: doc.read_i32(section, "type", def.light_type as i32).max(0) as u32,
+            omni_type: doc
+                .read_i32(section, "omni_type", def.omni_type as i32)
+                .max(0) as u32,
+            color: parse_ltx_fcolor(doc.read_str(section, color_key), def.color),
+            range: doc.read_f32(section, range_key, def.range),
+            omni_color: parse_ltx_fcolor(doc.read_str(section, omni_color_key), def.omni_color),
+            omni_range: doc.read_f32(section, omni_range_key, def.omni_range),
+            spot_angle_deg: doc.read_f32(section, "spot_angle", def.spot_angle_deg),
+            spot_texture: doc
+                .read_str(section, "spot_texture")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            color_animator: doc
+                .read_str(section, "color_animator")
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            guide_bone: doc
+                .read_str(section, "guide_bone")
+                .unwrap_or(&def.guide_bone)
+                .trim()
+                .to_string(),
+            glow_texture: doc
+                .read_str(section, "glow_texture")
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            glow_radius: doc.read_f32(section, "glow_radius", def.glow_radius),
+            volumetric: doc.read_bool(section, "volumetric", false),
+            volumetric_quality: doc.read_f32(section, "volumetric_quality", 1.0),
+            volumetric_intensity: doc.read_f32(section, "volumetric_intensity", 1.0),
+            volumetric_distance: doc.read_f32(section, "volumetric_distance", 1.0),
+        })
+    }
+
+    /// Build `(primary_spot_or_point, secondary_omni)` [`LevelLight`] instances at `position` & `direction`.
+    pub fn to_level_light_pair(
+        &self,
+        position: [f32; 3],
+        direction: [f32; 3],
+    ) -> (LevelLight, LevelLight) {
+        let phi = self.spot_angle_deg.to_radians();
+        let primary = LevelLight {
+            controller_id: u32::MAX,
+            light_type: self.light_type,
+            diffuse: self.color,
+            specular: [0.0; 4],
+            ambient: [0.0; 4],
+            position,
+            direction,
+            range: self.range,
+            falloff: 1.0,
+            attenuation: [0.0, 0.0, 0.0],
+            theta: phi * 0.5,
+            phi,
+        };
+        let omni = LevelLight {
+            controller_id: u32::MAX,
+            light_type: self.omni_type,
+            diffuse: self.omni_color,
+            specular: [0.0; 4],
+            ambient: [0.0; 4],
+            position,
+            direction,
+            range: self.omni_range,
+            falloff: 1.0,
+            attenuation: [0.0, 0.0, 0.0],
+            theta: 0.0,
+            phi: 0.0,
+        };
+        (primary, omni)
+    }
 }
 
 /// Resolved drawable mesh extracted from a level visual + `LevelGeometry`.
@@ -455,7 +1035,7 @@ impl ResolvedLevelMesh {
     }
 }
 
-/// Parsed `level` scene description (`hdrLEVEL`, shaders, visuals, portals, sectors, lights).
+/// Parsed `level` scene description (`hdrLEVEL`, shaders, visuals, portals, sectors, lights, glows).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LevelData {
     pub xrlc_version: u16,
@@ -465,6 +1045,7 @@ pub struct LevelData {
     pub portals: Vec<LevelPortal>,
     pub sectors: Vec<LevelSector>,
     pub lights: Vec<LevelLight>,
+    pub glows: Vec<LevelGlow>,
     pub glows_raw_len: usize,
 }
 
@@ -618,10 +1199,10 @@ impl LevelData {
             None => Vec::new(),
         };
 
-        let glows_raw_len = reader
-            .open_chunk(FSL_GLOWS)?
-            .map(|b| b.len())
-            .unwrap_or(0);
+        let (glows, glows_raw_len) = match reader.open_chunk(FSL_GLOWS)? {
+            Some(bytes) => (LevelGlow::parse_list(&bytes)?, bytes.len()),
+            None => (Vec::new(), 0),
+        };
 
         Ok(Self {
             xrlc_version,
@@ -631,6 +1212,7 @@ impl LevelData {
             portals,
             sectors,
             lights,
+            glows,
             glows_raw_len,
         })
     }
@@ -638,6 +1220,76 @@ impl LevelData {
     #[inline]
     pub fn visual_shader(&self, visual: &OgfModel) -> Option<&LevelShaderRef> {
         self.shaders.get(visual.header.shader_id as usize)
+    }
+
+    #[inline]
+    pub fn glow_shader(&self, glow: &LevelGlow) -> Option<&LevelShaderRef> {
+        self.shaders.get(glow.shader_id as usize)
+    }
+
+    #[inline]
+    pub fn sector_by_id(&self, sector_id: u32) -> Option<&LevelSector> {
+        self.sectors.iter().find(|s| s.id == sector_id)
+    }
+
+    /// Collect indices into `self.portals` referenced by `sector_id` (plus any portal connecting it).
+    pub fn portals_for_sector(&self, sector_id: u16) -> Vec<usize> {
+        if let Some(sec) = self.sector_by_id(u32::from(sector_id)) {
+            return sec
+                .portals
+                .iter()
+                .map(|&p| p as usize)
+                .filter(|&idx| idx < self.portals.len())
+                .collect();
+        }
+        self.portals
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, p)| {
+                (p.sector_front == sector_id || p.sector_back == sector_id).then_some(idx)
+            })
+            .collect()
+    }
+
+    /// Collect all sector IDs reachable from `start_sector` across portals whose bounding spheres
+    /// intersect `(sphere_center, sphere_radius)` — useful for light/geometry portal culling.
+    pub fn collect_reachable_sectors_within_sphere(
+        &self,
+        start_sector: u16,
+        sphere_center: [f32; 3],
+        sphere_radius: f32,
+    ) -> Vec<u16> {
+        let r_lim = sphere_radius.max(0.0);
+        let mut visited_sectors = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(start_sector);
+        queue.push_back(start_sector);
+
+        while let Some(sec_id) = queue.pop_front() {
+            visited_sectors.push(sec_id);
+            for portal_idx in self.portals_for_sector(sec_id) {
+                let portal = &self.portals[portal_idx];
+                let Some(next) = portal.opposite_sector(sec_id) else {
+                    continue;
+                };
+                if seen.contains(&next) {
+                    continue;
+                }
+                if let Some((pc, pr)) = portal.bounding_sphere() {
+                    let dx = pc[0] - sphere_center[0];
+                    let dy = pc[1] - sphere_center[1];
+                    let dz = pc[2] - sphere_center[2];
+                    let max_d = pr + r_lim;
+                    if dx * dx + dy * dy + dz * dz > max_d * max_d {
+                        continue;
+                    }
+                }
+                seen.insert(next);
+                queue.push_back(next);
+            }
+        }
+        visited_sectors
     }
 
     /// Resolve vertices & indices for any level visual (inline OGF, `OGF_GCONTAINER`,
@@ -1291,5 +1943,138 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fp_lo.indices, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn test_level_glows_build_lights_torch_cfg_light_eval_and_sector_portal_culling() {
+        use level_chunks::*;
+        use crate::weather::parse_ltx_str;
+
+        // 1. fsL_GLOWS (2 glow entries = 36B) + 2 portals + 3 sectors + shaders
+        let mut shd = Vec::new();
+        shd.extend_from_slice(&2u32.to_le_bytes());
+        shd.extend_from_slice(b"\0");
+        shd.extend_from_slice(b"effects\\glow/glow\\glow_white\0");
+
+        let mut glows_raw = Vec::new();
+        for (pos, r, sid) in [([1.0f32, 2.0, 3.0], 0.65f32, 1u16), ([8.0, 2.0, 0.0], 1.2, 1u16)] {
+            for f in pos {
+                glows_raw.extend_from_slice(&f.to_le_bytes());
+            }
+            glows_raw.extend_from_slice(&r.to_le_bytes());
+            glows_raw.extend_from_slice(&sid.to_le_bytes());
+        }
+
+        let mut ports = Vec::new();
+        let write_portal = |buf: &mut Vec<u8>, sf: u16, sb: u16, x: f32| {
+            buf.extend_from_slice(&sf.to_le_bytes());
+            buf.extend_from_slice(&sb.to_le_bytes());
+            for pv in [
+                [x, 0.0f32, 0.0],
+                [x, 4.0, 0.0],
+                [x, 4.0, 4.0],
+                [x, 0.0, 4.0],
+                [0.0; 3],
+                [0.0; 3],
+            ] {
+                for f in pv {
+                    buf.extend_from_slice(&f.to_le_bytes());
+                }
+            }
+            buf.extend_from_slice(&4u32.to_le_bytes());
+        };
+        write_portal(&mut ports, 0, 1, 5.0);
+        write_portal(&mut ports, 1, 2, 50.0);
+
+        let mut secs_w = ChunkWriter::new();
+        for (sid, plist) in [(0u32, vec![0u16]), (1, vec![0u16, 1]), (2, vec![1u16])] {
+            let mut sw = ChunkWriter::new();
+            let mut pb = Vec::new();
+            for p in plist {
+                pb.extend_from_slice(&p.to_le_bytes());
+            }
+            sw.write_chunk(sector_chunks::FSP_PORTALS, &pb);
+            secs_w.write_chunk(sid, &sw.into_bytes());
+        }
+
+        let mut lvl_w = ChunkWriter::new();
+        lvl_w.write_chunk(FSL_SHADERS, &shd);
+        lvl_w.write_chunk(FSL_PORTALS, &ports);
+        lvl_w.write_chunk(FSL_SECTORS, &secs_w.into_bytes());
+        lvl_w.write_chunk(FSL_GLOWS, &glows_raw);
+        let level = LevelData::parse(&lvl_w.into_bytes()).unwrap();
+
+        assert_eq!(level.glows.len(), 2);
+        assert_eq!(level.glows_raw_len, 36);
+        assert_eq!(level.glow_shader(&level.glows[0]).unwrap().shader, "effects\\glow");
+        assert_eq!(level.portals[0].opposite_sector(0), Some(1));
+        assert_eq!(level.portals[0].sector_facing([1.0, 2.0, 2.0]), Some(1));
+        let reachable = level.collect_reachable_sectors_within_sphere(0, [2.0, 2.0, 2.0], 10.0);
+        assert_eq!(reachable, vec![0, 1]);
+
+        // 2. build.lights Chunk 1 (104-byte R_Light)
+        let mut rlight = Vec::new();
+        rlight.extend_from_slice(&build_light_type::POINT.to_le_bytes());
+        rlight.extend_from_slice(&0u16.to_le_bytes());
+        for f in [
+            0.8f32, 0.7, 0.5, // diffuse
+            2.0, 3.0, 4.0, // pos
+            0.0, -1.0, 0.0, // dir
+            12.0, 144.0, 0.0, // range, range2, falloff
+            1.0, 0.1, 0.02, // attenuation
+            5.0,  // energy
+            0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, // tri[3]
+        ] {
+            rlight.extend_from_slice(&f.to_le_bytes());
+        }
+        assert_eq!(rlight.len(), BUILD_LIGHT_RECORD_SIZE);
+        let mut bl_w = ChunkWriter::new();
+        bl_w.write_chunk(1, &rlight);
+        let bl = BuildLights::parse(&bl_w.into_bytes()).unwrap();
+        assert_eq!(bl.hemi.len(), 1);
+        let ll = bl.hemi[0].to_level_light();
+        assert!(ll.is_point());
+        assert!((ll.evaluate_attenuation(0.0) - 1.0).abs() < 1e-6);
+        assert!(ll.evaluate_attenuation(12.0) == 0.0);
+
+        // 3. Spot cone + LAnim modulation + TorchLightConfig
+        let mut anim = LightAnimItem::new("flicker");
+        anim.fps = 10.0;
+        anim.resize(2);
+        anim.insert_key(0, crate::lanims::pack_argb(255, 255, 128, 0)).unwrap();
+
+        let torch_doc = parse_ltx_str(
+            r#"
+[torch_definition]
+type = 2
+omni_type = 1
+color = 0.4, 0.4, 0.4, 0.5
+color_r2 = 0.8, 0.7, 0.6, 1.0
+range = 15
+range_r2 = 30
+omni_color = 0.1, 0.1, 0.1, 0.2
+omni_color_r2 = 0.3, 0.25, 0.2, 0.5
+omni_range_r2 = 2.0
+spot_angle = 60
+spot_texture = internal\internal_light_torch_r2
+color_animator = flicker
+guide_bone = lights_bone
+glow_texture = glow\glow_torch_r2
+glow_radius = 0.35
+volumetric = on
+volumetric_intensity = 0.25
+"#,
+        );
+        let torch_cfg = TorchLightConfig::from_ltx(&torch_doc, "torch_definition", true).unwrap();
+        assert_eq!(torch_cfg.range, 30.0);
+        assert!(torch_cfg.volumetric);
+        let (spot, omni) = torch_cfg.to_level_light_pair([0.0, 2.0, 0.0], [0.0, 0.0, 1.0]);
+        assert!(spot.is_spot() && omni.is_point());
+        assert!((spot.evaluate_spot_factor([0.0, 2.0, 10.0]) - 1.0).abs() < 1e-5);
+        assert_eq!(spot.evaluate_spot_factor([0.0, 2.0, -5.0]), 0.0);
+        let (_sc, sr) = spot.bounding_sphere();
+        assert!(sr > 14.0 && sr < 25.0);
+        let contrib = spot.evaluate_contribution_at([0.0, 2.0, 10.0], Some(&anim), 0.0, false);
+        assert!(contrib[0] > 0.4 && contrib[2].abs() < 1e-6);
     }
 }

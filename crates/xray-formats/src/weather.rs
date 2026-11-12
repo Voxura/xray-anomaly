@@ -890,6 +890,53 @@ pub struct MixedEnvironment {
     pub active_thunderbolt_id: String,
 }
 
+impl MixedEnvironment {
+    #[inline]
+    pub fn sun_color_rgba(&self) -> [f32; 4] {
+        [self.sun_color[0], self.sun_color[1], self.sun_color[2], 1.0]
+    }
+
+    #[inline]
+    pub fn ambient_color_rgba(&self) -> [f32; 4] {
+        [
+            self.ambient_color[0],
+            self.ambient_color[1],
+            self.ambient_color[2],
+            1.0,
+        ]
+    }
+
+    #[inline]
+    pub fn fog_color_rgba(&self) -> [f32; 4] {
+        [
+            self.fog_color[0],
+            self.fog_color[1],
+            self.fog_color[2],
+            self.fog_density,
+        ]
+    }
+
+    #[inline]
+    pub fn sky_color_rgba(&self) -> [f32; 4] {
+        [self.sky_color[0], self.sky_color[1], self.sky_color[2], 1.0]
+    }
+
+    #[inline]
+    pub fn sun_dir_vec4(&self) -> [f32; 4] {
+        [self.sun_dir[0], self.sun_dir[1], self.sun_dir[2], 0.0]
+    }
+
+    #[inline]
+    pub fn effective_ambient_rgb(&self, hemi_weight: f32) -> [f32; 3] {
+        let hw = hemi_weight.max(0.0);
+        [
+            self.ambient_color[0] + self.hemi_color[0] * hw,
+            self.ambient_color[1] + self.hemi_color[1] * hw,
+            self.ambient_color[2] + self.hemi_color[2] * hw,
+        ]
+    }
+}
+
 #[inline]
 fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
     a * (1.0 - t) + b * t
@@ -1347,6 +1394,14 @@ bloom_threshold = 4.0
         // Base far_plane midpoint = 600; + 100 mod = 700; * 1 / (1+1) = 350
         assert!((sample.far_plane - 350.0).abs() < 1e-4);
         assert!(sample.fog_near < sample.fog_far);
+        assert!((sample.sun_color_rgba()[0] - 0.5).abs() < 1e-5);
+        assert_eq!(sample.sun_color_rgba()[3], 1.0);
+        assert!((sample.ambient_color_rgba()[0] - 0.15).abs() < 1e-5);
+        assert_eq!(sample.fog_color_rgba()[3], sample.fog_density);
+        assert!((sample.sky_color_rgba()[0] - 0.4).abs() < 1e-5);
+        assert_eq!(sample.sun_dir_vec4()[3], 0.0);
+        // ambient midpoint = 0.15, hemi midpoint = 0.4 -> 0.15 + 0.5 * 0.4 = 0.35
+        assert!((sample.effective_ambient_rgb(0.5)[0] - 0.35).abs() < 1e-5);
     }
 
     #[test]

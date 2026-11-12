@@ -14,7 +14,7 @@ use crate::fonts::{font_atlas_ini_vpath, resolve_font_section_owned, FontAtlas, 
 use crate::gamemtl::GameMaterialLibrary;
 use crate::hom::HomMesh;
 use crate::lanims::LightAnimLibrary;
-use crate::level::{LevelData, LevelGeometry};
+use crate::level::{BuildLights, LevelData, LevelGeometry, TorchLightConfig};
 use crate::ogf::{OgfModel, OgfTextureLink};
 use crate::omf::{BonePartitionSet, OmfMotions};
 use crate::particles::{
@@ -1051,6 +1051,28 @@ pub fn load_ui_xml_for_viewport_from_vfs(
         }
     }
     Err(AssetLoadError::Vfs(VfsError::FileNotFound))
+}
+
+/// Stream `$level$/build.lights` (accepting either full path or level directory like `"$game_levels$/l01_escape"`).
+pub fn load_build_lights_from_vfs(
+    vfs: &VirtualFileSystem,
+    level_dir_or_path: &str,
+) -> Result<BuildLights, AssetLoadError> {
+    let vpath = resolve_level_file_path(level_dir_or_path, "build.lights");
+    let bytes = vfs.read_bytes(&vpath)?;
+    Ok(BuildLights::parse(&bytes)?)
+}
+
+/// Stream a `[torch_definition]` lighting preset LTX section (+ optional DLTX overrides) from VFS.
+pub fn load_torch_light_config_from_vfs(
+    vfs: &VirtualFileSystem,
+    ltx_vpath: &str,
+    dltx_mod_paths: &[&str],
+    section: &str,
+    prefer_r2: bool,
+) -> Result<TorchLightConfig, AssetLoadError> {
+    let doc = load_ltx_tree_from_vfs(vfs, ltx_vpath, dltx_mod_paths)?;
+    Ok(TorchLightConfig::from_ltx(&doc, section, prefer_r2)?)
 }
 
 #[cfg(test)]
@@ -3149,5 +3171,112 @@ height = 18
                 .unwrap(),
             zone
         );
+    }
+
+    #[test]
+    fn test_stream_lighting_glows_build_lights_torch_and_hanging_lamp_from_vfs() {
+        use crate::lanims::{pack_argb, LightAnimItem, LightAnimLibrary, LANIM_VERSION};
+        use crate::level::{build_light_type, level_chunks, BUILD_LIGHT_RECORD_SIZE};
+        use crate::spawns::{
+            hanging_lamp_flags, AlifeDynamicVisualState, AlifeObjectHangingLampState,
+            AlifeObjectState, ServerPhSkeletonState, ServerVisualState,
+        };
+
+        // 1. lanims.xr
+        let mut anim = LightAnimItem::new("lights\\candle");
+        anim.fps = 10.0;
+        anim.resize(2);
+        anim.insert_key(0, pack_argb(255, 255, 128, 64)).unwrap();
+        let lanims_raw = LightAnimLibrary {
+            version: LANIM_VERSION,
+            items: vec![anim],
+        }
+        .to_bytes();
+
+        // 2. build.lights (1 hemi point light)
+        let mut bl_rec = Vec::new();
+        bl_rec.extend_from_slice(&build_light_type::POINT.to_le_bytes());
+        bl_rec.extend_from_slice(&0u16.to_le_bytes());
+        for f in [
+            0.5f32, 0.5, 0.4, 2.0, 3.0, 4.0, 0.0, -1.0, 0.0, 10.0, 100.0, 0.0, 1.0, 0.1, 0.01,
+            2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0,
+        ] {
+            bl_rec.extend_from_slice(&f.to_le_bytes());
+        }
+        assert_eq!(bl_rec.len(), BUILD_LIGHT_RECORD_SIZE);
+        let mut bl_w = ChunkWriter::new();
+        bl_w.write_chunk(1, &bl_rec);
+        let build_lights_raw = bl_w.into_bytes();
+
+        // 3. level (shader + 1 glow)
+        let mut shd = Vec::new();
+        shd.extend_from_slice(&2u32.to_le_bytes());
+        shd.extend_from_slice(b"\0effects\\glow/glow\\glow_white\0");
+        let mut glow_raw = Vec::new();
+        for f in [4.0f32, 2.5, 1.0, 0.5] {
+            glow_raw.extend_from_slice(&f.to_le_bytes());
+        }
+        glow_raw.extend_from_slice(&1u16.to_le_bytes());
+        let mut lvl_w = ChunkWriter::new();
+        lvl_w.write_chunk(level_chunks::FSL_SHADERS, &shd);
+        lvl_w.write_chunk(level_chunks::FSL_GLOWS, &glow_raw);
+        let level_raw = lvl_w.into_bytes();
+
+        // 4. light_night.ltx [torch_definition]
+        let torch_ltx = b"[torch_definition]\ntype = 2\nomni_type = 1\ncolor_r2 = 0.9, 0.85, 0.7, 1.0\nrange_r2 = 28\nspot_angle = 55\ncolor_animator = lights\\candle\n";
+
+        let entries = vec![
+            ("lanims.xr", lanims_raw.clone(), lanims_raw),
+            ("levels\\l01_escape\\build.lights", build_lights_raw.clone(), build_lights_raw),
+            ("levels\\l01_escape\\level", level_raw.clone(), level_raw),
+            ("configs\\models\\objects\\light_night.ltx", torch_ltx.to_vec(), torch_ltx.to_vec()),
+        ];
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_bytes("lights.db0", pack_synthetic_db(entries))
+            .unwrap();
+
+        let lanims = load_lanims_from_vfs(&vfs).unwrap();
+        let build_lights = load_build_lights_from_vfs(&vfs, "$game_levels$/l01_escape").unwrap();
+        let level = load_level_from_vfs(&vfs, "$game_levels$/l01_escape").unwrap();
+        let torch = load_torch_light_config_from_vfs(
+            &vfs,
+            "$game_configs$/models/objects/light_night.ltx",
+            &[],
+            "torch_definition",
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(build_lights.hemi.len(), 1);
+        assert_eq!(level.glows.len(), 1);
+        assert_eq!(level.glow_shader(&level.glows[0]).unwrap().shader, "effects\\glow");
+        assert_eq!(torch.range, 28.0);
+
+        let lamp = AlifeObjectHangingLampState {
+            base: AlifeDynamicVisualState {
+                alife: AlifeObjectState {
+                    game_vertex_id: 0,
+                    distance: 0.0,
+                    direct_control: true,
+                    level_vertex_id: 1,
+                    flags: 0,
+                    custom_data: String::new(),
+                    story_id: u32::MAX,
+                    spawn_story_id: u32::MAX,
+                    subclass_payload: Vec::new(),
+                },
+                visual: ServerVisualState::default(),
+                trailing: Vec::new(),
+            },
+            skeleton: ServerPhSkeletonState::default(),
+            brightness: 1.5,
+            color_animator: "lights\\candle".to_string(),
+            range: 12.0,
+            flags: hanging_lamp_flags::TYPE_SPOT | hanging_lamp_flags::R2,
+            ..Default::default()
+        };
+        let ll = lamp.to_level_light([0.0, 2.0, 0.0], [0.0; 3], Some(&lanims), 0.0);
+        assert!((ll.diffuse[0] - 1.5).abs() < 1e-4);
+        assert!((ll.evaluate_spot_factor([0.0, 2.0, 5.0]) - 1.0).abs() < 1e-5);
     }
 }

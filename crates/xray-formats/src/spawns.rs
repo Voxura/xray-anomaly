@@ -21,6 +21,9 @@ use crate::ai_graph::{
     XRAI_LARGE_VERSION,
 };
 use crate::chunk::{ByteCursor, ChunkReader, ChunkWriter, FormatError};
+use crate::lanims::{unpack_argb_f32, LightAnimLibrary};
+use crate::level::{d3d_light_type, LevelLight};
+use crate::ogf::{matrix_forward_dir, matrix_set_xyz_translate};
 
 pub const WAY_BASE: u32 = 0x1000;
 pub const POINT_BASE: u32 = 0x2000;
@@ -2922,6 +2925,695 @@ impl AlifeCreatureActorState {
     }
 }
 
+/// `CSE_ALifeObjectHangingLamp::flags` bitmask (`xrServer_Objects_ALife.h:463-472`).
+pub mod hanging_lamp_flags {
+    pub const PHYSIC: u16 = 1 << 0;
+    pub const CAST_SHADOW: u16 = 1 << 1;
+    pub const R1: u16 = 1 << 2;
+    pub const R2: u16 = 1 << 3;
+    pub const TYPE_SPOT: u16 = 1 << 4;
+    pub const POINT_AMBIENT: u16 = 1 << 5;
+    pub const VOLUMETRIC: u16 = 1 << 6;
+}
+
+/// Decoded `CSE_ALifeObjectHangingLamp::STATE_Read` (`xrServer_Objects_ALife.cpp:1352-1471`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeObjectHangingLampState {
+    pub base: AlifeDynamicVisualState,
+    pub skeleton: ServerPhSkeletonState,
+    /// ARGB packed diffuse color (`0xAARRGGBB`).
+    pub color: u32,
+    pub brightness: f32,
+    pub color_animator: String,
+    pub range: f32,
+    pub flags: u16,
+    pub startup_animation: String,
+    pub fixed_bones: String,
+    pub health: f32,
+    pub virtual_size: f32,
+    pub ambient_radius: f32,
+    pub ambient_power: f32,
+    pub ambient_texture: String,
+    pub light_texture: String,
+    pub light_main_bone: String,
+    /// Spot cone angle in radians (constructor default = `120 deg`).
+    pub spot_cone_angle: f32,
+    pub glow_texture: String,
+    pub glow_radius: f32,
+    pub light_ambient_bone: String,
+    pub volumetric_quality: f32,
+    pub volumetric_intensity: f32,
+    pub volumetric_distance: f32,
+    pub trailing: Vec<u8>,
+}
+
+impl Default for AlifeObjectHangingLampState {
+    fn default() -> Self {
+        Self {
+            base: AlifeDynamicVisualState {
+                alife: AlifeObjectState {
+                    game_vertex_id: INVALID_GAME_VERTEX,
+                    distance: 0.0,
+                    direct_control: true,
+                    level_vertex_id: INVALID_AI_VERTEX,
+                    flags: 0,
+                    custom_data: String::new(),
+                    story_id: INVALID_STORY_ID,
+                    spawn_story_id: INVALID_SPAWN_STORY_ID,
+                    subclass_payload: Vec::new(),
+                },
+                visual: ServerVisualState::default(),
+                trailing: Vec::new(),
+            },
+            skeleton: ServerPhSkeletonState::default(),
+            color: 0xFFFF_FFFF,
+            brightness: 1.0,
+            color_animator: String::new(),
+            range: 10.0,
+            flags: hanging_lamp_flags::TYPE_SPOT | hanging_lamp_flags::R1 | hanging_lamp_flags::R2,
+            startup_animation: String::new(),
+            fixed_bones: String::new(),
+            health: 100.0,
+            virtual_size: 0.1,
+            ambient_radius: 10.0,
+            ambient_power: 0.1,
+            ambient_texture: String::new(),
+            light_texture: String::new(),
+            light_main_bone: String::new(),
+            spot_cone_angle: 120.0f32.to_radians(),
+            glow_texture: String::new(),
+            glow_radius: 0.7,
+            light_ambient_bone: String::new(),
+            volumetric_quality: 1.0,
+            volumetric_intensity: 1.0,
+            volumetric_distance: 1.0,
+            trailing: Vec::new(),
+        }
+    }
+}
+
+impl AlifeObjectHangingLampState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let mut out = Self::default();
+
+        if version > 20 {
+            out.base = AlifeDynamicVisualState::parse_from_cursor(version, &mut cur)?;
+        }
+        if version >= 69 {
+            out.skeleton = ServerPhSkeletonState::parse_from_cursor(&mut cur)?;
+        }
+        if version < 32 {
+            out.base.visual = ServerVisualState::parse_from_cursor(version, &mut cur)?;
+        }
+
+        if version < 49 {
+            out.color = cur.read_u32()?;
+            out.color_animator = cur.read_zstring()?;
+            let _ = cur.read_zstring()?;
+            let _ = cur.read_zstring()?;
+            out.range = cur.read_f32()?;
+            let _ = cur.read_u8()?;
+            if version > 10 {
+                out.brightness = cur.read_f32()?;
+            }
+            if version > 11 {
+                out.flags = cur.read_u16()?;
+            }
+            if version > 12 {
+                let _ = cur.read_f32()?;
+            }
+            if version > 17 {
+                out.startup_animation = cur.read_zstring()?;
+            }
+            if version > 42 {
+                let _ = cur.read_zstring()?;
+                let _ = cur.read_f32()?;
+            }
+            if version > 43 {
+                out.fixed_bones = cur.read_zstring()?;
+            }
+            if version > 44 {
+                out.health = cur.read_f32()?;
+            }
+        } else {
+            out.color = cur.read_u32()?;
+            out.brightness = cur.read_f32()?;
+            out.color_animator = cur.read_zstring()?;
+            out.range = cur.read_f32()?;
+            out.flags = cur.read_u16()?;
+            out.startup_animation = cur.read_zstring()?;
+            out.fixed_bones = cur.read_zstring()?;
+            out.health = cur.read_f32()?;
+        }
+
+        if version > 55 {
+            out.virtual_size = cur.read_f32()?;
+            out.ambient_radius = cur.read_f32()?;
+            out.ambient_power = cur.read_f32()?;
+            out.ambient_texture = cur.read_zstring()?;
+            out.light_texture = cur.read_zstring()?;
+            out.light_main_bone = cur.read_zstring()?;
+            out.spot_cone_angle = cur.read_f32()?;
+            out.glow_texture = cur.read_zstring()?;
+            out.glow_radius = cur.read_f32()?;
+        }
+
+        out.light_ambient_bone = if version > 96 {
+            cur.read_zstring()?
+        } else {
+            out.light_main_bone.clone()
+        };
+
+        if version > 118 {
+            out.volumetric_quality = cur.read_f32()?;
+            out.volumetric_intensity = cur.read_f32()?;
+            out.volumetric_distance = cur.read_f32()?;
+        }
+
+        out.trailing = state_bytes[cur.position()..].to_vec();
+        Ok(out)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.base.write_to(&mut out);
+        self.skeleton.write_to(&mut out);
+        out.extend_from_slice(&self.color.to_le_bytes());
+        out.extend_from_slice(&self.brightness.to_le_bytes());
+        out.extend_from_slice(self.color_animator.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.range.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        out.extend_from_slice(self.startup_animation.as_bytes());
+        out.push(0);
+        out.extend_from_slice(self.fixed_bones.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.health.to_le_bytes());
+        out.extend_from_slice(&self.virtual_size.to_le_bytes());
+        out.extend_from_slice(&self.ambient_radius.to_le_bytes());
+        out.extend_from_slice(&self.ambient_power.to_le_bytes());
+        out.extend_from_slice(self.ambient_texture.as_bytes());
+        out.push(0);
+        out.extend_from_slice(self.light_texture.as_bytes());
+        out.push(0);
+        out.extend_from_slice(self.light_main_bone.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.spot_cone_angle.to_le_bytes());
+        out.extend_from_slice(self.glow_texture.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.glow_radius.to_le_bytes());
+        out.extend_from_slice(self.light_ambient_bone.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.volumetric_quality.to_le_bytes());
+        out.extend_from_slice(&self.volumetric_intensity.to_le_bytes());
+        out.extend_from_slice(&self.volumetric_distance.to_le_bytes());
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+
+    #[inline]
+    pub fn is_physic(&self) -> bool {
+        (self.flags & hanging_lamp_flags::PHYSIC) != 0
+    }
+
+    #[inline]
+    pub fn casts_shadow(&self) -> bool {
+        (self.flags & hanging_lamp_flags::CAST_SHADOW) != 0
+    }
+
+    #[inline]
+    pub fn supports_r1(&self) -> bool {
+        (self.flags & hanging_lamp_flags::R1) != 0
+    }
+
+    #[inline]
+    pub fn supports_r2(&self) -> bool {
+        (self.flags & hanging_lamp_flags::R2) != 0
+    }
+
+    #[inline]
+    pub fn is_spot(&self) -> bool {
+        (self.flags & hanging_lamp_flags::TYPE_SPOT) != 0
+    }
+
+    #[inline]
+    pub fn has_point_ambient(&self) -> bool {
+        (self.flags & hanging_lamp_flags::POINT_AMBIENT) != 0
+    }
+
+    #[inline]
+    pub fn is_volumetric(&self) -> bool {
+        (self.flags & hanging_lamp_flags::VOLUMETRIC) != 0
+    }
+
+    /// Evaluate linear RGBA `[r, g, b, 1.0]` matching `CHangingLamp::UpdateCL` (`HangingLamp.cpp:115-118, 295-303`).
+    pub fn eval_color_rgba(
+        &self,
+        lanims: Option<&LightAnimLibrary>,
+        t_sec: f32,
+        smooth: bool,
+    ) -> [f32; 4] {
+        let base_rgb = if !self.color_animator.is_empty()
+            && let Some(item) = lanims.and_then(|lib| lib.find_item_ci(&self.color_animator))
+        {
+            let c = item.sample_rgba_f32(t_sec, smooth);
+            [c[0], c[1], c[2]]
+        } else {
+            let c = unpack_argb_f32(self.color);
+            [c[0], c[1], c[2]]
+        };
+        [
+            base_rgb[0] * self.brightness,
+            base_rgb[1] * self.brightness,
+            base_rgb[2] * self.brightness,
+            1.0,
+        ]
+    }
+
+    /// Convert primary lamp light into [`LevelLight`] using `SpawnPacket::{position, angle}` (`setXYZ(o_Angle)`).
+    pub fn to_level_light(
+        &self,
+        position: [f32; 3],
+        angles: [f32; 3],
+        lanims: Option<&LightAnimLibrary>,
+        t_sec: f32,
+    ) -> LevelLight {
+        let xf = matrix_set_xyz_translate(angles, position);
+        let direction = matrix_forward_dir(&xf);
+        let diffuse = self.eval_color_rgba(lanims, t_sec, true);
+        let (light_type, phi, theta) = if self.is_spot() {
+            (
+                d3d_light_type::SPOT,
+                self.spot_cone_angle,
+                self.spot_cone_angle * 0.5,
+            )
+        } else {
+            (d3d_light_type::POINT, 0.0, 0.0)
+        };
+        LevelLight {
+            controller_id: u32::MAX,
+            light_type,
+            diffuse,
+            specular: [0.0; 4],
+            ambient: [0.0; 4],
+            position,
+            direction,
+            range: self.range,
+            falloff: 1.0,
+            attenuation: [0.0; 3],
+            theta,
+            phi,
+        }
+    }
+
+    /// Optional secondary point ambient fill light (`flPointAmbient`, `HangingLamp.cpp:143-154, 304-308`).
+    pub fn to_ambient_level_light(
+        &self,
+        position: [f32; 3],
+        lanims: Option<&LightAnimLibrary>,
+        t_sec: f32,
+    ) -> Option<LevelLight> {
+        if !self.has_point_ambient() {
+            return None;
+        }
+        let c = self.eval_color_rgba(lanims, t_sec, true);
+        Some(LevelLight {
+            controller_id: u32::MAX,
+            light_type: d3d_light_type::POINT,
+            diffuse: [
+                c[0] * self.ambient_power,
+                c[1] * self.ambient_power,
+                c[2] * self.ambient_power,
+                1.0,
+            ],
+            specular: [0.0; 4],
+            ambient: [0.0; 4],
+            position,
+            direction: [0.0, -1.0, 0.0],
+            range: self.ambient_radius,
+            falloff: 1.0,
+            attenuation: [0.0; 3],
+            theta: 0.0,
+            phi: 0.0,
+        })
+    }
+}
+
+/// Decoded `CSE_ALifeObjectBreakable::STATE_Read` (`xrServer_Objects_ALife.cpp:2028-2038`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeObjectBreakableState {
+    pub base: AlifeDynamicVisualState,
+    pub health: f32,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeObjectBreakableState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let base = AlifeDynamicVisualState::parse_from_cursor(version, &mut cur)?;
+        let health = cur.read_f32()?;
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            base,
+            health,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.base.write_to(&mut out);
+        out.extend_from_slice(&self.health.to_le_bytes());
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeObjectClimable::STATE_Read` (`xrServer_Objects_ALife.cpp:2088-2106`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeObjectClimableState {
+    pub alife: AlifeObjectState,
+    pub shapes: Vec<ServerShapeDef>,
+    pub material: String,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeObjectClimableState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let alife = if version >= 99 {
+            AlifeObjectState::parse_prefix_from_cursor(version, &mut cur)?
+        } else {
+            AlifeObjectState {
+                game_vertex_id: INVALID_GAME_VERTEX,
+                distance: 0.0,
+                direct_control: true,
+                level_vertex_id: INVALID_AI_VERTEX,
+                flags: 0,
+                custom_data: String::new(),
+                story_id: INVALID_STORY_ID,
+                spawn_story_id: INVALID_SPAWN_STORY_ID,
+                subclass_payload: Vec::new(),
+            }
+        };
+        let shapes = ServerShapeDef::parse_cform_shapes(&mut cur)?;
+        let material = if version > 126 {
+            cur.read_zstring()?
+        } else {
+            "materials\\fake_ladders".to_string()
+        };
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            alife,
+            shapes,
+            material,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.alife.write_prefix_to(&mut out);
+        ServerShapeDef::encode_cform_shapes(&self.shapes, &mut out);
+        out.extend_from_slice(self.material.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeHelicopter::STATE_Read` (`xrServer_Objects_ALife.cpp:1804-1823`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeHelicopterState {
+    pub base: AlifeDynamicVisualState,
+    pub motion: ServerMotionState,
+    pub skeleton: ServerPhSkeletonState,
+    pub startup_animation: String,
+    pub engine_sound: String,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeHelicopterState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let base = AlifeDynamicVisualState::parse_from_cursor(version, &mut cur)?;
+        let motion = ServerMotionState::parse_from_cursor(&mut cur)?;
+        let skeleton = if version >= 69 {
+            ServerPhSkeletonState::parse_from_cursor(&mut cur)?
+        } else {
+            ServerPhSkeletonState::default()
+        };
+        let startup_animation = cur.read_zstring()?;
+        let engine_sound = cur.read_zstring()?;
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            base,
+            motion,
+            skeleton,
+            startup_animation,
+            engine_sound,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.base.write_to(&mut out);
+        self.motion.write_to(&mut out);
+        self.skeleton.write_to(&mut out);
+        out.extend_from_slice(self.startup_animation.as_bytes());
+        out.push(0);
+        out.extend_from_slice(self.engine_sound.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeCar::STATE_Read` (`xrServer_Objects_ALife.cpp:1880-1898`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeCarState {
+    pub base: AlifeDynamicVisualState,
+    pub skeleton: ServerPhSkeletonState,
+    pub health: f32,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeCarState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let base = AlifeDynamicVisualState::parse_from_cursor(version, &mut cur)?;
+        let skeleton = if version > 65 {
+            ServerPhSkeletonState::parse_from_cursor(&mut cur)?
+        } else {
+            ServerPhSkeletonState::default()
+        };
+        if version > 52 && version < 55 {
+            let _ = cur.read_f32()?;
+        }
+        let mut health = if version > 92 { cur.read_f32()? } else { 1.0 };
+        if health > 1.0 {
+            health /= 100.0;
+        }
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            base,
+            skeleton,
+            health,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.base.write_to(&mut out);
+        self.skeleton.write_to(&mut out);
+        out.extend_from_slice(&self.health.to_le_bytes());
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeStationaryMgun::STATE_Read` under `STATIONARYMGUN_NEW` (`xrServer_Objects_ALife.cpp:2281-2330`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeStationaryMgunState {
+    pub base: AlifeDynamicVisualState,
+    pub skeleton: ServerPhSkeletonState,
+    pub ammo_type: u8,
+    pub ammo_elapsed: u16,
+    pub barrel_ammo_elapsed: Vec<u16>,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeStationaryMgunState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let base = AlifeDynamicVisualState::parse_from_cursor(version, &mut cur)?;
+        let skeleton = ServerPhSkeletonState::parse_from_cursor(&mut cur)?;
+        let ammo_type = cur.read_u8()?;
+        let ammo_elapsed = cur.read_u16()?;
+        let barrel_count = usize::from(cur.read_u16()?);
+        let mut barrel_ammo_elapsed = Vec::with_capacity(barrel_count.min(256));
+        for _ in 0..barrel_count {
+            barrel_ammo_elapsed.push(cur.read_u16()?);
+        }
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            base,
+            skeleton,
+            ammo_type,
+            ammo_elapsed,
+            barrel_ammo_elapsed,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.base.write_to(&mut out);
+        self.skeleton.write_to(&mut out);
+        out.push(self.ammo_type);
+        out.extend_from_slice(&self.ammo_elapsed.to_le_bytes());
+        out.extend_from_slice(&(self.barrel_ammo_elapsed.len().min(u16::MAX as usize) as u16).to_le_bytes());
+        for &elapsed in self.barrel_ammo_elapsed.iter().take(u16::MAX as usize) {
+            out.extend_from_slice(&elapsed.to_le_bytes());
+        }
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_ALifeOnlineOfflineGroup::STATE_Read` (`xrServer_Objects_ALife_Monsters.cpp:2269-2297`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeOnlineOfflineGroupState {
+    pub alife: AlifeObjectState,
+    pub member_ids: Vec<u16>,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeOnlineOfflineGroupState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let alife = AlifeObjectState::parse_prefix_from_cursor(version, &mut cur)?;
+        let count = cur.read_u32()? as usize;
+        let mut member_ids = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            member_ids.push(cur.read_u16()?);
+        }
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            alife,
+            member_ids,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.alife.write_prefix_to(&mut out);
+        out.extend_from_slice(&(self.member_ids.len() as u32).to_le_bytes());
+        for &id in &self.member_ids {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Decoded `CSE_SmartCover::STATE_Read` (`xrServer_Objects_ALife_Smartcovers.cpp:134-163`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlifeSmartCoverState {
+    pub alife: AlifeObjectState,
+    pub shapes: Vec<ServerShapeDef>,
+    pub description: String,
+    pub hold_position_time: f32,
+    pub enter_min_enemy_distance: f32,
+    pub exit_min_enemy_distance: f32,
+    pub is_combat_cover: bool,
+    pub can_fire: bool,
+    pub trailing: Vec<u8>,
+}
+
+impl AlifeSmartCoverState {
+    pub fn parse(version: u16, state_bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut cur = ByteCursor::new(state_bytes);
+        let alife = AlifeObjectState::parse_prefix_from_cursor(version, &mut cur)?;
+        let shapes = ServerShapeDef::parse_cform_shapes(&mut cur)?;
+        let description = cur.read_zstring()?;
+        let hold_position_time = cur.read_f32()?;
+        let (enter_min_enemy_distance, exit_min_enemy_distance) = if version >= 120 {
+            (cur.read_f32()?, cur.read_f32()?)
+        } else {
+            (0.0, 0.0)
+        };
+        let is_combat_cover = if version >= 122 {
+            cur.read_u8()? != 0
+        } else {
+            false
+        };
+        let can_fire = if version >= 128 {
+            cur.read_u8()? != 0
+        } else {
+            false
+        };
+        let trailing = state_bytes[cur.position()..].to_vec();
+        Ok(Self {
+            alife,
+            shapes,
+            description,
+            hold_position_time,
+            enter_min_enemy_distance,
+            exit_min_enemy_distance,
+            is_combat_cover,
+            can_fire,
+            trailing,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.alife.write_prefix_to(&mut out);
+        ServerShapeDef::encode_cform_shapes(&self.shapes, &mut out);
+        out.extend_from_slice(self.description.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&self.hold_position_time.to_le_bytes());
+        out.extend_from_slice(&self.enter_min_enemy_distance.to_le_bytes());
+        out.extend_from_slice(&self.exit_min_enemy_distance.to_le_bytes());
+        out.push(u8::from(self.is_combat_cover));
+        out.push(u8::from(self.can_fire));
+        out.extend_from_slice(&self.trailing);
+        out
+    }
+}
+
+/// Wire-identical `CSE_ALifeMountedWeapon::STATE_Read` (`xrServer_Objects_ALife.cpp:2156`).
+pub type AlifeMountedWeaponState = AlifeDynamicVisualState;
+/// Wire-identical `CSE_ALifeItemTorch::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:451`).
+pub type AlifeItemTorchState = AlifeInventoryItemState;
+/// Wire-identical `CSE_ALifeItemDetector::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:920`).
+pub type AlifeItemDetectorState = AlifeInventoryItemState;
+/// Wire-identical `CSE_ALifeItemArtefact::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:960`).
+pub type AlifeItemArtefactState = AlifeInventoryItemState;
+/// Wire-identical `CSE_ALifeItemCustomOutfit::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:1275`).
+pub type AlifeItemCustomOutfitState = AlifeInventoryItemState;
+/// Wire-identical `CSE_ALifeItemHelmet::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:1320`).
+pub type AlifeItemHelmetState = AlifeInventoryItemState;
+/// Wire-identical `CSE_ALifeItemGrenade::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:1136`).
+pub type AlifeItemGrenadeState = AlifeInventoryItemState;
+/// Wire-identical `CSE_ALifeItemExplosive::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:1174`).
+pub type AlifeItemExplosiveState = AlifeInventoryItemState;
+/// Wire-identical `CSE_ALifeItemBolt::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:1226`).
+pub type AlifeItemBoltState = AlifeInventoryItemState;
+/// Wire-identical `CSE_ALifeItemWeaponShotGun::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:709`).
+pub type AlifeItemWeaponShotgunState = AlifeItemWeaponState;
+/// Wire-identical `CSE_ALifeItemWeaponAutoShotGun::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:746`).
+pub type AlifeItemWeaponAutoShotgunState = AlifeItemWeaponState;
+/// Wire-identical `CSE_ALifeItemWeaponMagazined::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:787`).
+pub type AlifeItemWeaponMagazinedState = AlifeItemWeaponState;
+/// Wire-identical `CSE_ALifeItemWeaponMagazinedWGL::STATE_Read` (`xrServer_Objects_ALife_Items.cpp:829`).
+pub type AlifeItemWeaponMagazinedWglState = AlifeItemWeaponState;
+
 impl SpawnPacket {
     pub fn decode_dynamic_visual_state(&self) -> Result<AlifeDynamicVisualState, FormatError> {
         AlifeDynamicVisualState::parse(self.version, &self.state_payload)
@@ -3011,6 +3703,42 @@ impl SpawnPacket {
 
     pub fn decode_creature_actor_state(&self) -> Result<AlifeCreatureActorState, FormatError> {
         AlifeCreatureActorState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_hanging_lamp_state(&self) -> Result<AlifeObjectHangingLampState, FormatError> {
+        AlifeObjectHangingLampState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_breakable_state(&self) -> Result<AlifeObjectBreakableState, FormatError> {
+        AlifeObjectBreakableState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_climable_state(&self) -> Result<AlifeObjectClimableState, FormatError> {
+        AlifeObjectClimableState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_helicopter_state(&self) -> Result<AlifeHelicopterState, FormatError> {
+        AlifeHelicopterState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_car_state(&self) -> Result<AlifeCarState, FormatError> {
+        AlifeCarState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_stationary_mgun_state(
+        &self,
+    ) -> Result<AlifeStationaryMgunState, FormatError> {
+        AlifeStationaryMgunState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_online_offline_group_state(
+        &self,
+    ) -> Result<AlifeOnlineOfflineGroupState, FormatError> {
+        AlifeOnlineOfflineGroupState::parse(self.version, &self.state_payload)
+    }
+
+    pub fn decode_smart_cover_state(&self) -> Result<AlifeSmartCoverState, FormatError> {
+        AlifeSmartCoverState::parse(self.version, &self.state_payload)
     }
 }
 
@@ -3590,5 +4318,200 @@ p1:position = 4, 2, 6
             AlifeCreatureActorState::parse(SPAWN_VERSION, &actor.to_bytes()).unwrap(),
             actor
         );
+    }
+
+    #[test]
+    fn test_hanging_lamp_vehicles_mgun_squad_smartcover_and_items_codecs() {
+        use crate::lanims::{pack_argb, LightAnimItem, LightAnimLibrary, LANIM_VERSION};
+
+        let base_alife = AlifeObjectState {
+            game_vertex_id: 100,
+            distance: 1.5,
+            direct_control: true,
+            level_vertex_id: 2048,
+            flags: alife_object_flags::CAN_SAVE | alife_object_flags::VISIBLE_FOR_MAP,
+            custom_data: "[logic]\ncfg = scripts\\lamp.ltx\n".to_string(),
+            story_id: INVALID_STORY_ID,
+            spawn_story_id: 404,
+            subclass_payload: Vec::new(),
+        };
+        let dyn_vis = AlifeDynamicVisualState {
+            alife: base_alife.clone(),
+            visual: ServerVisualState {
+                visual_name: "dynamics\\light\\light_galogen_1_glass".to_string(),
+                flags: 1,
+            },
+            trailing: Vec::new(),
+        };
+        let skel = ServerPhSkeletonState {
+            startup_animation: "idle".to_string(),
+            flags: ph_skeleton_flags::ACTIVE,
+            source_id: INVALID_OBJECT_ID,
+            saved_bones: None,
+        };
+
+        // 1. HangingLamp (spot + ambient + lanim)
+        let lamp = AlifeObjectHangingLampState {
+            base: dyn_vis.clone(),
+            skeleton: skel.clone(),
+            color: pack_argb(255, 255, 200, 100),
+            brightness: 2.0,
+            color_animator: "lights\\flicker".to_string(),
+            range: 14.0,
+            flags: hanging_lamp_flags::CAST_SHADOW
+                | hanging_lamp_flags::R2
+                | hanging_lamp_flags::TYPE_SPOT
+                | hanging_lamp_flags::POINT_AMBIENT
+                | hanging_lamp_flags::VOLUMETRIC,
+            startup_animation: "idle".to_string(),
+            fixed_bones: "link".to_string(),
+            health: 100.0,
+            virtual_size: 0.25,
+            ambient_radius: 6.0,
+            ambient_power: 0.2,
+            ambient_texture: "internal\\ambient".to_string(),
+            light_texture: "internal\\spot_cone".to_string(),
+            light_main_bone: "bone_lamp".to_string(),
+            spot_cone_angle: 90.0f32.to_radians(),
+            glow_texture: "glow\\glow_01".to_string(),
+            glow_radius: 0.8,
+            light_ambient_bone: "bone_lamp".to_string(),
+            volumetric_quality: 0.8,
+            volumetric_intensity: 0.4,
+            volumetric_distance: 0.9,
+            trailing: Vec::new(),
+        };
+        let lamp_rt = AlifeObjectHangingLampState::parse(SPAWN_VERSION, &lamp.to_bytes()).unwrap();
+        assert_eq!(lamp_rt, lamp);
+        assert!(lamp_rt.is_spot() && lamp_rt.has_point_ambient() && lamp_rt.casts_shadow());
+
+        let mut anim = LightAnimItem::new("lights\\flicker");
+        anim.fps = 10.0;
+        anim.resize(2);
+        anim.insert_key(0, pack_argb(255, 0, 255, 0)).unwrap();
+        let lib = LightAnimLibrary {
+            version: LANIM_VERSION,
+            items: vec![anim],
+        };
+        // setXYZ([PI/2, 0, 0]) pitches +90 deg so forward k points +Y!
+        let spot_ll = lamp.to_level_light([1.0, 3.0, 2.0], [std::f32::consts::FRAC_PI_2, 0.0, 0.0], Some(&lib), 0.0);
+        assert!(spot_ll.is_spot());
+        assert!((spot_ll.direction[1] - 1.0).abs() < 1e-5);
+        assert!((spot_ll.diffuse[1] - 2.0).abs() < 1e-5 && spot_ll.diffuse[0].abs() < 1e-5);
+        let amb_ll = lamp.to_ambient_level_light([1.0, 3.0, 2.0], Some(&lib), 0.0).unwrap();
+        assert!(amb_ll.is_point());
+        assert!((amb_ll.diffuse[1] - 0.4).abs() < 1e-5);
+
+        // 2. Breakable, Climable, Helicopter, Car, StationaryMgun, Squad, SmartCover
+        let brk = AlifeObjectBreakableState {
+            base: dyn_vis.clone(),
+            health: 75.0,
+            trailing: Vec::new(),
+        };
+        assert_eq!(AlifeObjectBreakableState::parse(SPAWN_VERSION, &brk.to_bytes()).unwrap(), brk);
+
+        let climb = AlifeObjectClimableState {
+            alife: base_alife.clone(),
+            shapes: vec![ServerShapeDef::Box([
+                1.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.5, 0.0, 1.5, 0.0,
+            ])],
+            material: "materials\\fake_ladders".to_string(),
+            trailing: Vec::new(),
+        };
+        assert_eq!(AlifeObjectClimableState::parse(SPAWN_VERSION, &climb.to_bytes()).unwrap(), climb);
+
+        let heli = AlifeHelicopterState {
+            base: dyn_vis.clone(),
+            motion: ServerMotionState {
+                motion_name: "helicopter\\patrol.anm".to_string(),
+            },
+            skeleton: skel.clone(),
+            startup_animation: "idle".to_string(),
+            engine_sound: "vehicles\\mi24_engine".to_string(),
+            trailing: Vec::new(),
+        };
+        assert_eq!(AlifeHelicopterState::parse(SPAWN_VERSION, &heli.to_bytes()).unwrap(), heli);
+
+        let mut raw_car = Vec::new();
+        dyn_vis.write_to(&mut raw_car);
+        skel.write_to(&mut raw_car);
+        raw_car.extend_from_slice(&80.0f32.to_le_bytes()); // legacy > 1.0 health normalized -> 0.8
+        let car = AlifeCarState::parse(SPAWN_VERSION, &raw_car).unwrap();
+        assert!((car.health - 0.8).abs() < 1e-6);
+        assert_eq!(AlifeCarState::parse(SPAWN_VERSION, &car.to_bytes()).unwrap(), car);
+
+        let mgun = AlifeStationaryMgunState {
+            base: dyn_vis,
+            skeleton: skel,
+            ammo_type: 1,
+            ammo_elapsed: 200,
+            barrel_ammo_elapsed: vec![100, 100],
+            trailing: Vec::new(),
+        };
+        assert_eq!(
+            AlifeStationaryMgunState::parse(SPAWN_VERSION, &mgun.to_bytes()).unwrap(),
+            mgun
+        );
+
+        let squad = AlifeOnlineOfflineGroupState {
+            alife: base_alife.clone(),
+            member_ids: vec![10, 11, 12],
+            trailing: Vec::new(),
+        };
+        assert_eq!(
+            AlifeOnlineOfflineGroupState::parse(SPAWN_VERSION, &squad.to_bytes()).unwrap(),
+            squad
+        );
+
+        let cover = AlifeSmartCoverState {
+            alife: base_alife,
+            shapes: vec![ServerShapeDef::Sphere {
+                center: [0.0; 3],
+                radius: 1.0,
+            }],
+            description: "combat_front".to_string(),
+            hold_position_time: 12.5,
+            enter_min_enemy_distance: 4.0,
+            exit_min_enemy_distance: 2.0,
+            is_combat_cover: true,
+            can_fire: true,
+            trailing: Vec::new(),
+        };
+        assert_eq!(
+            AlifeSmartCoverState::parse(SPAWN_VERSION, &cover.to_bytes()).unwrap(),
+            cover
+        );
+
+        // 3. Verify SpawnPacket helper dispatch
+        let pkt = SpawnPacket {
+            section: "smart_cover".to_string(),
+            name_replace: "esc_cover_01".to_string(),
+            game_id_legacy: 0,
+            rp: 0xFE,
+            position: [0.0; 3],
+            angle: [0.0; 3],
+            respawn_time: 0,
+            id: INVALID_OBJECT_ID,
+            parent_id: INVALID_OBJECT_ID,
+            phantom_id: INVALID_OBJECT_ID,
+            flags: m_spawn_flags::VERSION,
+            version: SPAWN_VERSION,
+            game_type: u16::MAX,
+            script_version: 10,
+            client_data: Vec::new(),
+            spawn_id: 7,
+            state_payload: cover.to_bytes(),
+            trailing_update_payload: Vec::new(),
+        };
+        assert_eq!(pkt.decode_smart_cover_state().unwrap(), cover);
+
+        // Ensure leaf item type aliases remain wired to InventoryItem/Weapon wire layouts
+        let torch: AlifeItemTorchState = AlifeItemTorchState::parse(SPAWN_VERSION, &AlifeInventoryItemState {
+            base: lamp.base.clone(),
+            condition: 1.0,
+            upgrades: Vec::new(),
+            trailing: Vec::new(),
+        }.to_bytes()).unwrap();
+        assert_eq!(torch.condition, 1.0);
     }
 }
