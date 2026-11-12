@@ -553,11 +553,16 @@ impl SunPositionsConfig {
         let mut hourly = [[0.0f32; 2]; 24];
         for (hour, slot) in hourly.iter_mut().enumerate() {
             let key = format!("{hour:02}:00:00");
-            if !doc.sections.contains_key(&key) {
+            let key_alt = format!("{hour}:00:00");
+            let active_key = if doc.sections.contains_key(&key) {
+                key
+            } else if doc.sections.contains_key(&key_alt) {
+                key_alt
+            } else {
                 return Err(FormatError::InvalidValue("missing hourly sun_positions section"));
-            }
-            let alt = doc.read_f32(&key, "sun_altitude", 0.0);
-            let lon = doc.read_f32(&key, "sun_longitude", 0.0);
+            };
+            let alt = doc.read_f32(&active_key, "sun_altitude", 0.0);
+            let lon = doc.read_f32(&active_key, "sun_longitude", 0.0);
             if !alt.is_finite() || !lon.is_finite() {
                 return Err(FormatError::InvalidValue("non-finite sun angle"));
             }
@@ -697,26 +702,33 @@ pub fn time_weight(val: f32, min_t: f32, max_t: f32) -> f32 {
     weight.clamp(0.0, 1.0)
 }
 
-/// Parse `"HH:MM:SS"` keyframe section names into seconds (`0..=86400`).
+/// Parse `"HH:MM:SS"` or `"HH:MM"` keyframe section names into seconds (`0..=86400`).
 pub fn parse_hhmmss_seconds(ident: &str) -> Result<f32, FormatError> {
     let trimmed = ident.trim();
-    if trimmed == "24:00:00" {
+    if trimmed == "24:00:00" || trimmed == "24:00" {
         return Ok(DAY_LENGTH);
     }
-    let mut parts = trimmed.split(':');
-    let h = parts
-        .next()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .ok_or(FormatError::InvalidValue("invalid weather time hour"))?;
-    let m = parts
-        .next()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .ok_or(FormatError::InvalidValue("invalid weather time minute"))?;
-    let s = parts
-        .next()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .ok_or(FormatError::InvalidValue("invalid weather time second"))?;
-    if parts.next().is_some() || h >= 24 || m >= 60 || s >= 60 {
+    let parts: Vec<&str> = trimmed.split(':').map(str::trim).collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err(FormatError::InvalidValue("invalid weather time format"));
+    }
+    let h = parts[0]
+        .parse::<u32>()
+        .map_err(|_| FormatError::InvalidValue("invalid weather time hour"))?;
+    let m = parts[1]
+        .parse::<u32>()
+        .map_err(|_| FormatError::InvalidValue("invalid weather time minute"))?;
+    let s = if parts.len() == 3 {
+        parts[2]
+            .parse::<u32>()
+            .map_err(|_| FormatError::InvalidValue("invalid weather time second"))?
+    } else {
+        0
+    };
+    if h == 24 && m == 0 && s == 0 {
+        return Ok(DAY_LENGTH);
+    }
+    if h >= 24 || m >= 60 || s >= 60 {
         return Err(FormatError::InvalidValue("weather time out of range"));
     }
     Ok((h as f32) * 3600.0 + (m as f32) * 60.0 + (s as f32))
@@ -779,17 +791,25 @@ pub struct EnvSoundChannelDef {
 
 impl EnvSoundChannelDef {
     pub fn from_ltx(doc: &OwnedLtxDocument, section: &str) -> Result<Self, FormatError> {
-        let min_distance = doc.read_f32(section, "min_distance", 1.0);
-        let max_distance = doc.read_f32(section, "max_distance", min_distance + 1.0);
-        let period = [
-            doc.read_i32(section, "period0", 1000),
-            doc.read_i32(section, "period1", 5000),
-            doc.read_i32(section, "period2", 1000),
-            doc.read_i32(section, "period3", 5000),
-        ];
-        if period[0] > period[1] || period[2] > period[3] || max_distance <= min_distance {
-            return Err(FormatError::InvalidValue("invalid env sound channel bounds"));
+        let mut min_distance = doc.read_f32(section, "min_distance", 1.0).max(0.0);
+        let mut max_distance = doc.read_f32(section, "max_distance", min_distance + 1.0).max(0.0);
+        if max_distance < min_distance {
+            std::mem::swap(&mut min_distance, &mut max_distance);
         }
+        if (max_distance - min_distance).abs() < 1e-3 {
+            max_distance = min_distance + 1.0;
+        }
+        let mut p0 = doc.read_i32(section, "period0", 1000).max(0);
+        let mut p1 = doc.read_i32(section, "period1", 5000).max(0);
+        let mut p2 = doc.read_i32(section, "period2", 1000).max(0);
+        let mut p3 = doc.read_i32(section, "period3", 5000).max(0);
+        if p0 > p1 {
+            std::mem::swap(&mut p0, &mut p1);
+        }
+        if p2 > p3 {
+            std::mem::swap(&mut p2, &mut p3);
+        }
+        let period = [p0, p1, p2, p3];
         let sounds = parse_csv_strings(doc.read_str(section, "sounds"));
         if sounds.is_empty() {
             return Err(FormatError::InvalidValue("empty env sound channel sounds list"));
@@ -2372,7 +2392,15 @@ impl WeatherCycle {
     pub fn from_ltx(name: &str, doc: &OwnedLtxDocument) -> Result<Self, FormatError> {
         let mut descriptors = Vec::with_capacity(doc.sections.len());
         for sec in doc.sections.keys() {
-            descriptors.push(EnvDescriptor::from_ltx(doc, sec)?);
+            if !sec.contains(':') {
+                continue;
+            }
+            match EnvDescriptor::from_ltx(doc, sec) {
+                Ok(desc) => descriptors.push(desc),
+                Err(err) => {
+                    eprintln!("[weather] skipping invalid descriptor section '{sec}' in '{name}': {err}");
+                }
+            }
         }
         descriptors.sort_by(|a, b| a.exec_time_loaded.total_cmp(&b.exec_time_loaded));
         Ok(Self {
@@ -2451,8 +2479,14 @@ impl WeatherLibrary {
     pub fn parse_sound_channels(&mut self, doc: &OwnedLtxDocument) -> Result<(), FormatError> {
         for sec in doc.sections.keys() {
             if doc.read_str(sec, "sounds").is_some() {
-                self.sound_channels
-                    .insert(sec.clone(), EnvSoundChannelDef::from_ltx(doc, sec)?);
+                match EnvSoundChannelDef::from_ltx(doc, sec) {
+                    Ok(channel) => {
+                        self.sound_channels.insert(sec.clone(), channel);
+                    }
+                    Err(err) => {
+                        eprintln!("[weather] ignoring invalid sound channel '{sec}': {err}");
+                    }
+                }
             }
         }
         Ok(())
@@ -2461,8 +2495,14 @@ impl WeatherLibrary {
     pub fn parse_ambient_effects(&mut self, doc: &OwnedLtxDocument) -> Result<(), FormatError> {
         for sec in doc.sections.keys() {
             if doc.read_str(sec, "particles").is_some() {
-                self.ambient_effects
-                    .insert(sec.clone(), EnvAmbientEffectDef::from_ltx(doc, sec)?);
+                match EnvAmbientEffectDef::from_ltx(doc, sec) {
+                    Ok(effect) => {
+                        self.ambient_effects.insert(sec.clone(), effect);
+                    }
+                    Err(err) => {
+                        eprintln!("[weather] ignoring invalid ambient effect '{sec}': {err}");
+                    }
+                }
             }
         }
         Ok(())
@@ -2473,8 +2513,14 @@ impl WeatherLibrary {
             if doc.read_str(sec, "sound_channels").is_some()
                 || doc.read_str(sec, "effects").is_some()
             {
-                self.ambients
-                    .insert(sec.clone(), EnvAmbientDef::from_ltx(doc, sec)?);
+                match EnvAmbientDef::from_ltx(doc, sec) {
+                    Ok(ambient) => {
+                        self.ambients.insert(sec.clone(), ambient);
+                    }
+                    Err(err) => {
+                        eprintln!("[weather] ignoring invalid ambient '{sec}': {err}");
+                    }
+                }
             }
         }
         Ok(())

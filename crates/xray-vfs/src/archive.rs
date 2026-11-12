@@ -120,7 +120,13 @@ impl ArchiveHeader {
             .to_ascii_lowercase();
         let trimmed = ep.trim_matches('\\');
 
-        if trimmed.is_empty() || trimmed == "gamedata" || trimmed == "$game_data$" || trimmed == "$fs_root$" {
+        if trimmed.is_empty()
+            || trimmed == "gamedata"
+            || trimmed == "$game_data$"
+            || trimmed == "$fs_root$"
+            || trimmed == "$fs_root$\\gamedata"
+            || trimmed == "$fs_root$/gamedata"
+        {
             return String::new();
         }
         if let Some(rest) = trimmed.strip_prefix("$game_data$\\") {
@@ -130,6 +136,9 @@ impl ArchiveHeader {
             return with_trailing_backslash(rest);
         }
         if let Some(rest) = trimmed.strip_prefix("$fs_root$\\gamedata\\") {
+            return with_trailing_backslash(rest);
+        }
+        if let Some(rest) = trimmed.strip_prefix("$fs_root$\\") {
             return with_trailing_backslash(rest);
         }
         if trimmed == "$game_config$" || trimmed == "$game_configs$" {

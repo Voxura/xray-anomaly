@@ -671,8 +671,23 @@ fn load_weather_cycles_dir(
             continue;
         }
         let stem = &rest[..rest.len() - 4];
-        let doc = load_ltx_tree_from_vfs(vfs, &vpath, &[])?;
-        out.push((stem.to_owned(), WeatherCycle::from_ltx(stem, &doc)?));
+        let doc = match load_ltx_tree_from_vfs(vfs, &vpath, &[]) {
+            Ok(doc) => doc,
+            Err(err) => {
+                eprintln!("[weather] failed to load '{vpath}': {err}");
+                continue;
+            }
+        };
+        match WeatherCycle::from_ltx(stem, &doc) {
+            Ok(cycle) => {
+                if !cycle.descriptors.is_empty() {
+                    out.push((stem.to_owned(), cycle));
+                }
+            }
+            Err(err) => {
+                eprintln!("[weather] skipping cycle '{stem}': {err}");
+            }
+        }
     }
     Ok(out)
 }

@@ -147,8 +147,8 @@ impl VirtualFileSystem {
         let mut vfs = Self::new();
 
         let mut db_paths = Vec::new();
-        collect_archives_with_ext(root, "db", &mut db_paths)?;
-        collect_archives_with_ext(&root.join("db"), "db", &mut db_paths)?;
+        collect_archives_with_ext(root, "db", false, &mut db_paths)?;
+        collect_archives_with_ext(&root.join("db"), "db", true, &mut db_paths)?;
         db_paths.sort();
         for p in db_paths {
             let mounted = MountedArchive::open_mmap(&p)?;
@@ -158,8 +158,9 @@ impl VirtualFileSystem {
         }
 
         let mut xdb_paths = Vec::new();
-        collect_archives_with_ext(root, "xdb", &mut xdb_paths)?;
-        collect_archives_with_ext(&root.join("mods"), "xdb", &mut xdb_paths)?;
+        collect_archives_with_ext(root, "xdb", false, &mut xdb_paths)?;
+        collect_archives_with_ext(&root.join("mods"), "xdb", true, &mut xdb_paths)?;
+        collect_archives_with_ext(&root.join("db"), "xdb", true, &mut xdb_paths)?;
         xdb_paths.sort();
         for p in xdb_paths {
             let mounted = MountedArchive::open_mmap(&p)?;
@@ -377,6 +378,7 @@ fn is_clean_subpath(rel: &str) -> bool {
 fn collect_archives_with_ext(
     dir: &Path,
     ext_prefix: &str,
+    recursive: bool,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), VfsError> {
     if !dir.is_dir() {
@@ -385,14 +387,17 @@ fn collect_archives_with_ext(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            let lower = ext.to_ascii_lowercase();
-            // Matches `.db`, `.db0`, `.dba` or `.xdb`, `.xdb0` etc.
-            if lower.starts_with(ext_prefix) {
-                out.push(path);
+        if path.is_dir() {
+            if recursive {
+                collect_archives_with_ext(&path, ext_prefix, true, out)?;
+            }
+        } else if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let lower = ext.to_ascii_lowercase();
+                // Matches `.db`, `.db0`, `.dba` or `.xdb`, `.xdb0` etc.
+                if lower.starts_with(ext_prefix) {
+                    out.push(path);
+                }
             }
         }
     }
