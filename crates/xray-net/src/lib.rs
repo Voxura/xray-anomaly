@@ -13,8 +13,9 @@ pub mod stun;
 pub mod transport;
 
 pub use protocol::{
-    flags, ConnectChallenge, ConnectRequest, ConnectResponse, EntityDelta, Heartbeat, PacketHeader,
-    PacketType, PROTOCOL_MAGIC, PROTOCOL_VERSION,
+    flags, ConnectChallenge, ConnectRequest, ConnectResponse, EntityDelta, Heartbeat,
+    LevelChangeNotice, LevelChangePhase, PacketHeader, PacketType, PROTOCOL_MAGIC,
+    PROTOCOL_VERSION,
 };
 pub use relay::{RelayClient, RelayHeader, RelayServer, RELAY_HEADER_SIZE, RELAY_MAGIC};
 pub use reliability::ReliabilityTracker;

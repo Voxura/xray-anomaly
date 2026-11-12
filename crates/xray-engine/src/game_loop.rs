@@ -11,6 +11,7 @@ use crate::alife_manager::{AlifeManager, EntityRole};
 use crate::camera::FirstPersonCamera;
 use crate::hud_weapon::{HudWeaponController, WeaponState};
 use crate::input::{Action, EngineInput};
+use crate::level_transition::{canonical_level_name, LevelTransitionManager};
 use crate::physics::StalkerController;
 use crate::render_bridge::{HudOverlayState, RenderBridge, RenderBridgeConfig};
 use crate::timer::EngineTimer;
@@ -21,7 +22,7 @@ use crate::world_loader::{LevelLoadConfig, LoadedWorld, WorldLoader};
 use xray_audio::{AudioListener, AudioManager, AudioManagerConfig};
 use xray_formats::cform::CformBvh;
 use xray_formats::scoc::ScocFile;
-use xray_net::{ClientSession, EntityDelta, HostSession};
+use xray_net::{ClientSession, ClientState, EntityDelta, HostSession, LevelChangeNotice};
 use xray_render_dx12::Dx12Renderer;
 use xray_vfs::VirtualFileSystem;
 
@@ -67,6 +68,38 @@ impl NetworkSession {
             Self::Client(c) => c.send_entity_delta(delta),
         }
     }
+
+    pub fn send_level_change_notice(&mut self, notice: &LevelChangeNotice) -> std::io::Result<()> {
+        match self {
+            Self::Host(h) => h.send_level_change_notice(notice),
+            Self::Client(c) => c.send_level_change_notice(notice),
+        }
+    }
+
+    pub fn drain_level_change_notices(&mut self) -> Vec<LevelChangeNotice> {
+        match self {
+            Self::Host(h) => h.drain_level_change_notices(),
+            Self::Client(c) => c.drain_level_change_notices(),
+        }
+    }
+
+    pub fn is_host(&self) -> bool {
+        matches!(self, Self::Host(_))
+    }
+
+    pub fn is_connected_to_peer(&self) -> bool {
+        match self {
+            Self::Host(h) => h.has_peer(),
+            Self::Client(c) => c.state() == ClientState::Connected,
+        }
+    }
+
+    pub fn local_slot(&self) -> u8 {
+        match self {
+            Self::Host(_) => 0,
+            Self::Client(c) => c.assigned_slot().unwrap_or(1),
+        }
+    }
 }
 
 pub struct EngineRuntime {
@@ -83,6 +116,7 @@ pub struct EngineRuntime {
     pub hud_weapon: HudWeaponController,
     pub inventory: InventoryManager,
     pub pda: PdaManager,
+    pub level_transition: LevelTransitionManager,
     pub network: Option<NetworkSession>,
     pub world: Option<LoadedWorld>,
     pub alife: Option<AlifeManager>,
@@ -133,6 +167,7 @@ impl EngineRuntime {
             hud_weapon: HudWeaponController::default(),
             inventory: InventoryManager::new_starter(),
             pda: PdaManager::new(),
+            level_transition: LevelTransitionManager::default(),
             network: None,
             world: None,
             alife: None,
@@ -147,6 +182,8 @@ impl EngineRuntime {
         self.audio.attach_vfs(Arc::clone(&vfs));
         self.pda.invalidate_map_cache();
         self.pda.ensure_world_maps_loaded(&vfs);
+        self.level_transition.invalidate_vfs_cache();
+        self.level_transition.ensure_game_levels_loaded(&vfs);
         self.vfs = Some(vfs);
     }
 
@@ -171,7 +208,13 @@ impl EngineRuntime {
         }
         self.audio
             .set_occlusion_mesh(world.sound_occlusion.clone().map(Arc::new));
+        let lvl = canonical_level_name(&world.level_dir);
         self.world = Some(world);
+        self.level_transition.discover_from_world_and_alife(
+            &lvl,
+            self.world.as_ref(),
+            self.alife.as_ref(),
+        );
     }
 
     /// Attach an ALife simulation manager and synchronize camera, physics, inventory & weather initial state.
@@ -189,7 +232,41 @@ impl EngineRuntime {
         if let Some(world) = &mut self.world {
             world.weather.apply_scop_weather(&alife.weather_snapshot);
         }
+        let lvl = canonical_level_name(&alife.level_name);
         self.alife = Some(alife);
+        self.level_transition.discover_from_world_and_alife(
+            &lvl,
+            self.world.as_ref(),
+            self.alife.as_ref(),
+        );
+    }
+
+    /// Programmatically start a dynamic level transition and broadcast `PrepareTransition` if networked.
+    pub fn initiate_level_transition(
+        &mut self,
+        target_level: &str,
+        spawn_pos: [f32; 3],
+        spawn_angles: [f32; 3],
+    ) -> bool {
+        let local_slot = self.network.as_ref().map_or(0, NetworkSession::local_slot);
+        let networked = self
+            .network
+            .as_ref()
+            .is_some_and(NetworkSession::is_connected_to_peer);
+        let maybe_notice = self.level_transition.begin_transition(
+            target_level,
+            spawn_pos,
+            spawn_angles,
+            local_slot,
+            networked,
+        );
+        let started = self.level_transition.is_loading();
+        if let Some(notice) = maybe_notice
+            && let Some(session) = self.network.as_mut()
+        {
+            let _ = session.send_level_change_notice(&notice);
+        }
+        started
     }
 
     /// Synchronize currently attached world geometry, textures, lights, and grass details onto GPU.
@@ -241,6 +318,93 @@ impl EngineRuntime {
             return Ok(false);
         }
 
+        // 2. Handle window resize
+        if self.camera.aspect != (self.window.height() as f32 / self.window.width() as f32) {
+            self.camera.resize(self.window.width(), self.window.height());
+            if let Some(r) = &mut self.renderer {
+                r.resize(self.window.width(), self.window.height())?;
+            }
+        }
+
+        // 3. Update timer
+        let dt = self.timer.tick();
+        self.elapsed_sec += dt;
+
+        // If a multi-stage level transition is active, pump network sync + advance loader + render loading screen
+        if self.level_transition.is_loading() {
+            self.input.set_cursor_locked(false);
+            let local_slot = self.network.as_ref().map_or(0, NetworkSession::local_slot);
+            if let Some(session) = self.network.as_mut() {
+                if let Ok(deltas) = session.update()
+                    && let Some(mgr) = self.alife.as_mut()
+                {
+                    for delta in &deltas {
+                        mgr.apply_network_delta(delta);
+                    }
+                }
+                for notice in session.drain_level_change_notices() {
+                    self.level_transition.handle_network_notice(&notice, local_slot);
+                }
+            }
+
+            let is_host = self
+                .network
+                .as_ref()
+                .is_none_or(NetworkSession::is_host);
+            let has_connected_peer = self
+                .network
+                .as_ref()
+                .is_some_and(NetworkSession::is_connected_to_peer);
+            let step_out = self.level_transition.step_transition(
+                dt,
+                self.vfs.as_deref(),
+                &mut self.world,
+                &mut self.alife,
+                &mut self.renderer,
+                &mut self.render_bridge,
+                &mut self.inventory,
+                &mut self.hud_weapon,
+                &mut self.camera,
+                &mut self.physics,
+                &mut self.audio,
+                is_host,
+                has_connected_peer,
+                local_slot,
+            );
+            if let Some(session) = self.network.as_mut() {
+                for notice in &step_out.outgoing_notices {
+                    let _ = session.send_level_change_notice(notice);
+                }
+            }
+            if step_out.completed {
+                if let Some(mgr) = self.alife.as_ref() {
+                    self.hud.health = mgr.actor_stats.health.clamp(0.0, 1.0);
+                    self.hud.stamina = mgr.actor_stats.stamina.clamp(0.0, 1.0);
+                }
+                self.input.set_cursor_locked(true);
+            }
+
+            if let (Some(r), Some(rb)) = (&mut self.renderer, &mut self.render_bridge) {
+                r.begin_frame()?;
+                rb.render_frame_with_transition(
+                    r,
+                    &self.camera,
+                    self.world.as_ref(),
+                    self.alife.as_ref(),
+                    self.vfs.as_deref(),
+                    &self.hud,
+                    Some(&mut self.hud_weapon),
+                    Some(&self.inventory),
+                    Some(&mut self.pda),
+                    Some(&self.level_transition),
+                    dt,
+                    self.elapsed_sec,
+                )?;
+                r.end_frame(self.config.vsync)?;
+            }
+            return Ok(true);
+        }
+
         // Toggle Inventory (`Tab` / `I`), PDA (`P`), or handle `Esc` closing active UI modal
         if self.input.is_action_just_pressed(Action::Menu) {
             if self.inventory.dialogue.is_some() {
@@ -250,6 +414,8 @@ impl EngineRuntime {
                 self.inventory.set_open(false, Some(&mut self.audio));
             } else if self.pda.open {
                 self.pda.set_open(false, Some(&mut self.audio));
+            } else if self.level_transition.active_prompt.is_some() {
+                self.level_transition.cancel_prompt(Some(&mut self.audio));
             } else {
                 self.running = false;
                 return Ok(false);
@@ -273,20 +439,10 @@ impl EngineRuntime {
             self.pda.toggle(Some(&mut self.audio));
         }
 
-        let modal_open = self.inventory.is_modal_open() || self.pda.open;
+        let modal_open = self.inventory.is_modal_open()
+            || self.pda.open
+            || self.level_transition.is_modal_open();
         self.input.set_cursor_locked(!modal_open);
-
-        // 2. Handle window resize
-        if self.camera.aspect != (self.window.height() as f32 / self.window.width() as f32) {
-            self.camera.resize(self.window.width(), self.window.height());
-            if let Some(r) = &mut self.renderer {
-                r.resize(self.window.width(), self.window.height())?;
-            }
-        }
-
-        // 3. Update timer
-        let dt = self.timer.tick();
-        self.elapsed_sec += dt;
 
         // 4. Update camera orientation from mouse delta & compute world-space XZ wish vector
         if !modal_open && self.input.is_cursor_locked() {
@@ -352,6 +508,7 @@ impl EngineRuntime {
         let alife = &mut self.alife;
         let hud = &mut self.hud;
         let audio = &mut self.audio;
+        let level_transition = &mut self.level_transition;
         self.timer.step_fixed(fixed_dt, |f_dt| {
             let jump_req = std::mem::take(&mut jump_pending);
             physics.step(
@@ -375,12 +532,17 @@ impl EngineRuntime {
                 gamemtl_ref,
             );
 
-            if let Some(session) = net.as_mut()
-                && let Ok(deltas) = session.update()
-                && let Some(mgr) = alife.as_mut()
-            {
-                for delta in &deltas {
-                    mgr.apply_network_delta(delta);
+            if let Some(session) = net.as_mut() {
+                let local_slot = session.local_slot();
+                if let Ok(deltas) = session.update()
+                    && let Some(mgr) = alife.as_mut()
+                {
+                    for delta in &deltas {
+                        mgr.apply_network_delta(delta);
+                    }
+                }
+                for notice in session.drain_level_change_notices() {
+                    level_transition.handle_network_notice(&notice, local_slot);
                 }
             }
             if let Some(mgr) = alife.as_mut() {
@@ -429,22 +591,66 @@ impl EngineRuntime {
             Some(&mut self.audio),
         );
 
+        let vw = self.window.width();
+        let vh = self.window.height();
+
+        // Check level changer trigger volumes & travel confirmation prompt when no Inventory/PDA is open
+        if !self.inventory.is_modal_open() && !self.pda.open && !self.level_transition.is_loading()
+        {
+            let local_slot = self.network.as_ref().map_or(0, NetworkSession::local_slot);
+            let networked = self
+                .network
+                .as_ref()
+                .is_some_and(NetworkSession::is_connected_to_peer);
+            let actor_center = [
+                self.physics.feet_position[0],
+                self.physics.feet_position[1] + 0.9,
+                self.physics.feet_position[2],
+            ];
+            let prompt_was_open = self.level_transition.active_prompt.is_some();
+            if let Some(notice) =
+                self.level_transition
+                    .scan_player_triggers(actor_center, local_slot, networked)
+                && let Some(session) = self.network.as_mut()
+            {
+                let _ = session.send_level_change_notice(&notice);
+            }
+            if prompt_was_open
+                && let Some(notice) = self.level_transition.handle_input(
+                    &self.input,
+                    vw,
+                    vh,
+                    local_slot,
+                    networked,
+                    Some(&mut self.audio),
+                )
+                && let Some(session) = self.network.as_mut()
+            {
+                let _ = session.send_level_change_notice(&notice);
+            }
+        }
+
         // Proximity `'E'` (`Action::Use`) NPC/Trader dialogue & ground item pickup, plus modal UI input
-        if !self.inventory.is_modal_open() && !self.pda.open {
+        if !self.inventory.is_modal_open()
+            && !self.pda.open
+            && !self.level_transition.is_modal_open()
+        {
             self.inventory.scan_use_target(
                 self.camera.position,
                 self.camera.forward(),
                 self.alife.as_ref(),
             );
         }
-        if self.input.is_action_just_pressed(Action::Use) && !self.inventory.open && !self.pda.open {
+        if self.input.is_action_just_pressed(Action::Use)
+            && !self.inventory.open
+            && !self.pda.open
+            && !self.level_transition.is_modal_open()
+        {
             let _ = self
                 .inventory
                 .interact_with_target(self.alife.as_mut(), Some(&mut self.audio));
         }
 
-        let vw = self.window.width();
-        let vh = self.window.height();
         if self.inventory.is_modal_open() {
             self.inventory.handle_input(
                 &self.input,
@@ -496,7 +702,9 @@ impl EngineRuntime {
         }
         self.hud.health = self.inventory.actor_stats.health.clamp(0.0, 1.0);
         self.hud.stamina = self.inventory.actor_stats.stamina.clamp(0.0, 1.0);
-        let ui_open_after = self.inventory.is_modal_open() || self.pda.open;
+        let ui_open_after = self.inventory.is_modal_open()
+            || self.pda.open
+            || self.level_transition.is_modal_open();
         self.input.set_cursor_locked(!ui_open_after);
         self.hud.show_crosshair =
             !ui_open_after && self.hud_weapon.state != WeaponState::Aiming;
@@ -585,7 +793,7 @@ impl EngineRuntime {
         // 6. Direct3D 12 7-stage render graph presentation + first-person HUD weapon + UI Canvas pass
         if let (Some(r), Some(rb)) = (&mut self.renderer, &mut self.render_bridge) {
             r.begin_frame()?;
-            rb.render_frame_with_ui(
+            rb.render_frame_with_transition(
                 r,
                 &self.camera,
                 self.world.as_ref(),
@@ -595,6 +803,7 @@ impl EngineRuntime {
                 Some(&mut self.hud_weapon),
                 Some(&self.inventory),
                 Some(&mut self.pda),
+                Some(&self.level_transition),
                 dt,
                 self.elapsed_sec,
             )?;

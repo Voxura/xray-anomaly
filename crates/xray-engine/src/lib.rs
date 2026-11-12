@@ -13,6 +13,7 @@
 //! - First-person HUD weapons, skeletal viewmodel rig & ballistic combat (`hud_weapon`)
 //! - Interactive 2D grid Inventory, Equipment & NPC/Trader dialogue (`ui_inventory`)
 //! - Interactive PDA level map, co-op peer radar & story quest tracker (`ui_pda`)
+//! - Dynamic level transitions, multi-stage loading screen & co-op sync (`level_transition`)
 //! - Pure-Rust 3D spatial audio subsystem (`xray_audio`)
 
 pub mod alife_manager;
@@ -20,6 +21,7 @@ pub mod camera;
 pub mod game_loop;
 pub mod hud_weapon;
 pub mod input;
+pub mod level_transition;
 pub mod physics;
 pub mod render_bridge;
 pub mod timer;
@@ -39,6 +41,11 @@ pub use hud_weapon::{
     WeaponFireMode, WeaponSpec, WeaponState,
 };
 pub use input::{Action, EngineInput, MouseButton};
+pub use level_transition::{
+    canonical_level_name, lookup_level_metadata, resolve_level_vfs_dir, ActiveTransition,
+    LevelChangerVolume, LevelTransitionManager, TransitionState, TransitionStepOutput,
+    TransitionUiLayout, TravelPrompt, ZoneLevelMetadata,
+};
 pub use physics::{CapsuleConfig, StalkerController};
 pub use render_bridge::{FrameRenderStats, HudOverlayState, RenderBridge, RenderBridgeConfig};
 pub use timer::EngineTimer;

@@ -27,6 +27,7 @@ use windows::core::Result as WinResult;
 use crate::alife_manager::{AlifeManager, EntityRole};
 use crate::camera::FirstPersonCamera;
 use crate::hud_weapon::{HudWeaponController, WeaponState};
+use crate::level_transition::LevelTransitionManager;
 use crate::ui_inventory::{InventoryManager, UiFontResource};
 use crate::ui_pda::PdaManager;
 use crate::world_loader::{LoadedDynamicModel, LoadedWorld};
@@ -533,9 +534,42 @@ impl RenderBridge {
         alife: Option<&AlifeManager>,
         vfs: Option<&VirtualFileSystem>,
         hud: &HudOverlayState,
+        hud_weapon: Option<&mut HudWeaponController>,
+        inventory: Option<&InventoryManager>,
+        pda: Option<&mut PdaManager>,
+        dt: f32,
+        elapsed_sec: f32,
+    ) -> WinResult<FrameRenderStats> {
+        self.render_frame_with_transition(
+            renderer,
+            camera,
+            world,
+            alife,
+            vfs,
+            hud,
+            hud_weapon,
+            inventory,
+            pda,
+            None,
+            dt,
+            elapsed_sec,
+        )
+    }
+
+    /// Execute all 7 DX12 render graph passes plus Inventory, PDA, Dialogue, Travel Prompt & Loading Screen UI.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frame_with_transition(
+        &mut self,
+        renderer: &mut Dx12Renderer,
+        camera: &FirstPersonCamera,
+        world: Option<&LoadedWorld>,
+        alife: Option<&AlifeManager>,
+        vfs: Option<&VirtualFileSystem>,
+        hud: &HudOverlayState,
         mut hud_weapon: Option<&mut HudWeaponController>,
         inventory: Option<&InventoryManager>,
         pda: Option<&mut PdaManager>,
+        level_transition: Option<&LevelTransitionManager>,
         dt: f32,
         elapsed_sec: f32,
     ) -> WinResult<FrameRenderStats> {
@@ -955,7 +989,11 @@ impl RenderBridge {
             }
             let font_ref = self.ui_font.as_ref();
 
-            if let Some(inv) = inventory {
+            if let Some(lt) = level_transition
+                && lt.is_loading()
+            {
+                stats.ui_elements_drawn += lt.render_ui(renderer, vfs, width, height, font_ref);
+            } else if let Some(inv) = inventory {
                 let draw_crosshair = hud.show_crosshair && !is_aiming_ads;
                 let hw_ref = hud_weapon.as_deref();
                 stats.ui_elements_drawn += inv.render_ui(
@@ -974,6 +1012,9 @@ impl RenderBridge {
                         .unwrap_or("l01_escape");
                     stats.ui_elements_drawn +=
                         pda_mgr.render_ui(renderer, vfs, width, height, level_name, font_ref);
+                }
+                if let Some(lt) = level_transition {
+                    stats.ui_elements_drawn += lt.render_ui(renderer, vfs, width, height, font_ref);
                 }
             } else {
                 let fw = width as f32;
@@ -1005,6 +1046,9 @@ impl RenderBridge {
                     [0.2, 0.68, 0.92, 0.95],
                 );
                 stats.ui_elements_drawn += 4;
+                if let Some(lt) = level_transition {
+                    stats.ui_elements_drawn += lt.render_ui(renderer, vfs, width, height, font_ref);
+                }
             }
             renderer.ui_flush(width, height)?;
         }

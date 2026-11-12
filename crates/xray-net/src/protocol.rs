@@ -28,6 +28,7 @@ pub enum PacketType {
     Event = 7,
     Rpc = 8,
     SaveSync = 9,
+    LevelChangeNotice = 10,
     Unknown = 255,
 }
 
@@ -43,6 +44,7 @@ impl From<u8> for PacketType {
             7 => PacketType::Event,
             8 => PacketType::Rpc,
             9 => PacketType::SaveSync,
+            10 => PacketType::LevelChangeNotice,
             _ => PacketType::Unknown,
         }
     }
@@ -390,5 +392,157 @@ mod tests {
 
         let decoded = Heartbeat::read_from(&buf).expect("failed to decode heartbeat");
         assert_eq!(decoded, hb);
+    }
+
+    #[test]
+    fn test_level_change_notice_roundtrip() {
+        let notice = LevelChangeNotice {
+            transition_id: 77,
+            sender_slot: 1,
+            phase: LevelChangePhase::ReadyAtDestination,
+            source_level: "l01_escape".to_string(),
+            target_level: "l02_garbage".to_string(),
+            target_point: "gar_start_actor".to_string(),
+            spawn_pos: [-110.5, 1.25, -240.75],
+            spawn_angles: [0.05, 1.57, 0.0],
+            game_vertex_id: 412,
+            level_vertex_id: 98_765,
+        };
+        let mut buf = Vec::new();
+        notice.write_to(&mut buf);
+
+        let decoded =
+            LevelChangeNotice::read_from(&buf).expect("failed to decode level change notice");
+        assert_eq!(decoded, notice);
+    }
+}
+
+/// Phase within the synchronous co-op [`LevelChangeNotice`] handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LevelChangePhase {
+    PrepareTransition = 0,
+    ReadyAtDestination = 1,
+    CommitSpawn = 2,
+    Abort = 3,
+}
+
+impl TryFrom<u8> for LevelChangePhase {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::PrepareTransition),
+            1 => Ok(Self::ReadyAtDestination),
+            2 => Ok(Self::CommitSpawn),
+            3 => Ok(Self::Abort),
+            _ => Err("unknown level change phase"),
+        }
+    }
+}
+
+/// Synchronous co-op level transition coordination packet (`PacketType::LevelChangeNotice`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LevelChangeNotice {
+    pub transition_id: u32,
+    pub sender_slot: u8,
+    pub phase: LevelChangePhase,
+    pub source_level: String,
+    pub target_level: String,
+    pub target_point: String,
+    pub spawn_pos: [f32; 3],
+    pub spawn_angles: [f32; 3],
+    pub game_vertex_id: u16,
+    pub level_vertex_id: u32,
+}
+
+impl LevelChangeNotice {
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.transition_id.to_le_bytes());
+        out.push(self.sender_slot);
+        out.push(self.phase as u8);
+
+        for s in [&self.source_level, &self.target_level, &self.target_point] {
+            let bytes = s.as_bytes();
+            let len = bytes.len().min(128) as u8;
+            out.push(len);
+            out.extend_from_slice(&bytes[..len as usize]);
+        }
+        for &p in &self.spawn_pos {
+            out.extend_from_slice(&p.to_le_bytes());
+        }
+        for &a in &self.spawn_angles {
+            out.extend_from_slice(&a.to_le_bytes());
+        }
+        out.extend_from_slice(&self.game_vertex_id.to_le_bytes());
+        out.extend_from_slice(&self.level_vertex_id.to_le_bytes());
+    }
+
+    pub fn read_from(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < 9 {
+            return Err("level change notice truncated");
+        }
+        let transition_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let sender_slot = data[4];
+        let phase = LevelChangePhase::try_from(data[5])?;
+        let mut offset = 6usize;
+
+        let mut read_short_str = || -> Result<String, &'static str> {
+            if offset >= data.len() {
+                return Err("level change string length truncated");
+            }
+            let len = data[offset] as usize;
+            offset += 1;
+            if offset + len > data.len() {
+                return Err("level change string payload truncated");
+            }
+            let val = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
+            offset += len;
+            Ok(val)
+        };
+
+        let source_level = read_short_str()?;
+        let target_level = read_short_str()?;
+        let target_point = read_short_str()?;
+
+        if offset + 30 > data.len() {
+            return Err("level change transform truncated");
+        }
+        let read_f32 = |off: &mut usize| -> f32 {
+            let v = f32::from_le_bytes([data[*off], data[*off + 1], data[*off + 2], data[*off + 3]]);
+            *off += 4;
+            v
+        };
+        let spawn_pos = [
+            read_f32(&mut offset),
+            read_f32(&mut offset),
+            read_f32(&mut offset),
+        ];
+        let spawn_angles = [
+            read_f32(&mut offset),
+            read_f32(&mut offset),
+            read_f32(&mut offset),
+        ];
+        let game_vertex_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
+        offset += 2;
+        let level_vertex_id = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+
+        Ok(Self {
+            transition_id,
+            sender_slot,
+            phase,
+            source_level,
+            target_level,
+            target_point,
+            spawn_pos,
+            spawn_angles,
+            game_vertex_id,
+            level_vertex_id,
+        })
     }
 }

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::{
     flags, ConnectChallenge, ConnectRequest, ConnectResponse, EntityDelta, Heartbeat,
-    PacketHeader, PacketType,
+    LevelChangeNotice, PacketHeader, PacketType,
 };
 use crate::reliability::ReliabilityTracker;
 use crate::transport::{TransportConfig, UdpTransport};
@@ -46,6 +46,7 @@ pub struct HostSession {
     tick_rate: u8,
     peer: Option<PeerInfo>,
     expected_cookie: u64,
+    incoming_level_notices: Vec<LevelChangeNotice>,
 }
 
 impl HostSession {
@@ -62,6 +63,7 @@ impl HostSession {
             tick_rate: 60,
             peer: None,
             expected_cookie: 0xfeed_cafe_1234_5678,
+            incoming_level_notices: Vec::new(),
         })
     }
 
@@ -188,11 +190,49 @@ impl HostSession {
                         }
                     }
                 }
+                PacketType::LevelChangeNotice => {
+                    if let Some(peer) = &mut self.peer {
+                        if peer.endpoint == addr {
+                            peer.last_seen = Instant::now();
+                            peer.reliability.on_packet_received(header.sequence);
+                            peer.reliability.process_incoming_ack(header.ack, header.ack_bits);
+
+                            if let Ok(notice) = LevelChangeNotice::read_from(payload) {
+                                self.incoming_level_notices.push(notice);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
 
         Ok(deltas)
+    }
+
+    /// Drain queued incoming [`LevelChangeNotice`] packets from the connected peer.
+    pub fn drain_level_change_notices(&mut self) -> Vec<LevelChangeNotice> {
+        std::mem::take(&mut self.incoming_level_notices)
+    }
+
+    /// Sends a synchronous co-op [`LevelChangeNotice`] packet to the connected peer.
+    pub fn send_level_change_notice(&mut self, notice: &LevelChangeNotice) -> std::io::Result<()> {
+        if let Some(peer) = &mut self.peer {
+            let (ack, ack_bits) = peer.reliability.generate_ack();
+            let seq = peer.reliability.next_sequence();
+            let header = PacketHeader::new(
+                PacketType::LevelChangeNotice,
+                flags::RELIABLE | flags::ACK_REQUIRED,
+                seq,
+                ack,
+                ack_bits,
+            );
+            let mut msg = Vec::new();
+            header.write_to(&mut msg);
+            notice.write_to(&mut msg);
+            self.transport.send_to(&msg, peer.endpoint)?;
+        }
+        Ok(())
     }
 
     /// Sends an entity delta update to the connected peer.
@@ -228,6 +268,7 @@ pub struct ClientSession {
     reliability: ReliabilityTracker,
     last_sent_request: Instant,
     last_heard: Instant,
+    incoming_level_notices: Vec<LevelChangeNotice>,
 }
 
 impl ClientSession {
@@ -249,6 +290,7 @@ impl ClientSession {
             reliability: ReliabilityTracker::new(),
             last_sent_request: Instant::now() - Duration::from_secs(1),
             last_heard: Instant::now(),
+            incoming_level_notices: Vec::new(),
         };
 
         session.send_connect_request()?;
@@ -338,11 +380,42 @@ impl ClientSession {
                         deltas.push(delta);
                     }
                 }
+                PacketType::LevelChangeNotice => {
+                    if let Ok(notice) = LevelChangeNotice::read_from(payload) {
+                        self.incoming_level_notices.push(notice);
+                    }
+                }
                 _ => {}
             }
         }
 
         Ok(deltas)
+    }
+
+    /// Drain queued incoming [`LevelChangeNotice`] packets from the host.
+    pub fn drain_level_change_notices(&mut self) -> Vec<LevelChangeNotice> {
+        std::mem::take(&mut self.incoming_level_notices)
+    }
+
+    /// Sends a synchronous co-op [`LevelChangeNotice`] packet to the host.
+    pub fn send_level_change_notice(&mut self, notice: &LevelChangeNotice) -> std::io::Result<()> {
+        if self.state != ClientState::Connected {
+            return Ok(());
+        }
+        let (ack, ack_bits) = self.reliability.generate_ack();
+        let seq = self.reliability.next_sequence();
+        let header = PacketHeader::new(
+            PacketType::LevelChangeNotice,
+            flags::RELIABLE | flags::ACK_REQUIRED,
+            seq,
+            ack,
+            ack_bits,
+        );
+        let mut msg = Vec::new();
+        header.write_to(&mut msg);
+        notice.write_to(&mut msg);
+        self.transport.send_to(&msg, self.host_addr)?;
+        Ok(())
     }
 
     /// Sends client player entity delta to host.
