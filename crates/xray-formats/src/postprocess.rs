@@ -8,6 +8,7 @@
 //! - `src/Layers/xrRender/Blender_Recorder_StandartBinding.cpp` (`hdr10_parameters1..10`)
 //! - `gamedata/shaders/r3/{hdr10.h,combine_2_naa.ps,effects_sun.ps}`
 
+use crate::ogf::{matrix_transform_point, XRayMatrix};
 use crate::particle_sim::ParticleRng;
 use crate::weather::MixedEnvironment;
 
@@ -1491,6 +1492,396 @@ impl Default for SsfxScreenConfig {
     }
 }
 
+/// SSFX AO/IL/SSR/Water/Rain/SSS settings matching `xrRender_console.cpp:424-479`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsfxLightingConfig {
+    pub sss_quality: [f32; 4],
+    pub sss: [f32; 4],
+    pub ao_quality: i32,
+    pub ao: [f32; 4],
+    pub ao_setup1: [f32; 4],
+    pub il_quality: i32,
+    pub il: [f32; 4],
+    pub il_setup1: [f32; 4],
+    pub ssr_quality: i32,
+    pub ssr: [f32; 4],
+    pub ssr_2: [f32; 4],
+    pub water: [f32; 4],
+    pub water_quality: [f32; 3],
+    pub water_setup1: [f32; 4],
+    pub water_setup2: [f32; 4],
+    pub rain_1: [f32; 4],
+    pub rain_2: [f32; 4],
+    pub rain_3: [f32; 4],
+    pub rain_drops_setup: [f32; 4],
+}
+
+impl Default for SsfxLightingConfig {
+    fn default() -> Self {
+        Self {
+            sss_quality: [12.0, 4.0, 1.0, 1.0],
+            sss: [1.0, 1.0, 1.0, 0.0],
+            ao_quality: 4,
+            ao: [1.0, 5.0, 1.0, 2.5],
+            ao_setup1: [150.0, 1.0, 1.0, 0.0],
+            il_quality: 32,
+            il: [6.66, 1.0, 1.0, 5.0],
+            il_setup1: [150.0, 1.0, 0.5, 0.0],
+            ssr_quality: 0,
+            ssr: [1.0, 0.2, 0.0, 0.0],
+            ssr_2: [0.0, 1.3, 1.0, 0.015],
+            water: [1.0, 0.8, 1.0, 0.0],
+            water_quality: [1.0, 2.0, 0.0],
+            water_setup1: [0.6, 3.0, 0.3, 0.05],
+            water_setup2: [0.8, 6.0, 0.3, 0.5],
+            rain_1: [2.0, 0.1, 0.6, 2.0],
+            rain_2: [0.5, 0.1, 1.0, 0.5],
+            rain_3: [0.5, 1.0, 0.0, 0.0],
+            rain_drops_setup: [2500.0, 15.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// Number of persistent point/spot light slots tracked by `phase_ssfx_sss_ext`.
+pub const SSFX_SSS_EXT_MAX_SLOTS: usize = 8;
+
+/// Input candidate light for `SsfxSssExtSlots` matching `light_Package::v_shadowed` entries.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsfxSssCandidate {
+    pub id: u64,
+    pub position: [f32; 3],
+    pub range: f32,
+    /// Pre-sorted package distance from camera (`light::distance`).
+    pub distance: f32,
+    pub active: bool,
+    pub is_secondary_omnipart: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TrackedSssLight {
+    id: u64,
+    position: [f32; 3],
+    range: f32,
+    distance: f32,
+    active: bool,
+}
+
+/// Persistent 8-slot external light selector & view-space fadeout packer matching
+/// `CRenderTarget::phase_ssfx_sss_ext` (`rendertarget_phase_blur.cpp:631-840`).
+#[derive(Debug, Clone, Default)]
+pub struct SsfxSssExtSlots {
+    slots: [Option<TrackedSssLight>; SSFX_SSS_EXT_MAX_SLOTS],
+    initialized: bool,
+    next_refresh_frame: u32,
+}
+
+impl SsfxSssExtSlots {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clear a light immediately when destroyed (`OnLightDestroy`).
+    pub fn remove_light(&mut self, id: u64) {
+        for slot in &mut self.slots {
+            if slot.is_some_and(|l| l.id == id) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Return current slot assignment IDs (index `0..8`) for debugging/SSS pass offset correlation.
+    pub fn assigned_ids(&self) -> [Option<u64>; SSFX_SSS_EXT_MAX_SLOTS] {
+        self.slots.map(|entry| entry.map(|l| l.id))
+    }
+
+    /// Step the persistent 8-slot tracker and return `lights_data[8]` (`[vx, vy, vz, fade]`),
+    /// where `fade = 0.0` is full visibility and `1.0` is fully faded out.
+    pub fn update(
+        &mut self,
+        frame: u32,
+        camera_pos: [f32; 3],
+        view_matrix: &XRayMatrix,
+        shadowed_lights: &[SsfxSssCandidate],
+    ) -> [[f32; 4]; SSFX_SSS_EXT_MAX_SLOTS] {
+        let mut out = [[0.0f32; 4]; SSFX_SSS_EXT_MAX_SLOTS];
+        let mut sorted: Vec<(u8, f32, SsfxSssCandidate)> = Vec::new();
+        let check_package = !self.initialized || frame > self.next_refresh_frame;
+
+        if check_package {
+            self.initialized = true;
+            self.next_refresh_frame = frame.saturating_add(2);
+
+            for &cand in shadowed_lights {
+                if !cand.is_secondary_omnipart
+                    && cand.range > 1.5
+                    && cand.distance < 800.0
+                    && cand.active
+                {
+                    let dx = camera_pos[0] - cand.position[0];
+                    let dy = camera_pos[1] - cand.position[1];
+                    let dz = camera_pos[2] - cand.position[2];
+                    let dist_lpos = (dx * dx + dy * dy + dz * dz).sqrt();
+                    let priority = if dist_lpos <= cand.range { 0u8 } else { 1u8 };
+                    sorted.push((priority, dist_lpos, cand));
+                }
+            }
+
+            // Total ordering consistent with `SortLights`: inside-range lights first, then nearest `distance`.
+            sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.distance.total_cmp(&b.2.distance)));
+
+            for &(_, _, cand) in &sorted {
+                let mut add = true;
+                let mut free_slot: Option<usize> = None;
+                for (slot_idx, slot) in self.slots.iter().enumerate() {
+                    if let Some(existing) = slot {
+                        if existing.id == cand.id {
+                            add = false;
+                            break;
+                        }
+                    } else {
+                        free_slot = Some(slot_idx);
+                    }
+                }
+                if add && let Some(idx) = free_slot {
+                    self.slots[idx] = Some(TrackedSssLight {
+                        id: cand.id,
+                        position: cand.position,
+                        range: cand.range,
+                        distance: cand.distance,
+                        active: cand.active,
+                    });
+                }
+            }
+        }
+
+        for (slot_idx, slot) in self.slots.iter_mut().enumerate() {
+            let Some(mut tracked) = *slot else {
+                continue;
+            };
+
+            let mut remove = true;
+            let dist_lpos = if check_package {
+                if let Some(&(_, d, cand)) = sorted.iter().find(|entry| entry.2.id == tracked.id) {
+                    tracked.position = cand.position;
+                    tracked.range = cand.range;
+                    tracked.distance = cand.distance;
+                    tracked.active = cand.active;
+                    *slot = Some(tracked);
+                    remove = false;
+                    d
+                } else {
+                    f32::MAX
+                }
+            } else {
+                if let Some(cand) = shadowed_lights.iter().find(|c| c.id == tracked.id) {
+                    tracked.position = cand.position;
+                    tracked.range = cand.range;
+                    tracked.distance = cand.distance;
+                    tracked.active = cand.active;
+                    *slot = Some(tracked);
+                }
+                let dx = camera_pos[0] - tracked.position[0];
+                let dy = camera_pos[1] - tracked.position[1];
+                let dz = camera_pos[2] - tracked.position[2];
+                remove = false;
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            };
+
+            if dist_lpos > tracked.range * 2.0 {
+                remove = true;
+            }
+            if !tracked.active || remove {
+                *slot = None;
+                continue;
+            }
+
+            let vpos = matrix_transform_point(view_matrix, tracked.position);
+            let max_atte = 1.0 - ((tracked.distance - 780.0) / -100.0).clamp(0.0, 1.0);
+            let atte = 1.0
+                - ((dist_lpos - tracked.range * 1.9) / -(tracked.range * 0.5)).clamp(0.0, 1.0);
+            out[slot_idx] = [vpos[0], vpos[1], vpos[2], max_atte.max(atte)];
+        }
+
+        out
+    }
+}
+
+/// Single render pass descriptor emitted for SSFX blur / AO / IL / volumetric / bloom schedules.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsfxBlurPassDesc {
+    pub viewport_w: f32,
+    pub viewport_h: f32,
+    pub element_index: u8,
+    pub dst_slot: u8,
+    pub setup: [f32; 4],
+}
+
+/// Build the 4-pass bilateral blur schedule for `phase_ssfx_ao` (`r4_rendertarget_phase_ssao.cpp:177-302`).
+pub fn ssfx_ao_blur_schedule(
+    screen_w: u32,
+    screen_h: u32,
+    scale_factor: f32,
+) -> [SsfxBlurPassDesc; 4] {
+    let w = screen_w.max(1) as f32;
+    let h = screen_h.max(1) as f32;
+    let s = scale_factor.clamp(1.0, 8.0);
+    let sx = w / s;
+    let sy = h / s;
+    [
+        SsfxBlurPassDesc {
+            viewport_w: w,
+            viewport_h: h,
+            element_index: 1,
+            dst_slot: 1,
+            setup: [s, 0.25, sx, sy],
+        },
+        SsfxBlurPassDesc {
+            viewport_w: w,
+            viewport_h: h,
+            element_index: 2,
+            dst_slot: 0,
+            setup: [1.0, 0.5, sx, sy],
+        },
+        SsfxBlurPassDesc {
+            viewport_w: w,
+            viewport_h: h,
+            element_index: 1,
+            dst_slot: 1,
+            setup: [1.0, 0.75, sx, sy],
+        },
+        SsfxBlurPassDesc {
+            viewport_w: w,
+            viewport_h: h,
+            element_index: 2,
+            dst_slot: 0,
+            setup: [1.0, 1.0, sx, sy],
+        },
+    ]
+}
+
+/// Build the 4-pass blur schedule for `phase_ssfx_il` (`r4_rendertarget_phase_ssao.cpp:319-442`).
+pub fn ssfx_il_blur_schedule(
+    screen_w: u32,
+    screen_h: u32,
+    scale_factor: f32,
+) -> [SsfxBlurPassDesc; 4] {
+    let w = screen_w.max(1) as f32;
+    let h = screen_h.max(1) as f32;
+    let s = scale_factor.clamp(1.0, 8.0);
+    let sx = w / s;
+    let sy = h / s;
+    [
+        SsfxBlurPassDesc {
+            viewport_w: sx,
+            viewport_h: sy,
+            element_index: 4,
+            dst_slot: 1,
+            setup: [1.0, 0.25, sx, sy],
+        },
+        SsfxBlurPassDesc {
+            viewport_w: sx,
+            viewport_h: sy,
+            element_index: 5,
+            dst_slot: 0,
+            setup: [1.0, 0.5, sx, sy],
+        },
+        SsfxBlurPassDesc {
+            viewport_w: sx,
+            viewport_h: sy,
+            element_index: 4,
+            dst_slot: 1,
+            setup: [1.0, 0.75, sx, sy],
+        },
+        SsfxBlurPassDesc {
+            viewport_w: sx,
+            viewport_h: sy,
+            element_index: 5,
+            dst_slot: 0,
+            setup: [1.0, 1.0, sx, sy],
+        },
+    ]
+}
+
+/// Build the 4-pass 1/8-res `phase_ssfx_volumetric_blur` schedule (`rendertarget_phase_blur.cpp:365-391`).
+pub fn ssfx_volumetric_blur_schedule(screen_w: u32, screen_h: u32) -> [SsfxBlurPassDesc; 4] {
+    let vw = screen_w.max(1) as f32 / 8.0;
+    let vh = screen_h.max(1) as f32 / 8.0;
+    let pixelsize = [0.0, 1.0, 1.0, 2.0];
+    let pixelscale = [2.0, 0.5, 2.0, 0.5];
+    let mut out = [SsfxBlurPassDesc {
+        viewport_w: vw,
+        viewport_h: vh,
+        element_index: 0,
+        dst_slot: 0,
+        setup: [0.0; 4],
+    }; 4];
+    for b in 0..4 {
+        out[b] = SsfxBlurPassDesc {
+            viewport_w: vw,
+            viewport_h: vh,
+            element_index: (b % 2) as u8,
+            dst_slot: (b % 2) as u8,
+            setup: [vw, vh, pixelsize[b], pixelscale[b]],
+        };
+    }
+    out
+}
+
+/// Build the 6-pass multi-mip `phase_blur` schedule (`1/2`, `1/4`, `1/8` H+V, `rendertarget_phase_blur.cpp:33-184`).
+pub fn phase_blur_schedule(screen_w: u32, screen_h: u32) -> [SsfxBlurPassDesc; 6] {
+    let w0 = screen_w.max(1) as f32;
+    let h0 = screen_h.max(1) as f32;
+    let scales = [0.5f32, 0.25, 0.125];
+    let mut out = [SsfxBlurPassDesc {
+        viewport_w: w0 * 0.5,
+        viewport_h: h0 * 0.5,
+        element_index: 0,
+        dst_slot: 0,
+        setup: [0.0; 4],
+    }; 6];
+    for (level, &scale) in scales.iter().enumerate() {
+        let vw = w0 * scale;
+        let vh = h0 * scale;
+        out[level * 2] = SsfxBlurPassDesc {
+            viewport_w: vw,
+            viewport_h: vh,
+            element_index: (level * 2) as u8,
+            dst_slot: 0,
+            setup: [1.0, 0.0, vw, vh],
+        };
+        out[level * 2 + 1] = SsfxBlurPassDesc {
+            viewport_w: vw,
+            viewport_h: vh,
+            element_index: (level * 2 + 1) as u8,
+            dst_slot: 1,
+            setup: [0.0, 1.0, vw, vh],
+        };
+    }
+    out
+}
+
+/// SSFX Bloom lens 2-pass quarter-res blur schedule (`r4_rendertarget_phase_bloom.cpp:436-458`).
+pub fn ssfx_bloom_lens_blur_schedule(screen_w: u32, screen_h: u32) -> [SsfxBlurPassDesc; 2] {
+    let qw = screen_w.max(1) as f32 / 4.0;
+    let qh = screen_h.max(1) as f32 / 4.0;
+    [
+        SsfxBlurPassDesc {
+            viewport_w: qw,
+            viewport_h: qh,
+            element_index: 1,
+            dst_slot: 0,
+            setup: [qw, qh, 0.0, 2.0],
+        },
+        SsfxBlurPassDesc {
+            viewport_w: qw,
+            viewport_h: qh,
+            element_index: 2,
+            dst_slot: 1,
+            setup: [qw, qh, 0.0, 5.0],
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1702,5 +2093,89 @@ mod tests {
         let ssfx = SsfxScreenConfig::default();
         assert_eq!(ssfx.shadow_cascades, [20.0, 40.0, 160.0]);
         assert_eq!(ssfx.fog_scattering, 0.6);
+    }
+
+    #[test]
+    fn ssfx_sss_ext_slots_and_blur_schedules() {
+        let mut tracker = SsfxSssExtSlots::new();
+        let cam = [0.0, 0.0, 0.0];
+        let view = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let candidates = vec![
+            SsfxSssCandidate {
+                id: 1,
+                position: [2.0, 0.0, 0.0],
+                range: 10.0,
+                distance: 2.0,
+                active: true,
+                is_secondary_omnipart: false,
+            },
+            SsfxSssCandidate {
+                id: 2,
+                position: [0.0, 0.0, 15.0],
+                range: 10.0,
+                distance: 15.0,
+                active: true,
+                is_secondary_omnipart: false,
+            },
+            // Ignored: secondary omnipart or range <= 1.5
+            SsfxSssCandidate {
+                id: 3,
+                position: [1.0, 0.0, 0.0],
+                range: 10.0,
+                distance: 1.0,
+                active: true,
+                is_secondary_omnipart: true,
+            },
+            SsfxSssCandidate {
+                id: 4,
+                position: [1.0, 0.0, 0.0],
+                range: 1.0,
+                distance: 1.0,
+                active: true,
+                is_secondary_omnipart: false,
+            },
+        ];
+
+        let data0 = tracker.update(1, cam, &view, &candidates);
+        let assigned = tracker.assigned_ids();
+        assert!(assigned.contains(&Some(1)));
+        assert!(assigned.contains(&Some(2)));
+        assert!(!assigned.contains(&Some(3)));
+        assert!(!assigned.contains(&Some(4)));
+        let slot1 = assigned.iter().position(|&id| id == Some(1)).unwrap();
+        assert_eq!(data0[slot1], [2.0, 0.0, 0.0, 0.0]);
+
+        // Move camera past `2.0 * range` of light 1 -> evicted immediately even on skipped frame 2
+        let data1 = tracker.update(2, [25.0, 0.0, 0.0], &view, &candidates);
+        assert!(tracker.assigned_ids()[slot1].is_none());
+        assert_eq!(data1[slot1], [0.0; 4]);
+
+        let ao = ssfx_ao_blur_schedule(1920, 1080, 2.0);
+        assert_eq!(ao[0].setup, [2.0, 0.25, 960.0, 540.0]);
+        assert_eq!(ao[3].setup, [1.0, 1.0, 960.0, 540.0]);
+
+        let il = ssfx_il_blur_schedule(1920, 1080, 4.0);
+        assert_eq!(il[1].viewport_w, 480.0);
+        assert_eq!(il[1].setup, [1.0, 0.5, 480.0, 270.0]);
+
+        let vol = ssfx_volumetric_blur_schedule(1600, 800);
+        assert_eq!(vol[0].setup, [200.0, 100.0, 0.0, 2.0]);
+        assert_eq!(vol[3].setup, [200.0, 100.0, 2.0, 0.5]);
+
+        let mip_blur = phase_blur_schedule(1920, 1080);
+        assert_eq!(mip_blur[4].setup, [1.0, 0.0, 240.0, 135.0]);
+        assert_eq!(mip_blur[5].setup, [0.0, 1.0, 240.0, 135.0]);
+
+        let lens = ssfx_bloom_lens_blur_schedule(1280, 720);
+        assert_eq!(lens[0].setup, [320.0, 180.0, 0.0, 2.0]);
+        assert_eq!(lens[1].setup, [320.0, 180.0, 0.0, 5.0]);
+
+        let lighting_cfg = SsfxLightingConfig::default();
+        assert_eq!(lighting_cfg.il_quality, 32);
     }
 }

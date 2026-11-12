@@ -16,13 +16,14 @@
 //! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
 //! - `particle_sim`: Pure-Rust PAPI runtime simulator, 3D Perlin noise, `ParticleGroupInstance` timeline & billboard emitter
 //! - `particles`: `particles.xr` / loose `.pe` & `.pg` PAPI bytecode systems + LTX blood wallmark configs (no binary `level.wallmarks` in Anomaly/CoP)
-//! - `postprocess`: Phase-13+ PPE noise UVs, bloom kernels/adaptation, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision & SSFX TAA
+//! - `postprocess`: Phase-13+ PPE noise UVs, bloom kernels/adaptation, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision, SSFX TAA & blur/SSS helpers
 //! - `savegames`: Anomaly `.scop` LZO1X ALife savegame reader/writer (`GameDateTime`, spawn header, dynamic objects & 7 binary registries)
 //! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
 //! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, OMF pose evaluation & `1W`–`4W` CPU skinning
 //! - `sound_env`: `senvironment.xr` v4/v5, `level.som` BVH acoustic occlusion, `level.snd_env` & `level.snd_static`
 //! - `spawn_overlays`: Anomaly `spawn_overlays.ltx` / `mod_spawn_overlays_*.ltx` DLTX graph links/unlinks, patches & `level_cut` applicators
 //! - `spawns`: `level.game` (`RPoint`/`PatrolPath`), `patrol_paths.ltx`, `level.spawn`, `all.spawn` (`AlifeSpawnArchive`) & ALife `NET_Packet` entity/subclass codecs
+//! - `sun`: Pure-Rust Cascaded Sun Shadow Maps (CSM), `DumbConvexVolume`/`FixedConvexVolume` frustum-light hulls & texel snapping
 //! - `thm`: X-Ray `.thm` / `.ltx` texture descriptor parser (`_bump` / `_bump#` / detail / material links)
 //! - `weather`: Weather cycles (`weathers\*.ltx`), weather effects, sun positions, ambients, lens flares, thunderbolts & atmospheric mixer
 //! - `world_maps`: `game_levels.ltx` (`GameLevelsConfig`), `game_maps_single.ltx` + `level.ltx` PDA/minimap bounds (`WorldMapsConfig`) & coordinate transforms
@@ -51,6 +52,7 @@ pub mod skinning;
 pub mod sound_env;
 pub mod spawn_overlays;
 pub mod spawns;
+pub mod sun;
 pub mod thm;
 pub mod vfs_bridge;
 pub mod weather;
@@ -164,12 +166,15 @@ pub use particles::{
 pub use postprocess::{
     apply_st2084_pq_rgb, apply_vignette_rgb, bloom_build_4tap_uvs, bloom_filter_taps_horizontal,
     bloom_filter_taps_vertical, calc_gauss_k7, calc_gauss_wave, effects_sun_hdr_blend_factor,
-    uncharted2_tonemap_curve, BloomAdaptState, BloomConfig, BloomFilterGpuWeights, DofConfig,
-    DofGpuParams, GammaControlConfig, GasmaskConfig, GasmaskGpuParams, Hdr10Colorspace,
-    Hdr10Config, Hdr10GpuParams, Hdr10PassKind, Hdr10PingPongPass, Hdr10TonemapMode,
-    Hdr10Tonemapper, HeatVisionConfig, HeatVisionGpuParams, ImageCorrectionConfig,
-    ImageCorrectionGpuParams, NightVisionGen, NightVisionProfile, PostprocessNoiseState,
-    SsfxBloomGpuParams, SsfxScreenConfig, SsfxTaaConfig, TonemapGpuParams, TonemapParams,
+    phase_blur_schedule, ssfx_ao_blur_schedule, ssfx_bloom_lens_blur_schedule,
+    ssfx_il_blur_schedule, ssfx_volumetric_blur_schedule, uncharted2_tonemap_curve,
+    BloomAdaptState, BloomConfig, BloomFilterGpuWeights, DofConfig, DofGpuParams,
+    GammaControlConfig, GasmaskConfig, GasmaskGpuParams, Hdr10Colorspace, Hdr10Config,
+    Hdr10GpuParams, Hdr10PassKind, Hdr10PingPongPass, Hdr10TonemapMode, Hdr10Tonemapper,
+    HeatVisionConfig, HeatVisionGpuParams, ImageCorrectionConfig, ImageCorrectionGpuParams,
+    NightVisionGen, NightVisionProfile, PostprocessNoiseState, SsfxBloomGpuParams,
+    SsfxBlurPassDesc, SsfxLightingConfig, SsfxScreenConfig, SsfxSssCandidate, SsfxSssExtSlots,
+    SsfxTaaConfig, TonemapGpuParams, TonemapParams, SSFX_SSS_EXT_MAX_SLOTS,
 };
 pub use savegames::{
     compress_scop, decompress_scop, validate_scop_header, ActorStatDetail, ActorStatSection,
@@ -223,6 +228,11 @@ pub use spawns::{
     ServerPhSkeletonState, ServerShapeDef, ServerVisualState, SpawnEdge, SpawnHeader, SpawnPacket,
     SpawnVertex, INVALID_OBJECT_ID, INVALID_SPAWN_STORY_ID, INVALID_STORY_ID, M_SPAWN, M_UPDATE,
     POINT_BASE, RPOINT_CHUNK, SPAWN_VERSION, WAYOBJECT_VERSION, WAY_BASE, WAY_PATROLPATH_CHUNK,
+};
+pub use sun::{
+    compute_sun_cascades, matrix_invert_44, matrix_ortho_off_center_lh, matrix_translate,
+    snap_sun_cascade_to_texels, DumbConvexVolume, FixedConvexVolume, SunCascadeConfig,
+    SunCascadeResult, SunCascadeSpec, SunRay, SUN_FRUSTUM_CORNERS, SUN_FRUSTUM_FACETABLE,
 };
 pub use thm::{
     dds_caps2, strip_texture_extension, texture_flags, texture_stem_to_dds_vpath,
