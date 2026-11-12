@@ -1,0 +1,23 @@
+[package]
+name = "xray-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xray-core = { path = "../xray-core" }
+xray-vfs = { path = "../xray-vfs" }
+xray-formats = { path = "../xray-formats" }
+xray-render-dx12 = { path = "../xray-render-dx12" }
+xray-net = { path = "../xray-net" }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+] }
