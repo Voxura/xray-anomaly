@@ -1731,6 +1731,57 @@ pub const DU_BOX_VERTICES2: [[f32; 3]; DU_BOX_NUMVERTEX2] = [
     [0.5, 0.5, -0.5],
 ];
 
+pub const DU_CYLINDER_NUMVERTEX: usize = 26;
+pub const DU_CYLINDER_NUMFACES: usize = 48;
+pub const DU_CYLINDER_NUMLINES: usize = 30;
+
+/// Unit Z-aligned closed cylinder vertices (radius `0.5`, height `1.0`, `du_cylinder.cpp:8-35`).
+pub const DU_CYLINDER_VERTICES: [[f32; 3]; DU_CYLINDER_NUMVERTEX] = [
+    [0.5000, 0.0000, 0.5000],
+    [0.5000, -0.0000, -0.5000],
+    [0.4330, -0.2500, -0.5000],
+    [0.4330, -0.2500, 0.5000],
+    [0.2500, -0.4330, -0.5000],
+    [0.2500, -0.4330, 0.5000],
+    [0.0000, -0.5000, -0.5000],
+    [-0.0000, -0.5000, 0.5000],
+    [-0.2500, -0.4330, -0.5000],
+    [-0.2500, -0.4330, 0.5000],
+    [-0.4330, -0.2500, -0.5000],
+    [-0.4330, -0.2500, 0.5000],
+    [-0.5000, -0.0000, -0.5000],
+    [-0.5000, 0.0000, 0.5000],
+    [-0.4330, 0.2500, -0.5000],
+    [-0.4330, 0.2500, 0.5000],
+    [-0.2500, 0.4330, -0.5000],
+    [-0.2500, 0.4330, 0.5000],
+    [0.0000, 0.5000, -0.5000],
+    [-0.0000, 0.5000, 0.5000],
+    [0.2500, 0.4330, -0.5000],
+    [0.2500, 0.4330, 0.5000],
+    [0.4330, 0.2500, -0.5000],
+    [0.4330, 0.2500, 0.5000],
+    [-0.0000, 0.0000, 0.5000],
+    [0.0000, -0.0000, -0.5000],
+];
+
+/// Unit cylinder triangle index list (`du_cylinder_faces`, 48 triangles / 144 indices).
+pub const DU_CYLINDER_INDICES: [u16; DU_CYLINDER_NUMFACES * 3] = [
+    0, 2, 1, 3, 2, 0, 3, 4, 2, 5, 4, 3, 5, 6, 4, 7, 6, 5, 8, 6, 9, 9, 6, 7, 10, 8, 11, 11, 8, 9,
+    12, 10, 13, 13, 10, 11, 14, 12, 15, 12, 13, 15, 16, 14, 17, 17, 14, 15, 18, 16, 19, 19, 16, 17,
+    19, 20, 18, 21, 20, 19, 21, 22, 20, 23, 22, 21, 23, 1, 22, 23, 0, 1, 23, 24, 0, 21, 24, 23, 19,
+    24, 21, 17, 24, 19, 15, 24, 17, 13, 24, 15, 11, 24, 13, 9, 24, 11, 7, 24, 9, 5, 24, 7, 3, 24, 5,
+    0, 24, 3, 8, 25, 6, 10, 25, 8, 12, 25, 10, 14, 25, 12, 16, 25, 14, 18, 25, 16, 20, 25, 18, 22,
+    25, 20, 1, 25, 22, 2, 25, 1, 4, 25, 2, 6, 25, 4,
+];
+
+/// Unit cylinder wireframe line index list (`du_cylinder_lines`, 30 lines / 60 indices).
+pub const DU_CYLINDER_LINES: [u16; DU_CYLINDER_NUMLINES * 2] = [
+    0, 1, 4, 5, 8, 9, 12, 13, 16, 17, 20, 21, 1, 2, 2, 4, 4, 6, 6, 8, 8, 10, 10, 12, 12, 14, 14,
+    16, 16, 18, 18, 20, 20, 22, 22, 1, 0, 3, 3, 5, 5, 7, 7, 9, 9, 11, 11, 13, 13, 15, 15, 17, 17,
+    19, 19, 21, 21, 23, 23, 0,
+];
+
 /// Canonical slice count for volumetric spotlight proxy stack (`r4_rendertarget.h:12`).
 pub const VOLUMETRIC_SLICES: usize = 100;
 
@@ -2600,6 +2651,108 @@ pub fn check_grass_shadow_light(
         != crate::hom::FrustumVisibility::None
 }
 
+pub const SUN_LIGHT_DISTANCE: f32 = 500.0;
+pub const SUN_LIGHT_RANGE: f32 = 600.0;
+pub const SUN_ADAPTED_DOWN_Y: f32 = -0.75;
+
+/// Configuration for `CLight_DB::Update` directional sun light rig (`Light_DB.cpp:200-259`,
+/// `xrRender_console.cpp:240-243`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SunLightRigConfig {
+    pub lumscale: f32,
+    pub lumscale_color: [f32; 3],
+    pub distance: f32,
+    pub range: f32,
+}
+
+impl Default for SunLightRigConfig {
+    fn default() -> Self {
+        Self {
+            lumscale: 1.0,
+            lumscale_color: [1.0, 1.0, 1.0],
+            distance: SUN_LIGHT_DISTANCE,
+            range: SUN_LIGHT_RANGE,
+        }
+    }
+}
+
+/// Computed sun light pose (`direction`, `position`, `color_rgb`, `range`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SunLightPose {
+    pub direction: [f32; 3],
+    pub position: [f32; 3],
+    pub color_rgb: [f32; 3],
+    pub range: f32,
+}
+
+/// Paired `sun_original` & `sun_adapted` lights matching `CLight_DB::Update`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SunLightRig {
+    pub sun_original: SunLightPose,
+    pub sun_adapted: SunLightPose,
+}
+
+/// Compute `sun_original` & `sun_adapted` direction, origin, range, and scaled RGB from
+/// environment sun parameters (`CLight_DB::Update`, `Light_DB.cpp:229-259`).
+pub fn compute_sun_light_rig(
+    sun_dir: [f32; 3],
+    sun_color_rgb: [f32; 3],
+    camera_pos: [f32; 3],
+    is_sun_static: bool,
+    cfg: &SunLightRigConfig,
+) -> SunLightRig {
+    let orig_dir = normalize3_or(sun_dir, [0.0, -1.0, 0.0]);
+    let orig_pos = [
+        camera_pos[0] - orig_dir[0] * cfg.distance,
+        camera_pos[1] - orig_dir[1] * cfg.distance,
+        camera_pos[2] - orig_dir[2] * cfg.distance,
+    ];
+
+    let mut adapt_raw = [
+        sun_dir[0],
+        sun_dir[1] + SUN_ADAPTED_DOWN_Y,
+        sun_dir[2],
+    ];
+    let mut counter = 0usize;
+    while dot3(adapt_raw, adapt_raw).sqrt() < 0.001 && counter < 10 {
+        adapt_raw[0] += sun_dir[0];
+        adapt_raw[1] += sun_dir[1];
+        adapt_raw[2] += sun_dir[2];
+        counter += 1;
+    }
+    let mut adapt_dir = normalize3_or(adapt_raw, orig_dir);
+    let mut adapt_pos = [
+        camera_pos[0] - adapt_dir[0] * cfg.distance,
+        camera_pos[1] - adapt_dir[1] * cfg.distance,
+        camera_pos[2] - adapt_dir[2] * cfg.distance,
+    ];
+    if !is_sun_static {
+        adapt_dir = orig_dir;
+        adapt_pos = orig_pos;
+    }
+
+    let adapted_color = [
+        sun_color_rgb[0] * cfg.lumscale * cfg.lumscale_color[0],
+        sun_color_rgb[1] * cfg.lumscale * cfg.lumscale_color[1],
+        sun_color_rgb[2] * cfg.lumscale * cfg.lumscale_color[2],
+    ];
+
+    SunLightRig {
+        sun_original: SunLightPose {
+            direction: orig_dir,
+            position: orig_pos,
+            color_rgb: sun_color_rgb,
+            range: cfg.range,
+        },
+        sun_adapted: SunLightPose {
+            direction: adapt_dir,
+            position: adapt_pos,
+            color_rgb: adapted_color,
+            range: cfg.range,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3103,5 +3256,42 @@ mod tests {
         gs_cfg.rs_grass_shadow = true;
         assert!(check_grass_shadow_light(&gs_light, 10.0, &frustum, &gs_cfg));
         assert!(!check_grass_shadow_light(&gs_light, 35.0, &frustum, &gs_cfg));
+
+        assert_eq!(DU_CYLINDER_VERTICES.len(), DU_CYLINDER_NUMVERTEX);
+        assert_eq!(DU_CYLINDER_INDICES.len(), DU_CYLINDER_NUMFACES * 3);
+        assert_eq!(DU_CYLINDER_LINES.len(), DU_CYLINDER_NUMLINES * 2);
+        assert!(DU_CYLINDER_INDICES
+            .iter()
+            .all(|&i| (i as usize) < DU_CYLINDER_NUMVERTEX));
+        assert!(DU_CYLINDER_LINES
+            .iter()
+            .all(|&i| (i as usize) < DU_CYLINDER_NUMVERTEX));
+
+        let rig_cfg = SunLightRigConfig {
+            lumscale: 1.5,
+            lumscale_color: [1.0, 0.8, 0.5],
+            ..SunLightRigConfig::default()
+        };
+        let rig_static = compute_sun_light_rig(
+            [0.0, -0.5, 0.8660254],
+            [1.0, 1.0, 1.0],
+            [10.0, 5.0, -2.0],
+            true,
+            &rig_cfg,
+        );
+        assert_eq!(rig_static.sun_original.range, 600.0);
+        assert!((rig_static.sun_original.position[1] - 255.0).abs() < 1e-4);
+        assert!(rig_static.sun_adapted.direction[1] < rig_static.sun_original.direction[1]);
+        assert!((rig_static.sun_adapted.color_rgb[1] - 1.2).abs() < 1e-6);
+
+        let rig_dynamic = compute_sun_light_rig(
+            [0.0, -0.5, 0.8660254],
+            [1.0, 1.0, 1.0],
+            [10.0, 5.0, -2.0],
+            false,
+            &rig_cfg,
+        );
+        assert_eq!(rig_dynamic.sun_adapted.direction, rig_dynamic.sun_original.direction);
+        assert_eq!(rig_dynamic.sun_adapted.position, rig_dynamic.sun_original.position);
     }
 }

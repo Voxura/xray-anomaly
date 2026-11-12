@@ -14,6 +14,7 @@ use crate::ogf::{
 use crate::skinning::matrix_transform_dir;
 use crate::weather::dir_from_hp;
 
+const EPS: f32 = 1e-5;
 const EPS_L: f32 = 1e-3;
 const EPS_S: f32 = 1e-7;
 const TWEAK_COP_INITIAL_OFFS: f32 = 1200.0;
@@ -84,6 +85,7 @@ impl Default for SunRay {
 /// General 4x4 cofactor matrix inverse (handles perspective & orthographic matrices,
 /// matching `D3DXMatrixInverse`). Returns `None` if singular or non-finite.
 pub fn matrix_invert_44(m: &XRayMatrix) -> Option<XRayMatrix> {
+    let m: [[f64; 4]; 4] = std::array::from_fn(|r| std::array::from_fn(|c| m[r][c] as f64));
     let s0 = m[0][0] * m[1][1] - m[1][0] * m[0][1];
     let s1 = m[0][0] * m[1][2] - m[1][0] * m[0][2];
     let s2 = m[0][0] * m[1][3] - m[1][0] * m[0][3];
@@ -106,28 +108,28 @@ pub fn matrix_invert_44(m: &XRayMatrix) -> Option<XRayMatrix> {
 
     Some([
         [
-            (m[1][1] * c5 - m[1][2] * c4 + m[1][3] * c3) * inv_det,
-            (-m[0][1] * c5 + m[0][2] * c4 - m[0][3] * c3) * inv_det,
-            (m[3][1] * s5 - m[3][2] * s4 + m[3][3] * s3) * inv_det,
-            (-m[2][1] * s5 + m[2][2] * s4 - m[2][3] * s3) * inv_det,
+            ((m[1][1] * c5 - m[1][2] * c4 + m[1][3] * c3) * inv_det) as f32,
+            ((-m[0][1] * c5 + m[0][2] * c4 - m[0][3] * c3) * inv_det) as f32,
+            ((m[3][1] * s5 - m[3][2] * s4 + m[3][3] * s3) * inv_det) as f32,
+            ((-m[2][1] * s5 + m[2][2] * s4 - m[2][3] * s3) * inv_det) as f32,
         ],
         [
-            (-m[1][0] * c5 + m[1][2] * c2 - m[1][3] * c1) * inv_det,
-            (m[0][0] * c5 - m[0][2] * c2 + m[0][3] * c1) * inv_det,
-            (-m[3][0] * s5 + m[3][2] * s2 - m[3][3] * s1) * inv_det,
-            (m[2][0] * s5 - m[2][2] * s2 + m[2][3] * s1) * inv_det,
+            ((-m[1][0] * c5 + m[1][2] * c2 - m[1][3] * c1) * inv_det) as f32,
+            ((m[0][0] * c5 - m[0][2] * c2 + m[0][3] * c1) * inv_det) as f32,
+            ((-m[3][0] * s5 + m[3][2] * s2 - m[3][3] * s1) * inv_det) as f32,
+            ((m[2][0] * s5 - m[2][2] * s2 + m[2][3] * s1) * inv_det) as f32,
         ],
         [
-            (m[1][0] * c4 - m[1][1] * c2 + m[1][3] * c0) * inv_det,
-            (-m[0][0] * c4 + m[0][1] * c2 - m[0][3] * c0) * inv_det,
-            (m[3][0] * s4 - m[3][1] * s2 + m[3][3] * s0) * inv_det,
-            (-m[2][0] * s4 + m[2][1] * s2 - m[2][3] * s0) * inv_det,
+            ((m[1][0] * c4 - m[1][1] * c2 + m[1][3] * c0) * inv_det) as f32,
+            ((-m[0][0] * c4 + m[0][1] * c2 - m[0][3] * c0) * inv_det) as f32,
+            ((m[3][0] * s4 - m[3][1] * s2 + m[3][3] * s0) * inv_det) as f32,
+            ((-m[2][0] * s4 + m[2][1] * s2 - m[2][3] * s0) * inv_det) as f32,
         ],
         [
-            (-m[1][0] * c3 + m[1][1] * c1 - m[1][2] * c0) * inv_det,
-            (m[0][0] * c3 - m[0][1] * c1 + m[0][2] * c0) * inv_det,
-            (-m[3][0] * s3 + m[3][1] * s1 - m[3][2] * s0) * inv_det,
-            (m[2][0] * s3 - m[2][1] * s1 + m[2][2] * s0) * inv_det,
+            ((-m[1][0] * c3 + m[1][1] * c1 - m[1][2] * c0) * inv_det) as f32,
+            ((m[0][0] * c3 - m[0][1] * c1 + m[0][2] * c0) * inv_det) as f32,
+            ((-m[3][0] * s3 + m[3][1] * s1 - m[3][2] * s0) * inv_det) as f32,
+            ((m[2][0] * s3 - m[2][1] * s1 + m[2][2] * s0) * inv_det) as f32,
         ],
     ])
 }
@@ -1221,6 +1223,200 @@ pub fn compute_rain_shadow_setup(
     })
 }
 
+/// Shader element indices for `s_accum_mask` and `s_accum_direct` (`r2_types.h:158-172`).
+pub mod sun_pass_elements {
+    pub const SE_MASK_SPOT: usize = 0;
+    pub const SE_MASK_POINT: usize = 1;
+    pub const SE_MASK_DIRECT: usize = 2;
+    pub const SE_MASK_ACCUM_VOL: usize = 3;
+    pub const SE_MASK_ACCUM_2D: usize = 4;
+    pub const SE_MASK_ALBEDO: usize = 5;
+
+    pub const SE_SUN_NEAR: usize = 0;
+    pub const SE_SUN_MIDDLE: usize = 1;
+    pub const SE_SUN_FAR: usize = 2;
+    pub const SE_SUN_LUMINANCE: usize = 3;
+    pub const SE_SUN_NEAR_MINMAX: usize = 4;
+    pub const SE_SUN_RAIN_SMAP: usize = 5;
+}
+
+/// Default far sun shadow cascade distance limit (`OLES_SUN_LIMIT_27_01_07` in `r2_R_sun.cpp:13`).
+pub const SUN_FAR_LIMIT_DEFAULT: f32 = 100.0;
+
+/// Smooth jitter filter radius in texels used by `accum_direct_lum` (`r4_rendertarget_accum_direct.cpp:1108`).
+pub const ACCUM_DIRECT_LUM_SMOOTH: f32 = 0.6;
+
+/// 8 sub-frustum cuboid corners (`z in {0.7, 1.0}`) used by `CRenderTarget::accum_direct`
+/// (`r4_rendertarget_accum_direct.cpp:8-13`).
+pub const ACCUM_DIRECT_CUBOID_CORNERS: [[f32; 3]; 8] = [
+    [-1.0, -1.0, 0.7],
+    [-1.0, -1.0, 1.0],
+    [-1.0, 1.0, 1.0],
+    [-1.0, 1.0, 0.7],
+    [1.0, 1.0, 1.0],
+    [1.0, 1.0, 0.7],
+    [1.0, -1.0, 1.0],
+    [1.0, -1.0, 0.7],
+];
+
+/// 12 triangles (`36` indices) for the `accum_direct` frustum cuboid (`facetable[0..12]` in
+/// `r4_rendertarget_accum_direct.cpp:14-29`; rows `12..15` in C++ are `{0, 0, 0}` zero padding).
+pub const ACCUM_DIRECT_CUBOID_INDICES: [u16; 36] = [
+    3, 2, 1, 3, 1, 0, 7, 6, 5, 5, 6, 4, 3, 5, 2, 4, 2, 5, 1, 6, 7, 7, 0, 1, 5, 3, 0, 7, 5, 0, 1, 4,
+    6, 2, 4, 1,
+];
+
+/// Transform the 8 `ACCUM_DIRECT_CUBOID_CORNERS` back into world space using `inv_xdcombine`
+/// (`r4_rendertarget_accum_direct.cpp:567-580`).
+pub fn compute_accum_direct_cuboid_vertices(inv_xdcombine: &XRayMatrix) -> [[f32; 4]; 8] {
+    std::array::from_fn(|i| {
+        let c = ACCUM_DIRECT_CUBOID_CORNERS[i];
+        let p = matrix_transform_projected(inv_xdcombine, c).unwrap_or(c);
+        [p[0], p[1], p[2], 1.0]
+    })
+}
+
+/// Compute `Ldynamic_dir` passed to `s_accum_mask->E[SE_MASK_DIRECT]`
+/// (`r4_rendertarget_accum_direct.cpp:65-92`).
+#[inline]
+pub fn compute_direct_mask_dir(
+    sun_dir_world: [f32; 3],
+    sun_color_rgb: [f32; 3],
+    view: &XRayMatrix,
+) -> [f32; 4] {
+    let l_dir = normalize3_or(matrix_transform_dir(view, sun_dir_world), [0.0, 0.0, 1.0]);
+    let intensity =
+        0.3 * sun_color_rgb[0] + 0.48 * sun_color_rgb[1] + 0.22 * sun_color_rgb[2];
+    let scale = -(intensity.max(0.0) + EPS).sqrt();
+    [l_dir[0] * scale, l_dir[1] * scale, l_dir[2] * scale, 0.0]
+}
+
+/// Compute `view_shadow_proj` (`normalize(vec4(mul_dir(m_shadow, +Z).xy, 0, 0))`) for `SE_SUN_FAR`
+/// (`r4_rendertarget_accum_direct.cpp:594-605`).
+#[inline]
+pub fn compute_view_shadow_proj(m_shadow: &XRayMatrix) -> [f32; 4] {
+    let dir = matrix_transform_dir(m_shadow, [0.0, 0.0, 1.0]);
+    let len_sq = dir[0] * dir[0] + dir[1] * dir[1];
+    if len_sq > 1e-12 && len_sq.is_finite() {
+        let inv = 1.0 / len_sq.sqrt();
+        [dir[0] * inv, dir[1] * inv, 0.0, 0.0]
+    } else {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+}
+
+/// Compute `accum_direct` NV-DBT clip depth bounds `[z_min, z_max]` (`[0..sun_near]` for near,
+/// `[sun_near..sun_far_limit]` for far, `r4_rendertarget_accum_direct.cpp:609-628`).
+pub fn compute_accum_direct_depth_bounds(
+    is_near: bool,
+    sun_near: f32,
+    sun_far_limit: f32,
+    cam_pos: [f32; 3],
+    cam_dir: [f32; 3],
+    full_transform: &XRayMatrix,
+) -> [f32; 2] {
+    let (d_min, d_max) = if is_near {
+        (0.0, sun_near)
+    } else {
+        (sun_near, sun_far_limit)
+    };
+    let dir = normalize3_or(cam_dir, [0.0, 0.0, 1.0]);
+    let p_min = [
+        cam_pos[0] + dir[0] * d_min,
+        cam_pos[1] + dir[1] * d_min,
+        cam_pos[2] + dir[2] * d_min,
+    ];
+    let p_max = [
+        cam_pos[0] + dir[0] * d_max,
+        cam_pos[1] + dir[1] * d_max,
+        cam_pos[2] + dir[2] * d_max,
+    ];
+    let z_min = matrix_transform_projected(full_transform, p_min)
+        .map(|p| p[2])
+        .unwrap_or(0.0);
+    let z_max = matrix_transform_projected(full_transform, p_max)
+        .map(|p| p[2])
+        .unwrap_or(1.0);
+    [z_min, z_max]
+}
+
+/// Compute `volume_range` shader vec4 and clip-space depth `[z_min, z_max]` for
+/// `CRenderTarget::accum_direct_volumetric` (`r4_rendertarget_accum_direct.cpp:1287-1310`).
+pub fn compute_accum_direct_volumetric_range(
+    is_near: bool,
+    sun_near: f32,
+    sun_far_limit: f32,
+    cam_pos: [f32; 3],
+    cam_dir: [f32; 3],
+    full_transform: &XRayMatrix,
+) -> ([f32; 4], [f32; 2]) {
+    let d_max = if is_near { sun_near } else { sun_far_limit };
+    let dir = normalize3_or(cam_dir, [0.0, 0.0, 1.0]);
+    let p_max = [
+        cam_pos[0] + dir[0] * d_max,
+        cam_pos[1] + dir[1] * d_max,
+        cam_pos[2] + dir[2] * d_max,
+    ];
+    let z_min = matrix_transform_projected(full_transform, cam_pos)
+        .map(|p| p[2])
+        .unwrap_or(0.0);
+    let z_max = matrix_transform_projected(full_transform, p_max)
+        .map(|p| p[2])
+        .unwrap_or(1.0);
+    ([0.0, d_max, 0.0, 0.0], [z_min, z_max])
+}
+
+/// 88-byte screen-aligned vertex (`v_aa`) packed by `CRenderTarget::accum_direct_lum`
+/// (`r4_rendertarget_accum_direct.cpp:1097-1107`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AccumDirectLumVertex {
+    pub p: [f32; 4],
+    pub uv0: [f32; 2],
+    pub uv_j: [f32; 2],
+    pub uv1: [f32; 2],
+    pub uv2: [f32; 2],
+    pub uv3: [f32; 2],
+    pub uv4: [f32; 4],
+    pub uv5: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<AccumDirectLumVertex>() == 88);
+
+/// Build the 4 screen-space quad vertices for `accum_direct_lum`
+/// (`r4_rendertarget_accum_direct.cpp:1059-1150`).
+pub fn build_accum_direct_lum_quad(width: u32, height: u32) -> [AccumDirectLumVertex; 4] {
+    let w = width.max(1) as f32;
+    let h = height.max(1) as f32;
+    let tex_jitter = crate::lighting::TEX_JITTER_SIZE as f32;
+    let p0 = [0.5 / w, 0.5 / h];
+    let p1 = [(w + 0.5) / w, (h + 0.5) / h];
+    let scale_x = w / tex_jitter;
+    let jitter_off = 0.5 / tex_jitter;
+    let j0 = [jitter_off, jitter_off];
+    let j1 = [scale_x + jitter_off, scale_x + jitter_off];
+    let ddw = ACCUM_DIRECT_LUM_SMOOTH / w;
+    let ddh = ACCUM_DIRECT_LUM_SMOOTH / h;
+
+    let make = |x: f32, y: f32, u: f32, v: f32, ju: f32, jv: f32| AccumDirectLumVertex {
+        p: [x, y, EPS, 1.0],
+        uv0: [u, v],
+        uv_j: [ju, jv],
+        uv1: [u - ddw, v - ddh],
+        uv2: [u + ddw, v + ddh],
+        uv3: [u + ddw, v - ddh],
+        uv4: [u - ddw, v + ddh, 0.0, 0.0],
+        uv5: [0.0, 0.0, 0.0, 0.0],
+    };
+
+    [
+        make(EPS, h + EPS, p0[0], p1[1], j0[0], j1[1]),
+        make(EPS, EPS, p0[0], p0[1], j0[0], j0[1]),
+        make(w + EPS, h + EPS, p1[0], p1[1], j1[0], j1[1]),
+        make(w + EPS, EPS, p1[0], p0[1], j1[0], j0[1]),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1408,5 +1604,70 @@ mod tests {
         assert_eq!(ssfx_rain.rain_1, [2.0, 0.1, 0.6, 2.0]);
         assert_eq!(ssfx_rain.drops_setup, [2500.0, 15.0, 0.0, 0.0]);
         assert_eq!(ssfx_rain_pass_viewport(1920, 1080), [240.0, 135.0]);
+    }
+
+    #[test]
+    fn accum_direct_cuboid_mask_volumetric_and_lum_quad() {
+        assert_eq!(sun_pass_elements::SE_MASK_DIRECT, 2);
+        assert_eq!(sun_pass_elements::SE_SUN_FAR, 2);
+        assert_eq!(sun_pass_elements::SE_SUN_LUMINANCE, 3);
+        assert_eq!(SUN_FAR_LIMIT_DEFAULT, 100.0);
+        assert_eq!(ACCUM_DIRECT_CUBOID_INDICES.len(), 36);
+        assert!(ACCUM_DIRECT_CUBOID_INDICES.iter().all(|&i| (i as usize) < 8));
+
+        let view = matrix_build_camera_dir([0.0, 1.7, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]);
+        let proj = matrix_build_projection(75.0f32.to_radians(), 9.0 / 16.0, 0.2, 300.0);
+        let full = matrix_mul_44(&proj, &view);
+        let inv = matrix_invert_44(&full).unwrap();
+
+        let verts = compute_accum_direct_cuboid_vertices(&inv);
+        assert!(verts.iter().flatten().all(|v| v.is_finite()));
+        assert!((verts[0][3] - 1.0).abs() < 1e-6);
+        // Far vertices (z = 1.0) sit ~300m in front of camera (+Z); note IEEE-754 f32 matrix entries
+        // (`-1/near + 1/far` added to `1/near`) quantize 300m to ~0.022m, while z = 0.7 is ~0.67m.
+        assert!(verts[1][2] > verts[0][2]);
+        assert!((verts[1][2] - 300.0).abs() < 0.05);
+
+        let mask = compute_direct_mask_dir([0.0, -1.0, 0.0], [1.0, 1.0, 1.0], &view);
+        assert!((mask[1] - 1.0).abs() < 1e-4);
+        assert_eq!(mask[3], 0.0);
+
+        let vsp = compute_view_shadow_proj(&XRAY_IDENTITY_MATRIX);
+        assert_eq!(vsp, [0.0, 0.0, 0.0, 0.0]);
+        let mut rot = XRAY_IDENTITY_MATRIX;
+        rot[2] = [3.0, 4.0, 0.0, 0.0];
+        let vsp2 = compute_view_shadow_proj(&rot);
+        assert!((vsp2[0] - 0.6).abs() < 1e-5);
+        assert!((vsp2[1] - 0.8).abs() < 1e-5);
+
+        let db_near =
+            compute_accum_direct_depth_bounds(true, 12.0, SUN_FAR_LIMIT_DEFAULT, [0.0, 1.7, 0.0], [0.0, 0.0, 1.0], &full);
+        let db_far = compute_accum_direct_depth_bounds(
+            false,
+            12.0,
+            SUN_FAR_LIMIT_DEFAULT,
+            [0.0, 1.7, 0.0],
+            [0.0, 0.0, 1.0],
+            &full,
+        );
+        assert!(db_near[1] > 0.9 && db_near[1] < db_far[1] && db_far[1] < 1.0);
+        assert!((db_near[1] - db_far[0]).abs() < 1e-5);
+
+        let (vr, vz) = compute_accum_direct_volumetric_range(
+            false,
+            12.0,
+            SUN_FAR_LIMIT_DEFAULT,
+            [0.0, 1.7, 0.0],
+            [0.0, 0.0, 1.0],
+            &full,
+        );
+        assert_eq!(vr, [0.0, 100.0, 0.0, 0.0]);
+        assert!((vz[1] - db_far[1]).abs() < 1e-5);
+
+        assert_eq!(std::mem::size_of::<AccumDirectLumVertex>(), 88);
+        let quad = build_accum_direct_lum_quad(1280, 720);
+        assert!((quad[0].p[1] - (720.0 + EPS)).abs() < 1e-6);
+        assert!((quad[3].p[0] - (1280.0 + EPS)).abs() < 1e-6);
+        assert!((quad[2].uv_j[0] - (1280.0 / 64.0 + 0.5 / 64.0)).abs() < 1e-5);
     }
 }

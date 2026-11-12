@@ -730,6 +730,37 @@ pub struct ScreenLodThresholds {
 }
 
 impl ScreenLodThresholds {
+    /// True when the visual should be discarded below `r_ssaDISCARD`
+    /// (`r__dsgraph_build.cpp:67, 402`).
+    #[inline]
+    pub fn should_discard(&self, ssa: f32) -> bool {
+        ssa <= self.r_ssa_discard
+    }
+
+    /// Compute normalized `0.0..=1.0` progressive mesh LOD weight from `ssa` matching `calcLOD`
+    /// (`r__dsgraph_render.cpp:19-22`).
+    #[inline]
+    pub fn calc_lod(&self, ssa: f32) -> f32 {
+        let span = self.r_ssa_glod_start - self.r_ssa_glod_end;
+        if span.abs() <= 1e-12 {
+            if ssa >= self.r_ssa_glod_start {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            ((ssa - self.r_ssa_glod_end) / span).clamp(0.0, 1.0).sqrt()
+        }
+    }
+
+    /// Compute quantized hardware mip-LOD factor (`1.0..=7.0`) matching `R_LOD::set_LOD`
+    /// (`R_Backend_LOD.cpp:13`).
+    #[inline]
+    pub fn hardware_lod_factor(&self, ssa: f32) -> f32 {
+        let lod = self.calc_lod(ssa);
+        (lod.powi(5) * 8.0).ceil().clamp(1.0, 7.0)
+    }
+
     /// Compute quantized 8-bit billboard imposter alpha `uA` matching `r__dsgraph_render_lods.cpp:59-62`.
     #[inline]
     pub fn imposter_alpha(&self, ssa: f32) -> u8 {
@@ -738,6 +769,623 @@ impl ScreenLodThresholds {
         let scale = ssa_diff / ssa_range;
         ((1.0 - scale) * 255.0).floor().clamp(0.0, 255.0) as u8
     }
+}
+
+/// Compute screen-space area proxy `(ssa, dist_sq)` matching `CalcSSA`
+/// (`r__dsgraph_build.cpp:23-34`).
+#[inline]
+pub fn calc_ssa(cam_pos: [f32; 3], center: [f32; 3], radius: f32) -> (f32, f32) {
+    const EPS: f32 = 1e-5;
+    let dx = cam_pos[0] - center[0];
+    let dy = cam_pos[1] - center[1];
+    let dz = cam_pos[2] - center[2];
+    let dist_sq = dx * dx + dy * dy + dz * dz + EPS;
+    (radius / dist_sq, dist_sq)
+}
+
+/// Active renderer geometry pass (`enum { PHASE_NORMAL = 0, PHASE_SMAP = 1 }` in `r4.h:31-37`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RenderPhase {
+    Normal = 0,
+    Smap = 1,
+}
+
+/// Deffer shader element indices (`r2_types.h:146-148`, `r4.cpp:94`, `r__dsgraph_build.cpp:149`).
+pub mod deffer_shader_elements {
+    pub const SE_R2_NORMAL_HQ: usize = 0;
+    pub const SE_R2_NORMAL_LQ: usize = 1;
+    pub const SE_R2_SHADOW: usize = 2;
+    pub const SE_R2_TERRAIN_VERY_LOW: usize = 3;
+    pub const SE_R2_SPECIAL: usize = 4;
+}
+
+/// Select deffer shader element (`0..=2`) for a dynamic visual (`CRender::rimp_select_sh_dynamic`,
+/// `r4.cpp:71-79`).
+#[inline]
+pub fn select_dynamic_shader_element(
+    phase: RenderPhase,
+    dist_sq: f32,
+    sphere_radius: f32,
+    r_dtex_range: f32,
+) -> usize {
+    if phase == RenderPhase::Normal {
+        let sec_dist = dist_sq.max(0.0).sqrt() - sphere_radius;
+        if sec_dist < r_dtex_range {
+            deffer_shader_elements::SE_R2_NORMAL_HQ
+        } else {
+            deffer_shader_elements::SE_R2_NORMAL_LQ
+        }
+    } else {
+        deffer_shader_elements::SE_R2_SHADOW
+    }
+}
+
+/// Select deffer shader element (`0..=3`) for a static sector visual (`CRender::rimp_select_sh_static`,
+/// `r4.cpp:82-102`). Default `ssfx_terrain_quality_x` is `8.0` (`80.0m` HQ terrain threshold).
+#[inline]
+pub fn select_static_shader_element(
+    phase: RenderPhase,
+    is_landscape: bool,
+    dist_sq: f32,
+    sphere_radius: f32,
+    r_dtex_range: f32,
+    ssfx_terrain_quality_x: f32,
+) -> usize {
+    if phase != RenderPhase::Normal {
+        return deffer_shader_elements::SE_R2_SHADOW;
+    }
+    let sec_dist = dist_sq.max(0.0).sqrt() - sphere_radius;
+    if is_landscape {
+        if sec_dist > 240.0 {
+            deffer_shader_elements::SE_R2_TERRAIN_VERY_LOW
+        } else if sec_dist < ssfx_terrain_quality_x * 10.0 {
+            deffer_shader_elements::SE_R2_NORMAL_HQ
+        } else {
+            deffer_shader_elements::SE_R2_NORMAL_LQ
+        }
+    } else if sec_dist < r_dtex_range {
+        deffer_shader_elements::SE_R2_NORMAL_HQ
+    } else {
+        deffer_shader_elements::SE_R2_NORMAL_LQ
+    }
+}
+
+/// Reference FOV used by `GetDistFromCamera` (`BASE_FOV = 67.f` in `r__dsgraph_build.cpp:695`).
+pub const VISUAL_OPT_BASE_FOV: f32 = 67.0;
+
+/// Static geometry optimization distance cutoffs per `[L1..L5]` across `[LOW, MED, HII, ULT]`
+/// (`o_optimize_static_l*_dist` in `r__dsgraph_build.cpp:603-645, 677-686`).
+pub const VISUAL_OPT_STATIC_DIST: [[f32; 4]; 5] = [
+    [150.0, 50.0, 50.0, 35.0],
+    [200.0, 150.0, 150.0, 125.0],
+    [250.0, 200.0, 200.0, 175.0],
+    [350.0, 300.0, 300.0, 250.0],
+    [400.0, 400.0, 350.0, 300.0],
+];
+
+/// Static geometry optimization bounding-sphere volume thresholds (`o_optimize_static_l*_size`).
+pub const VISUAL_OPT_STATIC_VOL: [[f32; 4]; 5] = [
+    [10.0, 25.0, 50.0, 50.0],
+    [100.0, 200.0, 400.0, 500.0],
+    [500.0, 1000.0, 1500.0, 1750.0],
+    [2500.0, 2500.0, 5000.0, 5250.0],
+    [7000.0, 7000.0, 20000.0, 25000.0],
+];
+
+/// Dynamic geometry optimization distance cutoffs per `[L1..L3]` across `[LOW, MED, HII, ULT]`
+/// (`o_optimize_dynamic_l*_dist` in `r__dsgraph_build.cpp:649-675, 688-693`).
+pub const VISUAL_OPT_DYNAMIC_DIST: [[f32; 4]; 3] = [
+    [80.0, 40.0, 30.0, 30.0],
+    [150.0, 100.0, 80.0, 50.0],
+    [250.0, 200.0, 150.0, 110.0],
+];
+
+/// Dynamic geometry optimization bounding-sphere volume thresholds (`o_optimize_dynamic_l*_size`).
+pub const VISUAL_OPT_DYNAMIC_VOL: [[f32; 4]; 3] = [
+    [1.0, 1.0, 1.4, 2.0],
+    [3.0, 4.0, 4.0, 8.0],
+    [4000.0, 4000.0, 4000.0, 4000.0],
+];
+
+/// Console configuration for `IsValuableToRender` geometry distance/volume culling
+/// (`xrRender_console.cpp:481, 535-536`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisualOptConfig {
+    pub opt_static: i32,
+    pub opt_dynamic: i32,
+    pub opt_shadow_geom: bool,
+    pub far_shadow_cascade_dist: f32,
+}
+
+impl Default for VisualOptConfig {
+    fn default() -> Self {
+        Self {
+            opt_static: 2,
+            opt_dynamic: 2,
+            opt_shadow_geom: false,
+            far_shadow_cascade_dist: 160.0,
+        }
+    }
+}
+
+/// Sphere volume `(4 * PI / 3) * radius^3` (`Fsphere::volume`, `src/xrCore/_sphere.h:191-194`).
+#[inline]
+pub fn sphere_volume(radius: f32) -> f32 {
+    (4.0 * std::f32::consts::PI / 3.0) * (radius * radius * radius)
+}
+
+/// FOV-normalized distance matching `GetDistFromCamera` (`r__dsgraph_build.cpp:697-705`).
+#[inline]
+pub fn adjusted_distance_from_camera(
+    cam_pos: [f32; 3],
+    from_position: [f32; 3],
+    fov_deg: f32,
+) -> f32 {
+    let dx = cam_pos[0] - from_position[0];
+    let dy = cam_pos[1] - from_position[1];
+    let dz = cam_pos[2] - from_position[2];
+    let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+    let fov_k = VISUAL_OPT_BASE_FOV / fov_deg.max(1e-3);
+    distance / fov_k
+}
+
+#[inline]
+fn passes_opt_tiers<const N: usize>(
+    vol: f32,
+    adj_dist: f32,
+    col: usize,
+    vols: &[[f32; 4]; N],
+    dists: &[[f32; 4]; N],
+) -> bool {
+    for l in 0..N {
+        if vol < vols[l][col] && adj_dist > dists[l][col] {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+fn opt_level_to_col(level: i32) -> usize {
+    match level {
+        2 => 1,
+        3 => 2,
+        4 => 3,
+        _ => 0,
+    }
+}
+
+/// Static geometry `IsValuableToRender` test (`r__dsgraph_build.cpp:707-820`).
+pub fn is_valuable_to_render_static(
+    visual_type: OgfVisualType,
+    sphere: OgfBSphere,
+    cam_pos: [f32; 3],
+    fov_deg: f32,
+    is_shadow_map: bool,
+    cfg: &VisualOptConfig,
+) -> bool {
+    if cfg.opt_static < 1 {
+        return true;
+    }
+    let vol = sphere_volume(sphere.radius);
+    let adj_dist = adjusted_distance_from_camera(cam_pos, sphere.center, fov_deg);
+    if is_shadow_map && cfg.opt_shadow_geom {
+        if vol < 50_000.0 && adj_dist > cfg.far_shadow_cascade_dist {
+            return false;
+        }
+        return passes_opt_tiers(vol, adj_dist, 2, &VISUAL_OPT_STATIC_VOL, &VISUAL_OPT_STATIC_DIST);
+    }
+    if matches!(
+        visual_type,
+        OgfVisualType::Lod | OgfVisualType::TreePm | OgfVisualType::TreeSt
+    ) {
+        return true;
+    }
+    passes_opt_tiers(
+        vol,
+        adj_dist,
+        opt_level_to_col(cfg.opt_static),
+        &VISUAL_OPT_STATIC_VOL,
+        &VISUAL_OPT_STATIC_DIST,
+    )
+}
+
+/// Dynamic geometry `IsValuableToRender` test (`r__dsgraph_build.cpp:707-745, 822-867`).
+pub fn is_valuable_to_render_dynamic(
+    sphere: OgfBSphere,
+    transform: Option<&XRayMatrix>,
+    cam_pos: [f32; 3],
+    fov_deg: f32,
+    is_shadow_map: bool,
+    cfg: &VisualOptConfig,
+) -> bool {
+    if cfg.opt_dynamic < 1 {
+        return true;
+    }
+    let vol = sphere_volume(sphere.radius);
+    let world_center = match transform {
+        Some(xf) => matrix_transform_point(xf, sphere.center),
+        None => sphere.center,
+    };
+    let adj_dist = adjusted_distance_from_camera(cam_pos, world_center, fov_deg);
+    if is_shadow_map && cfg.opt_shadow_geom {
+        if vol < 50_000.0 && adj_dist > cfg.far_shadow_cascade_dist {
+            return false;
+        }
+        return passes_opt_tiers(vol, adj_dist, 2, &VISUAL_OPT_STATIC_VOL, &VISUAL_OPT_STATIC_DIST);
+    }
+    passes_opt_tiers(
+        vol,
+        adj_dist,
+        opt_level_to_col(cfg.opt_dynamic),
+        &VISUAL_OPT_DYNAMIC_VOL,
+        &VISUAL_OPT_DYNAMIC_DIST,
+    )
+}
+
+/// Destination scene-graph bucket produced by `r_dsgraph_insert_{dynamic,static}`
+/// (`r__dsgraph_build.cpp:36-600`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualPrimaryBucket {
+    CustomFovDistort,
+    CustomFovEmissive,
+    CustomFovSorted,
+    CustomFovOpaque,
+    HudDistort,
+    HudEmissive,
+    HudSorted,
+    HudOpaque,
+    CamAttachedEmissive,
+    CamAttachedSorted,
+    CamAttachedOpaque,
+    ScopeHudOpaque,
+    ScopeHudSorted,
+    ScopeCamAttachedOpaque,
+    ScopeCamAttachedSorted,
+    Ui3dSorted,
+    Ui3dOpaque,
+    Ui3dEmissive,
+    Distort,
+    Sorted,
+    Water,
+    Wmark,
+    Emissive,
+    Landscape,
+    NormalOpaque,
+    MatrixOpaque,
+}
+
+/// Shader/context flags driving scene-graph bucket routing (`r__dsgraph_build.cpp:36-600`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VisualRoutingFlags {
+    pub is_hud: bool,
+    pub is_cam_attached: bool,
+    pub is_ui_3d: bool,
+    pub custom_fov: f32,
+    pub is_invisible: bool,
+    pub priority: u8,
+    pub is_strict_b2f: bool,
+    pub is_emissive: bool,
+    pub is_distort: bool,
+    pub special_priority: u8,
+    pub is_wmark: bool,
+    pub is_water: bool,
+    pub is_landscape: bool,
+    pub scope_lense: u8,
+}
+
+/// Complete scene-graph submission decision for one visual draw (`r__dsgraph_build.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisualRoutingDecision {
+    pub ssa: f32,
+    pub dist_sq: f32,
+    pub shader_element: usize,
+    pub primary: Option<VisualPrimaryBucket>,
+    pub distort_bucket: Option<VisualPrimaryBucket>,
+    pub emissive_bucket: Option<VisualPrimaryBucket>,
+    pub custom_fov: f32,
+}
+
+/// Route a dynamic visual into R4 scene-graph buckets (`R_dsgraph_structure::r_dsgraph_insert_dynamic`,
+/// `r__dsgraph_build.cpp:36-386`). Returns `None` if discarded by SSA or all buckets filtered out.
+#[allow(clippy::too_many_arguments)]
+pub fn route_dynamic_visual(
+    phase: RenderPhase,
+    sphere_center_world: [f32; 3],
+    sphere_radius: f32,
+    cam_pos: [f32; 3],
+    thresholds: &ScreenLodThresholds,
+    flags: &VisualRoutingFlags,
+    pmask: &[bool; 2],
+    pmask_wmark: bool,
+    distortion_enabled: bool,
+) -> Option<VisualRoutingDecision> {
+    let (ssa, dist_sq) = calc_ssa(cam_pos, sphere_center_world, sphere_radius);
+    if thresholds.should_discard(ssa) {
+        return None;
+    }
+
+    let spec_prio = (flags.special_priority as usize / 2).min(1);
+    let distort_bucket = if distortion_enabled && flags.is_distort && pmask[spec_prio] {
+        Some(if flags.custom_fov != 0.0 {
+            VisualPrimaryBucket::CustomFovDistort
+        } else if flags.is_hud {
+            VisualPrimaryBucket::HudDistort
+        } else {
+            VisualPrimaryBucket::Distort
+        })
+    } else {
+        None
+    };
+
+    let shader_element =
+        select_dynamic_shader_element(phase, dist_sq, sphere_radius, thresholds.r_dtex_range);
+    let main_prio = (flags.priority as usize / 2).min(1);
+    if !pmask[main_prio] && !flags.is_ui_3d {
+        return distort_bucket.map(|_| VisualRoutingDecision {
+            ssa,
+            dist_sq,
+            shader_element,
+            primary: None,
+            distort_bucket,
+            emissive_bucket: None,
+            custom_fov: flags.custom_fov,
+        });
+    }
+
+    match flags.scope_lense {
+        1 => {
+            return Some(VisualRoutingDecision {
+                ssa,
+                dist_sq,
+                shader_element,
+                primary: Some(if flags.is_cam_attached {
+                    VisualPrimaryBucket::CamAttachedOpaque
+                } else {
+                    VisualPrimaryBucket::HudOpaque
+                }),
+                distort_bucket,
+                emissive_bucket: None,
+                custom_fov: flags.custom_fov,
+            });
+        }
+        2 => {
+            return Some(VisualRoutingDecision {
+                ssa,
+                dist_sq,
+                shader_element,
+                primary: Some(if flags.is_cam_attached {
+                    VisualPrimaryBucket::ScopeCamAttachedOpaque
+                } else {
+                    VisualPrimaryBucket::ScopeHudOpaque
+                }),
+                distort_bucket,
+                emissive_bucket: None,
+                custom_fov: flags.custom_fov,
+            });
+        }
+        3 => {
+            return Some(VisualRoutingDecision {
+                ssa,
+                dist_sq,
+                shader_element,
+                primary: Some(if flags.is_cam_attached {
+                    VisualPrimaryBucket::ScopeCamAttachedSorted
+                } else {
+                    VisualPrimaryBucket::ScopeHudSorted
+                }),
+                distort_bucket,
+                emissive_bucket: None,
+                custom_fov: flags.custom_fov,
+            });
+        }
+        _ => {}
+    }
+
+    if flags.is_hud {
+        let emissive_bucket = if flags.is_emissive {
+            Some(if flags.custom_fov != 0.0 {
+                VisualPrimaryBucket::CustomFovEmissive
+            } else if flags.is_cam_attached {
+                VisualPrimaryBucket::CamAttachedEmissive
+            } else {
+                VisualPrimaryBucket::HudEmissive
+            })
+        } else {
+            None
+        };
+        let primary = Some(if flags.is_strict_b2f {
+            if flags.custom_fov != 0.0 {
+                VisualPrimaryBucket::CustomFovSorted
+            } else if flags.is_cam_attached {
+                VisualPrimaryBucket::CamAttachedSorted
+            } else {
+                VisualPrimaryBucket::HudSorted
+            }
+        } else if flags.custom_fov != 0.0 {
+            VisualPrimaryBucket::CustomFovOpaque
+        } else if flags.is_cam_attached {
+            VisualPrimaryBucket::CamAttachedOpaque
+        } else {
+            VisualPrimaryBucket::HudOpaque
+        });
+        return Some(VisualRoutingDecision {
+            ssa,
+            dist_sq,
+            shader_element,
+            primary,
+            distort_bucket,
+            emissive_bucket,
+            custom_fov: flags.custom_fov,
+        });
+    }
+
+    if flags.is_ui_3d {
+        let (primary, emissive_bucket) = if flags.is_strict_b2f {
+            (Some(VisualPrimaryBucket::Ui3dSorted), None)
+        } else {
+            (
+                Some(VisualPrimaryBucket::Ui3dOpaque),
+                flags.is_emissive.then_some(VisualPrimaryBucket::Ui3dEmissive),
+            )
+        };
+        return Some(VisualRoutingDecision {
+            ssa,
+            dist_sq,
+            shader_element,
+            primary,
+            distort_bucket,
+            emissive_bucket,
+            custom_fov: 0.0,
+        });
+    }
+
+    if flags.is_invisible {
+        return distort_bucket.map(|_| VisualRoutingDecision {
+            ssa,
+            dist_sq,
+            shader_element,
+            primary: None,
+            distort_bucket,
+            emissive_bucket: None,
+            custom_fov: flags.custom_fov,
+        });
+    }
+
+    if flags.is_strict_b2f {
+        return Some(VisualRoutingDecision {
+            ssa,
+            dist_sq,
+            shader_element,
+            primary: Some(if flags.custom_fov != 0.0 {
+                VisualPrimaryBucket::CustomFovSorted
+            } else {
+                VisualPrimaryBucket::Sorted
+            }),
+            distort_bucket,
+            emissive_bucket: None,
+            custom_fov: flags.custom_fov,
+        });
+    }
+
+    let emissive_bucket = if flags.is_emissive {
+        Some(if flags.custom_fov != 0.0 {
+            VisualPrimaryBucket::CustomFovEmissive
+        } else {
+            VisualPrimaryBucket::Emissive
+        })
+    } else {
+        None
+    };
+
+    let primary = Some(if flags.is_wmark && pmask_wmark {
+        VisualPrimaryBucket::Wmark
+    } else {
+        VisualPrimaryBucket::MatrixOpaque
+    });
+
+    Some(VisualRoutingDecision {
+        ssa,
+        dist_sq,
+        shader_element,
+        primary,
+        distort_bucket,
+        emissive_bucket,
+        custom_fov: flags.custom_fov,
+    })
+}
+
+/// Route a static level visual into R4 scene-graph buckets (`R_dsgraph_structure::r_dsgraph_insert_static`,
+/// `r__dsgraph_build.cpp:388-600`).
+#[allow(clippy::too_many_arguments)]
+pub fn route_static_visual(
+    phase: RenderPhase,
+    sphere: OgfBSphere,
+    cam_pos: [f32; 3],
+    thresholds: &ScreenLodThresholds,
+    flags: &VisualRoutingFlags,
+    pmask: &[bool; 2],
+    pmask_wmark: bool,
+    distortion_enabled: bool,
+    ssfx_water_enabled: bool,
+    ssfx_terrain_quality_x: f32,
+) -> Option<VisualRoutingDecision> {
+    let (ssa, dist_sq) = calc_ssa(cam_pos, sphere.center, sphere.radius);
+    if thresholds.should_discard(ssa) {
+        return None;
+    }
+
+    let spec_prio = (flags.special_priority as usize / 2).min(1);
+    let distort_bucket = if distortion_enabled && flags.is_distort && pmask[spec_prio] {
+        Some(VisualPrimaryBucket::Distort)
+    } else {
+        None
+    };
+
+    let shader_element = select_static_shader_element(
+        phase,
+        flags.is_landscape,
+        dist_sq,
+        sphere.radius,
+        thresholds.r_dtex_range,
+        ssfx_terrain_quality_x,
+    );
+    let main_prio = (flags.priority as usize / 2).min(1);
+    if !pmask[main_prio] {
+        return distort_bucket.map(|_| VisualRoutingDecision {
+            ssa,
+            dist_sq,
+            shader_element,
+            primary: None,
+            distort_bucket,
+            emissive_bucket: None,
+            custom_fov: 0.0,
+        });
+    }
+
+    if flags.is_water && ssfx_water_enabled {
+        return Some(VisualRoutingDecision {
+            ssa,
+            dist_sq,
+            shader_element,
+            primary: Some(VisualPrimaryBucket::Water),
+            distort_bucket,
+            emissive_bucket: None,
+            custom_fov: 0.0,
+        });
+    }
+
+    if flags.is_strict_b2f {
+        return Some(VisualRoutingDecision {
+            ssa,
+            dist_sq,
+            shader_element,
+            primary: Some(VisualPrimaryBucket::Sorted),
+            distort_bucket,
+            emissive_bucket: None,
+            custom_fov: 0.0,
+        });
+    }
+
+    let emissive_bucket = flags.is_emissive.then_some(VisualPrimaryBucket::Emissive);
+    let primary = if flags.is_wmark && pmask_wmark {
+        VisualPrimaryBucket::Wmark
+    } else if flags.is_landscape && phase == RenderPhase::Normal {
+        VisualPrimaryBucket::Landscape
+    } else {
+        VisualPrimaryBucket::NormalOpaque
+    };
+
+    Some(VisualRoutingDecision {
+        ssa,
+        dist_sq,
+        shader_element,
+        primary: Some(primary),
+        distort_bucket,
+        emissive_bucket,
+        custom_fov: 0.0,
+    })
 }
 
 /// Compute normalized SSA thresholds and parallax detail range for `(screen_w, screen_h, fov_deg)`.
@@ -2958,5 +3606,130 @@ mod tests {
                 | 255;
             assert_eq!(quad[vit].sun_af, expected_sun_af);
         }
+    }
+
+    #[test]
+    fn visual_shader_selection_optimization_and_dsgraph_routing() {
+        let thresholds =
+            compute_screen_lod_thresholds(1920, 1080, 75.0, &ScreenLodConfig::default());
+
+        assert!(thresholds.should_discard(thresholds.r_ssa_discard));
+        assert!(!thresholds.should_discard(thresholds.r_ssa_discard * 2.0));
+        assert!((thresholds.calc_lod(thresholds.r_ssa_glod_start) - 1.0).abs() < 1e-6);
+        assert_eq!(thresholds.calc_lod(thresholds.r_ssa_glod_end), 0.0);
+        assert_eq!(thresholds.hardware_lod_factor(thresholds.r_ssa_glod_start), 7.0);
+        assert_eq!(thresholds.hardware_lod_factor(thresholds.r_ssa_glod_end), 1.0);
+
+        let (ssa, dist_sq) = calc_ssa([0.0, 0.0, 0.0], [0.0, 0.0, 10.0], 2.0);
+        assert!((dist_sq - 100.0).abs() < 1e-3);
+        assert!((ssa - 0.02).abs() < 1e-5);
+
+        assert_eq!(
+            select_dynamic_shader_element(RenderPhase::Smap, 100.0, 2.0, 50.0),
+            deffer_shader_elements::SE_R2_SHADOW
+        );
+        assert_eq!(
+            select_dynamic_shader_element(RenderPhase::Normal, 100.0, 2.0, 50.0),
+            deffer_shader_elements::SE_R2_NORMAL_HQ
+        );
+        assert_eq!(
+            select_dynamic_shader_element(RenderPhase::Normal, 10000.0, 2.0, 50.0),
+            deffer_shader_elements::SE_R2_NORMAL_LQ
+        );
+        assert_eq!(
+            select_static_shader_element(RenderPhase::Normal, true, 70.0 * 70.0, 1.0, 50.0, 8.0),
+            deffer_shader_elements::SE_R2_NORMAL_HQ
+        );
+        assert_eq!(
+            select_static_shader_element(RenderPhase::Normal, true, 120.0 * 120.0, 1.0, 50.0, 8.0),
+            deffer_shader_elements::SE_R2_NORMAL_LQ
+        );
+        assert_eq!(
+            select_static_shader_element(RenderPhase::Normal, true, 260.0 * 260.0, 1.0, 50.0, 8.0),
+            deffer_shader_elements::SE_R2_TERRAIN_VERY_LOW
+        );
+
+        let opt = VisualOptConfig::default();
+        let small_sphere = OgfBSphere {
+            center: [0.0, 0.0, 120.0],
+            radius: 1.0, // vol = 4.19 < 25
+        };
+        assert!(!is_valuable_to_render_static(
+            OgfVisualType::Normal,
+            small_sphere,
+            [0.0, 0.0, 0.0],
+            67.0,
+            false,
+            &opt
+        ));
+        assert!(is_valuable_to_render_static(
+            OgfVisualType::TreeSt,
+            small_sphere,
+            [0.0, 0.0, 0.0],
+            67.0,
+            false,
+            &opt
+        ));
+
+        let dyn_xf = matrix_set_xyz_translate([0.0; 3], [0.0, 0.0, 120.0]);
+        assert!(!is_valuable_to_render_dynamic(
+            OgfBSphere {
+                center: [0.0, 0.0, 0.0],
+                radius: 0.5, // vol = 0.52 < 1.0; dist = 120 > 40
+            },
+            Some(&dyn_xf),
+            [0.0, 0.0, 0.0],
+            67.0,
+            false,
+            &opt
+        ));
+
+        let scope_flags = VisualRoutingFlags {
+            is_hud: true,
+            is_cam_attached: true,
+            scope_lense: 2,
+            is_emissive: true,
+            is_distort: true,
+            ..VisualRoutingFlags::default()
+        };
+        let r_scope = route_dynamic_visual(
+            RenderPhase::Normal,
+            [0.0, 0.0, 1.0],
+            1.0,
+            [0.0, 0.0, 0.0],
+            &thresholds,
+            &scope_flags,
+            &[true, true],
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(r_scope.primary, Some(VisualPrimaryBucket::ScopeCamAttachedOpaque));
+        assert_eq!(r_scope.distort_bucket, Some(VisualPrimaryBucket::HudDistort));
+
+        let water_flags = VisualRoutingFlags {
+            is_water: true,
+            is_landscape: true,
+            is_distort: true,
+            ..VisualRoutingFlags::default()
+        };
+        let r_static = route_static_visual(
+            RenderPhase::Normal,
+            OgfBSphere {
+                center: [0.0, 0.0, 20.0],
+                radius: 5.0,
+            },
+            [0.0, 0.0, 0.0],
+            &thresholds,
+            &water_flags,
+            &[true, true],
+            true,
+            true,
+            true,
+            8.0,
+        )
+        .unwrap();
+        assert_eq!(r_static.primary, Some(VisualPrimaryBucket::Water));
+        assert_eq!(r_static.distort_bucket, Some(VisualPrimaryBucket::Distort));
     }
 }

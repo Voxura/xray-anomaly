@@ -11,6 +11,15 @@
 
 use crate::envelopes::{ObjectMotion, ObjectMotionLibrary, PostprocessEffect, PostprocessState};
 use crate::ogf::{matrix_set_xyzi_translate, XRayMatrix, XRAY_IDENTITY_MATRIX};
+use crate::weather::R_VIEWPORT_NEAR;
+
+pub const UI_3D_ICON_ORTHO_HEIGHT: f32 = 2.0;
+pub const UI_3D_ICON_NEAR_PLANE: f32 = 0.01;
+pub const UI_3D_ICON_FAR_PLANE: f32 = 100.0;
+pub const UI_3D_ICON_DISTANCE: f32 = 10.0;
+pub const DEFAULT_HUD_FOV_FACTOR: f32 = 0.45;
+pub const HUD_BASE_FOV_DEG: f32 = 83.0;
+pub const DEFAULT_PARALLAX_H: f32 = 0.02;
 
 #[inline]
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -108,6 +117,91 @@ pub fn matrix_build_projection_ortho(width: f32, height: f32, near: f32, far: f3
         [0.0, 0.0, m33, 0.0],
         [0.0, 0.0, m43, 1.0],
     ]
+}
+
+/// Build the orthographic projection matrix used for 3D UI item icons (`mProject3DIcons`,
+/// `CameraManager.cpp:505-506`), where `aspect` is X-Ray's `height / width`.
+#[inline]
+pub fn ui_3d_icon_projection(aspect: f32) -> XRayMatrix {
+    matrix_build_projection_ortho(
+        UI_3D_ICON_ORTHO_HEIGHT / aspect.max(1e-6),
+        UI_3D_ICON_ORTHO_HEIGHT,
+        UI_3D_ICON_NEAR_PLANE,
+        UI_3D_ICON_FAR_PLANE,
+    )
+}
+
+/// Build the orthographic projection matrix matching a 3D UI icon atlas surface (`BeginUI3DIconAtlas`,
+/// `r4_R_render.cpp:698-699`).
+#[inline]
+pub fn ui_3d_icon_atlas_projection(atlas_width: u32, atlas_height: u32) -> XRayMatrix {
+    let w = UI_3D_ICON_ORTHO_HEIGHT * (atlas_width.max(1) as f32) / (atlas_height.max(1) as f32);
+    matrix_build_projection_ortho(
+        w,
+        UI_3D_ICON_ORTHO_HEIGHT,
+        UI_3D_ICON_NEAR_PLANE,
+        UI_3D_ICON_FAR_PLANE,
+    )
+}
+
+/// Build the first-person HUD or camera-attached perspective projection matrix (`Device.mProjectHud` /
+/// `Device.mProjectCamAttached`, `CameraManager.cpp:503-504`) using `fov_factor * 83.0` deg and
+/// `R_VIEWPORT_NEAR` (`0.005`).
+#[inline]
+pub fn hud_projection_matrix(hud_fov_factor: f32, aspect: f32, far_plane: f32) -> XRayMatrix {
+    let fov_rad = (hud_fov_factor * HUD_BASE_FOV_DEG)
+        .clamp(1.0, 175.0)
+        .to_radians();
+    matrix_build_projection(
+        fov_rad,
+        aspect.max(1e-6),
+        R_VIEWPORT_NEAR,
+        far_plane.max(R_VIEWPORT_NEAR + 1e-3),
+    )
+}
+
+/// 48-byte view-space G-buffer position decompression and parallax shader constants
+/// (`cl_pos_decompress_params`, `cl_pos_decompress_params2`, `cl_parallax` in `r4.cpp:104-140`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PosDecompressParams {
+    /// `[horz_tan, vert_tan, (2.0 * horz_tan) / w, (2.0 * vert_tan) / h]`.
+    pub pos_decompression_params: [f32; 4],
+    /// `[w, h, 1.0 / w, 1.0 / h]`.
+    pub pos_decompression_params2: [f32; 4],
+    /// `[parallax_h, -0.5 * parallax_h, 1.0 / r_dtex_range, 1.0 / r_dtex_range]`.
+    pub parallax: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<PosDecompressParams>() == 48);
+
+impl PosDecompressParams {
+    /// Compute view-space decompression & detail-parallax constants matching `r4.cpp:104-140`.
+    pub fn compute(
+        fov_deg: f32,
+        aspect: f32,
+        screen_w: u32,
+        screen_h: u32,
+        parallax_h: f32,
+        r_dtex_range: f32,
+    ) -> Self {
+        let w = screen_w.max(1) as f32;
+        let h = screen_h.max(1) as f32;
+        let aspect_safe = aspect.max(1e-6);
+        let vert_tan = -((fov_deg.clamp(1.0, 175.0) * 0.5).to_radians().tan());
+        let horz_tan = -vert_tan / aspect_safe;
+        let dtex = r_dtex_range.max(1e-6);
+        Self {
+            pos_decompression_params: [
+                horz_tan,
+                vert_tan,
+                (2.0 * horz_tan) / w,
+                (2.0 * vert_tan) / h,
+            ],
+            pos_decompression_params2: [w, h, 1.0 / w, 1.0 / h],
+            parallax: [parallax_h, -parallax_h * 0.5, 1.0 / dtex, 1.0 / dtex],
+        }
+    }
 }
 
 /// Active camera frame state passed through camera effectors (`SCamEffectorInfo`, `CameraDefs.h:16-42`).
@@ -727,5 +821,35 @@ mod tests {
         let pp_override = mix_postprocess_effectors(0.016, &mut cam_mgr.pp_effectors);
         assert!((pp_override.blur - 0.9).abs() < 1e-4);
         assert_eq!(pp_override.cm_tex1, "fx_override");
+    }
+
+    #[test]
+    fn ui_3d_icon_hud_projection_and_pos_decompress_params() {
+        let aspect = 9.0 / 16.0;
+        let p_icon = ui_3d_icon_projection(aspect);
+        assert!((p_icon[0][0] - (2.0 * aspect / 2.0)).abs() < 1e-6);
+        assert!((p_icon[1][1] - 1.0).abs() < 1e-6);
+        let p_atlas = ui_3d_icon_atlas_projection(1920, 1080);
+        assert!((p_atlas[0][0] - p_icon[0][0]).abs() < 1e-5);
+        assert!((p_atlas[1][1] - p_icon[1][1]).abs() < 1e-6);
+
+        let p_hud = hud_projection_matrix(DEFAULT_HUD_FOV_FACTOR, aspect, 150.0);
+        let expected_hat = (DEFAULT_HUD_FOV_FACTOR * HUD_BASE_FOV_DEG * 0.5)
+            .to_radians()
+            .tan();
+        assert!((p_hud[1][1] - 1.0 / expected_hat).abs() < 1e-5);
+        assert!((p_hud[0][0] - aspect / expected_hat).abs() < 1e-5);
+
+        let pd = PosDecompressParams::compute(90.0, 0.5, 1920, 1080, DEFAULT_PARALLAX_H, 50.0);
+        assert_eq!(std::mem::size_of::<PosDecompressParams>(), 48);
+        assert!((pd.pos_decompression_params[0] - 2.0).abs() < 1e-5);
+        assert!((pd.pos_decompression_params[1] - (-1.0)).abs() < 1e-5);
+        assert!((pd.pos_decompression_params[2] - 4.0 / 1920.0).abs() < 1e-6);
+        assert!((pd.pos_decompression_params[3] - (-2.0 / 1080.0)).abs() < 1e-6);
+        assert_eq!(
+            pd.pos_decompression_params2,
+            [1920.0, 1080.0, 1.0 / 1920.0, 1.0 / 1080.0]
+        );
+        assert_eq!(pd.parallax, [0.02, -0.01, 0.02, 0.02]);
     }
 }

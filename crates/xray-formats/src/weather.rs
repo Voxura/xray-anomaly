@@ -1504,6 +1504,242 @@ impl StandardFrameUniforms {
     }
 }
 
+/// Default interpolation factor for `eye_position_lerp` / `eye_direction_lerp`
+/// (`scope_fog_interp` in `src/xrEngine/xr_ioc_cmd.cpp:1036`).
+pub const DEFAULT_SCOPE_FOG_INTERP: f32 = 0.15;
+
+/// Persistent interpolated eye pose state (`cl_eye_PL` / `cl_eye_DL`,
+/// `Blender_Recorder_StandartBinding.cpp:275-311`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ScopeEyeLerpState {
+    initialized: bool,
+    pub eye_position_lerp: [f32; 3],
+    pub eye_direction_lerp: [f32; 3],
+}
+
+impl ScopeEyeLerpState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_initial(pos: [f32; 3], dir: [f32; 3]) -> Self {
+        Self {
+            initialized: true,
+            eye_position_lerp: pos,
+            eye_direction_lerp: dir,
+        }
+    }
+
+    /// Advance smoothed scope eye `(position, direction)` using `interp` (`tV.lerp(tV, V, interp)`)
+    /// and return `(eye_position_lerp_vec4, eye_direction_lerp_vec4)`.
+    ///
+    /// Note: snaps to the initial camera pose on the very first call instead of lerping from world origin.
+    pub fn step(
+        &mut self,
+        cam_pos: [f32; 3],
+        cam_dir: [f32; 3],
+        interp: f32,
+    ) -> ([f32; 4], [f32; 4]) {
+        if !self.initialized {
+            self.eye_position_lerp = cam_pos;
+            self.eye_direction_lerp = cam_dir;
+            self.initialized = true;
+        } else {
+            let t = interp.clamp(0.0, 1.0);
+            for i in 0..3 {
+                self.eye_position_lerp[i] =
+                    self.eye_position_lerp[i] * (1.0 - t) + cam_pos[i] * t;
+                self.eye_direction_lerp[i] =
+                    self.eye_direction_lerp[i] * (1.0 - t) + cam_dir[i] * t;
+            }
+        }
+        (
+            [
+                self.eye_position_lerp[0],
+                self.eye_position_lerp[1],
+                self.eye_position_lerp[2],
+                1.0,
+            ],
+            [
+                self.eye_direction_lerp[0],
+                self.eye_direction_lerp[1],
+                self.eye_direction_lerp[2],
+                0.0,
+            ],
+        )
+    }
+}
+
+/// Console defaults for Crookr fake-scope optics (`src/xrEngine/xr_ioc_cmd.cpp:1036-1048`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FakeScopeConfig {
+    pub fog_interp: f32,
+    pub fog_travel: f32,
+    pub fog_attack: f32,
+    pub fog_mattack: f32,
+    pub ca: f32,
+    pub outer_blur: f32,
+    pub inner_blur: f32,
+    pub scroll_power: f32,
+    pub brightness: f32,
+    pub radius: f32,
+    pub fog_radius: f32,
+    pub fog_sharp: f32,
+}
+
+impl Default for FakeScopeConfig {
+    fn default() -> Self {
+        Self {
+            fog_interp: DEFAULT_SCOPE_FOG_INTERP,
+            fog_travel: 0.25,
+            fog_attack: 0.66,
+            fog_mattack: 0.25,
+            ca: 0.003,
+            outer_blur: 1.0,
+            inner_blur: 0.1,
+            scroll_power: 0.66,
+            brightness: 1.0,
+            radius: 0.0,
+            fog_radius: 1.25,
+            fog_sharp: 4.0,
+        }
+    }
+}
+
+impl FakeScopeConfig {
+    #[inline]
+    pub fn to_uniforms(&self) -> FakeScopeUniforms {
+        FakeScopeUniforms::from(self)
+    }
+}
+
+/// 48-byte packed Crookr fake-scope constant block (`cl_fakescope_params`, `cl_fakescope_ca`,
+/// `cl_fakescope_params3` in `Blender_Recorder_StandartBinding.cpp:326-364`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FakeScopeUniforms {
+    /// `[scroll_power, inner_blur, outer_blur, brightness]`.
+    pub fakescope_params: [f32; 4],
+    /// `[ca, fog_attack, fog_mattack, fog_travel]`.
+    pub fakescope_ca: [f32; 4],
+    /// `[radius, fog_radius, fog_sharp, 0.0]`.
+    pub fakescope_params3: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<FakeScopeUniforms>() == 48);
+
+impl Default for FakeScopeUniforms {
+    fn default() -> Self {
+        FakeScopeConfig::default().to_uniforms()
+    }
+}
+
+impl From<&FakeScopeConfig> for FakeScopeUniforms {
+    fn from(cfg: &FakeScopeConfig) -> Self {
+        Self {
+            fakescope_params: [
+                cfg.scroll_power,
+                cfg.inner_blur,
+                cfg.outer_blur,
+                cfg.brightness,
+            ],
+            fakescope_ca: [cfg.ca, cfg.fog_attack, cfg.fog_mattack, cfg.fog_travel],
+            fakescope_params3: [cfg.radius, cfg.fog_radius, cfg.fog_sharp, 0.0],
+        }
+    }
+}
+
+/// 128-byte 3D shader scope, reticle mark-switch, and reflex-sight uniforms
+/// (`Blender_Recorder_StandartBinding.cpp:366-442`, `xrRender_console.cpp:388-399`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct S3dsScopeUniforms {
+    pub markswitch_current: i32,
+    pub markswitch_count: i32,
+    pub _pad: [i32; 2],
+    pub markswitch_color: [f32; 4],
+    pub s3ds_param_1: [f32; 4],
+    pub s3ds_param_2: [f32; 4],
+    pub s3ds_param_3: [f32; 4],
+    pub s3ds_param_4: [f32; 4],
+    pub reflex_param: [f32; 4],
+    pub _tail_pad: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<S3dsScopeUniforms>() == 128);
+
+impl Default for S3dsScopeUniforms {
+    fn default() -> Self {
+        Self {
+            markswitch_current: 0,
+            markswitch_count: 0,
+            _pad: [0; 2],
+            markswitch_color: [0.0; 4],
+            s3ds_param_1: [0.0; 4],
+            s3ds_param_2: [0.0; 4],
+            s3ds_param_3: [0.0; 4],
+            s3ds_param_4: [0.0; 4],
+            reflex_param: [0.0; 4],
+            _tail_pad: [0.0; 4],
+        }
+    }
+}
+
+impl S3dsScopeUniforms {
+    #[inline]
+    pub fn markswitch_current_vec4(&self) -> [f32; 4] {
+        [self.markswitch_current as f32, 0.0, 0.0, 0.0]
+    }
+
+    #[inline]
+    pub fn markswitch_count_vec4(&self) -> [f32; 4] {
+        [self.markswitch_count as f32, 0.0, 0.0, 0.0]
+    }
+}
+
+/// Actor status shader binding (`IGame_Persistent::act_dat` / `cl_actor_params`,
+/// `Blender_Recorder_StandartBinding.cpp:692-706`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ActorShaderData {
+    pub health: f32,
+    pub stamina: f32,
+    pub bleeding: f32,
+    pub helmet: bool,
+}
+
+impl ActorShaderData {
+    #[inline]
+    pub fn to_vec4(&self) -> [f32; 4] {
+        [
+            self.health,
+            self.stamina,
+            self.bleeding,
+            if self.helmet { 1.0 } else { 0.0 },
+        ]
+    }
+}
+
+/// PDA display shader binding (`IGame_Persistent::pda_data` / `cl_pda_params`,
+/// `Blender_Recorder_StandartBinding.cpp:734-747`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PdaShaderParams {
+    pub display_factor: f32,
+    pub psy_influence: f32,
+    pub display_brightness: f32,
+}
+
+impl PdaShaderParams {
+    #[inline]
+    pub fn to_vec4(&self) -> [f32; 4] {
+        [
+            self.display_factor,
+            self.psy_influence,
+            self.display_brightness,
+            0.0,
+        ]
+    }
+}
+
 /// Blended atmospheric state output by `lerp_descriptors` (`CEnvDescriptorMixer`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MixedEnvironment {
@@ -4199,5 +4435,47 @@ sun = sun_clear
         );
         assert!(!away.render_active);
         assert!(away.quads.is_empty());
+    }
+
+    #[test]
+    fn scope_actor_and_pda_shader_uniforms() {
+        let mut eye = ScopeEyeLerpState::new();
+        let (p0, d0) = eye.step([1.0, 2.0, 3.0], [0.0, 0.0, 1.0], DEFAULT_SCOPE_FOG_INTERP);
+        assert_eq!(p0, [1.0, 2.0, 3.0, 1.0]);
+        assert_eq!(d0, [0.0, 0.0, 1.0, 0.0]);
+        let (p1, _) = eye.step([11.0, 2.0, 3.0], [1.0, 0.0, 0.0], 0.25);
+        assert!((p1[0] - 3.5).abs() < 1e-6);
+
+        let fake_cfg = FakeScopeConfig::default();
+        let fake_u = fake_cfg.to_uniforms();
+        assert_eq!(std::mem::size_of::<FakeScopeUniforms>(), 48);
+        assert_eq!(fake_u.fakescope_params, [0.66, 0.1, 1.0, 1.0]);
+        assert_eq!(fake_u.fakescope_ca, [0.003, 0.66, 0.25, 0.25]);
+        assert_eq!(fake_u.fakescope_params3, [0.0, 1.25, 4.0, 0.0]);
+
+        let s3ds = S3dsScopeUniforms {
+            markswitch_current: 2,
+            markswitch_count: 5,
+            markswitch_color: [1.0, 0.2, 0.1, 1.0],
+            ..S3dsScopeUniforms::default()
+        };
+        assert_eq!(std::mem::size_of::<S3dsScopeUniforms>(), 128);
+        assert_eq!(s3ds.markswitch_current_vec4(), [2.0, 0.0, 0.0, 0.0]);
+        assert_eq!(s3ds.markswitch_count_vec4(), [5.0, 0.0, 0.0, 0.0]);
+
+        let actor = ActorShaderData {
+            health: 0.85,
+            stamina: 0.5,
+            bleeding: 0.1,
+            helmet: true,
+        };
+        assert_eq!(actor.to_vec4(), [0.85, 0.5, 0.1, 1.0]);
+
+        let pda = PdaShaderParams {
+            display_factor: 0.75,
+            psy_influence: 0.25,
+            display_brightness: 0.9,
+        };
+        assert_eq!(pda.to_vec4(), [0.75, 0.25, 0.9, 0.0]);
     }
 }
