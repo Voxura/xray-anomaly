@@ -740,6 +740,20 @@ pub const XRAY_IDENTITY_MATRIX: XRayMatrix = [
     [0.0, 0.0, 0.0, 1.0],
 ];
 
+/// Compute `Fmatrix::rotateY(angle)` matching `src/xrCore/_matrix.h:363-376`.
+///
+/// Matches X-Ray's left-handed row-vector basis (`i = (cos, 0, -sin)`, `k = (sin, 0, cos)`),
+/// which rotates in the opposite direction to `matrix_set_hpb(angle, 0, 0)`.
+pub fn matrix_rotate_y(angle: f32) -> XRayMatrix {
+    let (sina, cosa) = angle.sin_cos();
+    [
+        [cosa, 0.0, -sina, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [sina, 0.0, cosa, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
 /// Compute `Fmatrix::setHPB(h, p, b)` matching `_matrix.h:852-876`.
 pub fn matrix_set_hpb(h: f32, p: f32, b: f32) -> XRayMatrix {
     let (sh, ch) = h.sin_cos();
@@ -2129,5 +2143,19 @@ mod tests {
         assert_eq!(swis.select_window(1.0).unwrap().num_tris, 4);
         assert_eq!(swis.select_window(0.5).unwrap().num_tris, 2);
         assert_eq!(swis.select_window(0.0).unwrap().num_tris, 1);
+    }
+
+    #[test]
+    fn test_matrix_rotate_y_matches_xray_fmatrix() {
+        let ry = matrix_rotate_y(std::f32::consts::FRAC_PI_2);
+        let vx = matrix_transform_point(&ry, [1.0, 2.0, 0.0]);
+        assert!((vx[0] - 0.0).abs() < 1e-6);
+        assert!((vx[1] - 2.0).abs() < 1e-6);
+        assert!((vx[2] + 1.0).abs() < 1e-6);
+
+        let vz = matrix_transform_point(&ry, [0.0, -1.0, 1.0]);
+        assert!((vz[0] - 1.0).abs() < 1e-6);
+        assert!((vz[1] + 1.0).abs() < 1e-6);
+        assert!((vz[2] - 0.0).abs() < 1e-6);
     }
 }

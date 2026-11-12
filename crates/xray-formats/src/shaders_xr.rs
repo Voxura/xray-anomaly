@@ -601,6 +601,22 @@ pub struct LevelEnvModifiers {
     pub modifiers: Vec<EnvModifier>,
 }
 
+/// Parse an `.ltx` `use_flags` integer matching C++ `strtoul(val, nullptr, 0)` (hex `0x..`, octal `0..`, or decimal).
+fn parse_env_mod_use_flags(raw: &str) -> Option<u16> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex.trim(), 16).ok()?
+    } else if s.starts_with('0') && s.len() > 1 && s.bytes().skip(1).all(|b| (b'0'..=b'7').contains(&b)) {
+        u32::from_str_radix(&s[1..], 8).ok()?
+    } else {
+        s.parse::<u32>().ok()?
+    };
+    Some((parsed & 0xFFFF) as u16)
+}
+
 impl LevelEnvModifiers {
     /// Parse binary `level.env_mod` (`CLevel::Load_GameSpecific_After` / `CEnvironment::Mods_Load`).
     pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
@@ -667,28 +683,36 @@ impl LevelEnvModifiers {
             let sky_color = doc.read_vec3(section, "sky_color").unwrap_or([0.0; 3]);
             let hemi_color = doc.read_vec3(section, "hemi_color").unwrap_or([0.0; 3]);
 
-            let mut use_flags = 0u16;
-            if doc.read_str(section, "far_plane").is_some() {
-                use_flags |= env_mod_flags::VIEW_DIST;
-            }
-            if doc.read_str(section, "fog_color").is_some() {
-                use_flags |= env_mod_flags::FOG_COLOR;
-            }
-            if doc.read_str(section, "fog_density").is_some() {
-                use_flags |= env_mod_flags::FOG_DENSITY;
-            }
-            if doc.read_str(section, "ambient").is_some() {
-                use_flags |= env_mod_flags::AMBIENT_COLOR;
-            }
-            if doc.read_str(section, "sky_color").is_some() {
-                use_flags |= env_mod_flags::SKY_COLOR;
-            }
-            if doc.read_str(section, "hemi_color").is_some() {
-                use_flags |= env_mod_flags::HEMI_COLOR;
-            }
-            if use_flags == 0 {
-                use_flags = env_mod_flags::ALL;
-            }
+            let use_flags = if let Some(explicit) =
+                doc.read_str(section, "use_flags").and_then(parse_env_mod_use_flags)
+            {
+                explicit
+            } else {
+                let mut inferred = 0u16;
+                if doc.read_str(section, "far_plane").is_some() {
+                    inferred |= env_mod_flags::VIEW_DIST;
+                }
+                if doc.read_str(section, "fog_color").is_some() {
+                    inferred |= env_mod_flags::FOG_COLOR;
+                }
+                if doc.read_str(section, "fog_density").is_some() {
+                    inferred |= env_mod_flags::FOG_DENSITY;
+                }
+                if doc.read_str(section, "ambient").is_some() {
+                    inferred |= env_mod_flags::AMBIENT_COLOR;
+                }
+                if doc.read_str(section, "sky_color").is_some() {
+                    inferred |= env_mod_flags::SKY_COLOR;
+                }
+                if doc.read_str(section, "hemi_color").is_some() {
+                    inferred |= env_mod_flags::HEMI_COLOR;
+                }
+                if inferred == 0 {
+                    env_mod_flags::ALL
+                } else {
+                    inferred
+                }
+            };
 
             modifiers.push(EnvModifier {
                 name: Some(section.to_string()),
@@ -735,28 +759,36 @@ impl LevelEnvModifiers {
             let sky_color = parse_vec3(doc.read_str(section, "sky_color")).unwrap_or([0.0; 3]);
             let hemi_color = parse_vec3(doc.read_str(section, "hemi_color")).unwrap_or([0.0; 3]);
 
-            let mut use_flags = 0u16;
-            if doc.read_str(section, "far_plane").is_some() {
-                use_flags |= env_mod_flags::VIEW_DIST;
-            }
-            if doc.read_str(section, "fog_color").is_some() {
-                use_flags |= env_mod_flags::FOG_COLOR;
-            }
-            if doc.read_str(section, "fog_density").is_some() {
-                use_flags |= env_mod_flags::FOG_DENSITY;
-            }
-            if doc.read_str(section, "ambient").is_some() {
-                use_flags |= env_mod_flags::AMBIENT_COLOR;
-            }
-            if doc.read_str(section, "sky_color").is_some() {
-                use_flags |= env_mod_flags::SKY_COLOR;
-            }
-            if doc.read_str(section, "hemi_color").is_some() {
-                use_flags |= env_mod_flags::HEMI_COLOR;
-            }
-            if use_flags == 0 {
-                use_flags = env_mod_flags::ALL;
-            }
+            let use_flags = if let Some(explicit) =
+                doc.read_str(section, "use_flags").and_then(parse_env_mod_use_flags)
+            {
+                explicit
+            } else {
+                let mut inferred = 0u16;
+                if doc.read_str(section, "far_plane").is_some() {
+                    inferred |= env_mod_flags::VIEW_DIST;
+                }
+                if doc.read_str(section, "fog_color").is_some() {
+                    inferred |= env_mod_flags::FOG_COLOR;
+                }
+                if doc.read_str(section, "fog_density").is_some() {
+                    inferred |= env_mod_flags::FOG_DENSITY;
+                }
+                if doc.read_str(section, "ambient").is_some() {
+                    inferred |= env_mod_flags::AMBIENT_COLOR;
+                }
+                if doc.read_str(section, "sky_color").is_some() {
+                    inferred |= env_mod_flags::SKY_COLOR;
+                }
+                if doc.read_str(section, "hemi_color").is_some() {
+                    inferred |= env_mod_flags::HEMI_COLOR;
+                }
+                if inferred == 0 {
+                    env_mod_flags::ALL
+                } else {
+                    inferred
+                }
+            };
 
             modifiers.push(EnvModifier {
                 name: Some(section.to_string()),
@@ -1197,5 +1229,73 @@ mod tests {
             transforms: [wf(0.0); 5],
         };
         assert_eq!(prog.evaluate_with_prev(custom, 3.0, &view_with_trans), custom);
+    }
+
+    #[test]
+    fn test_env_mods_ltx_explicit_use_flags_hex_and_decimal() {
+        use xray_core::ltx_loader::LoadedLtxSource;
+
+        let text = r#"
+[mod_fog_only]
+position = 10, 0, 10
+radius = 50
+power = 2.0
+far_plane = 300
+fog_color = 0.25, 0.35, 0.45
+fog_density = 0.9
+ambient = 0.4, 0.4, 0.4
+sky_color = 0.5, 0.5, 0.5
+hemi_color = 0.6, 0.6, 0.6
+use_flags = 0x02
+
+[mod_all_hex]
+position = 200, 0, 0
+radius = 10
+power = 1.0
+use_flags = 0X3F
+
+[mod_decimal]
+position = 500, 0, 0
+radius = 25
+power = 1.0
+far_plane = 120
+fog_density = 0.65
+ambient = 0.8, 0.8, 0.8
+use_flags = 5
+"#;
+        let borrowed = LtxDocument::parse(text);
+        let owned = OwnedLtxDocument::from_sources(&[LoadedLtxSource {
+            virtual_path: "configs\\environment\\env_mods\\test.ltx".to_string(),
+            depth: 0,
+            text: text.to_string(),
+        }]);
+
+        let parsed_b = LevelEnvModifiers::from_ltx(&borrowed);
+        let parsed_o = LevelEnvModifiers::from_owned_ltx(&owned);
+        assert_eq!(parsed_b, parsed_o);
+
+        // Sections sorted alphabetically: mod_all_hex, mod_decimal, mod_fog_only
+        assert_eq!(
+            parsed_o.modifiers[0].use_flags,
+            env_mod_flags::VIEW_DIST
+                | env_mod_flags::FOG_COLOR
+                | env_mod_flags::FOG_DENSITY
+                | env_mod_flags::AMBIENT_COLOR
+                | env_mod_flags::SKY_COLOR
+                | env_mod_flags::HEMI_COLOR
+        );
+        assert_eq!(
+            parsed_o.modifiers[1].use_flags,
+            env_mod_flags::VIEW_DIST | env_mod_flags::FOG_DENSITY
+        );
+        assert_eq!(parsed_o.modifiers[2].use_flags, env_mod_flags::FOG_COLOR);
+
+        // At [10, 0, 10], even though fog_density/ambient/etc. have values, only FOG_COLOR activates!
+        let accum = parsed_o.evaluate_at([10.0, 0.0, 10.0]);
+        assert_eq!(accum.active_flags, env_mod_flags::FOG_COLOR);
+        assert!((accum.fog_color[0] - 0.5).abs() < 1e-5);
+        assert_eq!(accum.fog_density, 0.0);
+        assert_eq!(accum.far_plane, 0.0);
+        assert_eq!(accum.ambient, [0.0; 3]);
     }
 }

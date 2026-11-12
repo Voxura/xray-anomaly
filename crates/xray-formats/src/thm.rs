@@ -359,6 +359,11 @@ impl TextureParams {
     }
 
     #[inline]
+    pub fn is_cubemap(&self) -> bool {
+        self.texture_type == TextureType::CubeMap
+    }
+
+    #[inline]
     pub fn has_diffuse_detail(&self) -> bool {
         (self.flags & texture_flags::FL_DIFFUSE_DETAIL) != 0 && !self.detail_name.is_empty()
     }
@@ -470,6 +475,545 @@ pub fn texture_stem_to_thm_vpath(tex_name: &str) -> String {
         format!("{work}.thm")
     } else {
         format!("textures\\{work}.thm")
+    }
+}
+
+// ============================================================================
+// Pure-Rust DDS Cubemap Header & Subresource Slicer
+// ============================================================================
+
+/// Little-endian `"DDS "` file magic (`0x20534444`).
+pub const DDS_MAGIC: u32 = 0x2053_4444;
+/// Size of `"DDS "` magic (4B) + `DDS_HEADER` (124B).
+pub const DDS_HEADER_BYTES: usize = 128;
+/// Size of `"DDS "` magic (4B) + `DDS_HEADER` (124B) + `DDS_HEADER_DXT10` (20B).
+pub const DDS_DX10_HEADER_BYTES: usize = 148;
+
+const DDSD_MIPMAPCOUNT: u32 = 0x0002_0000;
+const DDPF_ALPHAPIXELS: u32 = 0x0000_0001;
+const DDPF_FOURCC: u32 = 0x0000_0004;
+const DDPF_RGB: u32 = 0x0000_0040;
+
+const FOURCC_DXT1: u32 = u32::from_le_bytes(*b"DXT1");
+const FOURCC_DXT2: u32 = u32::from_le_bytes(*b"DXT2");
+const FOURCC_DXT3: u32 = u32::from_le_bytes(*b"DXT3");
+const FOURCC_DXT4: u32 = u32::from_le_bytes(*b"DXT4");
+const FOURCC_DXT5: u32 = u32::from_le_bytes(*b"DXT5");
+const FOURCC_ATI1: u32 = u32::from_le_bytes(*b"ATI1");
+const FOURCC_BC4U: u32 = u32::from_le_bytes(*b"BC4U");
+const FOURCC_BC4S: u32 = u32::from_le_bytes(*b"BC4S");
+const FOURCC_ATI2: u32 = u32::from_le_bytes(*b"ATI2");
+const FOURCC_BC5U: u32 = u32::from_le_bytes(*b"BC5U");
+const FOURCC_BC5S: u32 = u32::from_le_bytes(*b"BC5S");
+const FOURCC_DX10: u32 = u32::from_le_bytes(*b"DX10");
+
+/// DDS `dwCaps2` and `DDS_HEADER_DXT10::miscFlag` bitmasks for cubemaps.
+pub mod dds_caps2 {
+    pub const CUBEMAP: u32 = 0x0000_0200;
+    pub const CUBEMAP_POSITIVEX: u32 = 0x0000_0400;
+    pub const CUBEMAP_NEGATIVEX: u32 = 0x0000_0800;
+    pub const CUBEMAP_POSITIVEY: u32 = 0x0000_1000;
+    pub const CUBEMAP_NEGATIVEY: u32 = 0x0000_2000;
+    pub const CUBEMAP_POSITIVEZ: u32 = 0x0000_4000;
+    pub const CUBEMAP_NEGATIVEZ: u32 = 0x0000_8000;
+    pub const CUBEMAP_ALLFACES: u32 = 0x0000_FC00;
+    pub const DX10_MISC_TEXTURECUBE: u32 = 0x0000_0004;
+}
+
+/// Canonical Direct3D / DDS cubemap face order (`+X, -X, +Y, -Y, +Z, -Z`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum CubemapFace {
+    PositiveX = 0,
+    NegativeX = 1,
+    PositiveY = 2,
+    NegativeY = 3,
+    PositiveZ = 4,
+    NegativeZ = 5,
+}
+
+impl CubemapFace {
+    /// All 6 cubemap faces in DDS and D3D12 array-slice order.
+    pub const ALL: [Self; 6] = [
+        Self::PositiveX,
+        Self::NegativeX,
+        Self::PositiveY,
+        Self::NegativeY,
+        Self::PositiveZ,
+        Self::NegativeZ,
+    ];
+
+    #[inline]
+    pub const fn as_index(self) -> usize {
+        self as usize
+    }
+
+    #[inline]
+    pub const fn from_index(idx: usize) -> Option<Self> {
+        match idx {
+            0 => Some(Self::PositiveX),
+            1 => Some(Self::NegativeX),
+            2 => Some(Self::PositiveY),
+            3 => Some(Self::NegativeY),
+            4 => Some(Self::PositiveZ),
+            5 => Some(Self::NegativeZ),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub const fn dds_caps2_bit(self) -> u32 {
+        match self {
+            Self::PositiveX => dds_caps2::CUBEMAP_POSITIVEX,
+            Self::NegativeX => dds_caps2::CUBEMAP_NEGATIVEX,
+            Self::PositiveY => dds_caps2::CUBEMAP_POSITIVEY,
+            Self::NegativeY => dds_caps2::CUBEMAP_NEGATIVEY,
+            Self::PositiveZ => dds_caps2::CUBEMAP_POSITIVEZ,
+            Self::NegativeZ => dds_caps2::CUBEMAP_NEGATIVEZ,
+        }
+    }
+
+    /// D3D12 subresource index (`D3D12CalcSubresource(mip, face, 0, mip_count, 6)`).
+    #[inline]
+    pub const fn d3d12_subresource_index(self, mip_level: u32, mip_count: u32) -> u32 {
+        mip_level + (self as u32) * mip_count
+    }
+}
+
+/// Pure-Rust DDS pixel format descriptor mapped cleanly to numeric `DXGI_FORMAT` IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DdsPixelFormatKind {
+    Bc1Unorm,
+    Bc1UnormSrgb,
+    Bc2Unorm,
+    Bc2UnormSrgb,
+    Bc3Unorm,
+    Bc3UnormSrgb,
+    Bc4Unorm,
+    Bc4Snorm,
+    Bc5Unorm,
+    Bc5Snorm,
+    Bc6hUf16,
+    Bc6hSf16,
+    Bc7Unorm,
+    Bc7UnormSrgb,
+    Rgba8Unorm,
+    Rgba8UnormSrgb,
+    Bgra8Unorm,
+    Bgra8UnormSrgb,
+    Bgrx8Unorm,
+    Bgrx8UnormSrgb,
+    R16G16B16A16Float,
+    R32G32B32A32Float,
+    R16G16B16A16Unorm,
+    R10G10B10A2Unorm,
+    R11G11B10Float,
+}
+
+impl DdsPixelFormatKind {
+    /// Numeric `DXGI_FORMAT` enum value (`dxgiformat.h`).
+    #[inline]
+    pub const fn dxgi_format(self) -> u32 {
+        match self {
+            Self::R32G32B32A32Float => 2,
+            Self::R16G16B16A16Float => 10,
+            Self::R16G16B16A16Unorm => 11,
+            Self::R10G10B10A2Unorm => 24,
+            Self::R11G11B10Float => 26,
+            Self::Rgba8Unorm => 28,
+            Self::Rgba8UnormSrgb => 29,
+            Self::Bc1Unorm => 71,
+            Self::Bc1UnormSrgb => 72,
+            Self::Bc2Unorm => 74,
+            Self::Bc2UnormSrgb => 75,
+            Self::Bc3Unorm => 77,
+            Self::Bc3UnormSrgb => 78,
+            Self::Bc4Unorm => 80,
+            Self::Bc4Snorm => 81,
+            Self::Bc5Unorm => 83,
+            Self::Bc5Snorm => 84,
+            Self::Bgra8Unorm => 87,
+            Self::Bgrx8Unorm => 88,
+            Self::Bgra8UnormSrgb => 91,
+            Self::Bgrx8UnormSrgb => 93,
+            Self::Bc6hUf16 => 95,
+            Self::Bc6hSf16 => 96,
+            Self::Bc7Unorm => 98,
+            Self::Bc7UnormSrgb => 99,
+        }
+    }
+
+    #[inline]
+    pub const fn from_dxgi_format(dxgi_format: u32) -> Option<Self> {
+        match dxgi_format {
+            2 => Some(Self::R32G32B32A32Float),
+            10 => Some(Self::R16G16B16A16Float),
+            11 => Some(Self::R16G16B16A16Unorm),
+            24 => Some(Self::R10G10B10A2Unorm),
+            26 => Some(Self::R11G11B10Float),
+            28 => Some(Self::Rgba8Unorm),
+            29 => Some(Self::Rgba8UnormSrgb),
+            71 => Some(Self::Bc1Unorm),
+            72 => Some(Self::Bc1UnormSrgb),
+            74 => Some(Self::Bc2Unorm),
+            75 => Some(Self::Bc2UnormSrgb),
+            77 => Some(Self::Bc3Unorm),
+            78 => Some(Self::Bc3UnormSrgb),
+            80 => Some(Self::Bc4Unorm),
+            81 => Some(Self::Bc4Snorm),
+            83 => Some(Self::Bc5Unorm),
+            84 => Some(Self::Bc5Snorm),
+            87 => Some(Self::Bgra8Unorm),
+            88 => Some(Self::Bgrx8Unorm),
+            91 => Some(Self::Bgra8UnormSrgb),
+            93 => Some(Self::Bgrx8UnormSrgb),
+            95 => Some(Self::Bc6hUf16),
+            96 => Some(Self::Bc6hSf16),
+            98 => Some(Self::Bc7Unorm),
+            99 => Some(Self::Bc7UnormSrgb),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub const fn is_block_compressed(self) -> bool {
+        matches!(
+            self,
+            Self::Bc1Unorm
+                | Self::Bc1UnormSrgb
+                | Self::Bc2Unorm
+                | Self::Bc2UnormSrgb
+                | Self::Bc3Unorm
+                | Self::Bc3UnormSrgb
+                | Self::Bc4Unorm
+                | Self::Bc4Snorm
+                | Self::Bc5Unorm
+                | Self::Bc5Snorm
+                | Self::Bc6hUf16
+                | Self::Bc6hSf16
+                | Self::Bc7Unorm
+                | Self::Bc7UnormSrgb
+        )
+    }
+
+    /// Bytes per 4x4 block (if block-compressed) or bytes per pixel (if uncompressed).
+    #[inline]
+    pub const fn bytes_per_block_or_pixel(self) -> u32 {
+        match self {
+            Self::Bc1Unorm | Self::Bc1UnormSrgb | Self::Bc4Unorm | Self::Bc4Snorm => 8,
+            Self::Bc2Unorm
+            | Self::Bc2UnormSrgb
+            | Self::Bc3Unorm
+            | Self::Bc3UnormSrgb
+            | Self::Bc5Unorm
+            | Self::Bc5Snorm
+            | Self::Bc6hUf16
+            | Self::Bc6hSf16
+            | Self::Bc7Unorm
+            | Self::Bc7UnormSrgb => 16,
+            Self::Rgba8Unorm
+            | Self::Rgba8UnormSrgb
+            | Self::Bgra8Unorm
+            | Self::Bgra8UnormSrgb
+            | Self::Bgrx8Unorm
+            | Self::Bgrx8UnormSrgb
+            | Self::R10G10B10A2Unorm
+            | Self::R11G11B10Float => 4,
+            Self::R16G16B16A16Float | Self::R16G16B16A16Unorm => 8,
+            Self::R32G32B32A32Float => 16,
+        }
+    }
+}
+
+/// Byte slice coordinates for a single `(face, mip_level)` inside a DDS cubemap buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DdsSubresourceSlice {
+    pub face: CubemapFace,
+    pub mip_level: u32,
+    pub width: u32,
+    pub height: u32,
+    pub row_pitch: u32,
+    pub slice_pitch: u32,
+    pub offset: usize,
+    pub byte_len: usize,
+}
+
+impl DdsSubresourceSlice {
+    /// Zero-copy view of this face/mip payload within `dds_bytes`.
+    #[inline]
+    pub fn slice_bytes<'a>(&self, dds_bytes: &'a [u8]) -> Option<&'a [u8]> {
+        dds_bytes.get(self.offset..self.offset.saturating_add(self.byte_len))
+    }
+}
+
+#[inline]
+fn read_le_u32(bytes: &[u8], off: usize) -> Result<u32, FormatError> {
+    let slice = bytes.get(off..off + 4).ok_or(FormatError::UnexpectedEof)?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+/// Zero-copy DDS cubemap layout & face/mip offset table (`+X, -X, +Y, -Y, +Z, -Z` x `0..mip_count`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DdsCubemapLayout {
+    pub width: u32,
+    pub height: u32,
+    pub mip_count: u32,
+    pub format: DdsPixelFormatKind,
+    pub dxgi_format: u32,
+    pub is_dx10: bool,
+    pub present_faces_mask: u32,
+    pub data_offset: usize,
+    pub total_payload_bytes: usize,
+    /// All `6 * mip_count` subresources stored in face-major order (`face * mip_count + mip`),
+    /// matching both DDS file layout and `D3D12CalcSubresource`.
+    pub subresources: Vec<DdsSubresourceSlice>,
+}
+
+impl DdsCubemapLayout {
+    /// Fast header check returning `true` if `dds_bytes` starts with a valid cubemap DDS header.
+    pub fn is_dds_cubemap(dds_bytes: &[u8]) -> bool {
+        if dds_bytes.len() < DDS_HEADER_BYTES {
+            return false;
+        }
+        let Ok(magic) = read_le_u32(dds_bytes, 0) else {
+            return false;
+        };
+        let Ok(header_size) = read_le_u32(dds_bytes, 4) else {
+            return false;
+        };
+        if magic != DDS_MAGIC || header_size != 124 {
+            return false;
+        }
+        let Ok(pf_flags) = read_le_u32(dds_bytes, 80) else {
+            return false;
+        };
+        let Ok(pf_fourcc) = read_le_u32(dds_bytes, 84) else {
+            return false;
+        };
+        let Ok(caps2) = read_le_u32(dds_bytes, 112) else {
+            return false;
+        };
+        if (pf_flags & DDPF_FOURCC) != 0 && pf_fourcc == FOURCC_DX10 {
+            if dds_bytes.len() < DDS_DX10_HEADER_BYTES {
+                return false;
+            }
+            let Ok(misc_flag) = read_le_u32(dds_bytes, 136) else {
+                return false;
+            };
+            (misc_flag & dds_caps2::DX10_MISC_TEXTURECUBE) != 0
+                || (caps2 & dds_caps2::CUBEMAP) != 0
+        } else {
+            (caps2 & dds_caps2::CUBEMAP) != 0
+        }
+    }
+
+    /// Parse and validate a legacy (`128B`) or DX10 (`148B`) DDS cubemap buffer, computing
+    /// exact byte offsets and D3D12-aligned subresource slices for all 6 faces and mip levels.
+    pub fn parse(dds_bytes: &[u8]) -> Result<Self, FormatError> {
+        if dds_bytes.len() < DDS_HEADER_BYTES {
+            return Err(FormatError::UnexpectedEof);
+        }
+        if read_le_u32(dds_bytes, 0)? != DDS_MAGIC {
+            return Err(FormatError::InvalidValue("invalid DDS magic"));
+        }
+        if read_le_u32(dds_bytes, 4)? != 124 {
+            return Err(FormatError::InvalidValue("invalid DDS_HEADER dwSize (expected 124)"));
+        }
+
+        let flags = read_le_u32(dds_bytes, 8)?;
+        let height = read_le_u32(dds_bytes, 12)?;
+        let width = read_le_u32(dds_bytes, 16)?;
+        if width == 0 || height == 0 {
+            return Err(FormatError::InvalidValue("DDS cubemap has zero dimension"));
+        }
+        let mip_count = if (flags & DDSD_MIPMAPCOUNT) != 0 {
+            read_le_u32(dds_bytes, 28)?.max(1)
+        } else {
+            1
+        };
+
+        let pf_flags = read_le_u32(dds_bytes, 80)?;
+        let pf_fourcc = read_le_u32(dds_bytes, 84)?;
+        let pf_rgb_bits = read_le_u32(dds_bytes, 88)?;
+        let pf_r_mask = read_le_u32(dds_bytes, 92)?;
+        let pf_g_mask = read_le_u32(dds_bytes, 96)?;
+        let pf_b_mask = read_le_u32(dds_bytes, 100)?;
+        let pf_a_mask = read_le_u32(dds_bytes, 104)?;
+        let caps2 = read_le_u32(dds_bytes, 112)?;
+
+        let mut is_dx10 = false;
+        let mut data_offset = DDS_HEADER_BYTES;
+        let present_faces_mask: u32;
+
+        let format = if (pf_flags & DDPF_FOURCC) != 0 && pf_fourcc == FOURCC_DX10 {
+            is_dx10 = true;
+            data_offset = DDS_DX10_HEADER_BYTES;
+            if dds_bytes.len() < DDS_DX10_HEADER_BYTES {
+                return Err(FormatError::UnexpectedEof);
+            }
+            let dxgi_fmt = read_le_u32(dds_bytes, 128)?;
+            let resource_dim = read_le_u32(dds_bytes, 132)?;
+            let misc_flag = read_le_u32(dds_bytes, 136)?;
+            let array_size = read_le_u32(dds_bytes, 140)?;
+            if resource_dim != 3 {
+                return Err(FormatError::InvalidValue(
+                    "DX10 DDS cubemap must have Texture2D resourceDimension (3)",
+                ));
+            }
+            if (misc_flag & dds_caps2::DX10_MISC_TEXTURECUBE) == 0
+                && (caps2 & dds_caps2::CUBEMAP) == 0
+            {
+                return Err(FormatError::InvalidValue("DDS file is not marked as a cubemap"));
+            }
+            if array_size > 1 {
+                return Err(FormatError::InvalidValue(
+                    "cubemap arrays (arraySize > 1) are not supported by DdsCubemapLayout",
+                ));
+            }
+            present_faces_mask = dds_caps2::CUBEMAP_ALLFACES;
+            DdsPixelFormatKind::from_dxgi_format(dxgi_fmt)
+                .ok_or(FormatError::InvalidValue("unsupported DX10 cubemap DXGI_FORMAT"))?
+        } else {
+            if (caps2 & dds_caps2::CUBEMAP) == 0 {
+                return Err(FormatError::InvalidValue("DDS file is not marked as a cubemap"));
+            }
+            let face_bits = caps2 & dds_caps2::CUBEMAP_ALLFACES;
+            if face_bits != 0 && face_bits != dds_caps2::CUBEMAP_ALLFACES {
+                return Err(FormatError::InvalidValue(
+                    "incomplete legacy DDS cubemap (expected all 6 faces)",
+                ));
+            }
+            present_faces_mask = dds_caps2::CUBEMAP_ALLFACES;
+
+            if (pf_flags & DDPF_FOURCC) != 0 {
+                match pf_fourcc {
+                    FOURCC_DXT1 => DdsPixelFormatKind::Bc1Unorm,
+                    FOURCC_DXT2 | FOURCC_DXT3 => DdsPixelFormatKind::Bc2Unorm,
+                    FOURCC_DXT4 | FOURCC_DXT5 => DdsPixelFormatKind::Bc3Unorm,
+                    FOURCC_ATI1 | FOURCC_BC4U => DdsPixelFormatKind::Bc4Unorm,
+                    FOURCC_BC4S => DdsPixelFormatKind::Bc4Snorm,
+                    FOURCC_ATI2 | FOURCC_BC5U => DdsPixelFormatKind::Bc5Unorm,
+                    FOURCC_BC5S => DdsPixelFormatKind::Bc5Snorm,
+                    // D3DFMT_A16B16G16R16 (36), A16B16G16R16F (113), A32B32G32R32F (116)
+                    36 => DdsPixelFormatKind::R16G16B16A16Unorm,
+                    113 => DdsPixelFormatKind::R16G16B16A16Float,
+                    116 => DdsPixelFormatKind::R32G32B32A32Float,
+                    _ => return Err(FormatError::InvalidValue("unsupported DDS cubemap FourCC")),
+                }
+            } else if (pf_flags & DDPF_RGB) != 0 && pf_rgb_bits == 32 {
+                if pf_r_mask == 0x0000_00FF
+                    && pf_g_mask == 0x0000_FF00
+                    && pf_b_mask == 0x00FF_0000
+                {
+                    DdsPixelFormatKind::Rgba8Unorm
+                } else if pf_r_mask == 0x00FF_0000
+                    && pf_g_mask == 0x0000_FF00
+                    && pf_b_mask == 0x0000_00FF
+                {
+                    if (pf_flags & DDPF_ALPHAPIXELS) != 0 && pf_a_mask != 0 {
+                        DdsPixelFormatKind::Bgra8Unorm
+                    } else {
+                        DdsPixelFormatKind::Bgrx8Unorm
+                    }
+                } else {
+                    return Err(FormatError::InvalidValue("unsupported DDS cubemap RGB masks"));
+                }
+            } else {
+                return Err(FormatError::InvalidValue("unsupported DDS cubemap pixel format"));
+            }
+        };
+
+        let is_bc = format.is_block_compressed();
+        let bpp_or_block = format.bytes_per_block_or_pixel();
+        let mut subresources = Vec::with_capacity(6 * (mip_count as usize));
+        let mut cursor = data_offset;
+
+        for face in CubemapFace::ALL {
+            let mut mip_w = width;
+            let mut mip_h = height;
+            for mip_level in 0..mip_count {
+                let (row_pitch, slice_pitch) = if is_bc {
+                    let bw = mip_w.div_ceil(4);
+                    let bh = mip_h.div_ceil(4);
+                    let rp = bw
+                        .checked_mul(bpp_or_block)
+                        .ok_or(FormatError::InvalidValue("DDS row pitch overflow"))?;
+                    let sp = rp
+                        .checked_mul(bh)
+                        .ok_or(FormatError::InvalidValue("DDS slice pitch overflow"))?;
+                    (rp, sp)
+                } else {
+                    let rp = mip_w
+                        .checked_mul(bpp_or_block)
+                        .ok_or(FormatError::InvalidValue("DDS row pitch overflow"))?;
+                    let sp = rp
+                        .checked_mul(mip_h)
+                        .ok_or(FormatError::InvalidValue("DDS slice pitch overflow"))?;
+                    (rp, sp)
+                };
+
+                let byte_len = slice_pitch as usize;
+                let end = cursor
+                    .checked_add(byte_len)
+                    .ok_or(FormatError::InvalidValue("DDS offset overflow"))?;
+                if end > dds_bytes.len() {
+                    return Err(FormatError::UnexpectedEof);
+                }
+
+                subresources.push(DdsSubresourceSlice {
+                    face,
+                    mip_level,
+                    width: mip_w,
+                    height: mip_h,
+                    row_pitch,
+                    slice_pitch,
+                    offset: cursor,
+                    byte_len,
+                });
+
+                cursor = end;
+                mip_w = (mip_w / 2).max(1);
+                mip_h = (mip_h / 2).max(1);
+            }
+        }
+
+        Ok(Self {
+            width,
+            height,
+            mip_count,
+            format,
+            dxgi_format: format.dxgi_format(),
+            is_dx10,
+            present_faces_mask,
+            data_offset,
+            total_payload_bytes: cursor - data_offset,
+            subresources,
+        })
+    }
+
+    #[inline]
+    pub fn subresource(&self, face: CubemapFace, mip_level: u32) -> Option<&DdsSubresourceSlice> {
+        if mip_level >= self.mip_count {
+            return None;
+        }
+        let idx = face.as_index() * (self.mip_count as usize) + (mip_level as usize);
+        self.subresources.get(idx)
+    }
+
+    #[inline]
+    pub fn face_mips(&self, face: CubemapFace) -> &[DdsSubresourceSlice] {
+        let m = self.mip_count as usize;
+        let start = face.as_index() * m;
+        self.subresources.get(start..start + m).unwrap_or(&[])
+    }
+
+    #[inline]
+    pub const fn d3d12_subresource_index(&self, face: CubemapFace, mip_level: u32) -> Option<u32> {
+        if mip_level < self.mip_count {
+            Some(face.d3d12_subresource_index(mip_level, self.mip_count))
+        } else {
+            None
+        }
     }
 }
 
@@ -590,5 +1134,139 @@ mod tests {
         ));
         assert!(TextureFormat::Dxt5.has_alpha_channel());
         assert!(!TextureFormat::Dxt1.has_alpha_channel());
+    }
+
+    fn build_synthetic_cubemap_dds(
+        width: u32,
+        height: u32,
+        mip_count: u32,
+        fourcc: u32,
+        dx10_fmt: Option<u32>,
+        caps2: u32,
+        dx10_misc: u32,
+    ) -> Vec<u8> {
+        let mut hdr = vec![0u8; DDS_HEADER_BYTES];
+        hdr[0..4].copy_from_slice(&DDS_MAGIC.to_le_bytes());
+        hdr[4..8].copy_from_slice(&124u32.to_le_bytes());
+        let flags = 0x1 | 0x2 | 0x4 | 0x1000 | if mip_count > 1 { DDSD_MIPMAPCOUNT } else { 0 };
+        hdr[8..12].copy_from_slice(&flags.to_le_bytes());
+        hdr[12..16].copy_from_slice(&height.to_le_bytes());
+        hdr[16..20].copy_from_slice(&width.to_le_bytes());
+        hdr[28..32].copy_from_slice(&mip_count.to_le_bytes());
+        hdr[76..80].copy_from_slice(&32u32.to_le_bytes()); // ddspf size
+        hdr[80..84].copy_from_slice(&DDPF_FOURCC.to_le_bytes());
+        hdr[84..88].copy_from_slice(&fourcc.to_le_bytes());
+        hdr[108..112].copy_from_slice(&0x0040_1008u32.to_le_bytes()); // COMPLEX | MIPMAP | TEXTURE
+        hdr[112..116].copy_from_slice(&caps2.to_le_bytes());
+
+        if let Some(dxgi) = dx10_fmt {
+            hdr.extend_from_slice(&dxgi.to_le_bytes());
+            hdr.extend_from_slice(&3u32.to_le_bytes()); // Texture2D
+            hdr.extend_from_slice(&dx10_misc.to_le_bytes());
+            hdr.extend_from_slice(&1u32.to_le_bytes()); // arraySize = 1 cubemap
+            hdr.extend_from_slice(&0u32.to_le_bytes()); // miscFlags2
+        }
+
+        let fmt = dx10_fmt
+            .and_then(DdsPixelFormatKind::from_dxgi_format)
+            .unwrap_or(DdsPixelFormatKind::Bc1Unorm);
+        let bpb = fmt.bytes_per_block_or_pixel();
+
+        for face in 0..6u8 {
+            let mut mw = width;
+            let mut mh = height;
+            for mip in 0..mip_count {
+                let sz = if fmt.is_block_compressed() {
+                    mw.div_ceil(4) * mh.div_ceil(4) * bpb
+                } else {
+                    mw * mh * bpb
+                } as usize;
+                let tag = (face << 4) | (mip as u8);
+                hdr.resize(hdr.len() + sz, tag);
+                mw = (mw / 2).max(1);
+                mh = (mh / 2).max(1);
+            }
+        }
+        hdr
+    }
+
+    #[test]
+    fn test_thm_is_cubemap_and_dds_cubemap_legacy_dx10_slicing() {
+        // 1. Legacy DXT1 8x8 cubemap with 2 mips: mip0 = 4 blocks * 8 = 32B, mip1 = 1 block * 8 = 8B -> 40B/face, 240B total
+        let legacy = build_synthetic_cubemap_dds(
+            8,
+            8,
+            2,
+            FOURCC_DXT1,
+            None,
+            dds_caps2::CUBEMAP | dds_caps2::CUBEMAP_ALLFACES,
+            0,
+        );
+        assert!(DdsCubemapLayout::is_dds_cubemap(&legacy));
+        let layout = DdsCubemapLayout::parse(&legacy).unwrap();
+        assert!(!layout.is_dx10);
+        assert_eq!(layout.format, DdsPixelFormatKind::Bc1Unorm);
+        assert_eq!(layout.dxgi_format, 71);
+        assert_eq!(layout.mip_count, 2);
+        assert_eq!(layout.data_offset, 128);
+        assert_eq!(layout.total_payload_bytes, 240);
+        assert_eq!(layout.subresources.len(), 12);
+
+        let neg_z_mip1 = layout.subresource(CubemapFace::NegativeZ, 1).unwrap();
+        assert_eq!(
+            layout.d3d12_subresource_index(CubemapFace::NegativeZ, 1),
+            Some(11)
+        );
+        assert_eq!(neg_z_mip1.slice_bytes(&legacy).unwrap(), &[0x51; 8]);
+        assert_eq!(layout.face_mips(CubemapFace::PositiveY).len(), 2);
+
+        // 2. DX10 BC6H_UF16 4x4 cubemap with 1 mip marked only via DX10 miscFlag (TEXTURECUBE)
+        let dx10 = build_synthetic_cubemap_dds(
+            4,
+            4,
+            1,
+            FOURCC_DX10,
+            Some(95),
+            0,
+            dds_caps2::DX10_MISC_TEXTURECUBE,
+        );
+        assert!(DdsCubemapLayout::is_dds_cubemap(&dx10));
+        let dx10_layout = DdsCubemapLayout::parse(&dx10).unwrap();
+        assert!(dx10_layout.is_dx10);
+        assert_eq!(dx10_layout.format, DdsPixelFormatKind::Bc6hUf16);
+        assert_eq!(dx10_layout.dxgi_format, 95);
+        assert_eq!(dx10_layout.total_payload_bytes, 6 * 16);
+        assert_eq!(
+            dx10_layout
+                .subresource(CubemapFace::PositiveY, 0)
+                .unwrap()
+                .slice_bytes(&dx10)
+                .unwrap(),
+            &[0x20; 16]
+        );
+
+        // 3. Reject non-cubemap 2D DDS & truncated buffers
+        let flat_2d = build_synthetic_cubemap_dds(8, 8, 1, FOURCC_DXT1, None, 0, 0);
+        assert!(!DdsCubemapLayout::is_dds_cubemap(&flat_2d));
+        assert!(DdsCubemapLayout::parse(&flat_2d).is_err());
+
+        let truncated = &legacy[..legacy.len() - 4];
+        assert!(matches!(
+            DdsCubemapLayout::parse(truncated),
+            Err(FormatError::UnexpectedEof)
+        ));
+
+        // 4. THM is_cubemap check
+        let mut thm_w = ChunkWriter::new();
+        let mut tp = vec![0u8; 32];
+        tp[24..28].copy_from_slice(&512u32.to_le_bytes());
+        tp[28..32].copy_from_slice(&512u32.to_le_bytes());
+        thm_w.write_chunk(thm_chunks::THM_CHUNK_TEXTUREPARAM, &tp);
+        thm_w.write_chunk(
+            thm_chunks::THM_CHUNK_TEXTURE_TYPE,
+            &(TextureType::CubeMap as u32).to_le_bytes(),
+        );
+        let thm = TextureParams::parse(&thm_w.into_bytes()).unwrap();
+        assert!(thm.is_cubemap());
     }
 }

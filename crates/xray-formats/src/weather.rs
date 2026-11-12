@@ -15,10 +15,254 @@ use std::collections::BTreeMap;
 use xray_core::ltx_loader::OwnedLtxDocument;
 
 use crate::chunk::FormatError;
+use crate::ogf::{matrix_mul_43, matrix_rotate_y, XRayMatrix, XRAY_IDENTITY_MATRIX};
 use crate::shaders_xr::{env_mod_flags, EnvModAccum, LevelEnvModifiers};
+use crate::thm::texture_stem_to_dds_vpath;
 
 pub const DAY_LENGTH: f32 = 86_400.0;
 pub const WFX_TRANS_TIME: f32 = 5.0;
+
+// ============================================================================
+// Skybox Half-Box, Clouds Hemisphere, Wind & Rain Render Constants
+// ============================================================================
+
+/// Number of unique vertices in X-Ray's skybox half-box (`dxEnvironmentRender.cpp:15-36`).
+pub const SKYBOX_HBOX_VERTEX_COUNT: usize = 12;
+/// Number of triangles in X-Ray's skybox half-box (`dxEnvironmentRender.cpp:37-59`).
+pub const SKYBOX_HBOX_TRIANGLE_COUNT: usize = 20;
+/// Number of indices (`20 * 3`) in X-Ray's skybox half-box.
+pub const SKYBOX_HBOX_INDEX_COUNT: usize = 60;
+
+/// Single skybox half-box vertex (`v_skybox` position + 3D cubemap texcoord).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkyboxVertex {
+    pub pos: [f32; 3],
+    pub texcoord: [f32; 3],
+}
+
+/// 12 skybox half-box vertex positions matching `hbox_verts[v * 2]` (`dxEnvironmentRender.cpp:15-36`).
+pub const SKYBOX_HBOX_POSITIONS: [[f32; 3]; SKYBOX_HBOX_VERTEX_COUNT] = [
+    [-1.0, -1.0, -1.0],
+    [1.0, -1.0, -1.0],
+    [-1.0, -1.0, 1.0],
+    [1.0, -1.0, 1.0],
+    [-1.0, 1.0, -1.0],
+    [1.0, 1.0, -1.0],
+    [-1.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [-1.0, 0.0, -1.0],
+    [1.0, 0.0, -1.0],
+    [1.0, 0.0, 1.0],
+    [-1.0, 0.0, 1.0],
+];
+
+/// 12 skybox half-box 3D cubemap lookup coordinates matching `hbox_verts[v * 2 + 1]`
+/// (note bottom 4 vertices use `-1.01` Y for horizon seam compensation).
+pub const SKYBOX_HBOX_TEXCOORDS: [[f32; 3]; SKYBOX_HBOX_VERTEX_COUNT] = [
+    [-1.0, -1.01, -1.0],
+    [1.0, -1.01, -1.0],
+    [-1.0, -1.01, 1.0],
+    [1.0, -1.01, 1.0],
+    [-1.0, 1.0, -1.0],
+    [1.0, 1.0, -1.0],
+    [-1.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0],
+    [-1.0, -1.0, -1.0],
+    [1.0, -1.0, -1.0],
+    [1.0, -1.0, 1.0],
+    [-1.0, -1.0, 1.0],
+];
+
+/// 60 indices (`20 * 3`) matching `hbox_faces` (`dxEnvironmentRender.cpp:37-59`).
+pub const SKYBOX_HBOX_INDICES: [u16; SKYBOX_HBOX_INDEX_COUNT] = [
+    0, 2, 3, 3, 1, 0, 4, 5, 7, 7, 6, 4, 0, 1, 9, 9, 8, 0, 8, 9, 5, 5, 4, 8, 1, 3, 10, 10, 9, 1,
+    9, 10, 7, 7, 5, 9, 3, 2, 11, 11, 10, 3, 10, 11, 6, 6, 7, 10, 2, 0, 8, 8, 11, 2, 11, 8, 4, 4,
+    6, 11,
+];
+
+/// Construct the interleaved 12-vertex / 60-index skybox half-box mesh.
+pub fn skybox_hbox_mesh() -> ([SkyboxVertex; SKYBOX_HBOX_VERTEX_COUNT], [u16; SKYBOX_HBOX_INDEX_COUNT])
+{
+    let mut verts = [SkyboxVertex {
+        pos: [0.0; 3],
+        texcoord: [0.0; 3],
+    }; SKYBOX_HBOX_VERTEX_COUNT];
+    for (i, slot) in verts.iter_mut().enumerate() {
+        slot.pos = SKYBOX_HBOX_POSITIONS[i];
+        slot.texcoord = SKYBOX_HBOX_TEXCOORDS[i];
+    }
+    (verts, SKYBOX_HBOX_INDICES)
+}
+
+/// Number of vertices in X-Ray's tessellated clouds dome (`HEMI2_VERTS` in `xrHemisphere.cpp`).
+pub const CLOUDS_HEMI_VERTEX_COUNT: usize = 91;
+/// Number of triangles in X-Ray's tessellated clouds dome (`HEMI2_FACES` in `xrHemisphere.cpp`).
+pub const CLOUDS_HEMI_TRIANGLE_COUNT: usize = 160;
+/// Number of indices (`160 * 3`) in `CLOUDS_HEMI_INDICES`.
+pub const CLOUDS_HEMI_INDEX_COUNT: usize = 480;
+
+/// 91 unit-hemisphere vertex positions for cloud dome rendering (`hemi_2` in `xrHemisphere.cpp:86-179`).
+pub const CLOUDS_HEMI_POSITIONS: [[f32; 3]; CLOUDS_HEMI_VERTEX_COUNT] = [
+    [0.273268, 0.961937, -0.000000],
+    [0.084444, 0.961937, 0.259892],
+    [0.000000, 1.000000, -0.000000],
+    [0.525730, 0.850655, -0.000000],
+    [0.361805, 0.894424, 0.262865],
+    [0.162460, 0.850655, 0.500000],
+    [-0.221077, 0.961937, 0.160622],
+    [-0.138196, 0.894424, 0.425324],
+    [-0.425324, 0.850655, 0.309015],
+    [-0.221077, 0.961937, -0.160623],
+    [-0.447212, 0.894424, -0.000001],
+    [-0.425324, 0.850655, -0.309017],
+    [0.084445, 0.961937, -0.259892],
+    [-0.138196, 0.894424, -0.425327],
+    [0.162460, 0.850655, -0.500000],
+    [0.361805, 0.894424, -0.262865],
+    [0.447212, 0.723610, 0.525730],
+    [0.638195, 0.723610, 0.262865],
+    [0.688194, 0.525730, 0.500000],
+    [-0.361801, 0.723610, 0.587784],
+    [-0.052786, 0.723610, 0.688187],
+    [-0.262865, 0.525730, 0.809013],
+    [-0.670822, 0.723610, -0.162460],
+    [-0.670822, 0.723610, 0.162458],
+    [-0.850647, 0.525730, -0.000001],
+    [-0.052786, 0.723610, -0.688194],
+    [-0.361801, 0.723610, -0.587788],
+    [-0.262865, 0.525730, -0.809021],
+    [0.638195, 0.723610, -0.262865],
+    [0.447212, 0.723610, -0.525734],
+    [0.688194, 0.525730, -0.500000],
+    [0.738174, 0.674606, -0.000000],
+    [0.822617, 0.505722, -0.259892],
+    [0.894424, 0.447212, -0.000000],
+    [0.822617, 0.505722, 0.259892],
+    [0.228109, 0.674606, 0.702049],
+    [0.501377, 0.505722, 0.702049],
+    [0.276394, 0.447212, 0.850647],
+    [0.007032, 0.505722, 0.862671],
+    [-0.597195, 0.674606, 0.433887],
+    [-0.512752, 0.505722, 0.693779],
+    [-0.723602, 0.447212, 0.525730],
+    [-0.818275, 0.505722, 0.273266],
+    [-0.597195, 0.674606, -0.433887],
+    [-0.818275, 0.505722, -0.273268],
+    [-0.723602, 0.447212, -0.525734],
+    [-0.512753, 0.505722, -0.693779],
+    [0.228109, 0.674606, -0.702049],
+    [0.007032, 0.505722, -0.862671],
+    [0.276394, 0.447212, -0.850655],
+    [0.501377, 0.505722, -0.702049],
+    [0.861801, 0.276394, 0.425323],
+    [0.959251, 0.232454, 0.160622],
+    [0.951057, 0.000000, 0.309017],
+    [0.449184, 0.232454, 0.862671],
+    [0.670822, 0.276394, 0.688187],
+    [0.587788, 0.000000, 0.809013],
+    [-0.138196, 0.276394, 0.951057],
+    [0.143665, 0.232454, 0.961937],
+    [0.000000, 0.000000, 1.000000],
+    [-0.681641, 0.232454, 0.693779],
+    [-0.447212, 0.276394, 0.850647],
+    [-0.587784, 0.000000, 0.809013],
+    [-0.947212, 0.276394, 0.162458],
+    [-0.870460, 0.232454, 0.433887],
+    [-0.951057, 0.000000, 0.309015],
+    [-0.870460, 0.232454, -0.433887],
+    [-0.947212, 0.276394, -0.162460],
+    [-0.951057, 0.000000, -0.309017],
+    [-0.447212, 0.276394, -0.850655],
+    [-0.681641, 0.232454, -0.693779],
+    [-0.587784, 0.000000, -0.809021],
+    [0.143665, 0.232454, -0.961937],
+    [-0.138196, 0.276394, -0.951057],
+    [0.000000, 0.000000, -1.000000],
+    [0.670822, 0.276394, -0.688194],
+    [0.449188, 0.232454, -0.862671],
+    [0.587788, 0.000000, -0.809013],
+    [0.959251, 0.232454, -0.160623],
+    [0.861801, 0.276394, -0.425327],
+    [0.951057, 0.000000, -0.309017],
+    [1.000000, 0.000000, -0.000000],
+    [0.809021, 0.000000, 0.587784],
+    [0.309017, 0.000000, 0.951057],
+    [-0.309015, 0.000000, 0.951057],
+    [-0.809013, 0.000000, 0.587784],
+    [-1.000000, 0.000000, -0.000001],
+    [-0.809013, 0.000000, -0.587788],
+    [-0.309015, 0.000000, -0.951057],
+    [0.309017, 0.000000, -0.951057],
+    [0.809021, 0.000000, -0.587788],
+];
+
+/// 480 triangle indices (`160 * 3`) for cloud dome rendering (`hemi_2v` in `xrHemisphere.cpp:180-342`).
+pub const CLOUDS_HEMI_INDICES: [u16; CLOUDS_HEMI_INDEX_COUNT] = [
+    0, 1, 2, 3, 4, 0, 4, 1, 0, 4, 5, 1, 1, 6, 2, 5, 7, 1, 7, 6, 1, 7, 8, 6, 6, 9, 2, 8, 10, 6,
+    10, 9, 6, 10, 11, 9, 9, 12, 2, 11, 13, 9, 13, 12, 9, 13, 14, 12, 12, 0, 2, 14, 15, 12, 15, 0,
+    12, 15, 3, 0, 16, 17, 18, 5, 4, 16, 4, 17, 16, 4, 3, 17, 19, 20, 21, 8, 7, 19, 7, 20, 19, 7,
+    5, 20, 22, 23, 24, 11, 10, 22, 10, 23, 22, 10, 8, 23, 25, 26, 27, 14, 13, 25, 13, 26, 25, 13,
+    11, 26, 28, 29, 30, 3, 15, 28, 15, 29, 28, 15, 14, 29, 28, 31, 3, 30, 32, 28, 32, 31, 28, 32,
+    33, 31, 31, 17, 3, 33, 34, 31, 34, 17, 31, 34, 18, 17, 16, 35, 5, 18, 36, 16, 36, 35, 16, 36,
+    37, 35, 35, 20, 5, 37, 38, 35, 38, 20, 35, 38, 21, 20, 19, 39, 8, 21, 40, 19, 40, 39, 19, 40,
+    41, 39, 39, 23, 8, 41, 42, 39, 42, 23, 39, 42, 24, 23, 22, 43, 11, 24, 44, 22, 44, 43, 22, 44,
+    45, 43, 43, 26, 11, 45, 46, 43, 46, 26, 43, 46, 27, 26, 25, 47, 14, 27, 48, 25, 48, 47, 25, 48,
+    49, 47, 47, 29, 14, 49, 50, 47, 50, 29, 47, 50, 30, 29, 51, 52, 53, 18, 34, 51, 34, 52, 51, 34,
+    33, 52, 54, 55, 56, 37, 36, 54, 36, 55, 54, 36, 18, 55, 57, 58, 59, 21, 38, 57, 38, 58, 57, 38,
+    37, 58, 60, 61, 62, 41, 40, 60, 40, 61, 60, 40, 21, 61, 63, 64, 65, 24, 42, 63, 42, 64, 63, 42,
+    41, 64, 66, 67, 68, 45, 44, 66, 44, 67, 66, 44, 24, 67, 69, 70, 71, 27, 46, 69, 46, 70, 69, 46,
+    45, 70, 72, 73, 74, 49, 48, 72, 48, 73, 72, 48, 27, 73, 75, 76, 77, 30, 50, 75, 50, 76, 75, 50,
+    49, 76, 78, 79, 80, 33, 32, 78, 32, 79, 78, 32, 30, 79, 78, 52, 33, 80, 81, 78, 81, 52, 78, 81,
+    53, 52, 51, 55, 18, 53, 82, 51, 82, 55, 51, 82, 56, 55, 54, 58, 37, 56, 83, 54, 83, 58, 54, 83,
+    59, 58, 57, 61, 21, 59, 84, 57, 84, 61, 57, 84, 62, 61, 60, 64, 41, 62, 85, 60, 85, 64, 60, 85,
+    65, 64, 63, 67, 24, 65, 86, 63, 86, 67, 63, 86, 68, 67, 66, 70, 45, 68, 87, 66, 87, 70, 66, 87,
+    71, 70, 69, 73, 27, 71, 88, 69, 88, 73, 69, 88, 74, 73, 72, 76, 49, 74, 89, 72, 89, 76, 72, 89,
+    77, 76, 75, 79, 30, 77, 90, 75, 90, 79, 75, 90, 80, 79,
+];
+
+/// Rain emitter & streak geometry constants (`Rain.cpp:20-32`, `dxRainRender.cpp:7-18`).
+pub const RAIN_MAX_DESIRED_ITEMS: u32 = 2500;
+pub const RAIN_SOURCE_RADIUS: f32 = 15.0;
+pub const RAIN_CPU_SOURCE_RADIUS: f32 = 12.5;
+pub const RAIN_SOURCE_OFFSET: f32 = 20.0;
+pub const RAIN_MAX_DISTANCE: f32 = RAIN_SOURCE_OFFSET * 1.5;
+pub const RAIN_SINK_OFFSET: f32 = -(RAIN_MAX_DISTANCE - RAIN_SOURCE_OFFSET);
+pub const RAIN_DROP_LENGTH: f32 = 5.0;
+pub const RAIN_DROP_WIDTH: f32 = 0.30;
+pub const RAIN_DROP_MAX_ANGLE_RAD: f32 = 35.0 * (std::f32::consts::PI / 180.0);
+pub const RAIN_DROP_SPEED_MIN: f32 = 40.0;
+pub const RAIN_DROP_SPEED_MAX: f32 = 80.0;
+
+/// Accumulating wind animation state (`CEnvironment::wind_anim`, `Environment.cpp:617-628`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WindAnimState {
+    pub anim: [f32; 4],
+}
+
+impl WindAnimState {
+    /// Advance `wind_anim` by `dt_sec` (`Environment.cpp:617-628`):
+    /// - `anim.xy`: integrated `(vel * cos, vel * sin)` along `PI_DIV_2 - wind_direction_rad`
+    /// - `anim.z`: accumulated clamped gust speed
+    /// - `anim.w`: elapsed time in seconds
+    pub fn step(
+        &mut self,
+        dt_sec: f32,
+        wind_velocity: f32,
+        wind_direction_rad: f32,
+        tree_wind_min: f32,
+    ) {
+        if dt_sec <= 0.0 || !dt_sec.is_finite() {
+            return;
+        }
+        let vel = wind_velocity.max(tree_wind_min * 1000.0).max(200.0) * 0.001;
+        let dir = -wind_direction_rad + std::f32::consts::FRAC_PI_2;
+        let (ws, wc) = dir.sin_cos();
+        self.anim[0] += vel * wc * dt_sec;
+        self.anim[1] += vel * ws * dt_sec;
+        self.anim[2] += (vel * 1.33).clamp(0.0, 1.0) * dt_sec;
+        self.anim[3] += dt_sec;
+    }
+}
 
 /// Global atmospheric parameters from `environment\environment.ltx` `[environment]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -749,7 +993,11 @@ impl EnvDescriptor {
             .unwrap_or("")
             .trim()
             .to_string();
-        let sky_texture_env = format!("{sky_texture}#small");
+        let sky_texture_env = if sky_texture.is_empty() {
+            String::new()
+        } else {
+            format!("{sky_texture}#small")
+        };
         let clouds_texture = doc
             .read_str(identifier, "clouds_texture")
             .unwrap_or("")
@@ -854,6 +1102,8 @@ pub struct MixedEnvironment {
     pub to_id: String,
     pub sky_texture_a: String,
     pub sky_texture_b: String,
+    pub sky_texture_env_a: String,
+    pub sky_texture_env_b: String,
     pub clouds_texture_a: String,
     pub clouds_texture_b: String,
     pub clouds_color: [f32; 4],
@@ -924,6 +1174,165 @@ impl MixedEnvironment {
     #[inline]
     pub fn sun_dir_vec4(&self) -> [f32; 4] {
         [self.sun_dir[0], self.sun_dir[1], self.sun_dir[2], 0.0]
+    }
+
+    /// Unit direction pointing TOWARD the sun (`-sun_dir`), matching sky shader glow dot products.
+    #[inline]
+    pub fn sun_direction_to_sun_vec4(&self) -> [f32; 4] {
+        [-self.sun_dir[0], -self.sun_dir[1], -self.sun_dir[2], 0.0]
+    }
+
+    /// Skybox vertex tint RGBA (`[sky_color.r, sky_color.g, sky_color.b, weight]`, `dxEnvironmentRender.cpp:300-301`).
+    #[inline]
+    pub fn sky_tint_rgba(&self) -> [f32; 4] {
+        [
+            self.sky_color[0],
+            self.sky_color[1],
+            self.sky_color[2],
+            self.weight,
+        ]
+    }
+
+    /// Sun RGB combined with an explicit flare/glow alpha for `SkyPushConstants::sun_color`.
+    #[inline]
+    pub fn sun_glow_rgba(&self, glow_intensity: f32) -> [f32; 4] {
+        [
+            self.sun_color[0],
+            self.sun_color[1],
+            self.sun_color[2],
+            glow_intensity.max(0.0),
+        ]
+    }
+
+    /// Blended clouds tint RGBA (`clouds_color` with `0.5 * multiplier` already baked in).
+    #[inline]
+    pub fn clouds_color_rgba(&self) -> [f32; 4] {
+        self.clouds_color
+    }
+
+    /// Two normalized `[0..1]` UV wind drift direction pairs `(wd0_xz, wd1_xz)` matching
+    /// `dxEnvironmentRender.cpp:368-373`.
+    #[inline]
+    pub fn clouds_wind_uv_directions(&self) -> ([f32; 2], [f32; 2]) {
+        let wd0 = dir_from_hp(std::f32::consts::FRAC_PI_4, 0.0);
+        let wd1 = dir_from_hp(
+            std::f32::consts::FRAC_PI_4 + std::f32::consts::FRAC_PI_8,
+            0.0,
+        );
+        (
+            [0.5 * wd0[0] + 0.5, 0.5 * wd0[2] + 0.5],
+            [0.5 * wd1[0] + 0.5, 0.5 * wd1[2] + 0.5],
+        )
+    }
+
+    /// Normalized `[0..1]` clouds wind direction vector `[wd0.x, wd0.z, wd1.x, wd1.z]`.
+    ///
+    /// Note: C++ `dxEnvironmentRender.cpp:374` packs `color_rgba(wind_dir.x, wind_dir.y, wind_dir.w, wind_dir.z)`,
+    /// swapping components `2` and `3` for DX9 fixed-function `D3DCOLOR`.
+    #[inline]
+    pub fn clouds_wind_rgba(&self) -> [f32; 4] {
+        let (d0, d1) = self.clouds_wind_uv_directions();
+        [d0[0], d0[1], d1[0], d1[1]]
+    }
+
+    /// Rain vertex tint RGBA (`[rain_color.rgb, rain_density * 0.5 + 0.5]`, `dxRainRender.cpp:94-96`).
+    #[inline]
+    pub fn rain_color_rgba(&self) -> [f32; 4] {
+        [
+            self.rain_color[0],
+            self.rain_color[1],
+            self.rain_color[2],
+            (self.rain_density * 0.5 + 0.5).clamp(0.0, 1.0),
+        ]
+    }
+
+    /// Target rain streak instance count for `max_particles` (`dxRainRender.cpp:87`).
+    #[inline]
+    pub fn rain_desired_count(&self, max_particles: u32) -> u32 {
+        if self.rain_density <= 1e-5 {
+            0
+        } else {
+            (0.01 * (1.0 + self.rain_density.clamp(0.0, 1.0) * 99.0) * (max_particles as f32))
+                .floor()
+                .max(0.0) as u32
+        }
+    }
+
+    /// Rain fall direction unit vector and horizontal XZ spawn offset matching `CEffect_Rain::Prepare`
+    /// (`Rain.cpp:81-105`, without per-frame Perlin gust).
+    pub fn rain_streak_axis_and_offset(&self) -> ([f32; 3], [f32; 2]) {
+        let wind_vel = (self.wind_velocity * 0.001).clamp(0.0, 1.0);
+        let wind_dir = -self.wind_direction;
+        let pitch = RAIN_DROP_MAX_ANGLE_RAD * wind_vel;
+        let axis = dir_from_hp(wind_dir, pitch - std::f32::consts::FRAC_PI_2);
+        let denom = (std::f32::consts::FRAC_PI_2 - pitch).sin();
+        let dist = if denom.abs() > 1e-5 {
+            pitch.sin() * RAIN_SOURCE_OFFSET / denom
+        } else {
+            0.0
+        };
+        let fix_north = wind_dir - std::f32::consts::FRAC_PI_2;
+        (axis, [dist * fix_north.cos(), dist * fix_north.sin()])
+    }
+
+    /// Canonical VFS `.dds` paths `(sky_a, sky_b)` for primary skybox cubemaps.
+    #[inline]
+    pub fn sky_dds_vpaths(&self) -> (Option<String>, Option<String>) {
+        (
+            (!self.sky_texture_a.is_empty()).then(|| texture_stem_to_dds_vpath(&self.sky_texture_a)),
+            (!self.sky_texture_b.is_empty()).then(|| texture_stem_to_dds_vpath(&self.sky_texture_b)),
+        )
+    }
+
+    /// Canonical VFS `.dds` paths `(sky_env_a, sky_env_b)` for `#small` irradiance cubemaps.
+    #[inline]
+    pub fn sky_env_dds_vpaths(&self) -> (Option<String>, Option<String>) {
+        (
+            (!self.sky_texture_env_a.is_empty())
+                .then(|| texture_stem_to_dds_vpath(&self.sky_texture_env_a)),
+            (!self.sky_texture_env_b.is_empty())
+                .then(|| texture_stem_to_dds_vpath(&self.sky_texture_env_b)),
+        )
+    }
+
+    /// Canonical VFS `.dds` paths `(clouds_a, clouds_b)` for scrolling cloud textures.
+    #[inline]
+    pub fn clouds_dds_vpaths(&self) -> (Option<String>, Option<String>) {
+        (
+            (!self.clouds_texture_a.is_empty())
+                .then(|| texture_stem_to_dds_vpath(&self.clouds_texture_a)),
+            (!self.clouds_texture_b.is_empty())
+                .then(|| texture_stem_to_dds_vpath(&self.clouds_texture_b)),
+        )
+    }
+
+    /// Skybox world transform `rotateY(sky_rotation) + translate_over(camera_pos)`
+    /// (`dxEnvironmentRender.cpp:296-297`).
+    #[inline]
+    pub fn sky_world_transform(&self, camera_pos: [f32; 3]) -> XRayMatrix {
+        let mut m = matrix_rotate_y(self.sky_rotation);
+        m[3][0] = camera_pos[0];
+        m[3][1] = camera_pos[1];
+        m[3][2] = camera_pos[2];
+        m[3][3] = 1.0;
+        m
+    }
+
+    /// Clouds dome world transform `rotateY(sky_rotation) * scale(10, 0.4, 10) + translate_over(camera_pos)`
+    /// (`dxEnvironmentRender.cpp:362-366`).
+    #[inline]
+    pub fn clouds_world_transform(&self, camera_pos: [f32; 3]) -> XRayMatrix {
+        let mut m_scale = XRAY_IDENTITY_MATRIX;
+        m_scale[0][0] = 10.0;
+        m_scale[1][1] = 0.4;
+        m_scale[2][2] = 10.0;
+        let rot = matrix_rotate_y(self.sky_rotation);
+        let mut m = matrix_mul_43(&rot, &m_scale);
+        m[3][0] = camera_pos[0];
+        m[3][1] = camera_pos[1];
+        m[3][2] = camera_pos[2];
+        m[3][3] = 1.0;
+        m
     }
 
     #[inline]
@@ -1095,6 +1504,8 @@ pub fn lerp_descriptors(
         to_id: b.identifier.clone(),
         sky_texture_a: a.sky_texture.clone(),
         sky_texture_b: b.sky_texture.clone(),
+        sky_texture_env_a: a.sky_texture_env.clone(),
+        sky_texture_env_b: b.sky_texture_env.clone(),
         clouds_texture_a: a.clouds_texture.clone(),
         clouds_texture_b: b.clouds_texture.clone(),
         clouds_color,
@@ -1456,5 +1867,133 @@ fog_color = 0.25
         let gp = EnvGlobalParams::from_ltx(&env_doc);
         assert!((gp.min_dist_factor - 0.95).abs() < 1e-6);
         assert!((gp.second_probability - 0.35).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_skybox_clouds_wind_rain_and_vpath_helpers() {
+        // 1. Half-box & hemisphere geometry invariants
+        let (verts, idx) = skybox_hbox_mesh();
+        assert_eq!(verts.len(), SKYBOX_HBOX_VERTEX_COUNT);
+        assert_eq!(idx.len(), SKYBOX_HBOX_INDEX_COUNT);
+        assert!((verts[0].texcoord[1] + 1.01).abs() < 1e-6);
+        assert!(idx.iter().all(|&i| (i as usize) < SKYBOX_HBOX_VERTEX_COUNT));
+
+        assert_eq!(CLOUDS_HEMI_POSITIONS.len(), CLOUDS_HEMI_VERTEX_COUNT);
+        assert_eq!(CLOUDS_HEMI_INDICES.len(), CLOUDS_HEMI_INDEX_COUNT);
+        assert!(CLOUDS_HEMI_INDICES.iter().all(|&i| (i as usize) < CLOUDS_HEMI_VERTEX_COUNT));
+        for p in &CLOUDS_HEMI_POSITIONS {
+            let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            assert!((len - 1.0).abs() < 1e-4);
+            assert!(p[1] >= 0.0);
+        }
+
+        // 2. Empty sky_texture -> empty sky_texture_env & None DDS VFS path
+        let empty_doc = parse_ltx_str("[00:00:00]\nsky_color = 1, 1, 1\n");
+        let empty_desc = EnvDescriptor::from_ltx(&empty_doc, "00:00:00").unwrap();
+        assert!(empty_desc.sky_texture.is_empty());
+        assert!(empty_desc.sky_texture_env.is_empty());
+
+        // 3. MixedEnvironment helpers
+        let cycle_doc = parse_ltx_str(
+            r#"
+[00:00:00]
+sky_texture = sky\sky_night
+clouds_texture = sky\sky_oblaka
+sky_color = 0.2, 0.4, 0.6
+sky_rotation = 90
+rain_density = 0.5
+rain_color = 0.3, 0.3, 0.4
+wind_velocity = 500.0
+wind_direction = 90.0
+sun_color = 1.0, 0.8, 0.6
+
+[12:00:00]
+sky_texture = sky\sky_noon
+clouds_texture = sky\sky_oblaka_noon
+sky_color = 0.6, 0.8, 1.0
+sky_rotation = 90
+rain_density = 0.5
+rain_color = 0.3, 0.3, 0.4
+wind_velocity = 500.0
+wind_direction = 90.0
+sun_color = 1.0, 0.8, 0.6
+"#,
+        );
+        let cycle = WeatherCycle::from_ltx("w_test", &cycle_doc).unwrap();
+        let (a, b, w) = cycle.select_at(6.0 * 3600.0).unwrap();
+        let mut mixed = lerp_descriptors(
+            a,
+            b,
+            w,
+            &EnvModAccum {
+                total_power: 0.0,
+                active_flags: 0,
+                far_plane: 0.0,
+                fog_color: [0.0; 3],
+                fog_density: 0.0,
+                ambient: [0.0; 3],
+                sky_color: [0.0; 3],
+                hemi_color: [0.0; 3],
+            },
+            1.0,
+            &EnvBoost::default(),
+            0.0,
+            1.0,
+        );
+        mixed.sun_dir = [0.0, -0.6, 0.8];
+
+        assert_eq!(mixed.sky_texture_env_a, "sky\\sky_night#small");
+        assert_eq!(mixed.sky_texture_env_b, "sky\\sky_noon#small");
+        assert_eq!(
+            mixed.sky_dds_vpaths(),
+            (
+                Some("textures\\sky\\sky_night.dds".to_string()),
+                Some("textures\\sky\\sky_noon.dds".to_string())
+            )
+        );
+        assert_eq!(
+            mixed.sky_env_dds_vpaths(),
+            (
+                Some("textures\\sky\\sky_night#small.dds".to_string()),
+                Some("textures\\sky\\sky_noon#small.dds".to_string())
+            )
+        );
+        assert_eq!(
+            mixed.clouds_dds_vpaths(),
+            (
+                Some("textures\\sky\\sky_oblaka.dds".to_string()),
+                Some("textures\\sky\\sky_oblaka_noon.dds".to_string())
+            )
+        );
+
+        let tint = mixed.sky_tint_rgba();
+        assert!((tint[0] - 0.4).abs() < 1e-5);
+        assert!((tint[3] - 0.5).abs() < 1e-5);
+        assert!((mixed.rain_color_rgba()[3] - 0.75).abs() < 1e-5);
+        assert_eq!(mixed.rain_desired_count(RAIN_MAX_DESIRED_ITEMS), 1262);
+        assert_eq!(mixed.sun_direction_to_sun_vec4(), [0.0, 0.6, -0.8, 0.0]);
+        assert_eq!(mixed.sun_glow_rgba(0.4), [1.0, 0.8, 0.6, 0.4]);
+
+        let cam = [10.0, 20.0, 30.0];
+        let sky_m = mixed.sky_world_transform(cam);
+        let sky_pt = crate::ogf::matrix_transform_point(&sky_m, [1.0, 0.0, 0.0]);
+        assert!((sky_pt[0] - 10.0).abs() < 1e-5);
+        assert!((sky_pt[2] - 29.0).abs() < 1e-5);
+
+        let clouds_m = mixed.clouds_world_transform(cam);
+        let clouds_pt = crate::ogf::matrix_transform_point(&clouds_m, [1.0, 1.0, 0.0]);
+        assert!((clouds_pt[0] - 10.0).abs() < 1e-4);
+        assert!((clouds_pt[1] - 20.4).abs() < 1e-4);
+        assert!((clouds_pt[2] - 20.0).abs() < 1e-4);
+
+        let (rain_axis, rain_off) = mixed.rain_streak_axis_and_offset();
+        assert!(rain_axis[1] < -0.5);
+        assert!(rain_off[0].hypot(rain_off[1]) > 1.0);
+
+        let mut wind = WindAnimState::default();
+        wind.step(0.5, 400.0, 0.0, 0.0);
+        assert!((wind.anim[0] - 0.0).abs() < 1e-5);
+        assert!((wind.anim[1] - 0.2).abs() < 1e-5);
+        assert!((wind.anim[3] - 0.5).abs() < 1e-5);
     }
 }

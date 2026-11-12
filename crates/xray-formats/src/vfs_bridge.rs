@@ -32,7 +32,7 @@ use crate::spawn_overlays::SpawnOverlaysConfig;
 use crate::spawns::{AlifeSpawnArchive, LevelGameData, LevelSpawnData, PatrolPath};
 use crate::thm::{
     strip_texture_extension, texture_stem_to_dds_vpath, texture_stem_to_thm_vpath,
-    ResolvedTextureLinks, TextureParams,
+    DdsCubemapLayout, ResolvedTextureLinks, TextureParams,
 };
 use crate::weather::{EnvGlobalParams, SunPositionsConfig, WeatherCycle, WeatherLibrary};
 use crate::world_maps::{GameLevelsConfig, WorldMapsConfig};
@@ -1073,6 +1073,23 @@ pub fn load_torch_light_config_from_vfs(
 ) -> Result<TorchLightConfig, AssetLoadError> {
     let doc = load_ltx_tree_from_vfs(vfs, ltx_vpath, dltx_mod_paths)?;
     Ok(TorchLightConfig::from_ltx(&doc, section, prefer_r2)?)
+}
+
+/// Stream a skybox or irradiance (`#small`) `.dds` cubemap from VFS and compute its
+/// zero-copy 6-face x mip subresource slice layout (`DdsCubemapLayout`).
+pub fn load_cubemap_dds_from_vfs(
+    vfs: &VirtualFileSystem,
+    texture_name_or_vpath: &str,
+) -> Result<(Vec<u8>, DdsCubemapLayout), AssetLoadError> {
+    let trimmed = texture_name_or_vpath.trim();
+    let vpath = if trimmed.starts_with('$') {
+        ensure_extension_ci(trimmed, b".dds")
+    } else {
+        texture_stem_to_dds_vpath(trimmed)
+    };
+    let bytes = vfs.read_bytes(&vpath)?;
+    let layout = DdsCubemapLayout::parse(&bytes)?;
+    Ok((bytes, layout))
 }
 
 #[cfg(test)]
@@ -3278,5 +3295,175 @@ height = 18
         let ll = lamp.to_level_light([0.0, 2.0, 0.0], [0.0; 3], Some(&lanims), 0.0);
         assert!((ll.diffuse[0] - 1.5).abs() < 1e-4);
         assert!((ll.evaluate_spot_factor([0.0, 2.0, 5.0]) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_phase10_sky_cubemaps_env_mods_use_flags_and_level_ambients_over_vfs() {
+        use crate::shaders_xr::env_mod_flags;
+        use crate::thm::{
+            dds_caps2, thm_chunks, CubemapFace, DdsPixelFormatKind, TextureType, DDS_MAGIC,
+        };
+        use crate::weather::EnvBoost;
+
+        fn build_dxt1_cubemap(dim: u32, fill_seed: u8) -> Vec<u8> {
+            let mut dds = vec![0u8; 128];
+            dds[0..4].copy_from_slice(&DDS_MAGIC.to_le_bytes());
+            dds[4..8].copy_from_slice(&124u32.to_le_bytes());
+            dds[8..12].copy_from_slice(&0x1007u32.to_le_bytes());
+            dds[12..16].copy_from_slice(&dim.to_le_bytes());
+            dds[16..20].copy_from_slice(&dim.to_le_bytes());
+            dds[28..32].copy_from_slice(&1u32.to_le_bytes());
+            dds[76..80].copy_from_slice(&32u32.to_le_bytes());
+            dds[80..84].copy_from_slice(&0x4u32.to_le_bytes()); // DDPF_FOURCC
+            dds[84..88].copy_from_slice(b"DXT1");
+            dds[108..112].copy_from_slice(&0x0000_1008u32.to_le_bytes());
+            dds[112..116]
+                .copy_from_slice(&(dds_caps2::CUBEMAP | dds_caps2::CUBEMAP_ALLFACES).to_le_bytes());
+            let face_bytes = (dim.div_ceil(4) * dim.div_ceil(4) * 8) as usize;
+            for face in 0..6u8 {
+                dds.resize(dds.len() + face_bytes, fill_seed.wrapping_add(face));
+            }
+            dds
+        }
+
+        let sky_dds = build_dxt1_cubemap(8, 0x10);
+        let small_dds = build_dxt1_cubemap(4, 0x80);
+
+        let mut thm_w = ChunkWriter::new();
+        let mut tp = vec![0u8; 32];
+        tp[24..28].copy_from_slice(&8u32.to_le_bytes());
+        tp[28..32].copy_from_slice(&8u32.to_le_bytes());
+        thm_w.write_chunk(thm_chunks::THM_CHUNK_TEXTUREPARAM, &tp);
+        thm_w.write_chunk(
+            thm_chunks::THM_CHUNK_TEXTURE_TYPE,
+            &(TextureType::CubeMap as u32).to_le_bytes(),
+        );
+        let sky_thm = thm_w.into_bytes();
+
+        let weather_ltx = br#"
+[00:00:00]
+sky_texture = sky\sky_night
+clouds_texture = sky\sky_oblaka
+sky_color = 0.2, 0.3, 0.4
+sky_rotation = 90
+far_plane = 400
+fog_color = 0.2, 0.2, 0.2
+fog_density = 0.25
+fog_distance = 200
+ambient_color = 0.1, 0.1, 0.1
+hemisphere_color = 0.4, 0.4, 0.4, 1.0
+sun_color = 0.0, 0.0, 0.0
+ambient = env_night
+[12:00:00]
+sky_texture = sky\sky_night
+clouds_texture = sky\sky_oblaka
+sky_color = 0.2, 0.3, 0.4
+sky_rotation = 90
+far_plane = 400
+fog_color = 0.2, 0.2, 0.2
+fog_density = 0.25
+fog_distance = 200
+ambient_color = 0.1, 0.1, 0.1
+hemisphere_color = 0.4, 0.4, 0.4, 1.0
+sun_color = 0.0, 0.0, 0.0
+ambient = env_night
+"#;
+        let base_amb = b"[env_night]\nsound_channels = wind_quiet\n";
+        let lvl_amb = b"[env_night]\nsound_channels = bunker_hum\n";
+        let env_mods_ltx = br#"
+[bunker_fog]
+position = 0, 0, 0
+radius = 50
+power = 1.0
+far_plane = 100
+fog_color = 0.8, 0.6, 0.4
+fog_density = 0.9
+ambient = 0.5, 0.5, 0.5
+use_flags = 0x02
+"#;
+
+        let entries = vec![
+            ("textures\\sky\\sky_night.dds", sky_dds.clone(), sky_dds),
+            (
+                "textures\\sky\\sky_night#small.dds",
+                small_dds.clone(),
+                small_dds,
+            ),
+            ("textures\\sky\\sky_night.thm", sky_thm.clone(), sky_thm),
+            (
+                "configs\\environment\\weathers\\w_clear.ltx",
+                weather_ltx.to_vec(),
+                weather_ltx.to_vec(),
+            ),
+            (
+                "configs\\environment\\ambients.ltx",
+                base_amb.to_vec(),
+                base_amb.to_vec(),
+            ),
+            (
+                "configs\\environment\\ambients\\l01_escape.ltx",
+                lvl_amb.to_vec(),
+                lvl_amb.to_vec(),
+            ),
+            (
+                "configs\\environment\\env_mods\\l01_escape.ltx",
+                env_mods_ltx.to_vec(),
+                env_mods_ltx.to_vec(),
+            ),
+        ];
+
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_archive_bytes("sky.db0", pack_synthetic_db(entries))
+            .unwrap();
+
+        let lib = load_weather_library_from_vfs(&vfs, Some("l01_escape")).unwrap();
+        assert_eq!(lib.ambients["env_night"].sound_channels, vec!["bunker_hum"]);
+
+        let mods = load_env_mods_from_vfs(&vfs, "$game_levels$/l01_escape", Some("l01_escape"))
+            .unwrap();
+        assert_eq!(mods.modifiers[0].use_flags, env_mod_flags::FOG_COLOR);
+
+        let mixed = lib
+            .sample_at(
+                "w_clear",
+                6.0 * 3600.0,
+                Some(&mods),
+                [0.0, 0.0, 0.0],
+                1.0,
+                &EnvBoost::default(),
+            )
+            .unwrap();
+        // use_flags = 0x02 must modify fog_color ONLY and leave fog_density & far_plane untouched!
+        assert!((mixed.fog_color[0] - 0.5).abs() < 1e-5);
+        assert!((mixed.fog_density - 0.25).abs() < 1e-5);
+        assert!((mixed.far_plane - 400.0).abs() < 1e-4);
+
+        let thm = load_thm_from_vfs(&vfs, &mixed.sky_texture_a).unwrap().unwrap();
+        assert!(thm.is_cubemap());
+
+        let (sky_a_vpath, _) = mixed.sky_dds_vpaths();
+        let (env_a_vpath, _) = mixed.sky_env_dds_vpaths();
+        let (sky_raw, sky_cube) = load_cubemap_dds_from_vfs(&vfs, sky_a_vpath.as_deref().unwrap())
+            .unwrap();
+        let (env_raw, env_cube) = load_cubemap_dds_from_vfs(&vfs, env_a_vpath.as_deref().unwrap())
+            .unwrap();
+
+        assert_eq!(sky_cube.format, DdsPixelFormatKind::Bc1Unorm);
+        assert_eq!(
+            sky_cube
+                .subresource(CubemapFace::PositiveZ, 0)
+                .unwrap()
+                .slice_bytes(&sky_raw)
+                .unwrap(),
+            &[0x14; 32]
+        );
+        assert_eq!(
+            env_cube
+                .subresource(CubemapFace::NegativeY, 0)
+                .unwrap()
+                .slice_bytes(&env_raw)
+                .unwrap(),
+            &[0x83; 8]
+        );
     }
 }
