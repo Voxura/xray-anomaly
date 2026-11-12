@@ -27,6 +27,11 @@ pub const SMAP_ADAPT_MIN: u32 = 768;
 pub const SMAP_ADAPT_OPTIMAL: u32 = 768;
 pub const SMAP_ADAPT_MAX: u32 = 1536;
 pub const TEX_JITTER_SIZE: u32 = 64;
+pub const TEX_JITTER_COUNT: usize = 5;
+pub const TEX_MATERIAL_LDOTN: usize = 128;
+pub const TEX_MATERIAL_LDOTH: usize = 256;
+pub const TEX_MATERIAL_COUNT: usize = 4;
+pub const LIGHT_MARKER_ID_INIT: u32 = 5;
 
 pub const LIGHT_SSA_GLOD_START_DEFAULT: f32 = 256.0;
 pub const LIGHT_SSA_GLOD_END_DEFAULT: f32 = 64.0;
@@ -153,6 +158,45 @@ impl RenderLightType {
             _ => Self::Point,
         }
     }
+
+    /// Return the deferred volume geometry mesh descriptor matching
+    /// `CRenderTarget::draw_volume` (`r4_rendertarget_draw_volume.cpp:6-26`).
+    pub const fn volume_draw_desc(self) -> Option<RenderVolumeDrawDesc> {
+        match self {
+            Self::Reflected | Self::Point => Some(RenderVolumeDrawDesc {
+                kind: RenderVolumeGeometryKind::Sphere,
+                vertex_count: DU_SPHERE_NUMVERTEX,
+                face_count: DU_SPHERE_NUMFACES,
+            }),
+            Self::Spot => Some(RenderVolumeDrawDesc {
+                kind: RenderVolumeGeometryKind::Cone,
+                vertex_count: DU_CONE_NUMVERTEX,
+                face_count: DU_CONE_NUMFACES,
+            }),
+            Self::Omnipart => Some(RenderVolumeDrawDesc {
+                kind: RenderVolumeGeometryKind::SpherePart,
+                vertex_count: DU_SPHERE_PART_NUMVERTEX,
+                face_count: DU_SPHERE_PART_NUMFACES,
+            }),
+            Self::Direct => None,
+        }
+    }
+}
+
+/// Deferred light proxy geometry mesh kind selected by `CRenderTarget::draw_volume`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderVolumeGeometryKind {
+    Sphere,
+    Cone,
+    SpherePart,
+}
+
+/// Vertex and triangle counts for a `CRenderTarget::draw_volume` mesh draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderVolumeDrawDesc {
+    pub kind: RenderVolumeGeometryKind,
+    pub vertex_count: usize,
+    pub face_count: usize,
 }
 
 /// Console gloss parameters for `u_diffuse2s` (`r2_types.h:174-195`, `xrRender_console.cpp:466-533`).
@@ -2820,6 +2864,281 @@ pub fn compute_sun_light_rig(
     }
 }
 
+// ============================================================================
+// Material BRDF LUT, Jitter Textures, Normal Packing & Marker State (`r4_rendertarget.cpp`)
+// ============================================================================
+
+/// Build the 128 x 256 x 4 R8G8_UNORM (`u16` low-byte diffuse, high-byte specular)
+/// material BRDF LUT matching `CRenderTarget::CRenderTarget` (`r4_rendertarget.cpp:1084-1146`).
+pub fn build_brdf_material_lut() -> Vec<u16> {
+    const EPS_S: f32 = 1e-7;
+    let slice_pitch = TEX_MATERIAL_LDOTN * TEX_MATERIAL_LDOTH;
+    let mut out = vec![0u16; slice_pitch * TEX_MATERIAL_COUNT];
+
+    for slice in 0..TEX_MATERIAL_COUNT {
+        for y in 0..TEX_MATERIAL_LDOTH {
+            for x in 0..TEX_MATERIAL_LDOTN {
+                let ld = x as f32 / (TEX_MATERIAL_LDOTN - 1) as f32;
+                let mut ls = y as f32 / (TEX_MATERIAL_LDOTH - 1) as f32 + EPS_S;
+                ls *= ld.powf(1.0 / 32.0);
+                let (fd, fs) = match slice {
+                    0 => {
+                        // Oren-Nayar-like
+                        (ld.powf(0.75), ls.powf(16.0) * 0.5)
+                    }
+                    1 => {
+                        // Blinn-like
+                        (ld.powf(0.90), ls.powf(24.0))
+                    }
+                    2 => {
+                        // Phong-like
+                        (ld, (ls * 1.01).powf(128.0))
+                    }
+                    3 => {
+                        // Metal-like
+                        let s0 = (1.0 - (0.05 * (33.0 * ld).sin() + ld - ls).abs()).abs();
+                        let s1 = (1.0 - (0.05 * (33.0 * ld * ls).cos() + ld - ls).abs()).abs();
+                        let s2 = (1.0 - (ld - ls).abs()).abs();
+                        (ld, s0.max(s1).max(s2).powf(24.0) * ld.powf(1.0 / 7.0))
+                    }
+                    _ => (0.0, 0.0),
+                };
+                let mut d = (fd * 255.5).floor().clamp(0.0, 255.0) as i32;
+                let mut s = (fs * 255.5).floor().clamp(0.0, 255.0) as i32;
+                if y == TEX_MATERIAL_LDOTH - 1 && x == TEX_MATERIAL_LDOTN - 1 {
+                    d = 255;
+                    s = 255;
+                }
+                let idx = slice * slice_pitch + y * TEX_MATERIAL_LDOTN + x;
+                out[idx] = ((s as u16) << 8) | (d as u16);
+            }
+        }
+    }
+    out
+}
+
+/// Generate `elem_count` jitter 2D-offset texels using rejection sampling with Manhattan distance
+/// `>= 32`, matching `generate_jitter` (`r4_rendertarget.cpp:326-348`).
+pub fn generate_jitter_cell(elem_count: usize, rng: &mut CrngLcg) -> Vec<u32> {
+    let needed = elem_count.saturating_mul(2);
+    let mut samples: Vec<[i32; 2]> = Vec::with_capacity(needed);
+    let max_attempts = 4096usize.max(elem_count.saturating_mul(1024));
+    let mut attempts = 0usize;
+
+    while samples.len() < needed {
+        attempts += 1;
+        let candidate = [rng.rand_i_max(256), rng.rand_i_max(256)];
+        let valid = samples.iter().all(|s| {
+            (candidate[0] - s[0]).abs() + (candidate[1] - s[1]).abs() >= 32
+        });
+        if valid || attempts >= max_attempts {
+            samples.push(candidate);
+        }
+    }
+
+    (0..elem_count)
+        .map(|it| {
+            let s0 = samples[2 * it];
+            let s1 = samples[2 * it + 1];
+            // color_rgba(s0.x, s0.y, s1.y, s1.x) => (a<<24)|(r<<16)|(g<<8)|b
+            ((s1[0] as u32 & 0xFF) << 24)
+                | ((s0[0] as u32 & 0xFF) << 16)
+                | ((s0[1] as u32 & 0xFF) << 8)
+                | (s1[1] as u32 & 0xFF)
+        })
+        .collect()
+}
+
+/// Generate the 4 base `64x64` (`$user$jitter_0..3`) textures matching `CRenderTarget::CRenderTarget`
+/// (`r4_rendertarget.cpp:1203-1220`).
+pub fn generate_jitter_textures(rng: &mut CrngLcg) -> [Vec<u32>; TEX_JITTER_COUNT - 1] {
+    let side = TEX_JITTER_SIZE as usize;
+    let total = side * side;
+    let mut textures: [Vec<u32>; TEX_JITTER_COUNT - 1] = std::array::from_fn(|_| vec![0u32; total]);
+    for y in 0..side {
+        for x in 0..side {
+            let data = generate_jitter_cell(TEX_JITTER_COUNT - 1, rng);
+            let idx = y * side + x;
+            for it in 0..(TEX_JITTER_COUNT - 1) {
+                textures[it][idx] = data[it];
+            }
+        }
+    }
+    textures
+}
+
+/// Generate the `64x64` HDAO/HBAO (`$user$jitter_4`) RGBA32F jitter texture matching
+/// `CRenderTarget::CRenderTarget` (`r4_rendertarget.cpp:1259-1287`).
+pub fn generate_hdao_jitter_texture(ps_r_ssao: u32, rng: &mut CrngLcg) -> Vec<[f32; 4]> {
+    let num_dir = match ps_r_ssao {
+        1 => 4.0,
+        2 => 6.0,
+        3 | 4 => 8.0,
+        _ => 1.0,
+    };
+    let side = TEX_JITTER_SIZE as usize;
+    let mut out = Vec::with_capacity(side * side);
+    for _y in 0..side {
+        for _x in 0..side {
+            let angle = std::f32::consts::TAU * rng.rand_f(1.0) / num_dir;
+            let dist = rng.rand_f(1.0);
+            out.push([angle.cos(), angle.sin(), dist, 0.0]);
+        }
+    }
+    out
+}
+
+/// Quantize an X/Y normal component in `[-1, 1]` to `0..=255` (`fpack` in `r4_rendertarget.cpp:263-268`).
+#[inline]
+pub fn fpack_normal_coord(v: f32) -> u8 {
+    (((v + 1.0) * 0.5) * 255.0 + 0.5)
+        .floor()
+        .clamp(0.0, 255.0) as u8
+}
+
+/// Quantize a Z normal component (`|z|`) in `[0, 1]` to `0..=255` (`fpackZ` in `r4_rendertarget.cpp:270-275`).
+#[inline]
+pub fn fpack_normal_z(v: f32) -> u8 {
+    (v.abs() * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8
+}
+
+/// Unpack a quantized RGB normal tuple (`vunpack` in `r4_rendertarget.cpp:277-284`).
+#[inline]
+pub fn vunpack_normal(x: i32, y: i32, z: i32) -> [f32; 3] {
+    [
+        (x as f32 / 255.0 - 0.5) * 2.0,
+        (y as f32 / 255.0 - 0.5) * 2.0,
+        -(z as f32) / 255.0,
+    ]
+}
+
+/// Pack a unit/approximate normal vector via quantized neighborhood search matching
+/// `vpack` (`r4_rendertarget.cpp:291-324`).
+pub fn vpack_normal_with_radius(src: [f32; 3], search_radius: i32) -> [u8; 3] {
+    let bx = fpack_normal_coord(src[0]) as i32;
+    let by = fpack_normal_coord(src[1]) as i32;
+    let bz = fpack_normal_z(src[2]) as i32;
+    let d = search_radius.max(0);
+
+    let mut e_best = f32::MAX;
+    let mut best = [bx as u8, by as u8, bz as u8];
+
+    for x in (bx - d).max(0)..=(bx + d).min(255) {
+        for y in (by - d).max(0)..=(by + d).min(255) {
+            for z in (bz - d).max(0)..=(bz + d).min(255) {
+                let mut v = vunpack_normal(x, y, z);
+                let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                let me = (m - 1.0).abs();
+                if me > 0.03 {
+                    continue;
+                }
+                v[0] /= m;
+                v[1] /= m;
+                v[2] /= m;
+                let dot = src[0] * v[0] + src[1] * v[1] + src[2] * v[2];
+                let e = (dot - 1.0).abs();
+                if e < e_best {
+                    e_best = e;
+                    best = [x as u8, y as u8, z as u8];
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Pack a normal vector with X-Ray's release-build neighborhood radius `3`.
+#[inline]
+pub fn vpack_normal(src: [f32; 3]) -> [u8; 3] {
+    vpack_normal_with_radius(src, 3)
+}
+
+/// Deferred lighting stencil marker tracker (`CRenderTarget::dwLightMarkerID` /
+/// `reset_light_marker` / `increment_light_marker` in `r4_rendertarget.cpp:1493-1530`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightMarkerState {
+    pub marker_id: u32,
+}
+
+impl Default for LightMarkerState {
+    fn default() -> Self {
+        Self {
+            marker_id: LIGHT_MARKER_ID_INIT,
+        }
+    }
+}
+
+impl LightMarkerState {
+    #[inline]
+    pub fn reset(&mut self) {
+        self.marker_id = LIGHT_MARKER_ID_INIT;
+    }
+
+    /// Advance light stencil marker ID by 2; returns `true` if it exceeded the MSAA/non-MSAA limit
+    /// and reset to `5` (indicating a stencil clear quad pass using `s_occq->E[2]` is required).
+    #[inline]
+    pub fn increment(&mut self, dx10_msaa: bool) -> bool {
+        self.marker_id += 2;
+        let max_marker = if dx10_msaa { 127 } else { 255 };
+        if self.marker_id > max_marker {
+            self.reset();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Min-max shadow-map mode (`CRender::MMSM_*` in `r4.h:83`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum MinMaxSmMode {
+    #[default]
+    Off = 0,
+    On = 1,
+    Auto = 2,
+    AutoDetect = 3,
+}
+
+/// Return whether sunshafts should execute this frame
+/// (`CRenderTarget::need_to_render_sunshafts` in `r4_rendertarget.cpp:1532-1545`).
+#[inline]
+pub fn need_to_render_sunshafts(
+    advancedpp: bool,
+    ps_sunshafts_mode: u32,
+    env_sunshafts_intensity: f32,
+) -> bool {
+    if !(advancedpp && ps_sunshafts_mode != 0) {
+        return false;
+    }
+    env_sunshafts_intensity >= 0.0001
+}
+
+/// Return whether min-max SM acceleration should run this frame
+/// (`CRenderTarget::use_minmax_sm_this_frame` in `r4_rendertarget.cpp:1547-1570`).
+#[inline]
+pub fn use_minmax_sm_this_frame(
+    mode: MinMaxSmMode,
+    screen_width: u32,
+    screen_height: u32,
+    screenarea_threshold: u32,
+    render_sunshafts: bool,
+) -> bool {
+    match mode {
+        MinMaxSmMode::On => true,
+        MinMaxSmMode::Auto => render_sunshafts,
+        MinMaxSmMode::AutoDetect => {
+            let area = screen_width.saturating_mul(screen_height);
+            if area >= screenarea_threshold {
+                render_sunshafts
+            } else {
+                false
+            }
+        }
+        MinMaxSmMode::Off => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3401,5 +3720,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(active_vol.num_slices, 72);
+
+        // Volume draw dispatch descriptors
+        assert!(RenderLightType::Direct.volume_draw_desc().is_none());
+        let pt_desc = RenderLightType::Point.volume_draw_desc().unwrap();
+        assert_eq!(pt_desc.kind, RenderVolumeGeometryKind::Sphere);
+        assert_eq!(pt_desc.vertex_count, DU_SPHERE_NUMVERTEX);
+        assert_eq!(pt_desc.face_count, DU_SPHERE_NUMFACES);
+        assert_eq!(
+            RenderLightType::Spot.volume_draw_desc().unwrap().kind,
+            RenderVolumeGeometryKind::Cone
+        );
+        assert_eq!(
+            RenderLightType::Omnipart.volume_draw_desc().unwrap().kind,
+            RenderVolumeGeometryKind::SpherePart
+        );
+
+        // BRDF LUT dimensions and corner pin
+        let lut = build_brdf_material_lut();
+        assert_eq!(lut.len(), TEX_MATERIAL_LDOTN * TEX_MATERIAL_LDOTH * TEX_MATERIAL_COUNT);
+        let corner = lut[(TEX_MATERIAL_LDOTH - 1) * TEX_MATERIAL_LDOTN + (TEX_MATERIAL_LDOTN - 1)];
+        assert_eq!(corner, 0xFFFF);
+
+        // Jitter cell + full textures + HDAO jitter
+        let mut rng = CrngLcg::new(42);
+        let cell = generate_jitter_cell(TEX_JITTER_COUNT - 1, &mut rng);
+        assert_eq!(cell.len(), 4);
+        let jitter = generate_jitter_textures(&mut rng);
+        assert_eq!(jitter.len(), 4);
+        assert!(jitter.iter().all(|t| t.len() == (TEX_JITTER_SIZE * TEX_JITTER_SIZE) as usize));
+        let hdao = generate_hdao_jitter_texture(3, &mut rng);
+        assert_eq!(hdao.len(), (TEX_JITTER_SIZE * TEX_JITTER_SIZE) as usize);
+        assert!(hdao.iter().all(|p| ((p[0] * p[0] + p[1] * p[1]) - 1.0).abs() < 1e-4));
+
+        // Normal pack/unpack accuracy
+        let packed = vpack_normal([0.0, 1.0, 0.0]);
+        let unpacked = vunpack_normal(packed[0] as i32, packed[1] as i32, packed[2] as i32);
+        assert!((unpacked[1] - 1.0).abs() < 0.02);
+
+        // Light markers + min-max SM toggles
+        let mut marker = LightMarkerState::default();
+        assert_eq!(marker.marker_id, 5);
+        for _ in 0..61 {
+            assert!(!marker.increment(true));
+        }
+        assert_eq!(marker.marker_id, 127);
+        assert!(marker.increment(true));
+        assert_eq!(marker.marker_id, 5);
+
+        assert!(need_to_render_sunshafts(true, 1, 0.25));
+        assert!(!need_to_render_sunshafts(true, 0, 0.25));
+        assert!(use_minmax_sm_this_frame(MinMaxSmMode::AutoDetect, 1920, 1080, 1_000_000, true));
+        assert!(!use_minmax_sm_this_frame(MinMaxSmMode::AutoDetect, 800, 600, 1_000_000, true));
     }
 }

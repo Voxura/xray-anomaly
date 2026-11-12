@@ -12,14 +12,14 @@
 //! - `hom`: `level.hom` Hierarchical Occlusion Mapping parser, `ClipFrustum` (frustum/portal/occluder/poly) & 64x64->8 `OccRasterizer`
 //! - `lanims`: `$game_data$/lanims.xr` keyframed `LightAnimItem` / `LightAnimLibrary` color anims
 //! - `level`: `level` & `level.geom`/`level.geomx` scene, visuals, sectors, portals, portal/HOM traversal, lights & `D3DVERTEXELEMENT9` VB/IB/SWIS decoders
-//! - `lighting`: Pure-Rust dynamic lights, `SMAP_Allocator`, `ComputeXFS`, spot/point/GI accumulation, `light_vis`/`smapvis`/grass shadows & `LightTrack` cache
-//! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, LOD (`ScreenLodThresholds`/`LodImposterHwVertex`), tree (`TreeWindState`), and skeletal mesh + bone/IK parser
+//! - `lighting`: Pure-Rust dynamic lights, `SMAP_Allocator`, `ComputeXFS`, spot/point/GI accumulation, `light_vis`/`smapvis`/grass shadows, BRDF/jitter/normal LUTs, `LightMarkerState` & `LightTrack` cache
+//! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, LOD (`ScreenLodThresholds`/`LodImposterHwVertex`/batcher/dsgraph sort), tree (`TreeWindState`), and skeletal mesh + bone/IK parser
 //! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
 //! - `particle_sim`: Pure-Rust PAPI runtime simulator, 3D Perlin noise, `ParticleGroupInstance` timeline & billboard emitter
 //! - `particles`: `particles.xr` / loose `.pe` & `.pg` PAPI bytecode systems + LTX blood wallmark configs (no binary `level.wallmarks` in Anomaly/CoP)
-//! - `postprocess`: Phase-13+ PPE noise UVs, bloom/luminance adaptation, sunshafts/combine constants, SSAO/HDAO/SMAA/SSFX TAA schedules, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision, SSFX blur/SSS helpers
+//! - `postprocess`: Phase-13+ PPE noise UVs, bloom/luminance adaptation, sunshafts/combine constants, SSAO/HDAO/SMAA/SSFX TAA schedules, screen TL/TL2uv quads, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision, SSFX blur/SSS helpers
 //! - `savegames`: Anomaly `.scop` LZO1X ALife savegame reader/writer (`GameDateTime`, spawn header, dynamic objects & 7 binary registries)
-//! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
+//! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `uber_deffer`, R4/internal blender compilers, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
 //! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, OMF pose evaluation & `1W`–`4W` CPU skinning
 //! - `sound_env`: `senvironment.xr` v4/v5, `level.som` BVH acoustic occlusion, `level.snd_env` & `level.snd_static`
 //! - `spawn_overlays`: Anomaly `spawn_overlays.ltx` / `mod_spawn_overlays_*.ltx` DLTX graph links/unlinks, patches & `level_cut` applicators
@@ -135,19 +135,23 @@ pub use level::{
     BUILD_LIGHT_RECORD_SIZE, LEVEL_GLOW_RECORD_SIZE,
 };
 pub use lighting::{
-    accum_hemi_cube, build_reflected_lights, build_volumetric_slices_mesh,
-    check_grass_shadow_light, compute_light_vis_safe_area, compute_point_accum_constants,
-    compute_r_ssa_glod_bounds, compute_reflected_accum_constants, compute_spot_accum_constants,
-    compute_sun_light_rig, compute_texgen_jitter, compute_texgen_screen, compute_u_diffuse2s,
-    compute_volumetric_spot_params, compute_volumetric_spot_params_with_fade,
-    encode_hemi_material_id, generate_indirect_photons, generate_indirect_photons_cform,
-    hemi_cube_faces, near_plane_intersects_sphere, pack_smap_requests, sort_light_package_by_key,
-    ssfx_volumetric_distance_fade, transform_volumetric_clip_planes, AccumMaskElement,
-    AccumShaderElement, CrngLcg, DynamicLight, GiConfig, GlossConfig, GrassShadowConfig,
-    HemiMaterialGpuParams, LightIndirectPhoton, LightPackageOrderKey, LightSmapConfig,
-    LightSmapXform, LightTrackConfig, LightVisConfig, LightVisDecision, LightVisState,
-    ObjectLightTracker, OmnipartFaceLight, PointAccumConstants, ReflectedAccumConstants,
-    ReflectedLightInstance, RenderLightType, SmapAllocator, SmapPackAssignment, SmapRect,
+    accum_hemi_cube, build_brdf_material_lut, build_reflected_lights,
+    build_volumetric_slices_mesh, check_grass_shadow_light, compute_light_vis_safe_area,
+    compute_point_accum_constants, compute_r_ssa_glod_bounds, compute_reflected_accum_constants,
+    compute_spot_accum_constants, compute_sun_light_rig, compute_texgen_jitter,
+    compute_texgen_screen, compute_u_diffuse2s, compute_volumetric_spot_params,
+    compute_volumetric_spot_params_with_fade, encode_hemi_material_id, fpack_normal_coord,
+    fpack_normal_z, generate_hdao_jitter_texture, generate_indirect_photons,
+    generate_indirect_photons_cform, generate_jitter_cell, generate_jitter_textures,
+    hemi_cube_faces, near_plane_intersects_sphere, need_to_render_sunshafts, pack_smap_requests,
+    sort_light_package_by_key, ssfx_volumetric_distance_fade, transform_volumetric_clip_planes,
+    use_minmax_sm_this_frame, vpack_normal, vpack_normal_with_radius, vunpack_normal,
+    AccumMaskElement, AccumShaderElement, CrngLcg, DynamicLight, GiConfig, GlossConfig,
+    GrassShadowConfig, HemiMaterialGpuParams, LightIndirectPhoton, LightMarkerState,
+    LightPackageOrderKey, LightSmapConfig, LightSmapXform, LightTrackConfig, LightVisConfig,
+    LightVisDecision, LightVisState, MinMaxSmMode, ObjectLightTracker, OmnipartFaceLight,
+    PointAccumConstants, ReflectedAccumConstants, ReflectedLightInstance, RenderLightType,
+    RenderVolumeDrawDesc, RenderVolumeGeometryKind, SmapAllocator, SmapPackAssignment, SmapRect,
     SmapVisSolver, SmapVisStage, SpotAccumConfig, SpotAccumConstants, SsfxVolumetricDistanceResult,
     SunLightPose, SunLightRig, SunLightRigConfig, TrackedLightEntry, VolumetricLightConfig,
     VolumetricSlicesMesh, VolumetricSpotParams, DU_BOX_INDICES, DU_BOX_NUMFACES,
@@ -157,31 +161,34 @@ pub use lighting::{
     DU_CYLINDER_VERTICES, DU_SPHERE_INDICES, DU_SPHERE_NUMFACES, DU_SPHERE_NUMVERTEX,
     DU_SPHERE_PART_INDICES, DU_SPHERE_PART_NUMFACES, DU_SPHERE_PART_NUMVERTEX,
     DU_SPHERE_PART_VERTICES, DU_SPHERE_VERTICES, GI_DEFAULT_CLIP, GI_DEFAULT_PHOTONS,
-    GI_DEFAULT_REFL, GI_SEED, HEMI_SAMPLE_DIRS, LIGHT_LS_SQUALITY_DEFAULT,
+    GI_DEFAULT_REFL, GI_SEED, HEMI_SAMPLE_DIRS, LIGHT_LS_SQUALITY_DEFAULT, LIGHT_MARKER_ID_INIT,
     LIGHT_SLEEP_FRAMES_DEFAULT, LIGHT_SLIGHT_FADE_DEFAULT, LIGHT_SSA_GLOD_END_DEFAULT,
     LIGHT_SSA_GLOD_START_DEFAULT, LIGHT_VIS_CULL_FRAGMENTS, LIGHT_VIS_DELAY_LARGE_MAX,
     LIGHT_VIS_DELAY_LARGE_MIN, LIGHT_VIS_DELAY_SMALL_MAX, LIGHT_VIS_DELAY_SMALL_MIN, LT_DEC,
     LT_HEMISAMPLES, LT_INC, OMNIPART_CUBE_DIRS, OMNIPART_CUBE_UP_HINTS, SMAP_ADAPT_MAX,
     SMAP_ADAPT_MIN, SMAP_ADAPT_OPTIMAL, SMAP_NEAR_PLANE, SUN_ADAPTED_DOWN_Y, SUN_LIGHT_DISTANCE,
-    SUN_LIGHT_RANGE, TEX_JITTER_SIZE, VOLUMETRIC_SLICES,
+    SUN_LIGHT_RANGE, TEX_JITTER_COUNT, TEX_JITTER_SIZE, TEX_MATERIAL_COUNT, TEX_MATERIAL_LDOTH,
+    TEX_MATERIAL_LDOTN, VOLUMETRIC_SLICES,
 };
 pub use ogf::{
     adjusted_distance_from_camera, bone_shape_flags, calc_ssa, compute_screen_lod_thresholds,
     deffer_shader_elements, fvf_flags, is_valuable_to_render_dynamic,
-    is_valuable_to_render_static, matrix_forward_dir, matrix_invert_43, matrix_mul_43,
-    matrix_mul_44, matrix_rotate_x, matrix_rotate_y, matrix_rotate_z, matrix_scale,
-    matrix_set_hpb, matrix_set_xyz_translate, matrix_set_xyzi_translate, matrix_transform_point,
-    matrix_transform_projected, ogf_chunks, route_dynamic_visual, route_static_visual,
-    select_dynamic_shader_element, select_static_shader_element, skel_vert_type, sphere_volume,
-    vector_generate_orthonormal_basis, BoneIkData, BoneIkSection, BonePoseMatrices, BoneShape,
-    BoneShapeType, LodImposterHwVertex, LodImposterSample, OgfBBox, OgfBSphere, OgfBone,
-    OgfBufferRef, OgfDesc, OgfGContainerRef, OgfHeader, OgfLodDef, OgfLodFacet, OgfLodVertex,
-    OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows, OgfTextureLink, OgfTreeDef, OgfVertices,
-    OgfVisualType, RenderPhase, ScreenLodConfig, ScreenLodThresholds, SlideWindow, StaticVertex,
-    StaticVertexLayout, TreeInstanceGpuConstants, TreeLightingColor, TreeWindConfig, TreeWindFrame,
-    TreeWindState, UnifiedSkinnedVertex, VertBoned1W, VertBoned2W, VertBoned3W, VertBoned4W,
-    VisualOptConfig, VisualPrimaryBucket, VisualRoutingDecision, VisualRoutingFlags, XRayMatrix,
-    FTREE_VISUAL_QUANT, FTREE_VISUAL_TILE, LOD_IMPOSTER_QUAD_ORDER, OGF_LODDEF2_SIZE,
+    is_valuable_to_render_static, lod_shader_element_id, lod_shader_elements, matrix_forward_dir,
+    matrix_invert_43, matrix_mul_43, matrix_mul_44, matrix_rotate_x, matrix_rotate_y,
+    matrix_rotate_z, matrix_scale, matrix_set_hpb, matrix_set_xyz_translate,
+    matrix_set_xyzi_translate, matrix_transform_point, matrix_transform_projected, ogf_chunks,
+    pack_lod_imposter_batches, route_dynamic_visual, route_static_visual,
+    select_dynamic_shader_element, select_static_shader_element, skel_vert_type,
+    sort_dsgraph_texture_nodes, sphere_volume, vector_generate_orthonormal_basis, BoneIkData,
+    BoneIkSection, BonePoseMatrices, BoneShape, BoneShapeType, DsgraphTextureNode, LodBatchChunk,
+    LodDrawGroup, LodImposterHwVertex, LodImposterSample, LodRenderInput, OgfBBox, OgfBSphere,
+    OgfBone, OgfBufferRef, OgfDesc, OgfGContainerRef, OgfHeader, OgfLodDef, OgfLodFacet,
+    OgfLodVertex, OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows, OgfTextureLink, OgfTreeDef,
+    OgfVertices, OgfVisualType, RenderPhase, ScreenLodConfig, ScreenLodThresholds, SlideWindow,
+    StaticVertex, StaticVertexLayout, TreeInstanceGpuConstants, TreeLightingColor, TreeWindConfig,
+    TreeWindFrame, TreeWindState, UnifiedSkinnedVertex, VertBoned1W, VertBoned2W, VertBoned3W,
+    VertBoned4W, VisualOptConfig, VisualPrimaryBucket, VisualRoutingDecision, VisualRoutingFlags,
+    XRayMatrix, FTREE_VISUAL_QUANT, FTREE_VISUAL_TILE, LOD_IMPOSTER_QUAD_ORDER, OGF_LODDEF2_SIZE,
     OGF_LOD_VERTEX_SIZE, OGF_TREEDEF2_SIZE, VISUAL_OPT_BASE_FOV, VISUAL_OPT_DYNAMIC_DIST,
     VISUAL_OPT_DYNAMIC_VOL, VISUAL_OPT_STATIC_DIST, VISUAL_OPT_STATIC_VOL, XRAY_IDENTITY_MATRIX,
 };
@@ -211,11 +218,14 @@ pub use particles::{
 };
 pub use postprocess::{
     apply_st2084_pq_rgb, apply_vignette_rgb, bloom_build_4tap_uvs, bloom_filter_taps_horizontal,
-    bloom_filter_taps_vertical, build_postprocess_pass_plan, calc_gauss_k7, calc_gauss_wave,
-    combine2_aa_quad_uvs, combine2_shader_element, compute_combine1_params, compute_hdao_dispatch,
-    compute_ssao_params, effects_sun_hdr_blend_factor, luminance_filter_quad_uvs,
-    luminance_filter_taps, luminance_pass0_uvs, lut_pass_desc, phase_blur_schedule, smaa_schedule,
-    ssfx_ao_blur_schedule, ssfx_bloom_lens_blur_schedule, ssfx_il_blur_schedule, ssfx_taa_schedule,
+    bloom_filter_taps_vertical, build_create_minmax_sm_quad, build_draw_rain_light_quad,
+    build_draw_rain_mask_quad, build_mark_msaa_edges_quad, build_phase_ssfx_rain_quad,
+    build_postprocess_pass_plan, build_stencil_optimize_quad,
+    build_ui_3d_icons_postprocess_quad, calc_gauss_k7, calc_gauss_wave, combine2_aa_quad_uvs,
+    combine2_shader_element, compute_combine1_params, compute_hdao_dispatch, compute_ssao_params,
+    effects_sun_hdr_blend_factor, luminance_filter_quad_uvs, luminance_filter_taps,
+    luminance_pass0_uvs, lut_pass_desc, phase_blur_schedule, smaa_schedule, ssfx_ao_blur_schedule,
+    ssfx_bloom_lens_blur_schedule, ssfx_il_blur_schedule, ssfx_taa_schedule,
     ssfx_volumetric_blur_schedule, sunshafts_schedule, sunshafts_uv_bounds,
     uncharted2_tonemap_curve, BloomAdaptState, BloomConfig, BloomFilterGpuWeights, Combine1Config,
     Combine1GpuParams, Combine2AaCornerUvs, Combine2Config, Combine2GpuParams, Combine2MotionState,
@@ -224,13 +234,13 @@ pub use postprocess::{
     Hdr10TonemapMode, Hdr10Tonemapper, HeatVisionConfig, HeatVisionGpuParams,
     ImageCorrectionConfig, ImageCorrectionGpuParams, LuminanceAdaptState, LuminanceConfig,
     LutPassDesc, NightVisionGen, NightVisionProfile, OcclusionQueryAllocation, OcclusionQueryPool,
-    PostprocessNoiseState, PostprocessPassPlan, SmaaPassDesc, SmaaPassKind, SsaoParams,
-    SsfxBloomGpuParams, SsfxBlurPassDesc, SsfxLightingConfig, SsfxLutConfig, SsfxScreenConfig,
-    SsfxSssCandidate, SsfxSssExtSlots, SsfxTaaConfig, SsfxTaaPassDesc, SsfxTaaPassKind,
-    SunshaftsConfig, SunshaftsPassDesc, SunshaftsPassKind, TonemapGpuParams, TonemapParams,
-    BLOOM_SIZE_X, BLOOM_SIZE_Y, HDAO_GROUP_TEXEL_DIMENSION, HDAO_GROUP_TEXEL_OVERLAP,
-    HDAO_GROUP_TEXEL_STEP, LUT_ATLAS_TEXTURE, LUT_NOISE_TEXTURE, LUT_SHADER_NAME,
-    OCCQ_DEFAULT_LIMIT, OCCQ_INVALID_HANDLE, SSFX_SSS_EXT_MAX_SLOTS,
+    PostprocessNoiseState, PostprocessPassPlan, ScreenTl2uvVertex, ScreenTlVertex, SmaaPassDesc,
+    SmaaPassKind, SsaoParams, SsfxBloomGpuParams, SsfxBlurPassDesc, SsfxLightingConfig,
+    SsfxLutConfig, SsfxScreenConfig, SsfxSssCandidate, SsfxSssExtSlots, SsfxTaaConfig,
+    SsfxTaaPassDesc, SsfxTaaPassKind, SunshaftsConfig, SunshaftsPassDesc, SunshaftsPassKind,
+    TonemapGpuParams, TonemapParams, BLOOM_SIZE_X, BLOOM_SIZE_Y, HDAO_GROUP_TEXEL_DIMENSION,
+    HDAO_GROUP_TEXEL_OVERLAP, HDAO_GROUP_TEXEL_STEP, LUT_ATLAS_TEXTURE, LUT_NOISE_TEXTURE,
+    LUT_SHADER_NAME, OCCQ_DEFAULT_LIMIT, OCCQ_INVALID_HANDLE, SSFX_SSS_EXT_MAX_SLOTS,
 };
 pub use savegames::{
     compress_scop, decompress_scop, validate_scop_header, ActorStatDetail, ActorStatSection,
@@ -241,14 +251,15 @@ pub use savegames::{
 };
 pub use shaders_xr::{
     clsid_to_string, env_mod_flags, fix_texture_name, matrix_mode, plan_r4_blender_compile,
-    plan_uber_deffer, plan_uber_shadow, resolve_ui_shader_name, shader_xrlc_flags, tcm_flags,
-    transform_uv, ui_primitive_count, BlendFactor, BlendState, BlenderClsid, BlenderDesc,
-    BlenderProperty, BlenderPropertyValue, BlenderShader, CmpFunc, CompiledPassPlan,
-    CompiledShaderPlan, CullMode, DefferElement, Dx10MsaaAlphaTest, EngineShaderLibrary,
-    EnvModAccum, EnvModifier, FogVolume, LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles,
-    R4BlenderSpec, R4CompileConfig, SamplerBindingSpec, SamplerFilterMode, ShaderConstant,
-    ShaderMatrix, ShaderXrlcEntry, ShaderXrlcLibrary, StaticParticle, StencilOp, StencilState,
-    TessMethod, TexAddressMode, TextureBindingSpec, UberDefferInput, UberShadowInput, UiPointType,
+    plan_r4_internal_blender, plan_uber_deffer, plan_uber_shadow, resolve_ui_shader_name,
+    shader_xrlc_flags, tcm_flags, transform_uv, ui_primitive_count, BlendFactor, BlendState,
+    BlenderClsid, BlenderDesc, BlenderProperty, BlenderPropertyValue, BlenderShader, CmpFunc,
+    CompiledPassPlan, CompiledShaderPlan, CullMode, DefferElement, Dx10MsaaAlphaTest,
+    EngineShaderLibrary, EnvModAccum, EnvModifier, FogVolume, LevelEnvModifiers, LevelFogVolumes,
+    LevelStaticParticles, R4BlenderSpec, R4CompileConfig, R4InternalBlenderKind,
+    R4InternalBlenderOptions, SamplerBindingSpec, SamplerFilterMode, ShaderConstant, ShaderMatrix,
+    ShaderXrlcEntry, ShaderXrlcLibrary, StaticParticle, StencilOp, StencilState, TessMethod,
+    TexAddressMode, TextureBindingSpec, UberDefferInput, UberShadowInput, UiPointType,
     UiPrimitiveType, WaveForm, WaveFunction, CBLENDER_DESC_SIZE, SHADER_XRLC_ENTRY_SIZE,
 };
 pub use skinning::{

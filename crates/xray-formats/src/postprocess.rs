@@ -14,7 +14,10 @@
 
 use crate::envelopes::{PostprocessGpuParams, PostprocessState};
 use crate::lighting::{compute_u_diffuse2s, GlossConfig, TEX_JITTER_SIZE};
-use crate::ogf::{matrix_mul_44, matrix_transform_point, XRayMatrix, XRAY_IDENTITY_MATRIX};
+use crate::ogf::{
+    matrix_mul_44, matrix_transform_point, matrix_transform_projected, XRayMatrix,
+    XRAY_IDENTITY_MATRIX,
+};
 use crate::particle_sim::ParticleRng;
 use crate::skinning::{matrix_transform_dir, normalize_vec3};
 use crate::weather::MixedEnvironment;
@@ -2777,6 +2780,166 @@ impl OcclusionQueryPool {
     }
 }
 
+// ============================================================================
+// Screen-Space FVF Quad Vertex Builders (`FVF::TL` / `FVF::TL2uv`, `r4_rendertarget*.cpp`)
+// ============================================================================
+
+const EPS_QUAD: f32 = 1e-5; // `EPS` in `src/xrCore/vector.h:52`
+
+/// 28-byte screen-space vertex matching `FVF::TL` (`src/Layers/xrRender/FVF.h:108-147`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenTlVertex {
+    pub p: [f32; 4],
+    pub color: u32,
+    pub uv: [f32; 2],
+}
+const _: () = assert!(std::mem::size_of::<ScreenTlVertex>() == 28);
+
+/// 36-byte dual-UV screen-space vertex matching `FVF::TL2uv` (`src/Layers/xrRender/FVF.h:151-196`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenTl2uvVertex {
+    pub p: [f32; 4],
+    pub color: u32,
+    pub uv0: [f32; 2],
+    pub uv1: [f32; 2],
+}
+const _: () = assert!(std::mem::size_of::<ScreenTl2uvVertex>() == 36);
+
+#[inline]
+const fn quad_rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
+    ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+#[inline]
+fn build_ndc_tl2uv_quad() -> [ScreenTl2uvVertex; 4] {
+    let c = quad_rgba(255, 255, 255, 255);
+    [
+        ScreenTl2uvVertex {
+            p: [-1.0, -1.0, 0.0, 1.0],
+            color: c,
+            uv0: [0.0, 1.0],
+            uv1: [0.0, 0.0],
+        },
+        ScreenTl2uvVertex {
+            p: [-1.0, 1.0, EPS_S, 1.0],
+            color: c,
+            uv0: [0.0, 0.0],
+            uv1: [0.0, 0.0],
+        },
+        ScreenTl2uvVertex {
+            p: [1.0, -1.0, EPS_S, 1.0],
+            color: c,
+            uv0: [1.0, 1.0],
+            uv1: [0.0, 0.0],
+        },
+        ScreenTl2uvVertex {
+            p: [1.0, 1.0, EPS_S, 1.0],
+            color: c,
+            uv0: [1.0, 0.0],
+            uv1: [0.0, 0.0],
+        },
+    ]
+}
+
+/// Fullscreen quad for `CRenderTarget::create_minmax_SM` (`r4_rendertarget_create_minmaxSM.cpp:10-18`).
+#[inline]
+pub fn build_create_minmax_sm_quad() -> [ScreenTl2uvVertex; 4] {
+    build_ndc_tl2uv_quad()
+}
+
+/// Fullscreen quad for `CRenderTarget::mark_msaa_edges` (`r4_rendertarget_mark_msaa_edges.cpp:25-33`).
+#[inline]
+pub fn build_mark_msaa_edges_quad() -> [ScreenTl2uvVertex; 4] {
+    build_ndc_tl2uv_quad()
+}
+
+/// Half-texel shifted fullscreen quad for `u_stencil_optimize` / `reset_light_marker(true)`
+/// (`r4_rendertarget.cpp:1505-1513`).
+#[inline]
+pub fn build_stencil_optimize_quad(width: u32, height: u32) -> [ScreenTlVertex; 4] {
+    let w = width as f32;
+    let h = height as f32;
+    let c = quad_rgba(255, 255, 255, 255);
+    [
+        ScreenTlVertex { p: [-0.5, h - 0.5, 0.0, 1.0], color: c, uv: [0.0, 0.0] },
+        ScreenTlVertex { p: [-0.5, -0.5, 0.0, 1.0], color: c, uv: [0.0, 0.0] },
+        ScreenTlVertex { p: [w - 0.5, h - 0.5, 0.0, 1.0], color: c, uv: [0.0, 0.0] },
+        ScreenTlVertex { p: [w - 0.5, -0.5, 0.0, 1.0], color: c, uv: [0.0, 0.0] },
+    ]
+}
+
+/// Fullscreen quad for `CRenderTarget::phase_ui_3d_icons_postprocess` (`r4_rendertarget.cpp:1341-1345`).
+#[inline]
+pub fn build_ui_3d_icons_postprocess_quad(width: u32, height: u32) -> [ScreenTlVertex; 4] {
+    let w = width as f32;
+    let h = height as f32;
+    let c = quad_rgba(255, 255, 255, 255);
+    [
+        ScreenTlVertex { p: [0.0, h, EPS_S, 1.0], color: c, uv: [0.0, 1.0] },
+        ScreenTlVertex { p: [0.0, 0.0, EPS_S, 1.0], color: c, uv: [0.0, 0.0] },
+        ScreenTlVertex { p: [w, h, EPS_S, 1.0], color: c, uv: [1.0, 1.0] },
+        ScreenTlVertex { p: [w, 0.0, EPS_S, 1.0], color: c, uv: [1.0, 0.0] },
+    ]
+}
+
+/// Fullscreen quad for `CRenderTarget::phase_ssfx_rain` (`r4_rendertarget_phase_rain.cpp:17-34`).
+#[inline]
+pub fn build_phase_ssfx_rain_quad(width: u32, height: u32) -> [ScreenTlVertex; 4] {
+    let w = width as f32;
+    let h = height as f32;
+    let c = quad_rgba(0, 0, 0, 255);
+    [
+        ScreenTlVertex { p: [0.0, h, EPS_S, 1.0], color: c, uv: [0.0, 1.0] },
+        ScreenTlVertex { p: [0.0, 0.0, EPS_S, 1.0], color: c, uv: [0.0, 0.0] },
+        ScreenTlVertex { p: [w, h, EPS_S, 1.0], color: c, uv: [1.0, 1.0] },
+        ScreenTlVertex { p: [w, 0.0, EPS_S, 1.0], color: c, uv: [1.0, 0.0] },
+    ]
+}
+
+/// Fullscreen mask quad for `CRenderTarget::draw_rain` (`r4_rendertarget_draw_rain.cpp:10-44`).
+#[inline]
+pub fn build_draw_rain_mask_quad(width: u32, height: u32) -> [ScreenTlVertex; 4] {
+    let w = width.max(1) as f32;
+    let h = height.max(1) as f32;
+    let c = quad_rgba(255, 255, 255, 255);
+    let p0 = [0.5 / w, 0.5 / h];
+    let p1 = [(w + 0.5) / w, (h + 0.5) / h];
+    [
+        ScreenTlVertex { p: [EPS_QUAD, h + EPS_QUAD, EPS_S, 1.0], color: c, uv: [p0[0], p1[1]] },
+        ScreenTlVertex { p: [EPS_QUAD, EPS_QUAD, EPS_S, 1.0], color: c, uv: [p0[0], p0[1]] },
+        ScreenTlVertex { p: [w + EPS_QUAD, h + EPS_QUAD, EPS_S, 1.0], color: c, uv: [p1[0], p1[1]] },
+        ScreenTlVertex { p: [w + EPS_QUAD, EPS_QUAD, EPS_S, 1.0], color: c, uv: [p1[0], p0[1]] },
+    ]
+}
+
+/// Projected depth-clipped jittered quad for `CRenderTarget::draw_rain`
+/// (`r4_rendertarget_draw_rain.cpp:62-70, 173-189`).
+#[inline]
+pub fn build_draw_rain_light_quad(
+    width: u32,
+    f_rain_far: f32,
+    cam_pos: [f32; 3],
+    cam_dir: [f32; 3],
+    full_transform: &XRayMatrix,
+) -> [ScreenTl2uvVertex; 4] {
+    let center_pt = [
+        cam_pos[0] + cam_dir[0] * f_rain_far,
+        cam_pos[1] + cam_dir[1] * f_rain_far,
+        cam_pos[2] + cam_dir[2] * f_rain_far,
+    ];
+    let d_z = matrix_transform_projected(full_transform, center_pt).map_or(EPS_S, |p| p[2]);
+    let scale_x = width as f32 / TEX_JITTER_SIZE as f32;
+    let c = quad_rgba(255, 255, 255, 255);
+    [
+        ScreenTl2uvVertex { p: [-1.0, -1.0, d_z, 1.0], color: c, uv0: [0.0, 1.0], uv1: [0.0, scale_x] },
+        ScreenTl2uvVertex { p: [-1.0, 1.0, d_z, 1.0], color: c, uv0: [0.0, 0.0], uv1: [0.0, 0.0] },
+        ScreenTl2uvVertex { p: [1.0, -1.0, d_z, 1.0], color: c, uv0: [1.0, 1.0], uv1: [scale_x, scale_x] },
+        ScreenTl2uvVertex { p: [1.0, 1.0, d_z, 1.0], color: c, uv0: [1.0, 0.0], uv1: [scale_x, 0.0] },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3314,5 +3477,35 @@ mod tests {
 
         pool.set_enabled(false);
         assert!(pool.begin().is_none());
+
+        // Screen-space TL & TL2uv quad builders
+        let mm = build_create_minmax_sm_quad();
+        let msaa_e = build_mark_msaa_edges_quad();
+        assert_eq!(mm, msaa_e);
+        assert_eq!(mm[0].p[2], 0.0);
+        assert_eq!(mm[1].p[2], EPS_S);
+
+        let opt_q = build_stencil_optimize_quad(1920, 1080);
+        assert_eq!(opt_q[0].p, [-0.5, 1079.5, 0.0, 1.0]);
+        assert_eq!(opt_q[3].p, [1919.5, -0.5, 0.0, 1.0]);
+
+        let icons_q = build_ui_3d_icons_postprocess_quad(1280, 720);
+        assert_eq!(icons_q[0].color, 0xFFFF_FFFF);
+        let rain_bg = build_phase_ssfx_rain_quad(1280, 720);
+        assert_eq!(rain_bg[0].color, 0xFF00_0000);
+
+        let rain_mask = build_draw_rain_mask_quad(100, 50);
+        assert!((rain_mask[0].uv[0] - 0.005).abs() < 1e-6);
+        assert!((rain_mask[2].uv[1] - 1.01).abs() < 1e-6);
+
+        let rain_lit = build_draw_rain_light_quad(
+            1280,
+            50.0,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            &XRAY_IDENTITY_MATRIX,
+        );
+        assert!((rain_lit[0].p[2] - 50.0).abs() < 1e-5);
+        assert_eq!(rain_lit[0].uv1[1], 20.0);
     }
 }

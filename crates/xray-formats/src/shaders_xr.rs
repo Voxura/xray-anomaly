@@ -1298,6 +1298,7 @@ pub struct SamplerBindingSpec {
     pub address_mode: TexAddressMode,
     pub address_w: TexAddressMode,
     pub anisotropic_override: Option<bool>,
+    pub border_color: Option<u32>,
 }
 
 /// Complete DX10/DX11/DX12 render state + shader + resource recipe for a single pass.
@@ -1308,6 +1309,7 @@ pub struct CompiledPassPlan {
     pub ds: String,
     pub gs: String,
     pub ps: String,
+    pub cs: String,
     pub fog: bool,
     pub lighting: bool,
     pub z_test: bool,
@@ -1393,6 +1395,7 @@ impl PassCompiler {
             ds: "null".to_string(),
             gs: gs.to_string(),
             ps: ps.to_string(),
+            cs: "null".to_string(),
             fog,
             lighting: false,
             z_test,
@@ -1453,14 +1456,57 @@ impl PassCompiler {
         }
     }
 
-    fn pass_set_zb(&mut self, z_test: bool, mut z_write: bool) {
+    fn r_compute_pass(&mut self, cs: &str) {
+        let pass = CompiledPassPlan {
+            vs: "null".to_string(),
+            hs: "null".to_string(),
+            ds: "null".to_string(),
+            gs: "null".to_string(),
+            ps: "null".to_string(),
+            cs: cs.to_string(),
+            fog: false,
+            lighting: false,
+            z_test: false,
+            z_write: false,
+            z_func: CmpFunc::Always,
+            cull_mode: CullMode::Ccw,
+            wireframe: false,
+            blend: BlendState::default(),
+            stencil: StencilState::default(),
+            shader_options: Vec::new(),
+            textures: Vec::new(),
+            samplers: Vec::new(),
+        };
+        self.current = Some(pass);
+    }
+
+    fn pass_set_zb_full(&mut self, z_test: bool, mut z_write: bool, z_inverted: bool) {
         if !self.plan.passes.is_empty() {
             z_write = false;
         }
         if let Some(pass) = self.current.as_mut() {
             pass.z_test = z_test;
             pass.z_write = z_write;
-            pass.z_func = if z_test { CmpFunc::LessEqual } else { CmpFunc::Always };
+            pass.z_func = if z_test {
+                if z_inverted {
+                    CmpFunc::Greater
+                } else {
+                    CmpFunc::LessEqual
+                }
+            } else {
+                CmpFunc::Always
+            };
+        }
+    }
+
+    fn pass_set_zb(&mut self, z_test: bool, z_write: bool) {
+        self.pass_set_zb_full(z_test, z_write, false);
+    }
+
+    fn set_blend_factors(&mut self, src: BlendFactor, dst: BlendFactor) {
+        if let Some(pass) = self.current.as_mut() {
+            pass.blend.src = src;
+            pass.blend.dst = dst;
         }
     }
 
@@ -1632,6 +1678,7 @@ impl PassCompiler {
                 address_mode,
                 address_w,
                 anisotropic_override: aniso,
+                border_color: None,
             });
             idx
         } else {
@@ -1654,6 +1701,24 @@ impl PassCompiler {
         {
             s.anisotropic_override = Some(aniso);
         }
+    }
+
+    fn i_dx10_border_color(&mut self, stage: usize, color: u32) {
+        if let Some(pass) = self.current.as_mut()
+            && let Some(s) = pass.samplers.get_mut(stage)
+        {
+            s.border_color = Some(color);
+        }
+    }
+
+    fn jitter(&mut self) {
+        self.r_dx10_texture("jitter0", "$user$jitter_0");
+        self.r_dx10_texture("jitter1", "$user$jitter_1");
+        self.r_dx10_texture("jitter2", "$user$jitter_2");
+        self.r_dx10_texture("jitter3", "$user$jitter_3");
+        self.r_dx10_texture("jitter4", "$user$jitter_4");
+        self.r_dx10_texture("jitterMipped", "$user$jitter_mipped");
+        self.r_dx10_sampler("smp_jitter");
     }
 
     fn r_end(&mut self) {
@@ -3628,6 +3693,1919 @@ pub fn plan_r4_blender_compile(
     compiler.plan
 }
 
+/// Engine-internal non-serialized R4/DX11/SSFX blenders instantiated directly in
+/// `CRenderTarget` and `dxEnvironmentRender` (`r4_rendertarget.cpp:387-486`,
+/// `dxEnvironmentRender.h:9-48`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum R4InternalBlenderKind {
+    LightOccq,
+    AccumDirectMask,
+    AccumDirectMaskMsaa,
+    AccumDirect,
+    AccumDirectMsaa,
+    AccumDirectVolumetricMsaa,
+    AccumDirectVolumetricSunMsaa,
+    AccumPoint,
+    AccumPointMsaa,
+    AccumSpot,
+    AccumSpotMsaa,
+    AccumVolumetricMsaa,
+    AccumReflected,
+    AccumReflectedMsaa,
+    Combine,
+    CombineMsaa,
+    SsaoNoMsaa,
+    SsaoMsaa,
+    HdaoCs,
+    HdaoMsaaCs,
+    CreateMinMaxSm,
+    MsaaEdges,
+    Rain,
+    RainMsaa,
+    Skybox,
+    BloomBuild,
+    BloomBuildMsaa,
+    PostprocessMsaa,
+    SsfxBloomBuild,
+    SsfxBloomLens,
+    SsfxBloomDownsample,
+    SsfxBloomUpsample,
+    Blur,
+    SsfxSsr,
+    SsfxVolumetricBlur,
+    SsfxAo,
+    SsfxSss,
+    SsfxSssExt,
+    SsfxRain,
+    SsfxWaterBlur,
+    SsfxMotionBlur,
+    SsfxFogScattering,
+    Dof,
+    GasmaskDrops,
+    GasmaskDudv,
+    Hdr10BloomDownsample,
+    Hdr10BloomBlur,
+    Hdr10BloomUpsample,
+    Hdr10LensFlareDownsample,
+    Hdr10LensFlareFgen,
+    Hdr10LensFlareBlur,
+    Hdr10LensFlareUpsample,
+    Luminance,
+    Lut,
+    Nightvision,
+    Fakescope,
+    Heatvision,
+    PpBloom,
+    Smaa,
+    SsfxTaa,
+    Sunshafts,
+}
+
+/// Compilation options for [`plan_r4_internal_blender`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct R4InternalBlenderOptions {
+    pub element: u32,
+    pub dx10_msaa: bool,
+    pub fp16_blend: bool,
+    pub sunfilter: bool,
+}
+
+impl Default for R4InternalBlenderOptions {
+    fn default() -> Self {
+        Self {
+            element: 0,
+            dx10_msaa: false,
+            fp16_blend: true,
+            sunfilter: false,
+        }
+    }
+}
+
+/// Compile an internal R4/DX11/SSFX blender into a [`CompiledShaderPlan`],
+/// matching the corresponding `CBlender_*::Compile` implementation verbatim.
+pub fn plan_r4_internal_blender(
+    kind: R4InternalBlenderKind,
+    l_textures: &[&str],
+    options: R4InternalBlenderOptions,
+) -> CompiledShaderPlan {
+    let mut c = PassCompiler::new(1, false);
+    let tex0 = l_textures.first().copied().unwrap_or("");
+    let elem = options.element;
+
+    let add_combine_samplers = |c: &mut PassCompiler| {
+        c.r_dx10_sampler("smp_linear");
+        c.r_dx10_sampler("smp_nofilter");
+        c.r_dx10_sampler("smp_rtlinear");
+    };
+    let add_nvg_common = |c: &mut PassCompiler| {
+        c.r_dx10_texture("s_position", "$user$position");
+        c.r_dx10_texture("s_image", "$user$generic0");
+        c.r_dx10_texture("s_bloom_new", "$user$pp_bloom");
+        c.r_dx10_texture("s_blur_2", "$user$blur_2");
+        c.r_dx10_texture("s_blur_4", "$user$blur_4");
+        c.r_dx10_texture("s_blur_8", "$user$blur_8");
+    };
+    let add_nvg_samplers = |c: &mut PassCompiler| {
+        c.r_dx10_sampler("smp_base");
+        c.r_dx10_sampler("smp_nofilter");
+        c.r_dx10_sampler("smp_rtlinear");
+    };
+    let add_taa_samplers = |c: &mut PassCompiler| {
+        c.r_dx10_sampler("smp_point");
+        c.r_dx10_sampler("smp_linear");
+        c.r_dx10_sampler("smp_rtlinear");
+        c.r_dx10_sampler("smp_nofilter");
+    };
+
+    match kind {
+        R4InternalBlenderKind::LightOccq => match elem {
+            0 => {
+                c.r_pass_default("dumb", "dumb", false, true, false);
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default("stub_notransform_t", "dumb", false, false, false);
+                c.r_color_write_enable(false, false, false, false);
+                c.r_cull_mode(CullMode::None);
+                c.r_stencil(
+                    true,
+                    CmpFunc::LessEqual,
+                    0xFF,
+                    0x00,
+                    StencilOp::Keep,
+                    StencilOp::Keep,
+                    StencilOp::Keep,
+                );
+                c.r_end();
+            }
+            2 => {
+                c.r_pass_default("stub_notransform_t", "dumb", false, false, false);
+                c.r_color_write_enable(false, false, false, false);
+                c.r_cull_mode(CullMode::None);
+                let wmask = if options.dx10_msaa { 0x7E } else { 0xFE };
+                c.r_stencil(
+                    true,
+                    CmpFunc::Always,
+                    0x00,
+                    wmask,
+                    StencilOp::Zero,
+                    StencilOp::Zero,
+                    StencilOp::Zero,
+                );
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::AccumDirectMask | R4InternalBlenderKind::AccumDirectMaskMsaa => {
+            let msaa = kind == R4InternalBlenderKind::AccumDirectMaskMsaa;
+            match elem {
+                0 | 1 => {
+                    c.r_pass_default("accum_mask", "dumb", false, true, false);
+                    c.r_color_write_enable(false, false, false, false);
+                    c.r_end();
+                }
+                2 => {
+                    c.r_pass_full(
+                        "stub_notransform_t",
+                        "null",
+                        if msaa { "accum_sun_mask_msaa" } else { "accum_sun_mask_nomsaa" },
+                        false,
+                        false,
+                        false,
+                        true,
+                        BlendFactor::Zero,
+                        BlendFactor::One,
+                        true,
+                        1,
+                    );
+                    c.r_dx10_texture("s_position", "$user$position");
+                    c.r_dx10_texture("s_diffuse", "$user$albedo");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_color_write_enable(false, false, false, false);
+                    c.r_end();
+                }
+                3 => {
+                    c.r_pass_default(
+                        "accum_volume",
+                        if msaa { "copy_p_msaa" } else { "copy_p_nomsaa" },
+                        false,
+                        false,
+                        false,
+                    );
+                    c.r_dx10_texture("s_generic", "$user$accum_temp");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_end();
+                }
+                4 => {
+                    c.r_pass_default(
+                        "stub_notransform_t",
+                        if msaa { "copy_msaa" } else { "copy_nomsaa" },
+                        false,
+                        false,
+                        false,
+                    );
+                    c.r_dx10_texture("s_generic", "$user$accum_temp");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_end();
+                }
+                5 => {
+                    c.r_pass_default("stub_notransform_t", "copy_nomsaa", false, false, false);
+                    c.r_dx10_texture("s_generic", "$user$accum");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_end();
+                }
+                _ => {}
+            }
+        }
+
+        R4InternalBlenderKind::AccumDirect | R4InternalBlenderKind::AccumDirectMsaa => {
+            let msaa = kind == R4InternalBlenderKind::AccumDirectMsaa;
+            let _ = options.sunfilter; // `blend` is hardcoded `FALSE` in both C++ paths
+            let blend = false;
+            let dst = BlendFactor::Zero;
+            match elem {
+                0 | 1 => {
+                    c.r_pass_full(
+                        "accum_sun",
+                        "null",
+                        if msaa {
+                            "accum_sun_near_msaa_nominmax"
+                        } else {
+                            "accum_sun_near_nomsaa_nominmax"
+                        },
+                        false,
+                        true,
+                        false,
+                        blend,
+                        BlendFactor::One,
+                        dst,
+                        false,
+                        0,
+                    );
+                    c.r_cull_mode(CullMode::None);
+                    c.pass_set_zb_full(true, false, true);
+                    c.r_dx10_texture("s_position", "$user$position");
+                    c.r_dx10_texture("s_diffuse", "$user$albedo");
+                    c.r_dx10_texture("s_material", "$user$material");
+                    c.r_dx10_texture("s_accumulator", "$user$accum");
+                    c.r_dx10_texture("s_lmap", "sunmask");
+                    c.r_dx10_texture("s_smap", "$user$smap_depth");
+                    if !msaa {
+                        c.r_dx10_texture("s_smap_minmax", "$user$smap_depth_minmax");
+                    }
+                    c.r_dx10_texture("s_ssfx_sss", "$user$ssfx_sss");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_dx10_sampler("smp_material");
+                    c.r_dx10_sampler("smp_linear");
+                    c.jitter();
+                    c.r_dx10_sampler("smp_smap");
+                    c.r_end();
+                }
+                2 => {
+                    c.r_pass_full(
+                        "accum_sun",
+                        "null",
+                        if msaa { "accum_sun_far_msaa" } else { "accum_sun_far_nomsaa" },
+                        false,
+                        true,
+                        false,
+                        blend,
+                        BlendFactor::One,
+                        dst,
+                        false,
+                        0,
+                    );
+                    c.r_cull_mode(CullMode::None);
+                    c.r_dx10_texture("s_position", "$user$position");
+                    c.r_dx10_texture("s_diffuse", "$user$albedo");
+                    c.r_dx10_texture("s_material", "$user$material");
+                    c.r_dx10_texture("s_accumulator", "$user$accum");
+                    c.r_dx10_texture("s_lmap", "sunmask");
+                    c.r_dx10_texture("s_smap", "$user$smap_depth");
+                    c.r_dx10_texture("s_ssfx_sss", "$user$ssfx_sss");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_dx10_sampler("smp_material");
+                    c.r_dx10_sampler("smp_linear");
+                    c.jitter();
+                    let s = c.r_dx10_sampler("smp_smap");
+                    if s != usize::MAX {
+                        c.i_dx10_address(s, TexAddressMode::Border);
+                        c.i_dx10_border_color(s, 0xFFFF_FFFF);
+                    }
+                    c.r_end();
+                }
+                3 => {
+                    c.r_pass_default(
+                        "stub_notransform_aa_AA",
+                        if msaa { "accum_sun_msaa" } else { "accum_sun_nomsaa" },
+                        false,
+                        false,
+                        false,
+                    );
+                    c.r_cull_mode(CullMode::None);
+                    c.r_dx10_texture("s_position", "$user$position");
+                    c.r_dx10_texture("s_diffuse", "$user$albedo");
+                    c.r_dx10_texture("s_material", "$user$material");
+                    c.r_dx10_texture("s_smap", "$user$generic0");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_dx10_sampler("smp_material");
+                    c.jitter();
+                    c.r_end();
+                }
+                4 => {
+                    c.r_pass_full(
+                        "accum_sun",
+                        "null",
+                        if msaa {
+                            "accum_sun_near_msaa_minmax"
+                        } else {
+                            "accum_sun_near_nomsaa_minmax"
+                        },
+                        false,
+                        true,
+                        false,
+                        blend,
+                        BlendFactor::One,
+                        dst,
+                        false,
+                        0,
+                    );
+                    c.r_cull_mode(CullMode::None);
+                    c.pass_set_zb_full(true, false, true);
+                    c.r_dx10_texture("s_position", "$user$position");
+                    c.r_dx10_texture("s_diffuse", "$user$albedo");
+                    c.r_dx10_texture("s_material", "$user$material");
+                    c.r_dx10_texture("s_accumulator", "$user$accum");
+                    c.r_dx10_texture("s_lmap", "sunmask");
+                    c.r_dx10_texture("s_smap", "$user$smap_depth");
+                    c.r_dx10_texture("s_smap_minmax", "$user$smap_depth_minmax");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_dx10_sampler("smp_material");
+                    c.r_dx10_sampler("smp_linear");
+                    c.jitter();
+                    c.r_dx10_sampler("smp_smap");
+                    c.r_end();
+                }
+                _ => {}
+            }
+        }
+
+        R4InternalBlenderKind::AccumDirectVolumetricMsaa => {
+            if elem == 0 {
+                let _ = options.sunfilter;
+                c.r_pass_full(
+                    "accum_sun",
+                    "null",
+                    "accum_volumetric_sun_msaa",
+                    false,
+                    true,
+                    false,
+                    false,
+                    BlendFactor::One,
+                    BlendFactor::Zero,
+                    false,
+                    0,
+                );
+                c.r_dx10_texture("s_lmap", tex0);
+                c.r_dx10_texture("s_smap", "$user$smap_depth");
+                c.r_dx10_texture("s_noise", "fx\\fx_noise");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_smap");
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::AccumDirectVolumetricSunMsaa => {
+            if elem == 0 {
+                c.r_pass_full(
+                    "accum_sun",
+                    "null",
+                    "accum_volumetric_sun_msaa",
+                    false,
+                    false,
+                    false,
+                    true,
+                    BlendFactor::One,
+                    BlendFactor::One,
+                    false,
+                    0,
+                );
+                c.r_dx10_texture("s_smap", "$user$smap_depth");
+                c.r_dx10_texture("s_position", "$user$position");
+                c.jitter();
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_smap");
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::AccumPoint | R4InternalBlenderKind::AccumPointMsaa => {
+            let msaa = kind == R4InternalBlenderKind::AccumPointMsaa;
+            let blend = options.fp16_blend;
+            let dst = if blend { BlendFactor::One } else { BlendFactor::Zero };
+            match elem {
+                0 => {
+                    c.r_pass_default(
+                        "stub_notransform",
+                        if msaa { "copy_msaa" } else { "copy_nomsaa" },
+                        false,
+                        false,
+                        false,
+                    );
+                    c.r_dx10_texture("s_base", tex0);
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_end();
+                }
+                1 => {
+                    c.r_pass_full(
+                        "accum_volume",
+                        "null",
+                        if msaa {
+                            "accum_omni_unshadowed_msaa"
+                        } else {
+                            "accum_omni_unshadowed_nomsaa"
+                        },
+                        false,
+                        false,
+                        false,
+                        blend,
+                        BlendFactor::One,
+                        dst,
+                        false,
+                        0,
+                    );
+                    c.r_dx10_texture("s_position", "$user$position");
+                    c.r_dx10_texture("s_diffuse", "$user$albedo");
+                    c.r_dx10_texture("s_material", "$user$material");
+                    c.r_dx10_texture("s_lmap", tex0);
+                    c.r_dx10_texture("s_accumulator", "$user$accum");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_dx10_sampler("smp_material");
+                    c.r_dx10_sampler("smp_rtlinear");
+                    c.r_end();
+                }
+                2..=4 => {
+                    let ps = match (elem, msaa) {
+                        (4, true) => "accum_omni_transluent_msaa",
+                        (4, false) => "accum_omni_transluent_nomsaa",
+                        (_, true) => "accum_omni_normal_msaa",
+                        (_, false) => "accum_omni_normal_nomsaa",
+                    };
+                    c.r_pass_full(
+                        "accum_volume",
+                        "null",
+                        ps,
+                        false,
+                        false,
+                        false,
+                        blend,
+                        BlendFactor::One,
+                        dst,
+                        false,
+                        0,
+                    );
+                    c.r_dx10_texture("s_position", "$user$position");
+                    c.r_dx10_texture("s_diffuse", "$user$albedo");
+                    c.r_dx10_texture("s_material", "$user$material");
+                    c.r_dx10_texture("s_lmap", tex0);
+                    c.r_dx10_texture("s_smap", "$user$smap_depth");
+                    c.r_dx10_texture("s_accumulator", "$user$accum");
+                    c.r_dx10_texture("s_ssfx_sss", "$user$ssfx_sss_tmp");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_dx10_sampler("smp_material");
+                    c.r_dx10_sampler("smp_rtlinear");
+                    c.jitter();
+                    c.r_dx10_sampler("smp_smap");
+                    c.r_end();
+                }
+                _ => {}
+            }
+        }
+
+        R4InternalBlenderKind::AccumSpot | R4InternalBlenderKind::AccumSpotMsaa => {
+            let msaa = kind == R4InternalBlenderKind::AccumSpotMsaa;
+            let blend = options.fp16_blend;
+            let dst = if blend { BlendFactor::One } else { BlendFactor::Zero };
+            match elem {
+                0 => {
+                    c.r_pass_default(
+                        "stub_notransform",
+                        if msaa { "copy_msaa" } else { "copy_nomsaa" },
+                        false,
+                        false,
+                        false,
+                    );
+                    c.r_dx10_texture("s_base", tex0);
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_end();
+                }
+                1 => {
+                    c.r_pass_full(
+                        "accum_volume",
+                        "null",
+                        if msaa {
+                            "accum_spot_unshadowed_msaa"
+                        } else {
+                            "accum_spot_unshadowed_nomsaa"
+                        },
+                        false,
+                        false,
+                        false,
+                        blend,
+                        BlendFactor::One,
+                        dst,
+                        false,
+                        0,
+                    );
+                    c.r_dx10_texture("s_position", "$user$position");
+                    c.r_dx10_texture("s_diffuse", "$user$albedo");
+                    c.r_dx10_texture("s_material", "$user$material");
+                    c.r_dx10_texture("s_lmap", tex0);
+                    c.r_dx10_texture("s_accumulator", "$user$accum");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_dx10_sampler("smp_material");
+                    c.r_dx10_sampler("smp_rtlinear");
+                    c.r_end();
+                }
+                2..=4 => {
+                    let ps = match (elem, msaa) {
+                        (3 | 4, true) => "accum_spot_fullsize_msaa",
+                        (3 | 4, false) => "accum_spot_fullsize_nomsaa",
+                        (_, true) => "accum_spot_normal_msaa",
+                        (_, false) => "accum_spot_normal_nomsaa",
+                    };
+                    c.r_pass_full(
+                        "accum_volume",
+                        "null",
+                        ps,
+                        false,
+                        false,
+                        false,
+                        blend,
+                        BlendFactor::One,
+                        dst,
+                        false,
+                        0,
+                    );
+                    c.r_dx10_texture("s_position", "$user$position");
+                    c.r_dx10_texture("s_diffuse", "$user$albedo");
+                    c.r_dx10_texture("s_material", "$user$material");
+                    c.r_dx10_texture("s_lmap", tex0);
+                    c.r_dx10_texture("s_smap", "$user$smap_depth");
+                    c.r_dx10_texture("s_accumulator", "$user$accum");
+                    c.r_dx10_texture("s_ssfx_sss", "$user$ssfx_sss_tmp");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_dx10_sampler("smp_material");
+                    c.r_dx10_sampler("smp_rtlinear");
+                    c.jitter();
+                    c.r_dx10_sampler("smp_smap");
+                    c.r_end();
+                }
+                _ => {}
+            }
+        }
+
+        R4InternalBlenderKind::AccumVolumetricMsaa => {
+            if elem == 0 {
+                c.r_pass_default("accum_volumetric", "accum_volumetric_msaa", false, false, false);
+                c.r_dx10_texture("s_lmap", tex0);
+                c.r_dx10_texture("s_smap", "$user$smap_depth");
+                c.r_dx10_texture("s_noise", "fx\\fx_noise");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_smap");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::AccumReflected | R4InternalBlenderKind::AccumReflectedMsaa => {
+            let msaa = kind == R4InternalBlenderKind::AccumReflectedMsaa;
+            let blend = options.fp16_blend;
+            let dst = if blend { BlendFactor::One } else { BlendFactor::Zero };
+            c.r_pass_full(
+                "accum_volume",
+                "null",
+                if msaa { "accum_indirect_msaa" } else { "accum_indirect_nomsaa" },
+                false,
+                false,
+                false,
+                blend,
+                BlendFactor::One,
+                dst,
+                false,
+                0,
+            );
+            c.r_dx10_texture("s_position", "$user$position");
+            c.r_dx10_texture("s_diffuse", "$user$albedo");
+            c.r_dx10_texture("s_material", "$user$material");
+            c.r_dx10_texture("s_accumulator", "$user$accum");
+            c.r_dx10_sampler("smp_nofilter");
+            c.r_dx10_sampler("smp_material");
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::Combine | R4InternalBlenderKind::CombineMsaa => {
+            let msaa = kind == R4InternalBlenderKind::CombineMsaa;
+            match elem {
+                0 => {
+                    c.r_pass_full(
+                        "combine_1",
+                        "null",
+                        if msaa { "combine_1_msaa" } else { "combine_1_nomsaa" },
+                        false,
+                        false,
+                        false,
+                        true,
+                        BlendFactor::InvSrcAlpha,
+                        BlendFactor::SrcAlpha,
+                        false,
+                        0,
+                    );
+                    c.r_stencil(
+                        true,
+                        CmpFunc::LessEqual,
+                        0xFF,
+                        0x00,
+                        StencilOp::Keep,
+                        StencilOp::Keep,
+                        StencilOp::Keep,
+                    );
+                    c.r_stencil_ref(0x01);
+                    c.r_dx10_texture("s_position", "$user$position");
+                    c.r_dx10_texture("s_diffuse", "$user$albedo");
+                    c.r_dx10_texture("s_accumulator", "$user$accum");
+                    c.r_dx10_texture("s_depth", "$user$depth");
+                    c.r_dx10_texture("s_tonemap", "$user$tonemap");
+                    c.r_dx10_texture("s_material", "$user$material");
+                    if msaa {
+                        c.r_dx10_texture("s_occ", "$user$ssao_temp");
+                        c.r_dx10_texture("s_half_depth", "$user$half_depth");
+                    }
+                    c.r_dx10_texture("env_s0", "$user$env_s0");
+                    c.r_dx10_texture("env_s1", "$user$env_s1");
+                    c.r_dx10_texture("sky_s0", "$user$sky0");
+                    c.r_dx10_texture("sky_s1", "$user$sky1");
+                    if !msaa {
+                        c.r_dx10_texture("s_occ", "$user$ssao_temp");
+                        c.r_dx10_texture("s_half_depth", "$user$half_depth");
+                    }
+                    c.r_dx10_texture("ssfx_ao", "$user$ssfx_temp");
+                    c.r_dx10_texture("ssfx_il", "$user$ssfx_temp2");
+                    c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                    c.r_dx10_texture("s_ssfx_sss", "$user$ssfx_sss");
+                    c.jitter();
+                    c.r_dx10_sampler("smp_linear");
+                    c.r_dx10_sampler("smp_nofilter");
+                    c.r_dx10_sampler("smp_material");
+                    c.r_dx10_sampler("smp_rtlinear");
+                    c.r_end();
+                }
+                1..=4 => {
+                    let ps = match elem {
+                        1 => "combine_2_AA",
+                        2 => "combine_2_NAA",
+                        3 => "combine_2_AA_D",
+                        _ => "combine_2_NAA_D",
+                    };
+                    let z_write = msaa && matches!(elem, 2 | 4);
+                    c.r_pass_default("stub_notransform_aa_AA", ps, false, false, z_write);
+                    c.r_dx10_texture("s_position", "$user$position");
+                    c.r_dx10_texture("s_image", "$user$generic0");
+                    c.r_dx10_texture("s_bloom", "$user$bloom1");
+                    c.r_dx10_texture("s_bloom_new", "$user$pp_bloom");
+                    c.r_dx10_texture(
+                        "s_distort",
+                        if msaa { "$user$generic1_r" } else { "$user$generic1" },
+                    );
+                    c.r_dx10_texture("s_blur_2", "$user$blur_2");
+                    c.r_dx10_texture("s_blur_4", "$user$blur_4");
+                    c.r_dx10_texture("s_blur_8", "$user$blur_8");
+
+                    let lut_first = if msaa { elem <= 2 } else { elem == 1 };
+                    if lut_first {
+                        c.r_dx10_texture("s_lut_atlas", "shaders\\lut_atlas");
+                        c.r_dx10_texture("s_lens_dirt", "shaders\\lens_dirt");
+                        c.r_dx10_texture("s_noise_1", "shaders\\noise\\noise_tex");
+                        c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                        c.r_dx10_texture("s_ssfx_sss", "$user$ssfx_sss");
+                        c.r_dx10_texture("s_ssfx_bloom", "$user$ssfx_bloom1");
+                    } else {
+                        c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                        c.r_dx10_texture("s_ssfx_sss", "$user$ssfx_sss");
+                        c.r_dx10_texture("s_ssfx_bloom", "$user$ssfx_bloom1");
+                        c.r_dx10_texture("s_lut_atlas", "shaders\\lut_atlas");
+                        c.r_dx10_texture("s_lens_dirt", "shaders\\lens_dirt");
+                        c.r_dx10_texture("s_noise_1", "shaders\\noise\\noise_tex");
+                    }
+                    add_combine_samplers(&mut c);
+                    c.r_end();
+                }
+                _ => {}
+            }
+        }
+
+        R4InternalBlenderKind::SsaoNoMsaa => match elem {
+            0 => {
+                c.r_pass_default("combine_1", "ssao_calc_nomsaa", false, false, false);
+                c.r_stencil(
+                    true,
+                    CmpFunc::LessEqual,
+                    0xFF,
+                    0x00,
+                    StencilOp::Keep,
+                    StencilOp::Keep,
+                    StencilOp::Keep,
+                );
+                c.r_stencil_ref(0x01);
+                c.r_cull_mode(CullMode::None);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_tonemap", "$user$tonemap");
+                c.r_dx10_texture("s_half_depth", "$user$half_depth");
+                c.jitter();
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_material");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default("combine_1", "depth_downs", false, false, false);
+                c.r_cull_mode(CullMode::None);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_tonemap", "$user$tonemap");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_material");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsaoMsaa => {
+            if elem == 0 {
+                c.r_pass_default("combine_1", "ssao_calc_msaa", false, false, false);
+                c.r_stencil(
+                    true,
+                    CmpFunc::Equal,
+                    0x81,
+                    0x00,
+                    StencilOp::Keep,
+                    StencilOp::Keep,
+                    StencilOp::Keep,
+                );
+                c.r_stencil_ref(0x81);
+                c.r_cull_mode(CullMode::None);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.jitter();
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_material");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::HdaoCs | R4InternalBlenderKind::HdaoMsaaCs => {
+            if elem == 0 {
+                let cs = if kind == R4InternalBlenderKind::HdaoMsaaCs {
+                    "ssao_hdao_msaa"
+                } else {
+                    "ssao_hdao"
+                };
+                c.r_compute_pass(cs);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::CreateMinMaxSm => {
+            if elem == 0 {
+                c.r_pass_default(
+                    "stub_notransform_2uv",
+                    "create_minmax_sm",
+                    false,
+                    false,
+                    false,
+                );
+                c.pass_set_zb_full(false, false, false);
+                c.r_dx10_texture("s_smap", "$user$smap_depth");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::MsaaEdges => {
+            if elem == 0 {
+                c.r_pass_default(
+                    "stub_notransform_2uv",
+                    "mark_msaa_edges",
+                    false,
+                    false,
+                    false,
+                );
+                c.pass_set_zb_full(false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::Rain => match elem {
+            0 => {
+                c.r_pass_default("stub_notransform_2uv", "rain_layer", false, true, false);
+                c.pass_set_zb_full(true, false, true);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_material", "$user$material");
+                c.r_dx10_texture("s_accumulator", "$user$accum");
+                c.r_dx10_texture("s_lmap", "sunmask");
+                c.r_dx10_texture("s_smap", "$user$smap_depth");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_material");
+                c.r_dx10_sampler("smp_linear");
+                c.jitter();
+                c.r_dx10_sampler("smp_smap");
+                c.r_dx10_texture("s_water", "water\\water_normal");
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default(
+                    "stub_notransform_2uv",
+                    "rain_patch_normal_nomsaa",
+                    false,
+                    true,
+                    false,
+                );
+                c.pass_set_zb_full(true, false, true);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_material", "$user$material");
+                c.r_dx10_texture("s_lmap", "sunmask");
+                c.r_dx10_texture("s_smap", "$user$smap_depth");
+                c.r_dx10_texture("s_diffuse", "$user$albedo");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_material");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_base");
+                c.jitter();
+                c.r_dx10_sampler("smp_smap");
+                c.r_dx10_texture("s_water", "water\\water_SBumpVolume");
+                c.r_dx10_texture("s_waterFall", "water\\water_flowing_nmap");
+                c.r_dx10_texture("s_hud_mask", "$user$ssfx_motion_vectors");
+                c.r_end();
+            }
+            2 => {
+                c.r_pass_default(
+                    "stub_notransform_2uv",
+                    "rain_apply_normal_nomsaa",
+                    false,
+                    true,
+                    false,
+                );
+                c.pass_set_zb_full(true, false, true);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_material", "$user$material");
+                c.r_dx10_texture("s_lmap", "sunmask");
+                c.r_dx10_texture("s_smap", "$user$smap_depth");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_material");
+                c.r_dx10_sampler("smp_linear");
+                c.jitter();
+                c.r_dx10_sampler("smp_smap");
+                c.r_dx10_texture("s_patched_normal", "$user$accum");
+                c.r_color_write_enable(true, true, false, false);
+                c.r_end();
+            }
+            3 => {
+                c.r_pass_full(
+                    "stub_notransform_2uv",
+                    "null",
+                    "rain_apply_gloss_nomsaa",
+                    false,
+                    true,
+                    false,
+                    true,
+                    BlendFactor::One,
+                    BlendFactor::One,
+                    false,
+                    0,
+                );
+                c.pass_set_zb_full(true, false, true);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_material", "$user$material");
+                c.r_dx10_texture("s_lmap", "sunmask");
+                c.r_dx10_texture("s_smap", "$user$smap_depth");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_material");
+                c.r_dx10_sampler("smp_linear");
+                c.jitter();
+                c.r_dx10_sampler("smp_smap");
+                c.r_dx10_texture("s_patched_normal", "$user$accum");
+                c.set_blend_factors(BlendFactor::Zero, BlendFactor::SrcColor);
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::RainMsaa => match elem {
+            0 => {
+                c.r_pass_default(
+                    "stub_notransform_2uv",
+                    "rain_patch_normal_msaa",
+                    false,
+                    true,
+                    false,
+                );
+                c.pass_set_zb_full(true, false, true);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_material", "$user$material");
+                c.r_dx10_texture("s_lmap", "sunmask");
+                c.r_dx10_texture("s_smap", "$user$smap_depth");
+                c.r_dx10_texture("s_diffuse", "$user$albedo");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_material");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_base");
+                c.jitter();
+                c.r_dx10_sampler("smp_smap");
+                c.r_dx10_texture("s_water", "water\\water_SBumpVolume");
+                c.r_dx10_texture("s_waterFall", "water\\water_flowing_nmap");
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default(
+                    "stub_notransform_2uv",
+                    "rain_apply_normal_msaa",
+                    false,
+                    true,
+                    false,
+                );
+                c.pass_set_zb_full(true, false, true);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_material", "$user$material");
+                c.r_dx10_texture("s_lmap", "sunmask");
+                c.r_dx10_texture("s_smap", "$user$smap_depth");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_material");
+                c.r_dx10_sampler("smp_linear");
+                c.jitter();
+                c.r_dx10_sampler("smp_smap");
+                c.r_dx10_texture("s_patched_normal", "$user$accum");
+                c.r_color_write_enable(true, true, false, false);
+                c.r_end();
+            }
+            2 => {
+                c.r_pass_full(
+                    "stub_notransform_2uv",
+                    "null",
+                    "rain_apply_gloss_msaa",
+                    false,
+                    true,
+                    false,
+                    true,
+                    BlendFactor::One,
+                    BlendFactor::One,
+                    false,
+                    0,
+                );
+                c.pass_set_zb_full(true, false, true);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_material", "$user$material");
+                c.r_dx10_texture("s_lmap", "sunmask");
+                c.r_dx10_texture("s_smap", "$user$smap_depth");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_material");
+                c.r_dx10_sampler("smp_linear");
+                c.jitter();
+                c.r_dx10_sampler("smp_smap");
+                c.r_dx10_texture("s_patched_normal", "$user$accum");
+                c.set_blend_factors(BlendFactor::Zero, BlendFactor::SrcColor);
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::Skybox => match elem {
+            0 => {
+                c.r_pass_default("sky2", "sky2", false, true, false);
+                c.r_dx10_texture("s_sky0", "$null");
+                c.r_dx10_texture("s_sky1", "$null");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_texture("s_tonemap", "$user$tonemap");
+                c.pass_set_zb(false, false);
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default("ssfx_sky_mv", "ssfx_sky_mv", false, true, false);
+                c.pass_set_zb(false, false);
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::BloomBuild | R4InternalBlenderKind::BloomBuildMsaa => {
+            match elem {
+                0 => {
+                    c.r_pass_full(
+                        "stub_notransform_build",
+                        "null",
+                        "bloom_build",
+                        false,
+                        false,
+                        false,
+                        false,
+                        BlendFactor::SrcAlpha,
+                        BlendFactor::InvSrcAlpha,
+                        false,
+                        0,
+                    );
+                    c.r_dx10_texture("s_image", "$user$generic1");
+                    c.r_dx10_sampler("smp_rtlinear");
+                    c.r_end();
+                }
+                1 => {
+                    c.r_pass_default("stub_notransform_filter", "bloom_filter", false, false, false);
+                    c.r_dx10_texture("s_bloom", "$user$bloom1");
+                    c.r_dx10_sampler("smp_rtlinear");
+                    c.r_end();
+                }
+                2 => {
+                    c.r_pass_default("stub_notransform_filter", "bloom_filter", false, false, false);
+                    c.r_dx10_texture("s_bloom", "$user$bloom2");
+                    c.r_dx10_sampler("smp_rtlinear");
+                    c.r_end();
+                }
+                3 => {
+                    c.r_pass_default(
+                        "stub_notransform_build",
+                        "bloom_filter_f",
+                        false,
+                        false,
+                        false,
+                    );
+                    c.r_dx10_texture("s_bloom", "$user$bloom1");
+                    c.r_dx10_sampler("smp_rtlinear");
+                    c.r_end();
+                }
+                4 => {
+                    c.r_pass_default(
+                        "stub_notransform_build",
+                        "bloom_filter_f",
+                        false,
+                        false,
+                        false,
+                    );
+                    c.r_dx10_texture("s_bloom", "$user$bloom2");
+                    c.r_dx10_sampler("smp_rtlinear");
+                    c.r_end();
+                }
+                _ => {}
+            }
+        }
+
+        R4InternalBlenderKind::PostprocessMsaa => match elem {
+            0 => {
+                c.r_pass_full(
+                    "stub_notransform_postpr",
+                    "null",
+                    "postprocess",
+                    false,
+                    false,
+                    false,
+                    false,
+                    BlendFactor::SrcAlpha,
+                    BlendFactor::InvSrcAlpha,
+                    false,
+                    0,
+                );
+                c.r_dx10_texture("s_base0", "$user$generic");
+                c.r_dx10_texture("s_base1", "$user$generic");
+                c.r_dx10_texture("s_noise", "fx\\fx_noise2");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            4 => {
+                c.r_pass_full(
+                    "stub_notransform_postpr",
+                    "null",
+                    "postprocess_CM",
+                    false,
+                    false,
+                    false,
+                    false,
+                    BlendFactor::SrcAlpha,
+                    BlendFactor::InvSrcAlpha,
+                    false,
+                    0,
+                );
+                c.r_dx10_texture("s_base0", "$user$generic");
+                c.r_dx10_texture("s_base1", "$user$generic");
+                c.r_dx10_texture("s_noise", "fx\\fx_noise2");
+                c.r_dx10_texture("s_grad0", "$user$cmap0");
+                c.r_dx10_texture("s_grad1", "$user$cmap1");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsfxBloomBuild => match elem {
+            0 => {
+                c.r_pass_default("stub_screen_space", "ssfx_bloom", false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_scene", "$user$blur_2");
+                c.r_dx10_texture("s_emissive", "$user$ssfx_bloom_emissive");
+                c.r_dx10_texture("s_hud_mask", "$user$ssfx_motion_vectors");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default("stub_screen_space", "ssfx_bloom_combine", false, false, false);
+                c.r_dx10_texture("s_bloom", "$user$ssfx_bloom_tmp2");
+                c.r_dx10_texture("s_emissive", "$user$ssfx_bloom_emissive");
+                c.r_dx10_texture("s_ssfx_lensdirt", "fx\\lens_dirt");
+                c.r_dx10_texture("s_starburst", "fx\\starburst");
+                c.r_dx10_texture("s_bloom_lens", "$user$ssfx_bloom_lens");
+                c.r_dx10_texture("s_lenscolors", "fx\\lens_colors");
+                c.r_dx10_sampler("smp_point");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsfxBloomLens => match elem {
+            0 => {
+                c.r_pass_default("stub_screen_space", "ssfx_bloom_flares", false, false, false);
+                c.r_dx10_texture("s_emissive", "$user$ssfx_bloom_emissive");
+                c.r_dx10_texture("s_lenscolors", "fx\\lens_colors");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+            1 | 2 => {
+                let tex = if elem == 1 {
+                    "$user$ssfx_bloom_tmp4"
+                } else {
+                    "$user$ssfx_bloom_tmp4_2"
+                };
+                c.r_pass_default("stub_screen_space", "ssfx_bloom_upsample", false, false, false);
+                c.r_dx10_texture("s_bloom", tex);
+                c.r_dx10_texture("s_downsample", tex);
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsfxBloomDownsample => {
+            let src = match elem {
+                0 => Some(("$user$ssfx_bloom1", true)),
+                1 => Some(("$user$ssfx_bloom_tmp2", true)),
+                2 => Some(("$user$ssfx_bloom_tmp4", false)),
+                3 => Some(("$user$ssfx_bloom_tmp8", false)),
+                4 => Some(("$user$ssfx_bloom_tmp16", false)),
+                5 => Some(("$user$ssfx_bloom_tmp32", false)),
+                _ => None,
+            };
+            if let Some((tex, with_nofilter)) = src {
+                c.r_pass_default(
+                    "stub_screen_space",
+                    "ssfx_bloom_downsample",
+                    false,
+                    false,
+                    false,
+                );
+                c.r_dx10_texture("s_bloom", tex);
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_rtlinear");
+                if with_nofilter {
+                    c.r_dx10_sampler("smp_nofilter");
+                }
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::SsfxBloomUpsample => {
+            let pair = match elem {
+                0 => Some(("$user$ssfx_bloom_tmp64", "$user$ssfx_bloom_tmp64")),
+                1 => Some(("$user$ssfx_bloom_tmp32", "$user$ssfx_bloom_tmp32_2")),
+                2 => Some(("$user$ssfx_bloom_tmp16", "$user$ssfx_bloom_tmp16_2")),
+                3 => Some(("$user$ssfx_bloom_tmp8", "$user$ssfx_bloom_tmp8_2")),
+                4 => Some(("$user$ssfx_bloom_tmp4", "$user$ssfx_bloom_tmp4_2")),
+                _ => None,
+            };
+            if let Some((down_tex, bloom_tex)) = pair {
+                c.r_pass_default("stub_screen_space", "ssfx_bloom_upsample", false, false, false);
+                c.r_dx10_texture("s_downsample", down_tex);
+                c.r_dx10_texture("s_bloom", bloom_tex);
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::Blur => {
+            let img = match elem {
+                0 | 2 | 4 => Some("$user$generic0"),
+                1 => Some("$user$blur_h_2"),
+                3 => Some("$user$blur_h_4"),
+                5 => Some("$user$blur_h_8"),
+                _ => None,
+            };
+            if let Some(s_image) = img {
+                c.r_pass_default("stub_screen_space", "pp_blur", false, false, false);
+                c.r_dx10_texture("s_image", s_image);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_lut_atlas", "shaders\\lut_atlas");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::SsfxSsr => match elem {
+            0 => {
+                c.r_pass_default("stub_screen_space", "ssfx_ssr", false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("ssr_image", "$user$ssfx_ssr");
+                c.r_dx10_texture("s_rimage", "$user$generic_temp");
+                c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                c.r_dx10_texture("s_prev_pos", "$user$ssfx_prev_p");
+                c.r_dx10_texture("s_gloss_data", "$user$ssfx_temp3");
+                c.r_dx10_texture("blue_noise", "fx\\blue_noise");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            1 | 2 => {
+                c.r_pass_default("stub_screen_space", "ssfx_ssr_blur", false, false, false);
+                c.r_dx10_texture(
+                    "ssr_image",
+                    if elem == 1 { "$user$ssfx" } else { "$user$ssfx_temp" },
+                );
+                c.r_dx10_texture("s_diffuse", "$user$albedo");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+            3 => {
+                c.r_pass_default("stub_screen_space", "ssfx_ssr_combine", false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_rimage", "$user$generic_temp");
+                c.r_dx10_texture("ssr_image", "$user$ssfx_temp2");
+                c.r_dx10_texture("s_gloss_data", "$user$ssfx_temp3");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+            4 => {
+                c.r_pass_default("stub_screen_space", "ssfx_ssr_noblur", false, false, false);
+                c.r_dx10_texture("ssr_image", "$user$ssfx");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+            5 => {
+                c.r_pass_default("stub_screen_space", "ssfx_ssr_gloss", false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_diffuse", "$user$albedo");
+                c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                c.r_dx10_texture("env_s0", "$user$env_s0");
+                c.r_dx10_texture("env_s1", "$user$env_s1");
+                c.r_dx10_texture("sky_s0", "$user$sky0");
+                c.r_dx10_texture("sky_s1", "$user$sky1");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsfxVolumetricBlur => match elem {
+            0..=3 => {
+                let vol_buf = match elem {
+                    0 => "$user$ssfx_volumetric",
+                    1 => "$user$ssfx_volumetric_tmp",
+                    2 => "$user$generic2",
+                    _ => "$user$ssfx_accum",
+                };
+                c.r_pass_default("stub_screen_space", "ssfx_volumetric_blur", false, false, false);
+                c.r_dx10_texture("vol_buffer", vol_buf);
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            5 => {
+                c.r_pass_default(
+                    "stub_screen_space",
+                    "ssfx_volumetric_combine",
+                    false,
+                    false,
+                    false,
+                );
+                c.r_dx10_texture("vol_buffer", "$user$generic2");
+                c.r_dx10_texture("vol_point", "$user$ssfx_volumetric");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsfxAo => match elem {
+            0 => {
+                c.r_pass_default("stub_screen_space", "ssfx_ao", false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                c.r_dx10_texture("ssfx_ao", "$user$ssfx_ao");
+                c.r_dx10_texture("s_prev_pos", "$user$ssfx_prev_p");
+                c.r_dx10_texture("jitter0", "$user$jitter_0");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_jitter");
+                c.r_end();
+            }
+            1 | 2 => {
+                c.r_pass_default("stub_screen_space", "ssfx_ao_blur", false, false, false);
+                c.r_dx10_texture(
+                    "ao_image",
+                    if elem == 1 { "$user$ssfx_temp" } else { "$user$ssfx_temp3" },
+                );
+                c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            3 => {
+                c.r_pass_default("stub_screen_space", "ssfx_il", false, false, false);
+                c.r_dx10_texture("s_accumulator", "$user$accum");
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                c.r_dx10_texture("ssfx_ao", "$user$ssfx_il");
+                c.r_dx10_texture("s_prev_pos", "$user$ssfx_prev_p");
+                c.r_dx10_texture("jitter0", "$user$jitter_0");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_jitter");
+                c.r_end();
+            }
+            4 | 5 => {
+                c.r_pass_default("stub_screen_space", "ssfx_il_blur", false, false, false);
+                c.r_dx10_texture(
+                    "ao_image",
+                    if elem == 4 { "$user$ssfx_temp2" } else { "$user$ssfx_temp3" },
+                );
+                c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsfxSss => match elem {
+            0 => {
+                c.r_pass_default("stub_screen_space", "ssfx_sss", false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                c.r_dx10_texture("sss_image", "$user$ssfx_sss");
+                c.r_dx10_texture("s_prev_pos", "$user$ssfx_prev_p");
+                c.r_dx10_texture("jitter0", "$user$jitter_0");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_jitter");
+                c.r_end();
+            }
+            1 | 2 => {
+                c.r_pass_default("stub_screen_space", "ssfx_sss_blur", false, false, false);
+                c.r_dx10_texture(
+                    "sss_image",
+                    if elem == 1 { "$user$ssfx" } else { "$user$ssfx_temp" },
+                );
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_jitter");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsfxSssExt => match elem {
+            0 | 1 => {
+                c.r_pass_default("stub_screen_space", "ssfx_sss_ext", false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                c.r_dx10_texture(
+                    "sss_image",
+                    if elem == 0 { "$user$ssfx_sss_ext" } else { "$user$ssfx_sss_ext2" },
+                );
+                c.r_dx10_texture("s_prev_pos", "$user$ssfx_prev_p");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_dx10_sampler("smp_jitter");
+                c.r_end();
+            }
+            2 => {
+                c.r_pass_default(
+                    "stub_screen_space",
+                    "ssfx_sss_ext_combine",
+                    false,
+                    false,
+                    false,
+                );
+                c.r_dx10_texture("sss_image_1", "$user$ssfx_sss_ext");
+                c.r_dx10_texture("sss_image_2", "$user$ssfx_sss_ext2");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsfxRain => {
+            if matches!(elem, 0 | 1) {
+                c.r_pass_default("stub_screen_space", "ssfx_rain", false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture(
+                    "ssfx_color_buffer",
+                    if elem == 0 { "$user$generic0" } else { "$user$generic0_r" },
+                );
+                c.r_dx10_texture("volumetric_buffer", "$user$ssfx_volumetric");
+                c.r_dx10_texture("bloom_buffer", "$user$ssfx_bloom1");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::SsfxWaterBlur => match elem {
+            0..=2 => {
+                let (ps, buf) = match elem {
+                    0 => ("ssfx_water_blur", "$user$ssfx_temp"),
+                    1 => ("ssfx_water_blur", "$user$ssfx_temp2"),
+                    _ => ("ssfx_water_noblur", "$user$ssfx_temp2"),
+                };
+                c.r_pass_default("stub_screen_space", ps, false, false, false);
+                c.r_dx10_texture("water_buffer", buf);
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            5 => {
+                c.r_pass_default("stub_screen_space", "ssfx_water_waves", false, false, false);
+                c.r_dx10_texture("water_waves", "fx\\water_height");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsfxMotionBlur => match elem {
+            0 => {
+                c.r_pass_default("stub_screen_space", "ssfx_motion_blur", false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_image", "$user$generic0");
+                c.r_dx10_texture("ssfx_motion_vectors", "$user$ssfx_motion_vectors");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default("stub_screen_space", "ssfx_motion_blur", false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_image", "$user$ssfx_temp");
+                c.r_dx10_texture("ssfx_motion_vectors", "$user$ssfx_motion_vectors");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsfxFogScattering => match elem {
+            0 => {
+                c.r_pass_default(
+                    "stub_screen_space",
+                    "ssfx_fog_scattering",
+                    false,
+                    false,
+                    false,
+                );
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_image", "$user$generic0");
+                c.r_dx10_texture("s_blur_2", "$user$blur_2");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_linear");
+                c.r_end();
+            }
+            2 | 3 => {
+                c.r_pass_default(
+                    "stub_screen_space",
+                    "ssfx_fog_scattering_blur",
+                    false,
+                    false,
+                    false,
+                );
+                c.r_dx10_texture(
+                    "s_image",
+                    if elem == 2 { "$user$generic0" } else { "$user$blur_4" },
+                );
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::Dof => match elem {
+            0 => {
+                c.r_pass_default("stub_screen_space", "depth_of_field", false, false, false);
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_image", "$user$generic0");
+                c.r_dx10_texture("s_blur_2", "$user$blur_2");
+                add_nvg_samplers(&mut c);
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default("stub_screen_space", "post_processing", false, false, false);
+                c.r_dx10_texture("samplero_pepero", "$user$dof");
+                add_nvg_samplers(&mut c);
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::GasmaskDrops => {
+            c.r_pass_default("stub_screen_space", "gasmask_drops", false, false, false);
+            c.r_dx10_texture("s_image", "$user$generic0");
+            c.r_dx10_texture("s_noise", "shaders\\gasmasks\\mask_noise");
+            c.r_dx10_sampler("smp_base");
+            c.r_dx10_sampler("smp_nofilter");
+            c.r_dx10_sampler("smp_rtlinear");
+            c.r_dx10_sampler("smp_linear");
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::GasmaskDudv => {
+            c.r_pass_default("stub_screen_space", "gasmask_dudv", false, false, false);
+            c.r_dx10_texture("s_image", "$user$generic0");
+            c.r_dx10_texture("s_mask_droplets", "shaders\\gasmasks\\mask_droplets");
+            for (slot, path) in [
+                ("s_mask_nm_1", "shaders\\gasmasks\\mask_nm_1"),
+                ("s_mask_nm_2", "shaders\\gasmasks\\mask_nm_2"),
+                ("s_mask_nm_3", "shaders\\gasmasks\\mask_nm_3"),
+                ("s_mask_nm_4", "shaders\\gasmasks\\mask_nm_4"),
+                ("s_mask_nm_5", "shaders\\gasmasks\\mask_nm_5"),
+                ("s_mask_nm_6", "shaders\\gasmasks\\mask_nm_6"),
+                ("s_mask_nm_7", "shaders\\gasmasks\\mask_nm_7"),
+                ("s_mask_nm_8", "shaders\\gasmasks\\mask_nm_8"),
+                ("s_mask_nm_9", "shaders\\gasmasks\\mask_nm_9"),
+                ("s_mask_nm_10", "shaders\\gasmasks\\mask_nm_10"),
+            ] {
+                c.r_dx10_texture(slot, path);
+            }
+            add_nvg_samplers(&mut c);
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::Hdr10BloomDownsample => {
+            c.r_pass_default(
+                "stub_screen_space",
+                "hdr10_bloom_downsample",
+                false,
+                false,
+                false,
+            );
+            if elem == 0 {
+                c.r_dx10_texture("s_hdr10_game", "$user$generic0");
+            }
+            c.r_dx10_sampler("smp_rtlinear");
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::Hdr10BloomBlur => {
+            c.r_pass_default("stub_screen_space", "hdr10_bloom_blur", false, false, false);
+            match elem {
+                0 => c.r_dx10_texture("s_hdr10_halfres", "$user$hdr10_halfres0"),
+                1 => c.r_dx10_texture("s_hdr10_halfres", "$user$hdr10_halfres1"),
+                _ => {}
+            }
+            c.r_dx10_sampler("smp_rtlinear");
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::Hdr10BloomUpsample => {
+            c.r_pass_default("stub_screen_space", "hdr10_bloom_upsample", false, false, false);
+            match elem {
+                0 => c.r_dx10_texture("s_hdr10_halfres", "$user$hdr10_halfres0"),
+                1 => c.r_dx10_texture("s_hdr10_halfres", "$user$hdr10_halfres1"),
+                _ => {}
+            }
+            c.r_dx10_texture("s_hdr10_game", "$user$generic0");
+            c.r_dx10_sampler("smp_rtlinear");
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::Hdr10LensFlareDownsample => {
+            c.r_pass_default(
+                "stub_screen_space",
+                "hdr10_lens_flare_downsample",
+                false,
+                false,
+                false,
+            );
+            if elem == 0 {
+                c.r_dx10_texture("s_hdr10_game", "$user$generic0");
+            }
+            c.r_dx10_sampler("smp_rtlinear");
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::Hdr10LensFlareFgen => {
+            c.r_pass_default(
+                "stub_screen_space",
+                "hdr10_lens_flare_fgen",
+                false,
+                false,
+                false,
+            );
+            match elem {
+                0 => c.r_dx10_texture("s_hdr10_halfres", "$user$hdr10_halfres0"),
+                1 => c.r_dx10_texture("s_hdr10_halfres", "$user$hdr10_halfres1"),
+                _ => {}
+            }
+            c.r_dx10_sampler("smp_rtlinear");
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::Hdr10LensFlareBlur => {
+            c.r_pass_default(
+                "stub_screen_space",
+                "hdr10_lens_flare_blur",
+                false,
+                false,
+                false,
+            );
+            match elem {
+                0 => c.r_dx10_texture("s_hdr10_halfres", "$user$hdr10_halfres0"),
+                1 => c.r_dx10_texture("s_hdr10_halfres", "$user$hdr10_halfres1"),
+                _ => {}
+            }
+            c.r_dx10_sampler("smp_rtlinear");
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::Hdr10LensFlareUpsample => {
+            c.r_pass_default(
+                "stub_screen_space",
+                "hdr10_lens_flare_upsample",
+                false,
+                false,
+                false,
+            );
+            match elem {
+                0 => c.r_dx10_texture("s_hdr10_halfres", "$user$hdr10_halfres0"),
+                1 => c.r_dx10_texture("s_hdr10_halfres", "$user$hdr10_halfres1"),
+                _ => {}
+            }
+            c.r_dx10_texture("s_hdr10_game", "$user$generic0");
+            c.r_dx10_sampler("smp_rtlinear");
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::Luminance => match elem {
+            0 => {
+                c.r_pass_default("stub_notransform_build", "bloom_luminance_1", false, false, false);
+                c.r_dx10_texture("s_image", "$user$bloom1");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default("stub_notransform_filter", "bloom_luminance_2", false, false, false);
+                c.r_dx10_texture("s_image", "$user$lum_t64");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+            2 => {
+                c.r_pass_default("stub_notransform_filter", "bloom_luminance_3", false, false, false);
+                c.r_dx10_texture("s_image", "$user$lum_t8");
+                c.r_dx10_texture("s_tonemap", "$user$tonemap_src");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::Lut => {
+            c.r_pass_default("stub_screen_space", "pp_lut", false, false, false);
+            c.r_dx10_texture("s_image", "$user$generic0");
+            c.r_dx10_texture("debug_noise", "fx\\blue_noise");
+            c.r_dx10_texture("s_lut_atlas", "shaders\\lut_atlas");
+            c.r_dx10_sampler("smp_base");
+            c.r_dx10_sampler("smp_nofilter");
+            c.r_dx10_sampler("smp_rtlinear");
+            c.r_dx10_sampler("smp_linear");
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::Nightvision => match elem {
+            0 => {
+                c.r_pass_default("stub_screen_space", "copy_nomsaa", false, false, false);
+                c.r_dx10_texture("s_generic", "$user$generic0");
+                add_nvg_samplers(&mut c);
+                c.r_end();
+            }
+            1..=3 => {
+                let ps = match elem {
+                    1 => "nightvision_gen_1",
+                    2 => "nightvision_gen_2",
+                    _ => "nightvision_gen_3",
+                };
+                c.r_pass_default("stub_screen_space", ps, false, false, false);
+                add_nvg_common(&mut c);
+                c.r_dx10_texture("s_heat", "$user$heat");
+                add_nvg_samplers(&mut c);
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::Fakescope => {
+            c.r_pass_default("stub_screen_space", "fakescope", false, false, false);
+            add_nvg_common(&mut c);
+            c.r_dx10_texture("s_scope", "$user$scopeRT");
+            add_nvg_samplers(&mut c);
+            c.r_end();
+        }
+
+        R4InternalBlenderKind::Heatvision => match elem {
+            0 => {
+                c.r_pass_default("stub_screen_space", "copy_nomsaa", false, false, false);
+                c.r_dx10_texture("s_generic", "$user$generic0");
+                add_nvg_samplers(&mut c);
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default("stub_screen_space", "heatvision", false, false, false);
+                add_nvg_common(&mut c);
+                c.r_dx10_texture("s_heat", "$user$heat");
+                add_nvg_samplers(&mut c);
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::PpBloom => {
+            if elem == 0 {
+                c.r_pass_default("stub_screen_space", "pp_bloom", false, false, false);
+                c.r_dx10_texture("s_image", "$user$generic0");
+                c.r_dx10_texture("s_blur_2", "$user$blur_2");
+                c.r_dx10_texture("s_blur_4", "$user$blur_4");
+                c.r_dx10_texture("s_blur_8", "$user$blur_8");
+                add_nvg_samplers(&mut c);
+                c.r_end();
+            }
+        }
+
+        R4InternalBlenderKind::Smaa => match elem {
+            0 => {
+                c.r_pass_default("pp_smaa_ed", "pp_smaa_ed", false, false, false);
+                c.r_dx10_texture("s_image", "$user$generic0");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default("pp_smaa_bc", "pp_smaa_bc", false, false, false);
+                c.r_dx10_texture("s_image", "$user$generic0");
+                c.r_dx10_texture("s_edgetex", "$user$smaa_edgetex");
+                c.r_dx10_texture("s_areatex", "shaders\\smaa\\area_tex_dx11");
+                c.r_dx10_texture("s_searchtex", "shaders\\smaa\\search_tex");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+            2 => {
+                c.r_pass_default("pp_smaa_nb", "pp_smaa_nb", false, false, false);
+                c.r_dx10_texture("s_image", "$user$generic0");
+                c.r_dx10_texture("s_blendtex", "$user$smaa_blendtex");
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::SsfxTaa => match elem {
+            0 => {
+                c.r_pass_default("stub_screen_space", "ssfx_taa_prepare", false, false, false);
+                c.r_dx10_texture("s_ssfx_taa", "$user$ssfx_taa");
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                add_taa_samplers(&mut c);
+                c.r_end();
+            }
+            1 => {
+                c.r_pass_default("stub_screen_space", "ssfx_taa", false, false, false);
+                c.r_dx10_texture("s_current", "$user$generic0");
+                c.r_dx10_texture("s_previous", "$user$ssfx_prev_frame");
+                c.r_dx10_texture("s_motion_vectors", "$user$ssfx_taa");
+                c.r_dx10_texture("s_mv", "$user$ssfx_motion_vectors");
+                c.r_dx10_texture("s_depth", "$user$position");
+                c.r_dx10_texture("s_previous_depth", "$user$ssfx_prev_p");
+                c.r_dx10_texture("s_ssfx_temp", "$user$ssfx_temp");
+                add_taa_samplers(&mut c);
+                c.r_end();
+            }
+            2 => {
+                c.r_pass_default("stub_screen_space", "ssfx_taa_sharp", false, false, false);
+                c.r_dx10_texture("s_current", "$user$ssfx_prev_frame");
+                c.r_dx10_texture("s_motion_vectors", "$user$ssfx_motion_vectors");
+                add_taa_samplers(&mut c);
+                c.r_end();
+            }
+            _ => {}
+        },
+
+        R4InternalBlenderKind::Sunshafts => match elem {
+            0 => {
+                c.r_pass_default(
+                    "ssss_notransform",
+                    "ogse_sunshafts_mask",
+                    false,
+                    false,
+                    false,
+                );
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_image", "$user$generic0");
+                add_nvg_samplers(&mut c);
+                c.r_end();
+            }
+            1 | 2 => {
+                c.r_pass_default(
+                    "ssss_notransform",
+                    "ogse_sunshafts_blur",
+                    false,
+                    false,
+                    false,
+                );
+                c.r_dx10_texture(
+                    "s_sun_shafts",
+                    if elem == 1 { "$user$sun_shafts0" } else { "$user$sun_shafts1" },
+                );
+                add_nvg_samplers(&mut c);
+                c.r_end();
+            }
+            3 => {
+                c.r_pass_default(
+                    "ssss_notransform",
+                    "ogse_sunshafts_blur",
+                    false,
+                    false,
+                    false,
+                );
+                c.r_dx10_texture("s_sun_shafts", "$user$sun_shafts0");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+            4 => {
+                c.r_pass_default(
+                    "ssss_notransform",
+                    "ogse_sunshafts_final",
+                    false,
+                    false,
+                    false,
+                );
+                c.r_dx10_texture("s_position", "$user$position");
+                c.r_dx10_texture("s_sun_shafts", "$user$sun_shafts1");
+                c.r_dx10_texture("s_image", "$user$generic0");
+                c.jitter();
+                c.r_dx10_sampler("smp_nofilter");
+                c.r_dx10_sampler("smp_rtlinear");
+                c.r_end();
+            }
+            _ => {}
+        },
+    }
+
+    c.plan
+}
+
 /// UI vertex stream format (`dxUIRender::ePointType` in `dxUIRender.cpp:207-244`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UiPointType {
@@ -4365,5 +6343,182 @@ use_flags = 5
         assert_eq!(ui_primitive_count(UiPrimitiveType::TriList, 6), 2);
         assert_eq!(ui_primitive_count(UiPrimitiveType::LineStrip, 5), 4);
         assert_eq!(ui_primitive_count(UiPrimitiveType::LineList, 6), 3);
+    }
+
+    #[test]
+    fn r4_internal_blenders_match_cpp_passes() {
+        let base = |kind: R4InternalBlenderKind, element: u32, dx10_msaa: bool| {
+            plan_r4_internal_blender(
+                kind,
+                &["lights\\lights_spot01"],
+                R4InternalBlenderOptions {
+                    element,
+                    dx10_msaa,
+                    ..R4InternalBlenderOptions::default()
+                },
+            )
+        };
+
+        // LightOccq: clear stencil pass switches write mask between MSAA and non-MSAA
+        let occq1 = base(R4InternalBlenderKind::LightOccq, 1, false);
+        assert_eq!(occq1.passes[0].cull_mode, CullMode::None);
+        assert_eq!(occq1.passes[0].stencil.func, CmpFunc::LessEqual);
+        assert_eq!(occq1.passes[0].blend.color_write_enable, [false; 4]);
+        let occq2_no_msaa = base(R4InternalBlenderKind::LightOccq, 2, false);
+        let occq2_msaa = base(R4InternalBlenderKind::LightOccq, 2, true);
+        assert_eq!(occq2_no_msaa.passes[0].stencil.write_mask, 0xFE);
+        assert_eq!(occq2_msaa.passes[0].stencil.write_mask, 0x7E);
+
+        // AccumDirect / AccumDirectMsaa: inverted Z compare, minmax SM, border color
+        let sun_near = base(R4InternalBlenderKind::AccumDirect, 0, false);
+        assert_eq!(sun_near.passes[0].ps, "accum_sun_near_nomsaa_nominmax");
+        assert_eq!(sun_near.passes[0].z_func, CmpFunc::Greater);
+        assert!(sun_near.passes[0]
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_smap_minmax"));
+        let sun_near_msaa = base(R4InternalBlenderKind::AccumDirectMsaa, 0, true);
+        assert_eq!(sun_near_msaa.passes[0].ps, "accum_sun_near_msaa_nominmax");
+        assert!(!sun_near_msaa.passes[0]
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_smap_minmax"));
+
+        let sun_far = base(R4InternalBlenderKind::AccumDirect, 2, false);
+        assert_eq!(sun_far.passes[0].ps, "accum_sun_far_nomsaa");
+        let smp_smap = sun_far.passes[0]
+            .samplers
+            .iter()
+            .find(|s| s.resource_name == "smp_smap")
+            .unwrap();
+        assert_eq!(smp_smap.address_mode, TexAddressMode::Border);
+        assert_eq!(smp_smap.border_color, Some(0xFFFF_FFFF));
+
+        let sun_minmax_msaa = base(R4InternalBlenderKind::AccumDirectMsaa, 4, true);
+        assert_eq!(sun_minmax_msaa.passes[0].ps, "accum_sun_near_msaa_minmax");
+        assert!(sun_minmax_msaa.passes[0]
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_smap_minmax"));
+
+        // Volumetric sun MSAA vs non-sun MSAA
+        let vol_sun = base(R4InternalBlenderKind::AccumDirectVolumetricSunMsaa, 0, true);
+        assert!(!vol_sun.passes[0].z_test);
+        assert!(vol_sun.passes[0].blend.enable);
+        assert_eq!(vol_sun.passes[0].blend.dst, BlendFactor::One);
+        assert!(vol_sun.passes[0].textures.iter().any(|t| t.resource_name == "jitter0"));
+
+        // AccumPoint / AccumSpot / AccumReflected FP16 blend vs disabled
+        let refl_no_fp16 = plan_r4_internal_blender(
+            R4InternalBlenderKind::AccumReflected,
+            &[],
+            R4InternalBlenderOptions {
+                fp16_blend: false,
+                ..R4InternalBlenderOptions::default()
+            },
+        );
+        assert!(!refl_no_fp16.passes[0].blend.enable);
+        assert_eq!(refl_no_fp16.passes[0].blend.dst, BlendFactor::Zero);
+        let spot_full = base(R4InternalBlenderKind::AccumSpotMsaa, 3, true);
+        assert_eq!(spot_full.passes[0].ps, "accum_spot_fullsize_msaa");
+
+        // HDAO compute passes
+        let hdao = base(R4InternalBlenderKind::HdaoCs, 0, false);
+        assert_eq!(hdao.passes[0].cs, "ssao_hdao");
+        assert_eq!(hdao.passes[0].vs, "null");
+        assert_eq!(hdao.passes[0].ps, "null");
+        let hdao_msaa = base(R4InternalBlenderKind::HdaoMsaaCs, 0, true);
+        assert_eq!(hdao_msaa.passes[0].cs, "ssao_hdao_msaa");
+
+        // Combine vs CombineMsaa differences
+        let comb0_no = base(R4InternalBlenderKind::Combine, 0, false);
+        let comb0_msaa = base(R4InternalBlenderKind::CombineMsaa, 0, true);
+        let occ_no = comb0_no.passes[0]
+            .textures
+            .iter()
+            .position(|t| t.resource_name == "s_occ")
+            .unwrap();
+        let env_no = comb0_no.passes[0]
+            .textures
+            .iter()
+            .position(|t| t.resource_name == "env_s0")
+            .unwrap();
+        let occ_msaa = comb0_msaa.passes[0]
+            .textures
+            .iter()
+            .position(|t| t.resource_name == "s_occ")
+            .unwrap();
+        let env_msaa = comb0_msaa.passes[0]
+            .textures
+            .iter()
+            .position(|t| t.resource_name == "env_s0")
+            .unwrap();
+        assert!(occ_no > env_no);
+        assert!(occ_msaa < env_msaa);
+
+        let comb2_no = base(R4InternalBlenderKind::Combine, 2, false);
+        let comb2_msaa = base(R4InternalBlenderKind::CombineMsaa, 2, true);
+        assert!(!comb2_no.passes[0].z_write);
+        assert!(comb2_msaa.passes[0].z_write);
+        assert!(comb2_msaa.passes[0]
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_distort" && t.texture_name == "$user$generic1_r"));
+        let lut_pos_msaa2 = comb2_msaa.passes[0]
+            .textures
+            .iter()
+            .position(|t| t.resource_name == "s_lut_atlas")
+            .unwrap();
+        let mv_pos_msaa2 = comb2_msaa.passes[0]
+            .textures
+            .iter()
+            .position(|t| t.resource_name == "s_motion_vectors")
+            .unwrap();
+        assert!(lut_pos_msaa2 < mv_pos_msaa2);
+
+        // Rain vs RainMsaa: s_hud_mask + blend factor override on gloss pass
+        let rain1 = base(R4InternalBlenderKind::Rain, 1, false);
+        let rain_msaa0 = base(R4InternalBlenderKind::RainMsaa, 0, true);
+        assert!(rain1.passes[0].textures.iter().any(|t| t.resource_name == "s_hud_mask"));
+        assert!(!rain_msaa0.passes[0]
+            .textures
+            .iter()
+            .any(|t| t.resource_name == "s_hud_mask"));
+        let rain3 = base(R4InternalBlenderKind::Rain, 3, false);
+        assert_eq!(rain3.passes[0].blend.src, BlendFactor::Zero);
+        assert_eq!(rain3.passes[0].blend.dst, BlendFactor::SrcColor);
+
+        // Gasmask, SsfxSssExt, SsfxFogScattering, Sunshafts, SMAA, TAA, HDR10
+        let gasmask = base(R4InternalBlenderKind::GasmaskDudv, 0, false);
+        assert_eq!(
+            gasmask.passes[0]
+                .textures
+                .iter()
+                .filter(|t| t.resource_name.starts_with("s_mask_nm_"))
+                .count(),
+            10
+        );
+        let sss_ext0 = base(R4InternalBlenderKind::SsfxSssExt, 0, false);
+        assert!(sss_ext0.passes[0].samplers.iter().any(|s| s.resource_name == "smp_jitter"));
+        assert!(!sss_ext0.passes[0].textures.iter().any(|t| t.resource_name == "jitter0"));
+        assert!(base(R4InternalBlenderKind::SsfxFogScattering, 1, false).passes.is_empty());
+        assert_eq!(
+            base(R4InternalBlenderKind::SsfxFogScattering, 3, false).passes[0].textures[0].texture_name,
+            "$user$blur_4"
+        );
+        let sunshafts4 = base(R4InternalBlenderKind::Sunshafts, 4, false);
+        assert_eq!(sunshafts4.passes[0].ps, "ogse_sunshafts_final");
+        assert!(sunshafts4.passes[0].textures.iter().any(|t| t.resource_name == "jitter0"));
+        assert_eq!(base(R4InternalBlenderKind::Smaa, 1, false).passes[0].ps, "pp_smaa_bc");
+        assert_eq!(base(R4InternalBlenderKind::SsfxTaa, 2, false).passes[0].ps, "ssfx_taa_sharp");
+        assert_eq!(
+            base(R4InternalBlenderKind::Hdr10LensFlareFgen, 1, false).passes[0].textures[0]
+                .texture_name,
+            "$user$hdr10_halfres1"
+        );
+        assert_eq!(
+            base(R4InternalBlenderKind::Skybox, 1, false).passes[0].ps,
+            "ssfx_sky_mv"
+        );
     }
 }

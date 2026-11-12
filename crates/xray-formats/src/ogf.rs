@@ -2936,6 +2936,165 @@ fn compute_tree_wind_frame(
     }
 }
 
+// ============================================================================
+// LOD Imposter Batching & DSGraph Texture Sorting (`r__dsgraph_render_lods.cpp`, `r__dsgraph_render.cpp`)
+// ============================================================================
+
+/// Shader element indices used by tree/LOD rendering (`enum SE_R1` in `Shader.h:168-180`).
+pub mod lod_shader_elements {
+    pub const SE_R1_NORMAL_LQ: u32 = 1;
+    pub const SE_R1_LMODELS: u32 = 4;
+}
+
+/// Select the LOD shader element index matching `r_dsgraph_render_lods` (`r__dsgraph_render_lods.cpp:24`).
+#[inline]
+pub const fn lod_shader_element_id(setup_zb: bool) -> u32 {
+    if setup_zb {
+        lod_shader_elements::SE_R1_LMODELS
+    } else {
+        lod_shader_elements::SE_R1_NORMAL_LQ
+    }
+}
+
+/// Input entry to LOD imposter batch packing (`R_dsgraph::_LodItem`).
+#[derive(Debug, Clone, Copy)]
+pub struct LodRenderInput<'a> {
+    pub shader_key: u64,
+    pub bsphere: OgfBSphere,
+    pub ssa: f32,
+    pub lod_def: &'a OgfLodDef,
+}
+
+/// Contiguous shader run inside a single LOD VB batch (`lstLODgroups` in `r__dsgraph_render_lods.cpp:48-56`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LodDrawGroup {
+    pub shader_key: u64,
+    pub start_imposter: usize,
+    pub imposter_count: usize,
+}
+
+/// Packed dynamic VB chunk of up to `max_imposters_per_batch` LOD quads and its draw groups.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LodBatchChunk {
+    pub vertices: Vec<LodImposterHwVertex>,
+    pub groups: Vec<LodDrawGroup>,
+}
+
+/// Pack sorted LOD items into vertex-buffer-sized batches of imposter quads and contiguous shader
+/// draw groups, matching `R_dsgraph_structure::r_dsgraph_render_lods` (`r__dsgraph_render_lods.cpp:17-109`).
+///
+/// Note: Unlike the outer/inner loop double-increment quirk in C++, this advances cleanly by exact
+/// chunk length so every input item is emitted when multiple VB batches are needed.
+pub fn pack_lod_imposter_batches(
+    items: &[LodRenderInput<'_>],
+    camera_pos: [f32; 3],
+    thresholds: &ScreenLodThresholds,
+    max_imposters_per_batch: usize,
+) -> Vec<LodBatchChunk> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let cap = max_imposters_per_batch.max(1);
+    let mut chunks = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < items.len() {
+        let batch_len = (items.len() - offset).min(cap);
+        let mut vertices = Vec::with_capacity(batch_len * 4);
+        let mut groups = Vec::new();
+
+        let mut cur_shader = items[offset].shader_key;
+        let mut cur_start = 0usize;
+        let mut cur_count = 0usize;
+
+        for (j, item) in items[offset..offset + batch_len].iter().enumerate() {
+            if item.shader_key == cur_shader {
+                cur_count += 1;
+            } else {
+                groups.push(LodDrawGroup {
+                    shader_key: cur_shader,
+                    start_imposter: cur_start,
+                    imposter_count: cur_count,
+                });
+                cur_shader = item.shader_key;
+                cur_start = j;
+                cur_count = 1;
+            }
+
+            let quad = item.lod_def.build_imposter_quad(
+                camera_pos,
+                item.bsphere,
+                item.ssa,
+                thresholds,
+            );
+            vertices.extend_from_slice(&quad);
+        }
+
+        groups.push(LodDrawGroup {
+            shader_key: cur_shader,
+            start_imposter: cur_start,
+            imposter_count: cur_count,
+        });
+
+        chunks.push(LodBatchChunk { vertices, groups });
+        offset += batch_len;
+    }
+
+    chunks
+}
+
+/// Texture-bucket node for DSGraph rendering (`mapNormalTextures::TNode` / `mapMatrixTextures::TNode`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DsgraphTextureNode<K, V> {
+    pub texture_ids: K,
+    pub ssa: f32,
+    pub payload: V,
+}
+
+/// Sort DSGraph texture-bucket nodes matching `sort_tlist_nrm` / `sort_tlist_mat`
+/// (`r__dsgraph_render.cpp:329-421`).
+///
+/// - When `use_ssa` is `true` and texture tuple arity `<= 1`: sorts all nodes descending by `ssa`.
+/// - When `use_ssa` is `true` and arity `> 1`: puts `ssa > r_ssa_hzb_vs_tex` first (descending by
+///   `ssa`), followed by remaining nodes sorted lexicographically by `texture_ids`.
+/// - When `use_ssa` is `false`: sorts all nodes lexicographically by `texture_ids`.
+pub fn sort_dsgraph_texture_nodes<K, V>(
+    mut nodes: Vec<DsgraphTextureNode<K, V>>,
+    use_ssa: bool,
+    r_ssa_hzb_vs_tex: f32,
+) -> Vec<DsgraphTextureNode<K, V>>
+where
+    K: AsRef<[u32]>,
+{
+    let Some(first) = nodes.first() else {
+        return nodes;
+    };
+    let amount = first.texture_ids.as_ref().len();
+
+    if use_ssa {
+        if amount <= 1 {
+            nodes.sort_by(|a, b| b.ssa.total_cmp(&a.ssa));
+            return nodes;
+        }
+        let mut high = Vec::new();
+        let mut low = Vec::new();
+        for node in nodes {
+            if node.ssa > r_ssa_hzb_vs_tex {
+                high.push(node);
+            } else {
+                low.push(node);
+            }
+        }
+        high.sort_by(|a, b| b.ssa.total_cmp(&a.ssa));
+        low.sort_by(|a, b| a.texture_ids.as_ref().cmp(b.texture_ids.as_ref()));
+        high.extend(low);
+        high
+    } else {
+        nodes.sort_by(|a, b| a.texture_ids.as_ref().cmp(b.texture_ids.as_ref()));
+        nodes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3731,5 +3890,66 @@ mod tests {
         .unwrap();
         assert_eq!(r_static.primary, Some(VisualPrimaryBucket::Water));
         assert_eq!(r_static.distort_bucket, Some(VisualPrimaryBucket::Distort));
+
+        // LOD batch packing across multiple chunks and shader runs
+        assert_eq!(lod_shader_element_id(true), lod_shader_elements::SE_R1_LMODELS);
+        assert_eq!(lod_shader_element_id(false), lod_shader_elements::SE_R1_NORMAL_LQ);
+
+        let facets: [OgfLodFacet; 8] = std::array::from_fn(|i| {
+            let a = (i as f32) * std::f32::consts::FRAC_PI_4;
+            let n = [a.cos(), 0.0, a.sin()];
+            OgfLodFacet {
+                vertices: [
+                    OgfLodVertex { position: [-1.0, -1.0, 0.0], uv: [0.0, 1.0], rgb_hemi: 0x102030, sun: 12 },
+                    OgfLodVertex { position: [-1.0,  1.0, 0.0], uv: [0.0, 0.0], rgb_hemi: 0x102030, sun: 12 },
+                    OgfLodVertex { position: [ 1.0,  1.0, 0.0], uv: [1.0, 0.0], rgb_hemi: 0x102030, sun: 12 },
+                    OgfLodVertex { position: [ 1.0, -1.0, 0.0], uv: [1.0, 1.0], rgb_hemi: 0x102030, sun: 12 },
+                ],
+                normal: n,
+            }
+        });
+        let lod_def = OgfLodDef { facets, lod_factor: 1.0 };
+        let thresholds_lod = compute_screen_lod_thresholds(1920, 1080, 75.0, &ScreenLodConfig::default());
+        let inputs = [
+            LodRenderInput {
+                shader_key: 10,
+                bsphere: OgfBSphere { center: [0.0, 0.0, 10.0], radius: 2.0 },
+                ssa: 30.0,
+                lod_def: &lod_def,
+            },
+            LodRenderInput {
+                shader_key: 10,
+                bsphere: OgfBSphere { center: [5.0, 0.0, 10.0], radius: 2.0 },
+                ssa: 32.0,
+                lod_def: &lod_def,
+            },
+            LodRenderInput {
+                shader_key: 20,
+                bsphere: OgfBSphere { center: [10.0, 0.0, 10.0], radius: 2.0 },
+                ssa: 35.0,
+                lod_def: &lod_def,
+            },
+        ];
+        let batches = pack_lod_imposter_batches(&inputs, [0.0, 0.0, 0.0], &thresholds_lod, 2);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].vertices.len(), 8);
+        assert_eq!(batches[0].groups.len(), 1);
+        assert_eq!(batches[0].groups[0].imposter_count, 2);
+        assert_eq!(batches[1].vertices.len(), 4);
+        assert_eq!(batches[1].groups[0].shader_key, 20);
+
+        // DSGraph texture list sorting (SSA split vs lex-only)
+        let tex_nodes = vec![
+            DsgraphTextureNode { texture_ids: vec![5, 2], ssa: 1.0, payload: 0 },
+            DsgraphTextureNode { texture_ids: vec![2, 9], ssa: 50.0, payload: 1 },
+            DsgraphTextureNode { texture_ids: vec![1, 4], ssa: 2.0, payload: 2 },
+            DsgraphTextureNode { texture_ids: vec![8, 1], ssa: 100.0, payload: 3 },
+        ];
+        let sorted_ssa = sort_dsgraph_texture_nodes(tex_nodes.clone(), true, 10.0);
+        let order_ssa: Vec<usize> = sorted_ssa.iter().map(|n| n.payload).collect();
+        assert_eq!(order_ssa, vec![3, 1, 2, 0]);
+        let sorted_lex = sort_dsgraph_texture_nodes(tex_nodes, false, 10.0);
+        let order_lex: Vec<usize> = sorted_lex.iter().map(|n| n.payload).collect();
+        assert_eq!(order_lex, vec![2, 1, 0, 3]);
     }
 }
