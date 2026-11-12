@@ -19,6 +19,7 @@ use crate::ogf::{
     XRAY_IDENTITY_MATRIX,
 };
 use crate::particle_sim::ParticleRng;
+use crate::shaders_xr::{CmpFunc, CullMode, StencilOp, StencilState};
 use crate::skinning::{matrix_transform_dir, normalize_vec3};
 use crate::weather::MixedEnvironment;
 
@@ -2940,6 +2941,998 @@ pub fn build_draw_rain_light_quad(
     ]
 }
 
+// ============================================================================
+// Additional Post-Processing, Bloom & Combine Vertex Builders + R4 RT / Phase Specs
+// ============================================================================
+
+/// 48-byte fullscreen PPE vertex matching `TL_2c3uv` (`r4_rendertarget_phase_PP.cpp:95-112`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhasePpVertex {
+    pub p: [f32; 4],
+    pub color0_argb: u32,
+    pub color1_argb: u32,
+    pub uv0: [f32; 2],
+    pub uv1: [f32; 2],
+    pub uv2: [f32; 2],
+}
+const _: () = assert!(std::mem::size_of::<PhasePpVertex>() == 48);
+
+impl PostprocessPassPlan {
+    /// Emit 4-vertex fullscreen strip/quad matching `CRenderTarget::phase_pp` (`r4_rendertarget_phase_PP.cpp:153-163`).
+    pub fn build_quad(&self, width: u32, height: u32, du: f32, dv: f32) -> [PhasePpVertex; 4] {
+        let w = width as f32;
+        let h = height as f32;
+        let r = self.right_uv;
+        let l = self.left_uv;
+        let n = self.noise_uv;
+        let c0 = self.gpu_params.color0_argb;
+        let c1 = self.gpu_params.color1_argb;
+        [
+            PhasePpVertex {
+                p: [du, dv + h, EPS_S, 1.0],
+                color0_argb: c0,
+                color1_argb: c1,
+                uv0: [r[0], r[3]],
+                uv1: [l[0], l[3]],
+                uv2: [n[0], n[3]],
+            },
+            PhasePpVertex {
+                p: [du, dv, EPS_S, 1.0],
+                color0_argb: c0,
+                color1_argb: c1,
+                uv0: [r[0], r[1]],
+                uv1: [l[0], l[1]],
+                uv2: [n[0], n[1]],
+            },
+            PhasePpVertex {
+                p: [du + w, dv + h, EPS_S, 1.0],
+                color0_argb: c0,
+                color1_argb: c1,
+                uv0: [r[2], r[3]],
+                uv1: [l[2], l[3]],
+                uv2: [n[2], n[3]],
+            },
+            PhasePpVertex {
+                p: [du + w, dv, EPS_S, 1.0],
+                color0_argb: c0,
+                color1_argb: c1,
+                uv0: [r[2], r[1]],
+                uv1: [l[2], l[1]],
+                uv2: [n[2], n[1]],
+            },
+        ]
+    }
+}
+
+/// 48-byte 4-tap bloom build/fast-filter vertex matching `v_build` (`r4_rendertarget_phase_bloom.cpp:7-14`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BloomBuildVertex {
+    pub p: [f32; 4],
+    pub uv0: [f32; 2],
+    pub uv1: [f32; 2],
+    pub uv2: [f32; 2],
+    pub uv3: [f32; 2],
+}
+const _: () = assert!(std::mem::size_of::<BloomBuildVertex>() == 48);
+
+/// 144-byte 8x vec4 separable bloom filter vertex matching `v_filter` (`r4_rendertarget_phase_bloom.cpp:16-27`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BloomFilterVertex {
+    pub p: [f32; 4],
+    pub uv0: [f32; 4],
+    pub uv1: [f32; 4],
+    pub uv2: [f32; 4],
+    pub uv3: [f32; 4],
+    pub uv4: [f32; 4],
+    pub uv5: [f32; 4],
+    pub uv6: [f32; 4],
+    pub uv7: [f32; 4],
+}
+const _: () = assert!(std::mem::size_of::<BloomFilterVertex>() == 144);
+
+/// Build the initial bloom extraction quad (`CRenderTarget::phase_bloom` -> `rt_Bloom_1`, lines 85-131).
+pub fn build_bloom_build_quad(
+    device_width: u32,
+    device_height: u32,
+    bloom_w: u32,
+    bloom_h: u32,
+) -> [BloomBuildVertex; 4] {
+    let w = device_width.max(1) as f32;
+    let h = device_height.max(1) as f32;
+    let tw = bloom_w.max(1) as f32;
+    let th = bloom_h.max(1) as f32;
+    let aspect_w = (w * 0.5) / tw;
+    let aspect_h = (h * 0.5) / th;
+    let one_x = (1.0 / w) * aspect_w;
+    let one_y = (1.0 / h) * aspect_h;
+    let half_x = 0.5 / w;
+    let half_y = 0.5 / h;
+
+    let a_0 = [half_x, half_y];
+    let a_1 = [half_x + one_x, half_y];
+    let a_2 = [half_x, half_y + one_y];
+    let a_3 = [half_x + one_x, half_y + one_y];
+    let b_0 = [1.0 + a_0[0], 1.0 + a_0[1]];
+    let b_1 = [1.0 + a_1[0], 1.0 + a_1[1]];
+    let b_2 = [1.0 + a_2[0], 1.0 + a_2[1]];
+    let b_3 = [1.0 + a_3[0], 1.0 + a_3[1]];
+
+    [
+        BloomBuildVertex {
+            p: [EPS_QUAD, th + EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: [a_0[0], b_0[1]],
+            uv1: [a_1[0], b_1[1]],
+            uv2: [a_2[0], b_2[1]],
+            uv3: [a_3[0], b_3[1]],
+        },
+        BloomBuildVertex {
+            p: [EPS_QUAD, EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: a_0,
+            uv1: a_1,
+            uv2: a_2,
+            uv3: a_3,
+        },
+        BloomBuildVertex {
+            p: [tw + EPS_QUAD, th + EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: b_0,
+            uv1: b_1,
+            uv2: b_2,
+            uv3: b_3,
+        },
+        BloomBuildVertex {
+            p: [tw + EPS_QUAD, EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: [b_0[0], a_0[1]],
+            uv1: [b_1[0], a_1[1]],
+            uv2: [b_2[0], a_2[1]],
+            uv3: [b_3[0], a_3[1]],
+        },
+    ]
+}
+
+/// Build the fast-bloom 4-tap quad (`CRenderTarget::phase_bloom` `R2FLAG_FASTBLOOM`, lines 155-189).
+pub fn build_bloom_fast_filter_quad(
+    bloom_w: u32,
+    bloom_h: u32,
+    kernel_b: f32,
+) -> [BloomBuildVertex; 4] {
+    let w = bloom_w.max(1) as f32;
+    let h = bloom_h.max(1) as f32;
+    let ddw = (1.0 / w) * kernel_b;
+    let ddh = (1.0 / h) * kernel_b;
+    let p0 = [0.5 / w, 0.5 / h];
+    let p1 = [(w + 0.5) / w, (h + 0.5) / h];
+    [
+        BloomBuildVertex {
+            p: [EPS_QUAD, h + EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: [p0[0] - ddw, p1[1] - ddh],
+            uv1: [p0[0] + ddw, p1[1] + ddh],
+            uv2: [p0[0] + ddw, p1[1] - ddh],
+            uv3: [p0[0] - ddw, p1[1] + ddh],
+        },
+        BloomBuildVertex {
+            p: [EPS_QUAD, EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: [p0[0] - ddw, p0[1] - ddh],
+            uv1: [p0[0] + ddw, p0[1] + ddh],
+            uv2: [p0[0] + ddw, p0[1] - ddh],
+            uv3: [p0[0] - ddw, p0[1] + ddh],
+        },
+        BloomBuildVertex {
+            p: [w + EPS_QUAD, h + EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: [p1[0] - ddw, p1[1] - ddh],
+            uv1: [p1[0] + ddw, p1[1] + ddh],
+            uv2: [p1[0] + ddw, p1[1] - ddh],
+            uv3: [p1[0] - ddw, p1[1] + ddh],
+        },
+        BloomBuildVertex {
+            p: [w + EPS_QUAD, EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: [p1[0] - ddw, p0[1] - ddh],
+            uv1: [p1[0] + ddw, p0[1] + ddh],
+            uv2: [p1[0] + ddw, p0[1] - ddh],
+            uv3: [p1[0] - ddw, p0[1] + ddh],
+        },
+    ]
+}
+
+fn build_bloom_filter_vertices(w: f32, h: f32, a: &[[f32; 4]; 8]) -> [BloomFilterVertex; 4] {
+    [
+        BloomFilterVertex {
+            p: [EPS_QUAD, h + EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: [a[0][0], 1.0 + a[0][1], 0.0, 0.0],
+            uv1: [a[1][0], 1.0 + a[1][1], 1.0 + a[1][2], a[1][3]],
+            uv2: [a[2][0], 1.0 + a[2][1], 1.0 + a[2][2], a[2][3]],
+            uv3: [a[3][0], 1.0 + a[3][1], 1.0 + a[3][2], a[3][3]],
+            uv4: [a[4][0], 1.0 + a[4][1], 1.0 + a[4][2], a[4][3]],
+            uv5: [a[5][0], 1.0 + a[5][1], 1.0 + a[5][2], a[5][3]],
+            uv6: [a[6][0], 1.0 + a[6][1], 1.0 + a[6][2], a[6][3]],
+            uv7: [a[7][0], 1.0 + a[7][1], 1.0 + a[7][2], a[7][3]],
+        },
+        BloomFilterVertex {
+            p: [EPS_QUAD, EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: [a[0][0], a[0][1], 0.0, 0.0],
+            uv1: a[1],
+            uv2: a[2],
+            uv3: a[3],
+            uv4: a[4],
+            uv5: a[5],
+            uv6: a[6],
+            uv7: a[7],
+        },
+        BloomFilterVertex {
+            p: [w + EPS_QUAD, h + EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: [1.0 + a[0][0], 1.0 + a[0][1], 0.0, 0.0],
+            uv1: [1.0 + a[1][0], 1.0 + a[1][1], 1.0 + a[1][2], 1.0 + a[1][3]],
+            uv2: [1.0 + a[2][0], 1.0 + a[2][1], 1.0 + a[2][2], 1.0 + a[2][3]],
+            uv3: [1.0 + a[3][0], 1.0 + a[3][1], 1.0 + a[3][2], 1.0 + a[3][3]],
+            uv4: [1.0 + a[4][0], 1.0 + a[4][1], 1.0 + a[4][2], 1.0 + a[4][3]],
+            uv5: [1.0 + a[5][0], 1.0 + a[5][1], 1.0 + a[5][2], 1.0 + a[5][3]],
+            uv6: [1.0 + a[6][0], 1.0 + a[6][1], 1.0 + a[6][2], 1.0 + a[6][3]],
+            uv7: [1.0 + a[7][0], 1.0 + a[7][1], 1.0 + a[7][2], 1.0 + a[7][3]],
+        },
+        BloomFilterVertex {
+            p: [w + EPS_QUAD, EPS_QUAD, EPS_QUAD, 1.0],
+            uv0: [1.0 + a[0][0], a[0][1], 0.0, 0.0],
+            uv1: [1.0 + a[1][0], a[1][1], a[1][2], 1.0 + a[1][3]],
+            uv2: [1.0 + a[2][0], a[2][1], a[2][2], 1.0 + a[2][3]],
+            uv3: [1.0 + a[3][0], a[3][1], a[3][2], 1.0 + a[3][3]],
+            uv4: [1.0 + a[4][0], a[4][1], a[4][2], 1.0 + a[4][3]],
+            uv5: [1.0 + a[5][0], a[5][1], a[5][2], 1.0 + a[5][3]],
+            uv6: [1.0 + a[6][0], a[6][1], a[6][2], 1.0 + a[6][3]],
+            uv7: [1.0 + a[7][0], a[7][1], a[7][2], 1.0 + a[7][3]],
+        },
+    ]
+}
+
+/// Build the slow-bloom horizontal filter quad (`r4_rendertarget_phase_bloom.cpp:207-271`).
+pub fn build_bloom_filter_quad_horizontal(bloom_w: u32, bloom_h: u32) -> [BloomFilterVertex; 4] {
+    let w = bloom_w.max(1) as f32;
+    let h = bloom_h.max(1) as f32;
+    let taps = bloom_filter_taps_horizontal(bloom_w, bloom_h);
+    build_bloom_filter_vertices(w, h, &taps)
+}
+
+/// Build the slow-bloom vertical filter quad (`r4_rendertarget_phase_bloom.cpp:287-351`).
+pub fn build_bloom_filter_quad_vertical(bloom_w: u32, bloom_h: u32) -> [BloomFilterVertex; 4] {
+    let w = bloom_w.max(1) as f32;
+    let h = bloom_h.max(1) as f32;
+    let taps = bloom_filter_taps_vertical(bloom_w, bloom_h);
+    build_bloom_filter_vertices(w, h, &taps)
+}
+
+/// Fullscreen quad for every pass inside `CRenderTarget::phase_ssfx_bloom` (`r4_rendertarget_phase_bloom.cpp:401-405`).
+#[inline]
+pub fn build_ssfx_bloom_quad(width: u32, height: u32) -> [ScreenTlVertex; 4] {
+    let w = width as f32;
+    let h = height as f32;
+    [
+        ScreenTlVertex { p: [0.0, h, EPS_S, 1.0], color: 0, uv: [0.0, 1.0] },
+        ScreenTlVertex { p: [0.0, 0.0, EPS_S, 1.0], color: 0, uv: [0.0, 0.0] },
+        ScreenTlVertex { p: [w, h, EPS_S, 1.0], color: 0, uv: [1.0, 1.0] },
+        ScreenTlVertex { p: [w, 0.0, EPS_S, 1.0], color: 0, uv: [1.0, 0.0] },
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsfxBloomPassKind {
+    Build,
+    LensFlares,
+    LensBlur,
+    Downsample,
+    Upsample,
+    Combine,
+}
+
+/// Single render pass descriptor emitted by [`ssfx_bloom_schedule`] (`r4_rendertarget_phase_bloom.cpp:383-548`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsfxBloomPassDesc {
+    pub kind: SsfxBloomPassKind,
+    pub shader_name: &'static str,
+    pub element_index: u8,
+    pub dst_name: &'static str,
+    pub viewport_w: f32,
+    pub viewport_h: f32,
+    pub blur_setup: Option<[f32; 4]>,
+}
+
+/// Build the complete SSFX bloom render pass sequence matching `CRenderTarget::phase_ssfx_bloom`.
+pub fn ssfx_bloom_schedule(
+    width: u32,
+    height: u32,
+    mask_control_x: f32,
+    bloom_blur_scale: f32,
+) -> Vec<SsfxBloomPassDesc> {
+    let w = width as f32;
+    let h = height as f32;
+    let mut passes = Vec::with_capacity(16);
+
+    passes.push(SsfxBloomPassDesc {
+        kind: SsfxBloomPassKind::Build,
+        shader_name: "ssfx_bloom",
+        element_index: 0,
+        dst_name: "$user$ssfx_bloom1",
+        viewport_w: w * 0.5,
+        viewport_h: h * 0.5,
+        blur_setup: None,
+    });
+
+    if mask_control_x > 0.0 {
+        passes.push(SsfxBloomPassDesc {
+            kind: SsfxBloomPassKind::LensFlares,
+            shader_name: "ssfx_bloom_flares",
+            element_index: 0,
+            dst_name: "$user$ssfx_bloom_tmp4",
+            viewport_w: w * 0.25,
+            viewport_h: h * 0.25,
+            blur_setup: None,
+        });
+        let lens_targets = ["$user$ssfx_bloom_tmp4_2", "$user$ssfx_bloom_lens"];
+        for (i, &dst_name) in lens_targets.iter().enumerate() {
+            passes.push(SsfxBloomPassDesc {
+                kind: SsfxBloomPassKind::LensBlur,
+                shader_name: "ssfx_bloom_flares",
+                element_index: (1 + i) as u8,
+                dst_name,
+                viewport_w: w * 0.25,
+                viewport_h: h * 0.25,
+                blur_setup: Some([w * 0.25, h * 0.25, 0.0, 2.0 + 3.0 * (i as f32)]),
+            });
+        }
+    }
+
+    const DOWN_RTS: [&str; 6] = [
+        "$user$ssfx_bloom_tmp2",
+        "$user$ssfx_bloom_tmp4",
+        "$user$ssfx_bloom_tmp8",
+        "$user$ssfx_bloom_tmp16",
+        "$user$ssfx_bloom_tmp32",
+        "$user$ssfx_bloom_tmp64",
+    ];
+    for (i, &dst_name) in DOWN_RTS.iter().enumerate() {
+        let scale = (1u32 << (i + 1)) as f32;
+        passes.push(SsfxBloomPassDesc {
+            kind: SsfxBloomPassKind::Downsample,
+            shader_name: "ssfx_bloom_downsample",
+            element_index: i as u8,
+            dst_name,
+            viewport_w: w / scale,
+            viewport_h: h / scale,
+            blur_setup: Some([w / scale, h / scale, 0.0, bloom_blur_scale]),
+        });
+    }
+
+    const UP_RTS: [&str; 5] = [
+        "$user$ssfx_bloom_tmp32_2",
+        "$user$ssfx_bloom_tmp16_2",
+        "$user$ssfx_bloom_tmp8_2",
+        "$user$ssfx_bloom_tmp4_2",
+        "$user$ssfx_bloom_tmp2",
+    ];
+    for (i, &dst_name) in UP_RTS.iter().enumerate() {
+        let scale = (1u32 << (5 - i)) as f32;
+        passes.push(SsfxBloomPassDesc {
+            kind: SsfxBloomPassKind::Upsample,
+            shader_name: "ssfx_bloom_upsample",
+            element_index: i as u8,
+            dst_name,
+            viewport_w: w / scale,
+            viewport_h: h / scale,
+            blur_setup: Some([w / scale, h / scale, 0.0, bloom_blur_scale]),
+        });
+    }
+
+    // `Combine` runs before restoring device viewport (remaining at half-resolution `w / 2, h / 2`).
+    passes.push(SsfxBloomPassDesc {
+        kind: SsfxBloomPassKind::Combine,
+        shader_name: "ssfx_bloom",
+        element_index: 1,
+        dst_name: "$user$ssfx_bloom1",
+        viewport_w: w * 0.5,
+        viewport_h: h * 0.5,
+        blur_setup: None,
+    });
+
+    passes
+}
+
+/// 88-byte anti-aliasing combine vertex matching `v_aa` (`r4_rendertarget_phase_combine.cpp:614-624`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Combine2AaVertex {
+    pub p: [f32; 4],
+    pub uv0: [f32; 2],
+    pub uv1: [f32; 2],
+    pub uv2: [f32; 2],
+    pub uv3: [f32; 2],
+    pub uv4: [f32; 2],
+    pub uv5: [f32; 4],
+    pub uv6: [f32; 4],
+}
+const _: () = assert!(std::mem::size_of::<Combine2AaVertex>() == 88);
+
+/// Build the 4-vertex `combine_2` anti-aliasing quad (`r4_rendertarget_phase_combine.cpp:626-671`).
+pub fn build_combine2_aa_quad(width: u32, height: u32) -> [Combine2AaVertex; 4] {
+    let w = width.max(1) as f32;
+    let h = height.max(1) as f32;
+    let corners = combine2_aa_quad_uvs(width, height);
+    let positions = [
+        [EPS_QUAD, h + EPS_QUAD, EPS_QUAD, 1.0],
+        [EPS_QUAD, EPS_QUAD, EPS_QUAD, 1.0],
+        [w + EPS_QUAD, h + EPS_QUAD, EPS_QUAD, 1.0],
+        [w + EPS_QUAD, EPS_QUAD, EPS_QUAD, 1.0],
+    ];
+    std::array::from_fn(|i| Combine2AaVertex {
+        p: positions[i],
+        uv0: corners[i].uv0,
+        uv1: corners[i].uv1,
+        uv2: corners[i].uv2,
+        uv3: corners[i].uv3,
+        uv4: corners[i].uv4,
+        uv5: corners[i].uv5,
+        uv6: corners[i].uv6,
+    })
+}
+
+/// Build the fullscreen NDC quad for `CRenderTarget::phase_combine_volumetric`
+/// (`r4_rendertarget_phase_combine.cpp:892-896`).
+#[inline]
+pub fn build_combine_volumetric_quad() -> [ScreenTlVertex; 4] {
+    [
+        ScreenTlVertex { p: [-1.0, 1.0, 0.0, 1.0], color: 0, uv: [0.0, 1.0] },
+        ScreenTlVertex { p: [-1.0, -1.0, 0.0, 0.0], color: 0, uv: [0.0, 0.0] },
+        ScreenTlVertex { p: [1.0, 1.0, 1.0, 1.0], color: 0, uv: [1.0, 1.0] },
+        ScreenTlVertex { p: [1.0, -1.0, 1.0, 0.0], color: 0, uv: [1.0, 0.0] },
+    ]
+}
+
+// ============================================================================
+// R4 Render Target Allocation Catalog (`CRenderTarget::CRenderTarget`, `r4_rendertarget.cpp`)
+// ============================================================================
+
+/// Logical pixel format for DX11/DX12 R4 render targets (`D3DFMT_*` -> `DXGI_FORMAT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum R4TargetFormat {
+    Rgba16F,
+    Rgba8Unorm,
+    R10G10B10A2Unorm,
+    D24UnormS8Uint,
+    R32F,
+    R16F,
+}
+
+/// Feature flags controlling which RTs `CRenderTarget` allocates (`r4_rendertarget.cpp:487-993`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct R4RenderTargetConfig {
+    pub width: u32,
+    pub height: u32,
+    pub sample_count: u32,
+    pub smap_size: u32,
+    pub gpu_num: u32,
+    pub dx10_msaa: bool,
+    pub dx11_hdr10: bool,
+    pub hdr10_generic_r_on: bool,
+    pub mrtmixdepth: bool,
+    pub fp16_blend: bool,
+    pub advancedpp: bool,
+    pub ssfx_sss: bool,
+    pub ssfx_bloom: bool,
+    pub dx10_minmax_sm: bool,
+    pub ssao_opt_data: bool,
+    pub ssao_half_data: bool,
+    pub is_nvidia_vendor: bool,
+    pub ssao_hdao: bool,
+    pub ssao_ultra: bool,
+    pub atlas_enabled: bool,
+    pub atlas_width: u32,
+    pub atlas_height: u32,
+    pub atlas_samples: u32,
+}
+
+impl Default for R4RenderTargetConfig {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            sample_count: 1,
+            smap_size: 2048,
+            gpu_num: 1,
+            dx10_msaa: false,
+            dx11_hdr10: false,
+            hdr10_generic_r_on: false,
+            mrtmixdepth: true,
+            fp16_blend: true,
+            advancedpp: true,
+            ssfx_sss: true,
+            ssfx_bloom: true,
+            dx10_minmax_sm: false,
+            ssao_opt_data: true,
+            ssao_half_data: false,
+            is_nvidia_vendor: true,
+            ssao_hdao: false,
+            ssao_ultra: false,
+            atlas_enabled: true,
+            atlas_width: 1024,
+            atlas_height: 1024,
+            atlas_samples: 4,
+        }
+    }
+}
+
+/// Single render target specification emitted by [`build_r4_render_target_catalog`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct R4RenderTargetSpec {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub format: R4TargetFormat,
+    pub sample_count: u32,
+    pub uav: bool,
+}
+
+/// Build the canonical R4/Anomaly render-target allocation list matching `CRenderTarget::CRenderTarget`.
+pub fn build_r4_render_target_catalog(cfg: &R4RenderTargetConfig) -> Vec<R4RenderTargetSpec> {
+    let w = cfg.width.max(1);
+    let h = cfg.height.max(1);
+    let samples = if cfg.dx10_msaa {
+        cfg.sample_count.max(1)
+    } else {
+        1
+    };
+    let generic_fmt = if cfg.dx11_hdr10 {
+        R4TargetFormat::Rgba16F
+    } else {
+        R4TargetFormat::Rgba8Unorm
+    };
+    let mut list = Vec::with_capacity(64);
+    let mut push = |name: &str, rw: u32, rh: u32, format: R4TargetFormat, sc: u32, uav: bool| {
+        list.push(R4RenderTargetSpec {
+            name: name.to_string(),
+            width: rw.max(1),
+            height: rh.max(1),
+            format,
+            sample_count: sc.max(1),
+            uav,
+        });
+    };
+
+    push("$user$position", w, h, R4TargetFormat::Rgba16F, samples, false);
+    if cfg.dx10_msaa {
+        push("$user$msaadepth", w, h, R4TargetFormat::D24UnormS8Uint, samples, false);
+    }
+    push("$user$temp_zb", w, h, R4TargetFormat::D24UnormS8Uint, 1, false);
+
+    if cfg.mrtmixdepth {
+        let albedo_fmt = if cfg.dx11_hdr10 {
+            R4TargetFormat::Rgba16F
+        } else {
+            R4TargetFormat::Rgba8Unorm
+        };
+        push("$user$albedo", w, h, albedo_fmt, samples, false);
+        push("$user$accum", w, h, R4TargetFormat::Rgba16F, samples, false);
+    } else if cfg.fp16_blend {
+        push("$user$albedo", w, h, R4TargetFormat::Rgba16F, samples, false);
+        push("$user$accum", w, h, R4TargetFormat::Rgba16F, samples, false);
+    } else {
+        push("$user$albedo", w, h, R4TargetFormat::Rgba8Unorm, samples, false);
+        push("$user$accum", w, h, R4TargetFormat::Rgba16F, samples, false);
+        push("$user$accum_temp", w, h, R4TargetFormat::Rgba16F, samples, false);
+    }
+
+    push("$user$generic0", w, h, generic_fmt, 1, false);
+    push("$user$generic1", w, h, generic_fmt, 1, false);
+    push("$user$generic", w, h, generic_fmt, 1, false);
+    push("$user$scopeRT", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$heat", w, h, R4TargetFormat::Rgba8Unorm, samples, false);
+    push("$user$generic_temp", w, h, generic_fmt, samples, false);
+    push("$user$dof", w, h, generic_fmt, 1, false);
+
+    let ui_fmt = if cfg.dx11_hdr10 {
+        R4TargetFormat::R10G10B10A2Unorm
+    } else {
+        R4TargetFormat::Rgba8Unorm
+    };
+    push("$user$viewport2", w, h, ui_fmt, 1, false);
+    push("$user$ui", w, h, ui_fmt, 1, false);
+
+    if cfg.atlas_enabled {
+        let aw = cfg.atlas_width.max(1);
+        let ah = cfg.atlas_height.max(1);
+        let asc = cfg.atlas_samples.max(1);
+        push("$user$ui_3d_icons", aw, ah, R4TargetFormat::Rgba8Unorm, 1, false);
+        push("$user$ui_3d_icons_raw", aw, ah, R4TargetFormat::Rgba8Unorm, 1, false);
+        if asc > 1 {
+            push("$user$ui_3d_icons_raw_msaa", aw, ah, R4TargetFormat::Rgba8Unorm, asc, false);
+        }
+        push("$user$ui_3d_icons_depth", aw, ah, R4TargetFormat::D24UnormS8Uint, asc, false);
+    }
+
+    if cfg.dx11_hdr10 {
+        push("$user$hdr10_halfres0", w / 2, h / 2, R4TargetFormat::Rgba16F, 1, false);
+        push("$user$hdr10_halfres1", w / 2, h / 2, R4TargetFormat::Rgba16F, 1, false);
+    }
+
+    push("$user$sun_shafts0", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$sun_shafts1", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+
+    push("$user$blur_h_2", w / 2, h / 2, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$blur_2", w / 2, h / 2, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$blur_h_4", w / 4, h / 4, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$blur_4", w / 4, h / 4, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$blur_h_8", w / 8, h / 8, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$blur_8", w / 8, h / 8, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$pp_bloom", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+
+    push("$user$ssfx_taa", w, h, R4TargetFormat::Rgba16F, samples, false);
+    push("$user$ssfx_prev_frame", w, h, generic_fmt, 1, false);
+    push("$user$ssfx_motion_vectors", w, h, R4TargetFormat::Rgba16F, samples, false);
+    push("$user$ssfx", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$ssfx_temp", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$ssfx_temp2", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$ssfx_temp3", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$ssfx_accum", w, h, R4TargetFormat::Rgba16F, samples, false);
+    push("$user$ssfx_ssr", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$ssfx_water", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$ssfx_ao", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$ssfx_il", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+
+    if cfg.ssfx_sss {
+        push("$user$ssfx_sss", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+        push("$user$ssfx_sss_ext", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+        push("$user$ssfx_sss_ext2", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+        push("$user$ssfx_sss_tmp", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    }
+
+    if cfg.ssfx_bloom {
+        push("$user$ssfx_bloom1", w / 2, h / 2, R4TargetFormat::Rgba16F, 1, false);
+        push("$user$ssfx_bloom_emissive", w, h, R4TargetFormat::Rgba8Unorm, samples, false);
+        push("$user$ssfx_bloom_lens", w / 4, h / 4, R4TargetFormat::Rgba8Unorm, 1, false);
+        for (name, div) in [
+            ("$user$ssfx_bloom_tmp2", 2u32),
+            ("$user$ssfx_bloom_tmp4", 4),
+            ("$user$ssfx_bloom_tmp8", 8),
+            ("$user$ssfx_bloom_tmp16", 16),
+            ("$user$ssfx_bloom_tmp32", 32),
+            ("$user$ssfx_bloom_tmp64", 64),
+            ("$user$ssfx_bloom_tmp32_2", 32),
+            ("$user$ssfx_bloom_tmp16_2", 16),
+            ("$user$ssfx_bloom_tmp8_2", 8),
+            ("$user$ssfx_bloom_tmp4_2", 4),
+        ] {
+            push(name, w / div, h / div, R4TargetFormat::Rgba16F, 1, false);
+        }
+    }
+
+    push("$user$ssfx_volumetric", w / 8, h / 8, R4TargetFormat::Rgba16F, 1, false);
+    push("$user$ssfx_volumetric_tmp", w / 8, h / 8, R4TargetFormat::Rgba16F, 1, false);
+    push("$user$ssfx_rain", w / 8, h / 8, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$ssfx_water_waves", 512, 512, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$ssfx_prev_p", w, h, R4TargetFormat::Rgba16F, samples, false);
+
+    if cfg.dx10_msaa {
+        let gr_fmt = if cfg.hdr10_generic_r_on {
+            R4TargetFormat::Rgba16F
+        } else {
+            R4TargetFormat::Rgba8Unorm
+        };
+        push("$user$generic0_r", w, h, gr_fmt, samples, false);
+        push("$user$generic1_r", w, h, gr_fmt, samples, false);
+    }
+    if cfg.advancedpp {
+        push("$user$generic2", w, h, R4TargetFormat::Rgba16F, samples, false);
+    }
+
+    let smap_sz = cfg.smap_size.max(64);
+    push("$user$smap_depth", smap_sz, smap_sz, R4TargetFormat::D24UnormS8Uint, 1, false);
+    if cfg.dx10_minmax_sm {
+        push("$user$smap_depth_minmax", smap_sz / 4, smap_sz / 4, R4TargetFormat::R32F, 1, false);
+    }
+
+    push("$user$bloom1", BLOOM_SIZE_X, BLOOM_SIZE_Y, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$bloom2", BLOOM_SIZE_X, BLOOM_SIZE_Y, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$smaa_edgetex", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$smaa_blendtex", w, h, R4TargetFormat::Rgba8Unorm, 1, false);
+    push("$user$lum_t64", 64, 64, R4TargetFormat::Rgba16F, 1, false);
+    push("$user$lum_t8", 8, 8, R4TargetFormat::Rgba16F, 1, false);
+    for it in 0..(cfg.gpu_num.max(1) * 2) {
+        push(&format!("$user$luminance_{it}"), 1, 1, R4TargetFormat::R32F, 1, false);
+    }
+
+    if cfg.ssao_opt_data {
+        let (sw, sh) = if cfg.ssao_half_data {
+            (w / 2, h / 2)
+        } else {
+            (w, h)
+        };
+        let fmt = if cfg.is_nvidia_vendor {
+            R4TargetFormat::R32F
+        } else {
+            R4TargetFormat::R16F
+        };
+        push("$user$half_depth", sw, sh, fmt, 1, false);
+    }
+    if cfg.ssao_hdao && cfg.ssao_ultra {
+        push("$user$ssao_temp", w, h, R4TargetFormat::R16F, 1, true);
+    }
+
+    list
+}
+
+// ============================================================================
+// R4 Render-Phase Target/Depth/Clear/Stencil/Cull/ColorWrite State Machine
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum R4RtSlot {
+    Null,
+    BaseRt,
+    Position,
+    Albedo,
+    Accumulator,
+    AccumulatorTemp,
+    Heat,
+    SsfxMotionVectors,
+    Generic0,
+    Generic1,
+    Generic0Msaa,
+    Generic1Msaa,
+    Generic2,
+    SmapSurf,
+    CurrentRt0,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum R4DepthSlot {
+    Null,
+    BaseZb,
+    MsaaDepth,
+    SmapDepth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct R4PhaseClearSpec {
+    pub rt0_rgba: Option<[f32; 4]>,
+    pub rt1_rgba: Option<[f32; 4]>,
+    pub depth_value: Option<f32>,
+    pub stencil_value: Option<u8>,
+}
+
+impl R4PhaseClearSpec {
+    pub const NONE: Self = Self {
+        rt0_rgba: None,
+        rt1_rgba: None,
+        depth_value: None,
+        stencil_value: None,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum R4RenderPhaseKind {
+    ScenePrepare,
+    SceneBegin,
+    SceneEndAlbedoResolve,
+    AccumulatorFirstClear,
+    AccumulatorAppend,
+    VolumetricAccumulator,
+    ShadowDirect,
+    ShadowDirectTshadowsClear,
+    ShadowSpotClear,
+    ShadowSpot,
+    OcclusionQuery,
+    Wallmarks,
+    CombineVolumetric,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct R4PhaseStateOptions {
+    pub dx10_msaa: bool,
+    pub albedo_wo: bool,
+    pub fp16_blend: bool,
+    pub hw_smap: bool,
+    pub ssfx_volumetric: bool,
+}
+
+/// Complete R4 render-phase pipeline binding & clear contract
+/// (`r4_rendertarget_phase_{scene,accumulator,smap_D,smap_S,occq,combine}.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct R4RenderPhaseSpec {
+    pub rts: [R4RtSlot; 4],
+    pub depth: R4DepthSlot,
+    pub clears: R4PhaseClearSpec,
+    pub cull_mode: Option<CullMode>,
+    pub stencil: Option<StencilState>,
+    pub color_write_enable: Option<[bool; 4]>,
+}
+
+/// Compute exact RT/DSV/clear/cull/stencil/color-write contract for an R4 render phase.
+pub fn r4_phase_spec(kind: R4RenderPhaseKind, opts: R4PhaseStateOptions) -> R4RenderPhaseSpec {
+    let scene_zb = if opts.dx10_msaa {
+        R4DepthSlot::MsaaDepth
+    } else {
+        R4DepthSlot::BaseZb
+    };
+    let stencil_lessequal_01 = StencilState {
+        enable: true,
+        func: CmpFunc::LessEqual,
+        mask: 0xFF,
+        write_mask: 0x00,
+        fail: StencilOp::Keep,
+        pass: StencilOp::Keep,
+        zfail: StencilOp::Keep,
+        ref_value: 0x01,
+    };
+    match kind {
+        R4RenderPhaseKind::ScenePrepare => R4RenderPhaseSpec {
+            rts: [R4RtSlot::Position, R4RtSlot::Null, R4RtSlot::Null, R4RtSlot::Null],
+            depth: scene_zb,
+            clears: R4PhaseClearSpec {
+                rt0_rgba: Some([0.0; 4]),
+                rt1_rgba: Some([0.0; 4]), // `rt_Heat`
+                depth_value: Some(1.0),
+                stencil_value: Some(0),
+            },
+            cull_mode: None,
+            stencil: None,
+            color_write_enable: None,
+        },
+        R4RenderPhaseKind::SceneBegin => R4RenderPhaseSpec {
+            rts: [
+                R4RtSlot::Position,
+                if opts.albedo_wo { R4RtSlot::Accumulator } else { R4RtSlot::Albedo },
+                R4RtSlot::Heat,
+                R4RtSlot::SsfxMotionVectors,
+            ],
+            depth: scene_zb,
+            clears: R4PhaseClearSpec::NONE,
+            cull_mode: Some(CullMode::Ccw),
+            stencil: Some(StencilState {
+                enable: true,
+                func: CmpFunc::Always,
+                mask: 0xFF,
+                write_mask: 0x7F,
+                fail: StencilOp::Keep,
+                pass: StencilOp::Replace,
+                zfail: StencilOp::Keep,
+                ref_value: 0x01,
+            }),
+            color_write_enable: Some([true; 4]),
+        },
+        R4RenderPhaseKind::SceneEndAlbedoResolve => R4RenderPhaseSpec {
+            rts: [
+                if opts.albedo_wo { R4RtSlot::Albedo } else { R4RtSlot::Null },
+                R4RtSlot::Null,
+                R4RtSlot::Null,
+                R4RtSlot::Null,
+            ],
+            depth: scene_zb,
+            clears: R4PhaseClearSpec::NONE,
+            cull_mode: if opts.albedo_wo { Some(CullMode::None) } else { None },
+            stencil: if opts.albedo_wo { Some(stencil_lessequal_01) } else { None },
+            color_write_enable: if opts.albedo_wo { Some([true; 4]) } else { None },
+        },
+        R4RenderPhaseKind::AccumulatorFirstClear => R4RenderPhaseSpec {
+            rts: [R4RtSlot::Accumulator, R4RtSlot::Null, R4RtSlot::Null, R4RtSlot::Null],
+            depth: scene_zb,
+            clears: R4PhaseClearSpec {
+                rt0_rgba: Some([0.0; 4]),
+                rt1_rgba: None,
+                depth_value: None,
+                stencil_value: None,
+            },
+            cull_mode: Some(CullMode::None),
+            stencil: Some(stencil_lessequal_01),
+            color_write_enable: Some([true; 4]),
+        },
+        R4RenderPhaseKind::AccumulatorAppend => R4RenderPhaseSpec {
+            rts: [
+                if opts.fp16_blend { R4RtSlot::Accumulator } else { R4RtSlot::AccumulatorTemp },
+                R4RtSlot::Null,
+                R4RtSlot::Null,
+                R4RtSlot::Null,
+            ],
+            depth: scene_zb,
+            clears: R4PhaseClearSpec::NONE,
+            cull_mode: None,
+            stencil: None,
+            color_write_enable: None,
+        },
+        R4RenderPhaseKind::VolumetricAccumulator => R4RenderPhaseSpec {
+            rts: [R4RtSlot::Generic2, R4RtSlot::Null, R4RtSlot::Null, R4RtSlot::Null],
+            depth: if opts.ssfx_volumetric { R4DepthSlot::Null } else { scene_zb },
+            clears: R4PhaseClearSpec::NONE,
+            cull_mode: Some(CullMode::None),
+            stencil: Some(StencilState::default()),
+            color_write_enable: Some([true; 4]),
+        },
+        R4RenderPhaseKind::ShadowDirect => R4RenderPhaseSpec {
+            rts: [R4RtSlot::SmapSurf, R4RtSlot::Null, R4RtSlot::Null, R4RtSlot::Null],
+            depth: R4DepthSlot::SmapDepth,
+            clears: R4PhaseClearSpec {
+                rt0_rgba: None,
+                rt1_rgba: None,
+                depth_value: Some(1.0),
+                stencil_value: None,
+            },
+            cull_mode: None,
+            stencil: Some(StencilState::default()),
+            color_write_enable: None,
+        },
+        R4RenderPhaseKind::ShadowDirectTshadowsClear | R4RenderPhaseKind::ShadowSpotClear => {
+            if kind == R4RenderPhaseKind::ShadowSpotClear {
+                R4RenderPhaseSpec {
+                    rts: [R4RtSlot::Null; 4],
+                    depth: R4DepthSlot::SmapDepth,
+                    clears: R4PhaseClearSpec {
+                        rt0_rgba: None,
+                        rt1_rgba: None,
+                        depth_value: Some(1.0),
+                        stencil_value: None,
+                    },
+                    cull_mode: None,
+                    stencil: None,
+                    color_write_enable: None,
+                }
+            } else {
+                R4RenderPhaseSpec {
+                    rts: [R4RtSlot::CurrentRt0, R4RtSlot::Null, R4RtSlot::Null, R4RtSlot::Null],
+                    depth: R4DepthSlot::Null,
+                    clears: R4PhaseClearSpec {
+                        rt0_rgba: Some([1.0; 4]),
+                        rt1_rgba: None,
+                        depth_value: None,
+                        stencil_value: None,
+                    },
+                    cull_mode: None,
+                    stencil: None,
+                    color_write_enable: Some([true; 4]),
+                }
+            }
+        }
+        R4RenderPhaseKind::ShadowSpot => R4RenderPhaseSpec {
+            rts: [R4RtSlot::SmapSurf, R4RtSlot::Null, R4RtSlot::Null, R4RtSlot::Null],
+            depth: R4DepthSlot::SmapDepth,
+            clears: R4PhaseClearSpec::NONE,
+            cull_mode: Some(CullMode::Ccw),
+            stencil: Some(StencilState::default()),
+            color_write_enable: if opts.hw_smap { Some([false; 4]) } else { None },
+        },
+        R4RenderPhaseKind::OcclusionQuery => R4RenderPhaseSpec {
+            rts: [
+                if opts.dx10_msaa { R4RtSlot::Null } else { R4RtSlot::BaseRt },
+                R4RtSlot::Null,
+                R4RtSlot::Null,
+                R4RtSlot::Null,
+            ],
+            depth: scene_zb,
+            clears: R4PhaseClearSpec::NONE,
+            cull_mode: Some(CullMode::Ccw),
+            stencil: Some(stencil_lessequal_01),
+            color_write_enable: Some([false; 4]),
+        },
+        R4RenderPhaseKind::Wallmarks => R4RenderPhaseSpec {
+            rts: [R4RtSlot::Albedo, R4RtSlot::Null, R4RtSlot::Null, R4RtSlot::Null],
+            depth: scene_zb,
+            clears: R4PhaseClearSpec::NONE,
+            cull_mode: Some(CullMode::Ccw),
+            stencil: Some(stencil_lessequal_01),
+            color_write_enable: Some([true, true, true, false]),
+        },
+        R4RenderPhaseKind::CombineVolumetric => R4RenderPhaseSpec {
+            rts: [
+                if opts.dx10_msaa { R4RtSlot::Generic0Msaa } else { R4RtSlot::Generic0 },
+                if opts.dx10_msaa { R4RtSlot::Generic1Msaa } else { R4RtSlot::Generic1 },
+                R4RtSlot::Null,
+                R4RtSlot::Null,
+            ],
+            depth: scene_zb,
+            clears: R4PhaseClearSpec::NONE,
+            cull_mode: None,
+            stencil: None,
+            color_write_enable: Some([true, true, true, false]),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3507,5 +4500,90 @@ mod tests {
         );
         assert!((rain_lit[0].p[2] - 50.0).abs() < 1e-5);
         assert_eq!(rain_lit[0].uv1[1], 20.0);
+    }
+
+    #[test]
+    fn pp_bloom_combine_quads_rt_catalog_and_phase_specs() {
+        assert_eq!(std::mem::size_of::<PhasePpVertex>(), 48);
+        assert_eq!(std::mem::size_of::<BloomBuildVertex>(), 48);
+        assert_eq!(std::mem::size_of::<BloomFilterVertex>(), 144);
+        assert_eq!(std::mem::size_of::<Combine2AaVertex>(), 88);
+
+        let mut noise = PostprocessNoiseState::new(3);
+        let state = PostprocessState {
+            gray: 0.5,
+            noise_intensity: 0.2,
+            cm_influence: 0.4,
+            ..PostprocessState::identity()
+        };
+        let plan = build_postprocess_pass_plan(&state, &mut noise, 0.01, 64, 64, 1920, 1080, 1920, 1080, 1.0);
+        let pp_quad = plan.build_quad(1920, 1080, 0.25, -0.5);
+        assert_eq!(pp_quad[0].p, [0.25, 1079.5, EPS_S, 1.0]);
+        assert_eq!(pp_quad[3].p, [1920.25, -0.5, EPS_S, 1.0]);
+        assert_eq!(pp_quad[0].color0_argb, plan.gpu_params.color0_argb);
+        assert_eq!(pp_quad[0].uv0, [plan.right_uv[0], plan.right_uv[3]]);
+
+        let bloom_q = build_bloom_build_quad(1920, 1080, BLOOM_SIZE_X, BLOOM_SIZE_Y);
+        assert_eq!(bloom_q[2].p, [256.0 + EPS_QUAD, 256.0 + EPS_QUAD, EPS_QUAD, 1.0]);
+        assert!((bloom_q[0].uv0[1] - (1.0 + 0.5 / 1080.0)).abs() < 1e-6);
+
+        let fast_q = build_bloom_fast_filter_quad(256, 256, 2.0);
+        assert!((fast_q[1].uv0[0] - (0.5 / 256.0 - 2.0 / 256.0)).abs() < 1e-6);
+
+        let h_q = build_bloom_filter_quad_horizontal(256, 256);
+        let v_q = build_bloom_filter_quad_vertical(256, 256);
+        assert_eq!(h_q[0].p[1], 256.0 + EPS_QUAD);
+        assert!((v_q[1].uv0[0] - 0.5 / 256.0).abs() < 1e-6);
+
+        let ssfx_q = build_ssfx_bloom_quad(1920, 1080);
+        assert_eq!(ssfx_q[0].color, 0);
+        assert_eq!(ssfx_q[2].uv, [1.0, 1.0]);
+
+        let ssfx_no_lens = ssfx_bloom_schedule(1920, 1080, 0.0, 2.0);
+        assert_eq!(ssfx_no_lens.len(), 13);
+        assert_eq!(ssfx_no_lens[0].kind, SsfxBloomPassKind::Build);
+        assert_eq!(ssfx_no_lens.last().unwrap().kind, SsfxBloomPassKind::Combine);
+        assert_eq!(ssfx_no_lens.last().unwrap().viewport_w, 960.0);
+
+        let ssfx_with_lens = ssfx_bloom_schedule(1920, 1080, 1.0, 2.0);
+        assert_eq!(ssfx_with_lens.len(), 16);
+        assert_eq!(ssfx_with_lens[1].kind, SsfxBloomPassKind::LensFlares);
+        assert_eq!(ssfx_with_lens[3].dst_name, "$user$ssfx_bloom_lens");
+        assert_eq!(ssfx_with_lens[3].blur_setup, Some([480.0, 270.0, 0.0, 5.0]));
+
+        let aa_q = build_combine2_aa_quad(1000, 500);
+        assert_eq!(aa_q[0].p, [EPS_QUAD, 500.0 + EPS_QUAD, EPS_QUAD, 1.0]);
+        assert!((aa_q[0].uv1[0] - (0.5 / 1000.0 - 1.0 / 1000.0)).abs() < 1e-7);
+
+        let vol_q = build_combine_volumetric_quad();
+        assert_eq!(vol_q[0].p, [-1.0, 1.0, 0.0, 1.0]);
+        assert_eq!(vol_q[3].p, [1.0, -1.0, 1.0, 0.0]);
+
+        let rt_cat = build_r4_render_target_catalog(&R4RenderTargetConfig {
+            dx10_msaa: true,
+            sample_count: 4,
+            dx11_hdr10: true,
+            hdr10_generic_r_on: true,
+            ssao_hdao: true,
+            ssao_ultra: true,
+            dx10_minmax_sm: true,
+            ..R4RenderTargetConfig::default()
+        });
+        assert!(rt_cat.iter().any(|r| r.name == "$user$msaadepth" && r.sample_count == 4));
+        assert!(rt_cat.iter().any(|r| r.name == "$user$hdr10_halfres0" && r.width == 960));
+        assert!(rt_cat.iter().any(|r| r.name == "$user$ssao_temp" && r.uav));
+        assert!(rt_cat.iter().any(|r| r.name == "$user$smap_depth_minmax" && r.format == R4TargetFormat::R32F));
+
+        let sb = r4_phase_spec(
+            R4RenderPhaseKind::SceneBegin,
+            R4PhaseStateOptions { dx10_msaa: true, albedo_wo: true, ..R4PhaseStateOptions::default() },
+        );
+        assert_eq!(sb.rts[1], R4RtSlot::Accumulator);
+        assert_eq!(sb.depth, R4DepthSlot::MsaaDepth);
+        assert_eq!(sb.stencil.unwrap().write_mask, 0x7F);
+
+        let wm = r4_phase_spec(R4RenderPhaseKind::Wallmarks, R4PhaseStateOptions::default());
+        assert_eq!(wm.color_write_enable, Some([true, true, true, false]));
+        assert_eq!(wm.stencil.unwrap().func, CmpFunc::LessEqual);
     }
 }

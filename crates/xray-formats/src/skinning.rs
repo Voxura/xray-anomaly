@@ -11,7 +11,11 @@ use crate::ogf::{
     OgfObb, OgfSkeleton, OgfTextureLink, OgfVertices, OgfVisualType, StaticVertex, XRayMatrix,
     XRAY_IDENTITY_MATRIX,
 };
-use crate::omf::OmfMotions;
+use crate::omf::{
+    AnimationBlend, AnimationChannels, BlendCurvature, BoneKeyframe, BonePartitionSet,
+    ChannelMixType, MotionID, OmfMotions, MAX_ANIM_CHANNELS, MAX_BLENDED_PER_CHANNEL,
+    MAX_BLENDED_POOL, MAX_PARTS,
+};
 
 /// Transposed 4x3 shader bone matrix (`3 x float4` rows) matching `SkeletonX.cpp:136-138`:
 /// - `rows[0] = [m[0][0], m[1][0], m[2][0], m[3][0]]`
@@ -1066,6 +1070,711 @@ pub fn pick_ogf_bone(
     hit
 }
 
+// ============================================================================
+// Multi-Channel Skeletal Blend Mixer (`CKinematicsAnimated` / `SkeletonAnimated.cpp`)
+// ============================================================================
+
+const MIXER_EPS_S: f32 = 1e-7;
+
+/// Per-bone active blend index list (`CBlendInstance`, max `MAX_BLENDED_PER_CHANNEL` = 16).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnimatedBlendInstance {
+    pub blends: Vec<usize>,
+}
+
+impl AnimatedBlendInstance {
+    /// Register `pool_idx` matching `CBlendInstance::blend_add` (`SkeletonAnimated.cpp:23-36`).
+    pub fn add_blend(&mut self, pool_idx: usize, pool: &[AnimationBlend]) {
+        if self.blends.len() >= MAX_BLENDED_PER_CHANNEL {
+            if pool.get(pool_idx).is_some_and(|b| b.fall_at_end) {
+                return;
+            }
+            if let Some((min_pos, _)) = self
+                .blends
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    let wa = pool.get(**a).map_or(0.0, |x| x.blend_amount);
+                    let wb = pool.get(**b).map_or(0.0, |x| x.blend_amount);
+                    wa.total_cmp(&wb)
+                })
+            {
+                self.blends.remove(min_pos);
+            }
+        }
+        self.blends.push(pool_idx);
+    }
+
+    /// Remove first matching `pool_idx` matching `CBlendInstance::blend_remove`.
+    pub fn remove_blend(&mut self, pool_idx: usize) {
+        if let Some(pos) = self.blends.iter().position(|&idx| idx == pool_idx) {
+            self.blends.remove(pos);
+        }
+    }
+}
+
+/// Output of [`AnimatedBlendMixer::evaluate_pose`], providing visible skinning matrices plus `mTransformHidden`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimatedPoseResult {
+    pub palette: BonePalette,
+    pub hidden_transforms: Vec<XRayMatrix>,
+}
+
+/// Stateful pure-Rust skeletal animation mixer matching `CKinematicsAnimated`
+/// (`SkeletonAnimated.cpp:170-1031`): 4 channels (`Lerp`/`Lerp`/`Add`/`Add`),
+/// `MAX_PARTS` partitions, cycle + FX tracks, and hidden-bone collapse propagation.
+#[derive(Debug, Clone)]
+pub struct AnimatedBlendMixer {
+    pub blend_pool: Vec<AnimationBlend>,
+    pub blend_cycles: [Vec<usize>; MAX_PARTS],
+    pub blend_fx: Vec<usize>,
+    pub bone_instances: Vec<AnimatedBlendInstance>,
+    pub channels: AnimationChannels,
+    pub partitions: [Vec<u16>; MAX_PARTS],
+    pub active_parts: [bool; MAX_PARTS],
+    pub visible_bones: BoneMask,
+    pub root_bone: u16,
+    slot_track_maps: Vec<Vec<Option<usize>>>,
+}
+
+impl AnimatedBlendMixer {
+    /// Initialize mixer storage, partition bone lists, and OMF->skeleton track remaps.
+    pub fn new(
+        skeleton: &OgfSkeleton,
+        motion_slots: &[&OmfMotions],
+        custom_partitions: Option<&BonePartitionSet>,
+    ) -> Result<Self, FormatError> {
+        let bone_count = skeleton.bones.len();
+        if bone_count == 0 {
+            return Err(FormatError::InvalidValue("skeleton has zero bones"));
+        }
+        let root_bone = skeleton.root_bone.unwrap_or(0);
+
+        let mut partitions: [Vec<u16>; MAX_PARTS] = std::array::from_fn(|_| Vec::new());
+        let mut active_parts = [false; MAX_PARTS];
+
+        if let Some(part_set) = custom_partitions {
+            for p in 0..MAX_PARTS {
+                if let Some(def) = part_set.part(p as u16)
+                    && !def.bone_names.is_empty()
+                {
+                    active_parts[p] = true;
+                    for bname in &def.bone_names {
+                        if let Some(id) = skeleton.bone_id(bname) {
+                            partitions[p].push(id);
+                        }
+                    }
+                }
+            }
+        } else if let Some(first_slot) = motion_slots.first() {
+            for (p, mp) in first_slot.partitions.iter().enumerate().take(MAX_PARTS) {
+                if !mp.bones.is_empty() {
+                    active_parts[p] = true;
+                    for pbone in &mp.bones {
+                        if let Some(id) = skeleton.bone_id(&pbone.name) {
+                            partitions[p].push(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        let slot_track_maps = motion_slots
+            .iter()
+            .map(|omf| omf.skeleton_to_track_map(skeleton))
+            .collect();
+
+        Ok(Self {
+            blend_pool: vec![AnimationBlend::free_slot(); MAX_BLENDED_POOL],
+            blend_cycles: std::array::from_fn(|_| Vec::new()),
+            blend_fx: Vec::new(),
+            bone_instances: vec![AnimatedBlendInstance::default(); bone_count],
+            channels: AnimationChannels::new(),
+            partitions,
+            active_parts,
+            visible_bones: BoneMask::all(bone_count),
+            root_bone,
+            slot_track_maps,
+        })
+    }
+
+    #[inline]
+    pub fn set_bone_visible(&mut self, bone_id: u16, visible: bool) {
+        self.visible_bones.set_visible(bone_id, visible);
+    }
+
+    #[inline]
+    pub fn is_bone_visible(&self, bone_id: u16) -> bool {
+        self.visible_bones.is_visible(bone_id)
+    }
+
+    #[inline]
+    pub fn set_channel_factor(&mut self, channel: usize, factor: f32) {
+        self.channels.set_factor(channel, factor);
+    }
+
+    /// Resolve a motion identifier by name searching slots in reverse load order (`LL_MotionID`).
+    pub fn resolve_motion_id(motion_slots: &[&OmfMotions], name: &str) -> Option<MotionID> {
+        for (slot_idx, omf) in motion_slots.iter().enumerate().rev() {
+            if let Some((idx, _)) = omf.find_def(name) {
+                return Some(MotionID::new(slot_idx as u16, idx as u16));
+            }
+        }
+        None
+    }
+
+    /// Resolve a non-FX cycle motion identifier (`ID_Cycle_Safe`).
+    pub fn resolve_cycle_id(motion_slots: &[&OmfMotions], name: &str) -> Option<MotionID> {
+        for (slot_idx, omf) in motion_slots.iter().enumerate().rev() {
+            if let Some((idx, def)) = omf.find_def(name)
+                && !def.is_fx()
+            {
+                return Some(MotionID::new(slot_idx as u16, idx as u16));
+            }
+        }
+        None
+    }
+
+    /// Resolve an FX motion identifier (`ID_FX_Safe`).
+    pub fn resolve_fx_id(motion_slots: &[&OmfMotions], name: &str) -> Option<MotionID> {
+        for (slot_idx, omf) in motion_slots.iter().enumerate().rev() {
+            if let Some((idx, def)) = omf.find_def(name)
+                && def.is_fx()
+            {
+                return Some(MotionID::new(slot_idx as u16, idx as u16));
+            }
+        }
+        None
+    }
+
+    fn alloc_blend_slot(&self) -> Option<usize> {
+        self.blend_pool.iter().position(AnimationBlend::is_free)
+    }
+
+    fn bone_motion_start_im(&mut self, bone_id: u16, pool_idx: usize) {
+        if let Some(inst) = self.bone_instances.get_mut(bone_id as usize) {
+            inst.add_blend(pool_idx, &self.blend_pool);
+        }
+    }
+
+    fn bone_motion_stop_im(&mut self, bone_id: u16, pool_idx: usize) {
+        if let Some(inst) = self.bone_instances.get_mut(bone_id as usize) {
+            inst.remove_blend(pool_idx);
+        }
+    }
+
+    fn bone_motion_start(&mut self, skeleton: &OgfSkeleton, bone_id: u16, pool_idx: usize) {
+        self.bone_motion_start_im(bone_id, pool_idx);
+        if let Some(bone) = skeleton.bones.get(bone_id as usize) {
+            for &child in &bone.children {
+                self.bone_motion_start(skeleton, child, pool_idx);
+            }
+        }
+    }
+
+    fn bone_motion_stop(&mut self, skeleton: &OgfSkeleton, bone_id: u16, pool_idx: usize) {
+        self.bone_motion_stop_im(bone_id, pool_idx);
+        if let Some(bone) = skeleton.bones.get(bone_id as usize) {
+            for &child in &bone.children {
+                self.bone_motion_stop(skeleton, child, pool_idx);
+            }
+        }
+    }
+
+    fn clip_duration_for_bone(
+        &self,
+        motion_slots: &[&OmfMotions],
+        motion_id: MotionID,
+        bone_id: u16,
+    ) -> Option<f32> {
+        let slot = motion_slots.get(motion_id.slot as usize)?;
+        let def = slot.defs.get(motion_id.idx as usize)?;
+        let clip = slot
+            .clips
+            .get(def.motion as usize)
+            .or_else(|| slot.clips.get(motion_id.idx as usize))?;
+        let track_idx = self
+            .slot_track_maps
+            .get(motion_id.slot as usize)
+            .and_then(|m| m.get(bone_id as usize))
+            .copied()
+            .flatten();
+        Some(
+            track_idx
+                .and_then(|t| clip.tracks.get(t))
+                .map_or_else(|| clip.duration_seconds(), |t| t.duration_seconds()),
+        )
+    }
+
+    /// Transition matching cycle blends in `part` to `Falloff` (`LL_FadeCycle`).
+    pub fn fade_cycle(&mut self, part: u16, falloff: f32, channel_mask: u8) {
+        let Some(cycle_list) = self.blend_cycles.get(part as usize) else {
+            return;
+        };
+        for &pool_idx in cycle_list {
+            let b = &mut self.blend_pool[pool_idx];
+            if (channel_mask & (1u8 << (b.channel as u32 % 8))) == 0 {
+                continue;
+            }
+            b.curvature = BlendCurvature::Falloff;
+            b.blend_falloff = falloff;
+            if b.stop_at_end {
+                b.stop_at_end_callback = false;
+            }
+        }
+    }
+
+    /// Immediately terminate and detach matching cycle blends in `part` (`LL_CloseCycle`).
+    pub fn close_cycle(&mut self, part: u16, channel_mask: u8) {
+        if part == u16::MAX || (part as usize) >= MAX_PARTS {
+            return;
+        }
+        let part_idx = part as usize;
+        let mut i = 0;
+        while i < self.blend_cycles[part_idx].len() {
+            let pool_idx = self.blend_cycles[part_idx][i];
+            let channel = self.blend_pool[pool_idx].channel;
+            if (channel_mask & (1u8 << (channel as u32 % 8))) == 0 {
+                i += 1;
+                continue;
+            }
+            let bone_or_part = self.blend_pool[pool_idx].bone_or_part as usize;
+            self.blend_pool[pool_idx].curvature = BlendCurvature::FreeSlot;
+            if let Some(part_bones) = self.partitions.get(bone_or_part).cloned() {
+                for bone_id in part_bones {
+                    self.bone_motion_stop_im(bone_id, pool_idx);
+                }
+            }
+            self.blend_cycles[part_idx].remove(i);
+        }
+    }
+
+    /// Play a cycle clip on `part` (or `u16::MAX` to unroll across all active partitions)
+    /// matching `CKinematicsAnimated::LL_PlayCycle` (`SkeletonAnimated.cpp:371-413`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_cycle_with_params(
+        &mut self,
+        motion_slots: &[&OmfMotions],
+        part: u16,
+        motion_id: MotionID,
+        mixing: bool,
+        blend_accrue: f32,
+        blend_falloff: f32,
+        speed: f32,
+        stop_at_end: bool,
+        channel: u8,
+    ) -> Option<usize> {
+        if !motion_id.is_valid() {
+            return None;
+        }
+        if part == u16::MAX {
+            for p in 0..MAX_PARTS {
+                self.play_cycle_with_params(
+                    motion_slots,
+                    p as u16,
+                    motion_id,
+                    mixing,
+                    blend_accrue,
+                    blend_falloff,
+                    speed,
+                    stop_at_end,
+                    channel,
+                );
+            }
+            return None;
+        }
+        let part_idx = part as usize;
+        if part_idx >= MAX_PARTS || !self.active_parts[part_idx] {
+            return None;
+        }
+        if (channel as usize) >= MAX_ANIM_CHANNELS {
+            return None;
+        }
+
+        let time_total = self.clip_duration_for_bone(motion_slots, motion_id, self.root_bone)?;
+
+        if channel == 0 {
+            if mixing {
+                self.fade_cycle(part, blend_falloff, 1);
+            } else {
+                self.close_cycle(part, 1);
+            }
+        }
+
+        let pool_idx = self.alloc_blend_slot()?;
+        self.blend_pool[pool_idx] = AnimationBlend {
+            blend_amount: if mixing { MIXER_EPS_S } else { 1.0 },
+            time_current: 0.0,
+            time_total,
+            motion_id,
+            bone_or_part: part,
+            channel,
+            curvature: BlendCurvature::Accrue,
+            blend_accrue,
+            blend_falloff: 0.0,
+            blend_power: 1.0,
+            speed,
+            playing: true,
+            stop_at_end_callback: true,
+            stop_at_end,
+            fall_at_end: stop_at_end && channel > 1,
+            frame: 0,
+        };
+
+        let part_bones = self.partitions[part_idx].clone();
+        for bone_id in part_bones {
+            self.bone_motion_start_im(bone_id, pool_idx);
+        }
+        self.blend_cycles[part_idx].push(pool_idx);
+        Some(pool_idx)
+    }
+
+    /// Play a cycle using parameters from its `MotionDef` (`PlayCycle` / `LL_PlayCycle`).
+    pub fn play_cycle(
+        &mut self,
+        motion_slots: &[&OmfMotions],
+        part_override: Option<u16>,
+        motion_id: MotionID,
+        mixing: bool,
+        channel: u8,
+        speed_multiplier: f32,
+    ) -> Option<usize> {
+        let def = motion_slots
+            .get(motion_id.slot as usize)?
+            .defs
+            .get(motion_id.idx as usize)?;
+        let part = part_override.unwrap_or(def.bone_or_part);
+        let speed = def.quantized_speed() * speed_multiplier;
+        self.play_cycle_with_params(
+            motion_slots,
+            part,
+            motion_id,
+            mixing,
+            def.effective_accrue(),
+            def.effective_falloff(),
+            speed,
+            def.stop_at_end(),
+            channel,
+        )
+    }
+
+    /// Play an additive/override FX clip rooted at `bone_id` (or `u16::MAX` for root)
+    /// matching `CKinematicsAnimated::LL_PlayFX` (`SkeletonAnimated.cpp:487-522`).
+    pub fn play_fx(
+        &mut self,
+        skeleton: &OgfSkeleton,
+        motion_slots: &[&OmfMotions],
+        bone_override: Option<u16>,
+        motion_id: MotionID,
+        power_scale: f32,
+    ) -> Option<usize> {
+        if !motion_id.is_valid() || self.blend_fx.len() >= MAX_BLENDED_PER_CHANNEL {
+            return None;
+        }
+        let def = motion_slots
+            .get(motion_id.slot as usize)?
+            .defs
+            .get(motion_id.idx as usize)?;
+        let raw_bone = bone_override.unwrap_or(def.bone_or_part);
+        let bone = if raw_bone == u16::MAX {
+            self.root_bone
+        } else {
+            raw_bone
+        };
+        if (bone as usize) >= skeleton.bones.len() {
+            return None;
+        }
+
+        let time_total = self.clip_duration_for_bone(motion_slots, motion_id, bone)?;
+        let pool_idx = self.alloc_blend_slot()?;
+        self.blend_pool[pool_idx] = AnimationBlend {
+            blend_amount: MIXER_EPS_S,
+            time_current: 0.0,
+            time_total,
+            motion_id,
+            bone_or_part: bone,
+            channel: 0,
+            curvature: BlendCurvature::Accrue,
+            blend_accrue: def.effective_accrue(),
+            blend_falloff: def.effective_falloff(),
+            blend_power: def.quantized_power() * power_scale,
+            speed: def.quantized_speed(),
+            playing: true,
+            stop_at_end_callback: true,
+            stop_at_end: false,
+            fall_at_end: false,
+            frame: 0,
+        };
+
+        self.bone_motion_start(skeleton, bone, pool_idx);
+        self.blend_fx.push(pool_idx);
+        Some(pool_idx)
+    }
+
+    /// Advance all active cycle and FX tracks by `dt_sec` matching `LL_UpdateTracks` + `LL_UpdateFxTracks`.
+    /// Returns the `MotionID`s whose `stop_at_end_callback` fired this step.
+    pub fn update_tracks(
+        &mut self,
+        skeleton: &OgfSkeleton,
+        dt_sec: f32,
+        frame: u32,
+        force: bool,
+        leave_blends: bool,
+    ) -> Vec<MotionID> {
+        let mut fired_callbacks = Vec::new();
+
+        for part_idx in 0..MAX_PARTS {
+            if !self.active_parts[part_idx] {
+                continue;
+            }
+            let mut i = 0;
+            while i < self.blend_cycles[part_idx].len() {
+                let pool_idx = self.blend_cycles[part_idx][i];
+                let (destroy, cb_fired, motion_id, bone_or_part) = {
+                    let b = &mut self.blend_pool[pool_idx];
+                    if !force && b.frame == frame {
+                        i += 1;
+                        continue;
+                    }
+                    b.frame = frame;
+                    let (destroy, cb_fired) = b.update(dt_sec);
+                    (destroy, cb_fired, b.motion_id, b.bone_or_part as usize)
+                };
+                if cb_fired {
+                    fired_callbacks.push(motion_id);
+                }
+                if destroy && !leave_blends {
+                    self.blend_pool[pool_idx].curvature = BlendCurvature::FreeSlot;
+                    if let Some(part_bones) = self.partitions.get(bone_or_part).cloned() {
+                        for bone_id in part_bones {
+                            self.bone_motion_stop_im(bone_id, pool_idx);
+                        }
+                    }
+                    self.blend_cycles[part_idx].remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        let mut i = 0;
+        while i < self.blend_fx.len() {
+            let pool_idx = self.blend_fx[i];
+            let mut destroy = false;
+            {
+                let b = &mut self.blend_pool[pool_idx];
+                if !b.stop_at_end_callback {
+                    b.playing = false;
+                    i += 1;
+                    continue;
+                }
+                b.update_time(dt_sec);
+                match b.curvature {
+                    BlendCurvature::FreeSlot => {}
+                    BlendCurvature::Accrue => {
+                        b.blend_amount += dt_sec * b.blend_accrue * b.blend_power * b.speed;
+                        if b.blend_amount >= b.blend_power {
+                            b.blend_amount = b.blend_power;
+                            b.curvature = BlendCurvature::Falloff;
+                        }
+                    }
+                    BlendCurvature::Falloff => {
+                        b.blend_amount -= dt_sec * b.blend_falloff * b.blend_power * b.speed;
+                        if b.blend_amount <= 0.0 {
+                            b.blend_amount = 0.0;
+                            b.curvature = BlendCurvature::FreeSlot;
+                            destroy = true;
+                        }
+                    }
+                }
+            }
+            if destroy {
+                let bone_id = self.blend_pool[pool_idx].bone_or_part;
+                self.bone_motion_stop(skeleton, bone_id, pool_idx);
+                self.blend_fx.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        fired_callbacks
+    }
+
+    fn build_bone_local_matrix(
+        &self,
+        bone_id: usize,
+        motion_slots: &[&OmfMotions],
+        channel_mask: u8,
+    ) -> XRayMatrix {
+        let mut counts = [0usize; MAX_ANIM_CHANNELS];
+        let mut keys = [[BoneKeyframe::ZERO; MAX_BLENDED_PER_CHANNEL]; MAX_ANIM_CHANNELS];
+        let mut base_keys = [[BoneKeyframe::ZERO; MAX_BLENDED_PER_CHANNEL]; MAX_ANIM_CHANNELS];
+        let mut weights = [[0.0f32; MAX_BLENDED_PER_CHANNEL]; MAX_ANIM_CHANNELS];
+
+        if let Some(inst) = self.bone_instances.get(bone_id) {
+            for &pool_idx in &inst.blends {
+                let b = &self.blend_pool[pool_idx];
+                let ch = b.channel as usize;
+                if ch >= MAX_ANIM_CHANNELS || (channel_mask & (1u8 << ch)) == 0 {
+                    continue;
+                }
+                let cnt = counts[ch];
+                if cnt >= MAX_BLENDED_PER_CHANNEL {
+                    continue;
+                }
+                let Some(slot) = motion_slots.get(b.motion_id.slot as usize) else {
+                    continue;
+                };
+                let Some(def) = slot.defs.get(b.motion_id.idx as usize) else {
+                    continue;
+                };
+                let Some(clip) = slot
+                    .clips
+                    .get(def.motion as usize)
+                    .or_else(|| slot.clips.get(b.motion_id.idx as usize))
+                else {
+                    continue;
+                };
+                let Some(track_idx) = self
+                    .slot_track_maps
+                    .get(b.motion_id.slot as usize)
+                    .and_then(|m| m.get(bone_id))
+                    .copied()
+                    .flatten()
+                else {
+                    continue;
+                };
+                let Some(track) = clip.tracks.get(track_idx) else {
+                    continue;
+                };
+
+                keys[ch][cnt] = track.sample_at_time(b.time_current);
+                base_keys[ch][cnt] = track.sample_at_frame(0);
+                weights[ch][cnt] = b.blend_amount;
+                counts[ch] += 1;
+            }
+        }
+
+        for ch in 0..MAX_ANIM_CHANNELS {
+            if AnimationChannels::rule(ch).external == ChannelMixType::Add {
+                for k in 0..counts[ch] {
+                    keys[ch][k] = BoneKeyframe::key_sub(keys[ch][k], base_keys[ch][k]);
+                }
+            }
+        }
+
+        let mut ch_keys = [BoneKeyframe::IDENTITY; MAX_ANIM_CHANNELS];
+        let mut ch_defs = [self.channels.def(0); MAX_ANIM_CHANNELS];
+        let mut ch_count = 0usize;
+        for ch in 0..MAX_ANIM_CHANNELS {
+            if ch != 0 && counts[ch] == 0 {
+                continue;
+            }
+            ch_keys[ch_count] =
+                BoneKeyframe::mix_interlerp(&keys[ch][..counts[ch]], &weights[ch][..counts[ch]]);
+            ch_defs[ch_count] = self.channels.def(ch);
+            ch_count += 1;
+        }
+
+        BoneKeyframe::mix_channels(&ch_keys[..ch_count], &ch_defs[..ch_count]).to_matrix()
+    }
+
+    /// Evaluate hierarchical model-space, hidden-bone, and skinning transforms across `skeleton`
+    /// (`CKinematicsAnimated::LL_BoneMatrixBuild` / `Bone_Calculate`).
+    pub fn evaluate_pose(
+        &self,
+        skeleton: &OgfSkeleton,
+        motion_slots: &[&OmfMotions],
+        channel_mask: u8,
+    ) -> Result<AnimatedPoseResult, FormatError> {
+        let bone_count = skeleton.bones.len();
+        if bone_count != self.bone_instances.len() {
+            return Err(FormatError::InvalidValue(
+                "AnimatedBlendMixer bone count does not match OGF skeleton",
+            ));
+        }
+
+        let mut model_transforms = vec![XRAY_IDENTITY_MATRIX; bone_count];
+        let mut hidden_transforms = vec![XRAY_IDENTITY_MATRIX; bone_count];
+
+        #[allow(clippy::too_many_arguments)]
+        fn recurse(
+            mixer: &AnimatedBlendMixer,
+            skeleton: &OgfSkeleton,
+            motion_slots: &[&OmfMotions],
+            channel_mask: u8,
+            bone_id: u16,
+            parent_world: &XRayMatrix,
+            model_out: &mut [XRayMatrix],
+            hidden_out: &mut [XRayMatrix],
+            depth: usize,
+        ) -> Result<(), FormatError> {
+            if depth > skeleton.bones.len() {
+                return Err(FormatError::InvalidValue("cycle in OGF skeleton hierarchy"));
+            }
+            let b_idx = bone_id as usize;
+            let bone = skeleton
+                .bones
+                .get(b_idx)
+                .ok_or(FormatError::InvalidValue("invalid OGF bone id"))?;
+
+            let local_res = mixer.build_bone_local_matrix(b_idx, motion_slots, channel_mask);
+            let full_world = matrix_mul_43(parent_world, &local_res);
+            hidden_out[b_idx] = full_world;
+
+            let visible_world = if mixer.visible_bones.is_visible(bone_id) {
+                full_world
+            } else {
+                [
+                    [0.0; 4],
+                    [0.0; 4],
+                    [0.0; 4],
+                    [
+                        parent_world[3][0],
+                        parent_world[3][1],
+                        parent_world[3][2],
+                        1.0,
+                    ],
+                ]
+            };
+            model_out[b_idx] = visible_world;
+
+            for &child in &bone.children {
+                recurse(
+                    mixer,
+                    skeleton,
+                    motion_slots,
+                    channel_mask,
+                    child,
+                    &visible_world,
+                    model_out,
+                    hidden_out,
+                    depth + 1,
+                )?;
+            }
+            Ok(())
+        }
+
+        recurse(
+            self,
+            skeleton,
+            motion_slots,
+            channel_mask,
+            self.root_bone,
+            &XRAY_IDENTITY_MATRIX,
+            &mut model_transforms,
+            &mut hidden_transforms,
+            0,
+        )?;
+
+        let palette = BonePalette::from_model_transforms(skeleton, &model_transforms)?;
+        Ok(AnimatedPoseResult {
+            palette,
+            hidden_transforms,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1603,5 +2312,240 @@ mod tests {
         )
         .unwrap();
         assert!((p_links[0] - 2.25).abs() < 1e-4);
+    }
+
+    type OmfTransSpec = ([i16; 3], [i16; 3], [f32; 3], [f32; 3]);
+
+    fn write_omf_clip_static_rot(
+        name: &str,
+        frame_count: u32,
+        bone0_trans: Option<OmfTransSpec>,
+        bone1_trans: Option<OmfTransSpec>,
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&frame_count.to_le_bytes());
+
+        for trans in [bone0_trans, bone1_trans] {
+            if let Some((k0, k1, size_t, init_t)) = trans {
+                payload.push(
+                    crate::omf::motion_key_flags::FL_RKEY_ABSENT
+                        | crate::omf::motion_key_flags::FL_TKEY_PRESENT
+                        | crate::omf::motion_key_flags::FL_TKEY_16_IS_BIT,
+                );
+                for v in [0i16, 0, 0, 32767] {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                payload.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+                for v in k0 {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                for v in k1 {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                write_vec3(&mut payload, size_t);
+                write_vec3(&mut payload, init_t);
+            } else {
+                payload.push(crate::omf::motion_key_flags::FL_RKEY_ABSENT);
+                for v in [0i16, 0, 0, 32767] {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                write_vec3(&mut payload, [0.0, 0.0, 0.0]);
+            }
+        }
+        payload
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_omf_def(
+        mp: &mut Vec<u8>,
+        name: &str,
+        flags: u16,
+        bone_or_part: u16,
+        motion: u16,
+        speed: f32,
+        power: f32,
+        accrue: f32,
+        falloff: f32,
+    ) {
+        mp.extend_from_slice(name.as_bytes());
+        mp.push(0);
+        mp.extend_from_slice(&(flags as u32).to_le_bytes());
+        mp.extend_from_slice(&bone_or_part.to_le_bytes());
+        mp.extend_from_slice(&motion.to_le_bytes());
+        mp.extend_from_slice(&speed.to_le_bytes());
+        mp.extend_from_slice(&power.to_le_bytes());
+        mp.extend_from_slice(&accrue.to_le_bytes());
+        mp.extend_from_slice(&falloff.to_le_bytes());
+        mp.extend_from_slice(&0u32.to_le_bytes()); // 0 marks
+    }
+
+    #[test]
+    fn test_animated_blend_mixer_cycles_additive_fx_and_hidden_bones() {
+        let (skel, _) = build_two_bone_skeleton_and_omf();
+
+        // Slot 0: 1 partition ("default": root + arm), 3 defs:
+        //   0: base_idle (cycle, part 0) -> root T=[0, 10, 0] constant, arm T=[2, 0, 0]
+        //   1: recoil_add (cycle, part 0) -> arm f0=[0,0,0], f1=[4,0,0] (delta +4 X)
+        //   2: hit_fx (fx, bone 1) -> arm T=[0, 10, 0] -> arm + child inheritance
+        let mut mp0 = Vec::new();
+        mp0.extend_from_slice(&4u16.to_le_bytes()); // vers = 4
+        mp0.extend_from_slice(&1u16.to_le_bytes()); // 1 partition
+        mp0.extend_from_slice(b"default\0");
+        mp0.extend_from_slice(&2u16.to_le_bytes());
+        mp0.extend_from_slice(b"root\0");
+        mp0.extend_from_slice(&0u32.to_le_bytes());
+        mp0.extend_from_slice(b"arm\0");
+        mp0.extend_from_slice(&1u32.to_le_bytes());
+
+        mp0.extend_from_slice(&3u16.to_le_bytes());
+        write_omf_def(&mut mp0, "base_idle", 0, 0, 0, 1.0, 1.0, 2.0, 1.0);
+        write_omf_def(
+            &mut mp0,
+            "recoil_add",
+            crate::omf::motion_def_flags::ESM_STOP_AT_END,
+            0,
+            1,
+            1.0,
+            1.0,
+            4.0,
+            1.0,
+        );
+        write_omf_def(
+            &mut mp0,
+            "hit_fx",
+            crate::omf::motion_def_flags::ESM_FX,
+            1,
+            2,
+            1.0,
+            1.0,
+            2.0,
+            2.0,
+        );
+
+        let mut ms0 = ChunkWriter::new();
+        ms0.write_chunk(0, &3u32.to_le_bytes());
+        ms0.write_chunk(
+            1,
+            &write_omf_clip_static_rot(
+                "base_idle",
+                2,
+                Some(([0, 0, 0], [0, 0, 0], [0.0; 3], [0.0, 10.0, 0.0])),
+                Some(([0, 0, 0], [0, 0, 0], [0.0; 3], [2.0, 0.0, 0.0])),
+            ),
+        );
+        ms0.write_chunk(
+            2,
+            &write_omf_clip_static_rot(
+                "recoil_add",
+                2,
+                None,
+                Some(([0, 0, 0], [100, 0, 0], [0.04, 0.0, 0.0], [1.0, 0.0, 0.0])),
+            ),
+        );
+        ms0.write_chunk(
+            3,
+            &write_omf_clip_static_rot(
+                "hit_fx",
+                2,
+                None,
+                Some(([0, 0, 0], [0, 0, 0], [0.0; 3], [0.0, 10.0, 0.0])),
+            ),
+        );
+        let mut omf0_w = ChunkWriter::new();
+        omf0_w.write_chunk(crate::ogf::ogf_chunks::OGF_S_SMPARAMS, &mp0);
+        omf0_w.write_chunk(crate::ogf::ogf_chunks::OGF_S_MOTIONS, &ms0.into_bytes());
+        let omf0 = OmfMotions::parse(&omf0_w.into_bytes()).unwrap();
+
+        // Slot 1 overrides `base_idle` to test reverse slot search (`LL_MotionID` / `ID_Cycle_Safe`)
+        let mut mp1 = Vec::new();
+        mp1.extend_from_slice(&4u16.to_le_bytes());
+        mp1.extend_from_slice(&1u16.to_le_bytes());
+        mp1.extend_from_slice(b"default\0");
+        mp1.extend_from_slice(&2u16.to_le_bytes());
+        mp1.extend_from_slice(b"root\0");
+        mp1.extend_from_slice(&0u32.to_le_bytes());
+        mp1.extend_from_slice(b"arm\0");
+        mp1.extend_from_slice(&1u32.to_le_bytes());
+        mp1.extend_from_slice(&1u16.to_le_bytes());
+        write_omf_def(&mut mp1, "base_idle", 0, 0, 0, 1.0, 1.0, 2.0, 1.0);
+        let mut ms1 = ChunkWriter::new();
+        ms1.write_chunk(0, &1u32.to_le_bytes());
+        ms1.write_chunk(
+            1,
+            &write_omf_clip_static_rot(
+                "base_idle",
+                2,
+                Some(([0, 0, 0], [0, 0, 0], [0.0; 3], [0.0, 5.0, 0.0])),
+                Some(([0, 0, 0], [0, 0, 0], [0.0; 3], [2.0, 0.0, 0.0])),
+            ),
+        );
+        let mut omf1_w = ChunkWriter::new();
+        omf1_w.write_chunk(crate::ogf::ogf_chunks::OGF_S_SMPARAMS, &mp1);
+        omf1_w.write_chunk(crate::ogf::ogf_chunks::OGF_S_MOTIONS, &ms1.into_bytes());
+        let omf1 = OmfMotions::parse(&omf1_w.into_bytes()).unwrap();
+
+        let slots = [&omf0, &omf1];
+        assert_eq!(
+            AnimatedBlendMixer::resolve_cycle_id(&slots, "base_idle"),
+            Some(MotionID::new(1, 0))
+        );
+        assert!(AnimatedBlendMixer::resolve_cycle_id(&slots, "hit_fx").is_none());
+        assert_eq!(
+            AnimatedBlendMixer::resolve_fx_id(&slots, "hit_fx"),
+            Some(MotionID::new(0, 2))
+        );
+        assert_eq!(
+            AnimatedBlendMixer::resolve_motion_id(&slots, "recoil_add"),
+            Some(MotionID::new(0, 1))
+        );
+
+        let mut mixer = AnimatedBlendMixer::new(&skel, &slots, None).unwrap();
+        // Play base_idle on ch 0 (unmixed -> blend_amount=1.0) and recoil_add on ch 2 (additive)
+        mixer
+            .play_cycle(&slots, None, MotionID::new(0, 0), false, 0, 1.0)
+            .unwrap();
+        mixer
+            .play_cycle(&slots, None, MotionID::new(0, 1), false, 2, 1.0)
+            .unwrap();
+        mixer.set_channel_factor(2, 0.5);
+
+        // Advance past frame 1 (SAMPLE_SPF = 1/30) so recoil_add hits end (+4.0 X delta -> * 0.5 factor = +2.0 X)
+        let cbs = mixer.update_tracks(&skel, crate::omf::SAMPLE_SPF * 1.1, 1, false, false);
+        assert_eq!(cbs, vec![MotionID::new(0, 1)]);
+
+        let pose = mixer.evaluate_pose(&skel, &slots, 0b1111).unwrap();
+        // root = [0, 10, 0], arm = root + ([2, 0, 0] + 0.5 * [4, 0, 0]) = [4, 10, 0]
+        assert!((pose.palette.model_transforms[0][3][1] - 10.0).abs() < 1e-3);
+        assert!((pose.palette.model_transforms[1][3][0] - 4.0).abs() < 1e-2);
+        assert!((pose.palette.model_transforms[1][3][1] - 10.0).abs() < 1e-3);
+
+        // Hide arm -> model_transform has zero 3x3 and copies parent [0, 10, 0], while hidden_transform preserves [4, 10, 0]
+        mixer.set_bone_visible(1, false);
+        let hidden_pose = mixer.evaluate_pose(&skel, &slots, 0b1111).unwrap();
+        assert_eq!(hidden_pose.palette.model_transforms[1][0][0], 0.0);
+        assert!((hidden_pose.palette.model_transforms[1][3][0] - 0.0).abs() < 1e-5);
+        assert!((hidden_pose.palette.model_transforms[1][3][1] - 10.0).abs() < 1e-3);
+        assert!((hidden_pose.hidden_transforms[1][3][0] - 4.0).abs() < 1e-2);
+
+        // Un-hide arm and run FX lifecycle: accrue -> falloff -> destroy
+        mixer.set_bone_visible(1, true);
+        let fx_pool = mixer
+            .play_fx(&skel, &slots, None, MotionID::new(0, 2), 1.0)
+            .unwrap();
+        assert_eq!(mixer.blend_fx.len(), 1);
+        mixer.update_tracks(&skel, 0.5, 2, false, false);
+        assert_eq!(mixer.blend_pool[fx_pool].curvature, crate::omf::BlendCurvature::Falloff);
+        mixer.update_tracks(&skel, 0.6, 3, false, false);
+        assert!(mixer.blend_fx.is_empty());
+        assert!(mixer.blend_pool[fx_pool].is_free());
+
+        // Custom BonePartitionSet overrides OMF partition list cleanly
+        let ltx = xray_core::LtxDocument::parse("[part_0]\nroot =\npartition_name = body\n");
+        let parts = crate::omf::BonePartitionSet::from_ltx(&ltx);
+        let custom_mixer = AnimatedBlendMixer::new(&skel, &slots, Some(&parts)).unwrap();
+        assert_eq!(custom_mixer.partitions[0], vec![0]);
+        assert!(!custom_mixer.active_parts[1]);
     }
 }

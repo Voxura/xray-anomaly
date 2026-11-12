@@ -314,6 +314,286 @@ pub enum BoneTranslationKeys {
     },
 }
 
+/// Maximum number of simultaneous blended animation channels per skeleton (`MAX_CHANNELS` in `KinematicAnimatedDefs.h`).
+pub const MAX_ANIM_CHANNELS: usize = 4;
+/// Maximum number of active blends per bone or FX list (`MAX_BLENDED` in `KinematicAnimatedDefs.h`).
+pub const MAX_BLENDED_PER_CHANNEL: usize = 16;
+/// Preallocated blend slot capacity (`MAX_BLENDED_POOL` in `KinematicAnimatedDefs.h`).
+pub const MAX_BLENDED_POOL: usize = MAX_BLENDED_PER_CHANNEL * MAX_PARTS * MAX_ANIM_CHANNELS;
+/// Maximum motion slot files referenced by a single animated skeleton (`MAX_ANIM_SLOT`).
+pub const MAX_ANIM_SLOTS: usize = 48;
+
+/// Animation mixing operator (`animation::mix_type` in `Animation.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelMixType {
+    Lerp = 0,
+    Add = 1,
+}
+
+/// Per-channel internal + external blending rule (`animation::channal_rule` in `Animation.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelRule {
+    pub internal: ChannelMixType,
+    pub external: ChannelMixType,
+}
+
+/// Resolved runtime weight & rule for a single channel (`animation::channel_def`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChannelDef {
+    pub factor: f32,
+    pub rule: ChannelRule,
+}
+
+/// Canonical 4-channel mixing table matching `channels::rules` (`Animation.cpp:7`).
+pub const CHANNEL_RULES: [ChannelRule; MAX_ANIM_CHANNELS] = [
+    ChannelRule {
+        internal: ChannelMixType::Lerp,
+        external: ChannelMixType::Lerp,
+    },
+    ChannelRule {
+        internal: ChannelMixType::Lerp,
+        external: ChannelMixType::Lerp,
+    },
+    ChannelRule {
+        internal: ChannelMixType::Lerp,
+        external: ChannelMixType::Add,
+    },
+    ChannelRule {
+        internal: ChannelMixType::Lerp,
+        external: ChannelMixType::Add,
+    },
+];
+
+/// Per-instance channel factor table (`animation::channels` in `Animation.h`/`Animation.cpp`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnimationChannels {
+    factors: [f32; MAX_ANIM_CHANNELS],
+}
+
+impl Default for AnimationChannels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AnimationChannels {
+    pub fn new() -> Self {
+        Self {
+            factors: [1.0; MAX_ANIM_CHANNELS],
+        }
+    }
+
+    #[inline]
+    pub fn rule(channel: usize) -> ChannelRule {
+        CHANNEL_RULES[channel.min(MAX_ANIM_CHANNELS - 1)]
+    }
+
+    #[inline]
+    pub fn set_factor(&mut self, channel: usize, factor: f32) {
+        if let Some(slot) = self.factors.get_mut(channel) {
+            *slot = factor;
+        }
+    }
+
+    #[inline]
+    pub fn factor(&self, channel: usize) -> f32 {
+        self.factors.get(channel).copied().unwrap_or(1.0)
+    }
+
+    #[inline]
+    pub fn def(&self, channel: usize) -> ChannelDef {
+        ChannelDef {
+            factor: self.factor(channel),
+            rule: Self::rule(channel),
+        }
+    }
+}
+
+/// Packed `(slot, idx)` motion identifier matching `MotionID` (`animation_motion.h:8-42`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MotionID {
+    pub slot: u16,
+    pub idx: u16,
+}
+
+impl Default for MotionID {
+    fn default() -> Self {
+        Self::INVALID
+    }
+}
+
+impl MotionID {
+    pub const INVALID: Self = Self {
+        slot: u16::MAX,
+        idx: u16::MAX,
+    };
+
+    #[inline]
+    pub const fn new(slot: u16, idx: u16) -> Self {
+        Self { slot, idx }
+    }
+
+    #[inline]
+    pub const fn is_valid(self) -> bool {
+        self.slot != u16::MAX && self.idx != u16::MAX
+    }
+}
+
+/// Lifecycle state of a runtime [`AnimationBlend`] (`CBlend::ECurvature` in `animation_blend.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendCurvature {
+    FreeSlot = 0,
+    Accrue = 1,
+    Falloff = 2,
+}
+
+/// Active skeletal animation blend instance matching `CBlend` (`src/Include/xrRender/animation_blend.h`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnimationBlend {
+    pub blend_amount: f32,
+    pub time_current: f32,
+    pub time_total: f32,
+    pub motion_id: MotionID,
+    pub bone_or_part: u16,
+    pub channel: u8,
+    pub curvature: BlendCurvature,
+    pub blend_accrue: f32,
+    pub blend_falloff: f32,
+    pub blend_power: f32,
+    pub speed: f32,
+    pub playing: bool,
+    pub stop_at_end_callback: bool,
+    pub stop_at_end: bool,
+    pub fall_at_end: bool,
+    pub frame: u32,
+}
+
+impl Default for AnimationBlend {
+    fn default() -> Self {
+        Self::free_slot()
+    }
+}
+
+impl AnimationBlend {
+    pub const fn free_slot() -> Self {
+        Self {
+            blend_amount: 0.0,
+            time_current: 0.0,
+            time_total: 0.0,
+            motion_id: MotionID::INVALID,
+            bone_or_part: 0,
+            channel: 0,
+            curvature: BlendCurvature::FreeSlot,
+            blend_accrue: 0.0,
+            blend_falloff: 0.0,
+            blend_power: 0.0,
+            speed: 0.0,
+            playing: false,
+            stop_at_end_callback: false,
+            stop_at_end: false,
+            fall_at_end: false,
+            frame: 0,
+        }
+    }
+
+    #[inline]
+    pub fn is_free(&self) -> bool {
+        self.curvature == BlendCurvature::FreeSlot
+    }
+
+    /// Advance clip time by `dt` seconds matching `CBlend::update_time` (`animation_blend.h:157-191`).
+    /// Returns `true` when `stop_at_end` reaches either clip boundary.
+    pub fn update_time(&mut self, dt: f32) -> bool {
+        if !self.playing {
+            return false;
+        }
+        let quant = dt * self.speed;
+        self.time_current += quant;
+
+        let running_fwrd = quant > 0.0;
+        const END_EPS: f32 = SAMPLE_SPF + 1e-5;
+        let at_end = running_fwrd && (self.time_current > (self.time_total - END_EPS));
+        let at_begin = !running_fwrd && (self.time_current < 0.0);
+
+        if !self.stop_at_end {
+            if at_begin {
+                self.time_current += self.time_total;
+            }
+            if at_end {
+                let wrap_len = self.time_total - END_EPS;
+                if wrap_len > 0.0 {
+                    self.time_current -= wrap_len;
+                } else {
+                    self.time_current = 0.0;
+                }
+            }
+            if self.time_current < 0.0 {
+                self.time_current = 0.0;
+            }
+            return false;
+        }
+
+        if !at_end && !at_begin {
+            return false;
+        }
+
+        if at_end {
+            self.time_current = (self.time_total - END_EPS).max(0.0);
+        } else {
+            self.time_current = 0.0;
+        }
+        true
+    }
+
+    /// Advance accrue phase matching `CBlend::update_play` (`animation_blend.h:121-155`).
+    /// Returns `true` once if `stop_at_end_callback` transitioned from armed to fired.
+    pub fn update_play(&mut self, dt: f32) -> bool {
+        let mut pow_dt = dt;
+        if pow_dt < 0.0 {
+            pow_dt = 0.0;
+            if self.stop_at_end && self.blend_accrue > 0.0 {
+                pow_dt = (self.time_current + dt - 1.0 / self.blend_accrue).clamp(dt, 0.0);
+            }
+        }
+
+        self.blend_amount = (self.blend_amount + pow_dt * self.blend_accrue * self.blend_power)
+            .clamp(0.0, self.blend_power);
+
+        if !self.update_time(dt) {
+            return false;
+        }
+
+        let callback_fired = self.stop_at_end_callback;
+        self.stop_at_end_callback = false;
+
+        if self.fall_at_end {
+            self.curvature = BlendCurvature::Falloff;
+            self.blend_falloff = 2.0;
+        }
+        callback_fired
+    }
+
+    /// Advance falloff phase matching `CBlend::update_falloff` (`animation_blend.h:193-203`).
+    /// Returns `true` when `blend_amount <= 0.0` and the blend should be freed.
+    pub fn update_falloff(&mut self, dt: f32) -> bool {
+        self.update_time(dt);
+        self.blend_amount -= dt * self.blend_falloff * self.blend_power;
+        let finished = self.blend_amount <= 0.0;
+        self.blend_amount = self.blend_amount.clamp(0.0, self.blend_power);
+        finished
+    }
+
+    /// Update either `Accrue` or `Falloff` phase (`CBlend::update`).
+    /// Returns `(should_destroy, stop_callback_fired)`.
+    pub fn update(&mut self, dt: f32) -> (bool, bool) {
+        match self.curvature {
+            BlendCurvature::FreeSlot => (false, false),
+            BlendCurvature::Accrue => (false, self.update_play(dt)),
+            BlendCurvature::Falloff => (self.update_falloff(dt), false),
+        }
+    }
+}
+
 /// Dequantized single-bone keyframe `(rotation_xyzw, translation)` (`struct CKey`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BoneKeyframe {
@@ -321,7 +601,158 @@ pub struct BoneKeyframe {
     pub translation: [f32; 3],
 }
 
+#[inline]
+fn quat_mul_xyzw(q1: [f32; 4], q2: [f32; 4]) -> [f32; 4] {
+    let [x1, y1, z1, w1] = q1;
+    let [x2, y2, z2, w2] = q2;
+    [
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ]
+}
+
 impl BoneKeyframe {
+    pub const IDENTITY: Self = Self {
+        rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+        translation: [0.0, 0.0, 0.0],
+    };
+
+    pub const ZERO: Self = Self {
+        rotation_xyzw: [0.0, 0.0, 0.0, 0.0],
+        translation: [0.0, 0.0, 0.0],
+    };
+
+    /// Right-hand keyframe difference `k0 * k1^-1` matching `AnimationKeyCalculate::key_sub`.
+    #[inline]
+    pub fn key_sub(k0: Self, k1: Self) -> Self {
+        let inv_q1 = [
+            -k1.rotation_xyzw[0],
+            -k1.rotation_xyzw[1],
+            -k1.rotation_xyzw[2],
+            k1.rotation_xyzw[3],
+        ];
+        Self {
+            rotation_xyzw: quat_mul_xyzw(k0.rotation_xyzw, inv_q1),
+            translation: [
+                k0.translation[0] - k1.translation[0],
+                k0.translation[1] - k1.translation[1],
+                k0.translation[2] - k1.translation[2],
+            ],
+        }
+    }
+
+    /// Keyframe composition `k0 * k1` matching `AnimationKeyCalculate::key_add`.
+    #[inline]
+    pub fn key_add(k0: Self, k1: Self) -> Self {
+        Self {
+            rotation_xyzw: quat_mul_xyzw(k0.rotation_xyzw, k1.rotation_xyzw),
+            translation: [
+                k0.translation[0] + k1.translation[0],
+                k0.translation[1] + k1.translation[1],
+                k0.translation[2] + k1.translation[2],
+            ],
+        }
+    }
+
+    /// Scale a delta/additive keyframe by `v` matching `AnimationKeyCalculate::key_scale` / `q_scale`.
+    #[inline]
+    pub fn scale(k: Self, v: f32) -> Self {
+        let [x, y, z, w] = k.rotation_xyzw;
+        let s = (x * x + y * y + z * z).sqrt();
+        let rotation_xyzw = if s > 1e-7 {
+            let inv_s = 1.0 / s;
+            let half_angle = s.atan2(w) * v;
+            let (sin_t, cos_t) = half_angle.sin_cos();
+            [x * inv_s * sin_t, y * inv_s * sin_t, z * inv_s * sin_t, cos_t]
+        } else {
+            [0.0, 0.0, 0.0, 1.0]
+        };
+        Self {
+            rotation_xyzw,
+            translation: [
+                k.translation[0] * v,
+                k.translation[1] * v,
+                k.translation[2] * v,
+            ],
+        }
+    }
+
+    /// Additive multiply-add `scale(k1, v) + k0` matching `AnimationKeyCalculate::key_mad`.
+    #[inline]
+    pub fn mad(k0: Self, k1: Self, v: f32) -> Self {
+        Self::key_add(Self::scale(k1, v), k0)
+    }
+
+    /// Blend `keys` by weights `weights` matching `AnimationKeyCalculate::MixInterlerp`
+    /// (sorted descending by weight when `count >= 3`).
+    pub fn mix_interlerp(keys: &[Self], weights: &[f32]) -> Self {
+        let count = keys.len().min(weights.len());
+        match count {
+            0 => Self::ZERO,
+            1 => keys[0],
+            2 => {
+                let ws = weights[0] + weights[1];
+                let w = if ws.abs() <= 1e-7 {
+                    0.0
+                } else {
+                    (weights[1] / ws).clamp(0.0, 1.0)
+                };
+                Self::blend(keys[0], keys[1], w)
+            }
+            _ => {
+                let mut pairs: Vec<(Self, f32)> =
+                    keys[..count].iter().copied().zip(weights[..count].iter().copied()).collect();
+                pairs.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let mut total = pairs[0].1;
+                let mut tmp = pairs[0].0;
+                for &(k, w) in &pairs[1..] {
+                    total += w;
+                    let d = if total.abs() <= 1e-7 {
+                        0.0
+                    } else {
+                        (w / total).clamp(0.0, 1.0)
+                    };
+                    tmp = Self::blend(tmp, k, d);
+                }
+                tmp
+            }
+        }
+    }
+
+    /// Combine already-reduced per-channel keyframes matching `AnimationKeyCalculate::MixChannels`.
+    pub fn mix_channels(channel_keys: &[Self], defs: &[ChannelDef]) -> Self {
+        let count = channel_keys.len().min(defs.len());
+        if count == 0 {
+            return Self::IDENTITY;
+        }
+        let mut res = channel_keys[0];
+        let mut lerp_factor_sum = 0.0f32;
+        for (&k_ch, &def) in channel_keys[..count].iter().zip(&defs[..count]).skip(1) {
+            match def.rule.external {
+                ChannelMixType::Add => {
+                    let q = res.rotation_xyzw;
+                    let q_len_sq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+                    if q_len_sq <= 1e-12 {
+                        res.rotation_xyzw = [0.0, 0.0, 0.0, 1.0];
+                    }
+                    res = Self::mad(res, k_ch, def.factor);
+                }
+                ChannelMixType::Lerp => {
+                    lerp_factor_sum += def.factor;
+                    let alpha = if lerp_factor_sum.abs() <= 1e-7 {
+                        0.0
+                    } else {
+                        (def.factor / lerp_factor_sum).clamp(0.0, 1.0)
+                    };
+                    res = Self::blend(res, k_ch, alpha);
+                }
+            }
+        }
+        res
+    }
+
     /// Blend two keyframes by `t` in `[0.0, 1.0]` using shortest-arc quaternion SLERP
     /// and linear translation interpolation (`AnimationBlend` / `MixChannels`).
     pub fn blend(a: Self, b: Self, t: f32) -> Self {
@@ -562,6 +993,21 @@ impl OmfMotions {
             ));
         }
         Ok(rm_bones)
+    }
+
+    /// Map each `skeleton.bones` index to its OMF clip track index (`None` if not mapped by this OMF).
+    pub fn skeleton_to_track_map(&self, skeleton: &OgfSkeleton) -> Vec<Option<usize>> {
+        let mut map = vec![None; skeleton.bones.len()];
+        for part in &self.partitions {
+            for pbone in &part.bones {
+                if let Some(skel_id) = skeleton.bone_id(&pbone.name)
+                    && let Some(slot) = map.get_mut(skel_id as usize)
+                {
+                    *slot = Some(pbone.motion_bone_index as usize);
+                }
+            }
+        }
+        map
     }
 
     /// Evaluate model-space pose matrices for every bone in `skeleton` at `clip_index` and `time_sec`,
@@ -1173,5 +1619,142 @@ mod tests {
             let p2 = real_parts.part(2).unwrap();
             assert!(p2.bone_names.iter().any(|b| b == "lead_gun"));
         }
+    }
+
+    #[test]
+    fn test_animation_blend_channels_key_math_and_track_map() {
+        // Channel rules and runtime factors
+        let mut channels = AnimationChannels::new();
+        assert_eq!(AnimationChannels::rule(0).external, ChannelMixType::Lerp);
+        assert_eq!(AnimationChannels::rule(1).external, ChannelMixType::Lerp);
+        assert_eq!(AnimationChannels::rule(2).external, ChannelMixType::Add);
+        assert_eq!(AnimationChannels::rule(3).external, ChannelMixType::Add);
+        channels.set_factor(2, 0.5);
+        assert_eq!(channels.def(2).factor, 0.5);
+
+        // Looping vs stop_at_end + fall_at_end CBlend update transitions
+        let mut loop_blend = AnimationBlend {
+            blend_amount: 0.2,
+            time_current: 0.0,
+            time_total: 1.0,
+            motion_id: MotionID::new(0, 0),
+            bone_or_part: 0,
+            channel: 0,
+            curvature: BlendCurvature::Accrue,
+            blend_accrue: 2.0,
+            blend_falloff: 0.0,
+            blend_power: 1.0,
+            speed: 1.0,
+            playing: true,
+            stop_at_end_callback: true,
+            stop_at_end: false,
+            fall_at_end: false,
+            frame: 1,
+        };
+        let (destroy0, cb0) = loop_blend.update(0.5);
+        assert!(!destroy0 && !cb0);
+        assert!((loop_blend.blend_amount - 1.0).abs() < 1e-6);
+        assert!((loop_blend.time_current - 0.5).abs() < 1e-6);
+
+        let mut fx_blend = AnimationBlend {
+            stop_at_end: true,
+            fall_at_end: true,
+            channel: 2,
+            ..loop_blend
+        };
+        fx_blend.time_current = 0.0;
+        let (destroy1, cb1) = fx_blend.update(1.2);
+        assert!(!destroy1 && cb1);
+        assert_eq!(fx_blend.curvature, BlendCurvature::Falloff);
+        assert_eq!(fx_blend.blend_falloff, 2.0);
+        // Second call does not re-fire stop callback and steps through falloff until <= 0
+        let (destroy2, cb2) = fx_blend.update(0.6);
+        assert!(destroy2 && !cb2);
+        assert_eq!(fx_blend.blend_amount, 0.0);
+
+        // BoneKeyframe key_sub/key_add/scale/mad + MixInterlerp (>=3 unsorted weights) + MixChannels
+        let qz = [0.0, 0.0, FRAC_PI_2.sin() * 0.5, FRAC_PI_2.cos() * 0.5];
+        // Build unit quaternion for +90deg around Z (angle/2 = pi/4)
+        let qz90 = [0.0, 0.0, (FRAC_PI_2 * 0.5).sin(), (FRAC_PI_2 * 0.5).cos()];
+        let _ = qz;
+        let k_base = BoneKeyframe {
+            rotation_xyzw: [0.0, 0.0, 0.0, 1.0],
+            translation: [1.0, 2.0, 3.0],
+        };
+        let k_pose = BoneKeyframe {
+            rotation_xyzw: qz90,
+            translation: [4.0, 6.0, 8.0],
+        };
+        let delta = BoneKeyframe::key_sub(k_pose, k_base);
+        let recon = BoneKeyframe::key_add(delta, k_base);
+        assert!((recon.translation[0] - 4.0).abs() < 1e-5);
+        assert!((recon.rotation_xyzw[2] - qz90[2]).abs() < 1e-5);
+
+        let scaled_half = BoneKeyframe::mad(k_base, delta, 0.5);
+        assert!((scaled_half.translation[0] - 2.5).abs() < 1e-5);
+        assert!((scaled_half.rotation_xyzw[2] - (FRAC_PI_2 * 0.25).sin()).abs() < 1e-5);
+
+        // Unsorted weights (0.1, 0.7, 0.2) must still agree with (0.7, 0.2, 0.1) after sort
+        let keys3 = [
+            BoneKeyframe { rotation_xyzw: [0.0, 0.0, 0.0, 1.0], translation: [10.0, 0.0, 0.0] },
+            BoneKeyframe { rotation_xyzw: [0.0, 0.0, 0.0, 1.0], translation: [0.0, 10.0, 0.0] },
+            BoneKeyframe { rotation_xyzw: [0.0, 0.0, 0.0, 1.0], translation: [0.0, 0.0, 10.0] },
+        ];
+        let mixed = BoneKeyframe::mix_interlerp(&keys3, &[0.1, 0.7, 0.2]);
+        assert!((mixed.translation[0] - 1.0).abs() < 1e-5);
+        assert!((mixed.translation[1] - 7.0).abs() < 1e-5);
+        assert!((mixed.translation[2] - 2.0).abs() < 1e-5);
+
+        let mixed_ch = BoneKeyframe::mix_channels(
+            &[
+                BoneKeyframe { rotation_xyzw: [0.0, 0.0, 0.0, 1.0], translation: [1.0, 0.0, 0.0] },
+                BoneKeyframe { rotation_xyzw: [0.0, 0.0, 0.0, 1.0], translation: [3.0, 0.0, 0.0] },
+                BoneKeyframe { rotation_xyzw: [0.0, 0.0, 0.0, 1.0], translation: [0.0, 4.0, 0.0] },
+            ],
+            &[channels.def(0), channels.def(1), channels.def(2)],
+        );
+        // Channel 0 (1,0,0) blended 100% with channel 1 (factor 1.0 -> 3,0,0), plus 0.5 * (0,4,0) = (3,2,0)
+        assert!((mixed_ch.translation[0] - 3.0).abs() < 1e-5);
+        assert!((mixed_ch.translation[1] - 2.0).abs() < 1e-5);
+
+        // skeleton_to_track_map on partial partition
+        let mut bn = Vec::new();
+        bn.extend_from_slice(&2u32.to_le_bytes());
+        let id_obb = OgfObb {
+            rotate: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translate: [0.0; 3],
+            halfsize: [0.5; 3],
+        };
+        let write_obb = |out: &mut Vec<u8>, o: &OgfObb| {
+            for r in o.rotate {
+                write_f32_3(out, r);
+            }
+            write_f32_3(out, o.translate);
+            write_f32_3(out, o.halfsize);
+        };
+        bn.extend_from_slice(b"root\0\0");
+        write_obb(&mut bn, &id_obb);
+        bn.extend_from_slice(b"unmapped\0root\0");
+        write_obb(&mut bn, &id_obb);
+        let mut ogf_w = ChunkWriter::new();
+        let mut hdr = vec![4u8, OgfVisualType::SkeletonAnim as u8, 0, 0];
+        hdr.extend_from_slice(&[0u8; 40]);
+        ogf_w.write_chunk(OGF_HEADER, &hdr);
+        ogf_w.write_chunk(OGF_S_BONE_NAMES, &bn);
+        let skel = OgfModel::parse(&ogf_w.into_bytes()).unwrap().skeleton.unwrap();
+
+        let partial_omf = OmfMotions {
+            sm_params_version: 4,
+            partitions: vec![MotionPartition {
+                name: "all".into(),
+                bones: vec![MotionPartitionBone {
+                    name: "root".into(),
+                    motion_bone_index: 5,
+                }],
+            }],
+            defs: Vec::new(),
+            clips: Vec::new(),
+        };
+        assert_eq!(partial_omf.skeleton_to_track_map(&skel), vec![Some(5), None]);
     }
 }

@@ -3095,6 +3095,356 @@ where
     }
 }
 
+/// Render pass group matching `R_dsgraph_structure::r_dsgraph_render_*` (`r__dsgraph_render.cpp:638-942`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsgraphPassGroup {
+    Hud {
+        no_ps: bool,
+        scope_3d_fake_enabled: bool,
+        ssfx_motion_vectors: bool,
+        has_cam_attached: bool,
+        has_scope_cam_attached: bool,
+    },
+    Ui3d,
+    Sorted {
+        has_cam_attached: bool,
+    },
+    ScopeSorted {
+        has_scope_cam_attached: bool,
+    },
+    Emissive {
+        clear: bool,
+        render_hud: bool,
+    },
+    Distort,
+}
+
+/// DSGraph render queue bucket traversed during [`dsgraph_pass_schedule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsgraphQueueBucket {
+    MapHud,
+    MapCustomFov,
+    MapCamAttached,
+    MapScopeHud,
+    MapScopeCamAttached,
+    MapUi3d,
+    MapUi3dEmissive,
+    MapUi3dSorted,
+    MapSorted,
+    MapCustomFovSorted,
+    MapHudSorted,
+    MapCamAttachedSorted,
+    MapScopeHudSorted,
+    MapScopeCamAttachedSorted,
+    MapEmissive,
+    MapCustomFovEmissive,
+    MapHudEmissive,
+    MapDistort,
+    MapCustomFovDistort,
+    MapHudDistort,
+}
+
+/// Spatial/key traversal order inside a DSGraph queue (`traverseLR` vs `traverseRL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsgraphTraverseOrder {
+    LeftToRight,
+    RightToLeft,
+}
+
+/// Active projection matrix bound for a DSGraph queue pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsgraphProjectionKind {
+    Normal,
+    Hud,
+    CamAttached,
+    Ui3dIcons,
+}
+
+/// Optional MRT slot-3 transition required around 3D shader scopes (`r__dsgraph_render.cpp:677-696`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsgraphRt3Slot {
+    Keep,
+    Temp,
+    MotionVectors,
+    Null,
+}
+
+/// Single ordered queue draw step emitted by [`dsgraph_pass_schedule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DsgraphQueueStep {
+    pub bucket: DsgraphQueueBucket,
+    pub traverse_order: DsgraphTraverseOrder,
+    pub projection: DsgraphProjectionKind,
+    pub near_range: bool,
+    pub rt3_before: DsgraphRt3Slot,
+    pub rt3_after: DsgraphRt3Slot,
+    pub clear_after: bool,
+}
+
+/// Emit the exact DX11 / R4 traversal schedule for a DSGraph pass group
+/// (`src/Layers/xrRender/r__dsgraph_render.cpp:638-942`).
+pub fn dsgraph_pass_schedule(group: DsgraphPassGroup) -> Vec<DsgraphQueueStep> {
+    match group {
+        DsgraphPassGroup::Hud {
+            no_ps,
+            scope_3d_fake_enabled,
+            ssfx_motion_vectors,
+            has_cam_attached,
+            has_scope_cam_attached,
+        } => {
+            if no_ps {
+                return Vec::new();
+            }
+            let mut steps = vec![
+                DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapHud,
+                    traverse_order: DsgraphTraverseOrder::LeftToRight,
+                    projection: DsgraphProjectionKind::Hud,
+                    near_range: true,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: true,
+                },
+                DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapCustomFov,
+                    traverse_order: DsgraphTraverseOrder::LeftToRight,
+                    projection: DsgraphProjectionKind::Hud,
+                    near_range: true,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: true,
+                },
+            ];
+            if has_cam_attached {
+                steps.push(DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapCamAttached,
+                    traverse_order: DsgraphTraverseOrder::LeftToRight,
+                    projection: DsgraphProjectionKind::CamAttached,
+                    near_range: true,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: true,
+                });
+            }
+            if scope_3d_fake_enabled {
+                let restore_rt3 = if ssfx_motion_vectors {
+                    DsgraphRt3Slot::MotionVectors
+                } else {
+                    DsgraphRt3Slot::Null
+                };
+                steps.push(DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapScopeHud,
+                    traverse_order: DsgraphTraverseOrder::LeftToRight,
+                    projection: DsgraphProjectionKind::Hud,
+                    near_range: false,
+                    rt3_before: DsgraphRt3Slot::Temp,
+                    rt3_after: if has_scope_cam_attached {
+                        DsgraphRt3Slot::Keep
+                    } else {
+                        restore_rt3
+                    },
+                    clear_after: true,
+                });
+                if has_scope_cam_attached {
+                    steps.push(DsgraphQueueStep {
+                        bucket: DsgraphQueueBucket::MapScopeCamAttached,
+                        traverse_order: DsgraphTraverseOrder::LeftToRight,
+                        projection: DsgraphProjectionKind::CamAttached,
+                        near_range: false,
+                        rt3_before: DsgraphRt3Slot::Keep,
+                        rt3_after: restore_rt3,
+                        clear_after: true,
+                    });
+                }
+            }
+            steps
+        }
+        DsgraphPassGroup::Ui3d => vec![
+            DsgraphQueueStep {
+                bucket: DsgraphQueueBucket::MapUi3d,
+                traverse_order: DsgraphTraverseOrder::LeftToRight,
+                projection: DsgraphProjectionKind::Ui3dIcons,
+                near_range: false,
+                rt3_before: DsgraphRt3Slot::Keep,
+                rt3_after: DsgraphRt3Slot::Keep,
+                clear_after: true,
+            },
+            DsgraphQueueStep {
+                bucket: DsgraphQueueBucket::MapUi3dEmissive,
+                traverse_order: DsgraphTraverseOrder::LeftToRight,
+                projection: DsgraphProjectionKind::Ui3dIcons,
+                near_range: false,
+                rt3_before: DsgraphRt3Slot::Keep,
+                rt3_after: DsgraphRt3Slot::Keep,
+                clear_after: true,
+            },
+            DsgraphQueueStep {
+                bucket: DsgraphQueueBucket::MapUi3dSorted,
+                traverse_order: DsgraphTraverseOrder::LeftToRight,
+                projection: DsgraphProjectionKind::Ui3dIcons,
+                near_range: false,
+                rt3_before: DsgraphRt3Slot::Keep,
+                rt3_after: DsgraphRt3Slot::Keep,
+                clear_after: true,
+            },
+        ],
+        DsgraphPassGroup::Sorted { has_cam_attached } => {
+            let mut steps = vec![
+                DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapSorted,
+                    traverse_order: DsgraphTraverseOrder::RightToLeft,
+                    projection: DsgraphProjectionKind::Normal,
+                    near_range: false,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: true,
+                },
+                DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapCustomFovSorted,
+                    traverse_order: DsgraphTraverseOrder::RightToLeft,
+                    projection: DsgraphProjectionKind::Normal,
+                    near_range: false,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: true,
+                },
+                DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapHudSorted,
+                    traverse_order: DsgraphTraverseOrder::RightToLeft,
+                    projection: DsgraphProjectionKind::Hud,
+                    near_range: true,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: true,
+                },
+            ];
+            if has_cam_attached {
+                steps.push(DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapCamAttachedSorted,
+                    traverse_order: DsgraphTraverseOrder::RightToLeft,
+                    projection: DsgraphProjectionKind::CamAttached,
+                    near_range: true,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: true,
+                });
+            }
+            steps
+        }
+        DsgraphPassGroup::ScopeSorted {
+            has_scope_cam_attached,
+        } => {
+            let mut steps = vec![DsgraphQueueStep {
+                bucket: DsgraphQueueBucket::MapScopeHudSorted,
+                traverse_order: DsgraphTraverseOrder::RightToLeft,
+                projection: DsgraphProjectionKind::Hud,
+                near_range: true,
+                rt3_before: DsgraphRt3Slot::Keep,
+                rt3_after: DsgraphRt3Slot::Keep,
+                clear_after: true,
+            }];
+            if has_scope_cam_attached {
+                steps.push(DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapScopeCamAttachedSorted,
+                    traverse_order: DsgraphTraverseOrder::LeftToRight,
+                    projection: DsgraphProjectionKind::CamAttached,
+                    near_range: true,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: true,
+                });
+            }
+            steps
+        }
+        DsgraphPassGroup::Emissive { clear, render_hud } => {
+            let mut steps = vec![
+                DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapEmissive,
+                    traverse_order: DsgraphTraverseOrder::LeftToRight,
+                    projection: DsgraphProjectionKind::Normal,
+                    near_range: false,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: clear,
+                },
+                DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapCustomFovEmissive,
+                    traverse_order: DsgraphTraverseOrder::LeftToRight,
+                    projection: DsgraphProjectionKind::Normal,
+                    near_range: false,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: clear,
+                },
+                DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapHudEmissive,
+                    traverse_order: DsgraphTraverseOrder::LeftToRight,
+                    projection: DsgraphProjectionKind::Hud,
+                    near_range: true,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: clear,
+                },
+            ];
+            if render_hud {
+                steps.push(DsgraphQueueStep {
+                    bucket: DsgraphQueueBucket::MapHudSorted,
+                    traverse_order: DsgraphTraverseOrder::RightToLeft,
+                    projection: DsgraphProjectionKind::Hud,
+                    near_range: true,
+                    rt3_before: DsgraphRt3Slot::Keep,
+                    rt3_after: DsgraphRt3Slot::Keep,
+                    clear_after: false,
+                });
+            }
+            steps
+        }
+        DsgraphPassGroup::Distort => vec![
+            DsgraphQueueStep {
+                bucket: DsgraphQueueBucket::MapDistort,
+                traverse_order: DsgraphTraverseOrder::RightToLeft,
+                projection: DsgraphProjectionKind::Normal,
+                near_range: false,
+                rt3_before: DsgraphRt3Slot::Keep,
+                rt3_after: DsgraphRt3Slot::Keep,
+                clear_after: true,
+            },
+            DsgraphQueueStep {
+                bucket: DsgraphQueueBucket::MapCustomFovDistort,
+                traverse_order: DsgraphTraverseOrder::RightToLeft,
+                projection: DsgraphProjectionKind::Normal,
+                near_range: false,
+                rt3_before: DsgraphRt3Slot::Keep,
+                rt3_after: DsgraphRt3Slot::Keep,
+                clear_after: true,
+            },
+            DsgraphQueueStep {
+                bucket: DsgraphQueueBucket::MapHudDistort,
+                traverse_order: DsgraphTraverseOrder::LeftToRight,
+                projection: DsgraphProjectionKind::Hud,
+                near_range: true,
+                rt3_before: DsgraphRt3Slot::Keep,
+                rt3_after: DsgraphRt3Slot::Keep,
+                clear_after: true,
+            },
+        ],
+    }
+}
+
+/// Build an item's custom-FOV projection matrix matching `r__dsgraph_render.cpp:72, 111`
+/// (`proj.build_projection(deg2rad(fov), aspect, R_VIEWPORT_NEAR, far_plane)`),
+/// where `aspect` follows X-Ray's `height / width` convention (`Device.fAspect`).
+#[inline]
+pub fn build_custom_fov_projection(fov_deg: f32, aspect: f32, far_plane: f32) -> XRayMatrix {
+    let near_plane = crate::weather::R_VIEWPORT_NEAR;
+    crate::camera::matrix_build_projection(
+        fov_deg.clamp(1.0, 175.0).to_radians(),
+        aspect.max(1e-6),
+        near_plane,
+        far_plane.max(near_plane + 1e-3),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3951,5 +4301,99 @@ mod tests {
         let sorted_lex = sort_dsgraph_texture_nodes(tex_nodes, false, 10.0);
         let order_lex: Vec<usize> = sorted_lex.iter().map(|n| n.payload).collect();
         assert_eq!(order_lex, vec![2, 1, 0, 3]);
+    }
+
+    #[test]
+    fn dsgraph_pass_schedule_and_custom_fov_projection() {
+        let hud = dsgraph_pass_schedule(DsgraphPassGroup::Hud {
+            no_ps: false,
+            scope_3d_fake_enabled: true,
+            ssfx_motion_vectors: true,
+            has_cam_attached: true,
+            has_scope_cam_attached: true,
+        });
+        assert_eq!(hud.len(), 5);
+        assert_eq!(hud[0].bucket, DsgraphQueueBucket::MapHud);
+        assert_eq!(hud[0].traverse_order, DsgraphTraverseOrder::LeftToRight);
+        assert_eq!(hud[0].projection, DsgraphProjectionKind::Hud);
+        assert!(hud[0].near_range);
+        assert_eq!(hud[0].rt3_before, DsgraphRt3Slot::Keep);
+        assert_eq!(hud[2].bucket, DsgraphQueueBucket::MapCamAttached);
+        assert_eq!(hud[2].projection, DsgraphProjectionKind::CamAttached);
+        assert_eq!(hud[3].bucket, DsgraphQueueBucket::MapScopeHud);
+        assert_eq!(hud[3].rt3_before, DsgraphRt3Slot::Temp);
+        assert_eq!(hud[3].rt3_after, DsgraphRt3Slot::Keep);
+        assert_eq!(hud[4].bucket, DsgraphQueueBucket::MapScopeCamAttached);
+        assert_eq!(hud[4].rt3_after, DsgraphRt3Slot::MotionVectors);
+
+        let hud_no_mv = dsgraph_pass_schedule(DsgraphPassGroup::Hud {
+            no_ps: false,
+            scope_3d_fake_enabled: true,
+            ssfx_motion_vectors: false,
+            has_cam_attached: false,
+            has_scope_cam_attached: false,
+        });
+        assert_eq!(hud_no_mv.len(), 3);
+        assert_eq!(hud_no_mv[2].bucket, DsgraphQueueBucket::MapScopeHud);
+        assert_eq!(hud_no_mv[2].rt3_before, DsgraphRt3Slot::Temp);
+        assert_eq!(hud_no_mv[2].rt3_after, DsgraphRt3Slot::Null);
+
+        assert!(
+            dsgraph_pass_schedule(DsgraphPassGroup::Hud {
+                no_ps: true,
+                scope_3d_fake_enabled: true,
+                ssfx_motion_vectors: true,
+                has_cam_attached: true,
+                has_scope_cam_attached: true,
+            })
+            .is_empty()
+        );
+
+        let ui3d = dsgraph_pass_schedule(DsgraphPassGroup::Ui3d);
+        assert_eq!(ui3d.len(), 3);
+        assert!(ui3d.iter().all(|s| s.projection == DsgraphProjectionKind::Ui3dIcons));
+
+        let scope_sorted = dsgraph_pass_schedule(DsgraphPassGroup::ScopeSorted {
+            has_scope_cam_attached: true,
+        });
+        assert_eq!(scope_sorted[0].bucket, DsgraphQueueBucket::MapScopeHudSorted);
+        assert_eq!(scope_sorted[0].traverse_order, DsgraphTraverseOrder::RightToLeft);
+        assert_eq!(scope_sorted[1].bucket, DsgraphQueueBucket::MapScopeCamAttachedSorted);
+        assert_eq!(scope_sorted[1].traverse_order, DsgraphTraverseOrder::LeftToRight);
+
+        let distort = dsgraph_pass_schedule(DsgraphPassGroup::Distort);
+        assert_eq!(distort[0].bucket, DsgraphQueueBucket::MapDistort);
+        assert_eq!(distort[0].traverse_order, DsgraphTraverseOrder::RightToLeft);
+        assert_eq!(distort[1].bucket, DsgraphQueueBucket::MapCustomFovDistort);
+        assert_eq!(distort[1].traverse_order, DsgraphTraverseOrder::RightToLeft);
+        assert_eq!(distort[2].bucket, DsgraphQueueBucket::MapHudDistort);
+        assert_eq!(distort[2].traverse_order, DsgraphTraverseOrder::LeftToRight);
+
+        let sorted = dsgraph_pass_schedule(DsgraphPassGroup::Sorted {
+            has_cam_attached: true,
+        });
+        assert_eq!(sorted.len(), 4);
+        assert_eq!(sorted[0].bucket, DsgraphQueueBucket::MapSorted);
+        assert_eq!(sorted[3].bucket, DsgraphQueueBucket::MapCamAttachedSorted);
+        assert_eq!(sorted[3].traverse_order, DsgraphTraverseOrder::RightToLeft);
+
+        let emissive = dsgraph_pass_schedule(DsgraphPassGroup::Emissive {
+            clear: true,
+            render_hud: true,
+        });
+        assert_eq!(emissive.len(), 4);
+        assert_eq!(emissive[0].traverse_order, DsgraphTraverseOrder::LeftToRight);
+        assert!(emissive[0].clear_after);
+        assert_eq!(emissive[3].bucket, DsgraphQueueBucket::MapHudSorted);
+        assert_eq!(emissive[3].traverse_order, DsgraphTraverseOrder::RightToLeft);
+        assert!(!emissive[3].clear_after);
+
+        let custom_p = build_custom_fov_projection(90.0, 9.0 / 16.0, 250.0);
+        let expected_m22 = 250.0 / (250.0 - crate::weather::R_VIEWPORT_NEAR);
+        assert!((custom_p[1][1] - 1.0).abs() < 1e-5);
+        assert!((custom_p[0][0] - (9.0 / 16.0)).abs() < 1e-5);
+        assert!((custom_p[2][2] - expected_m22).abs() < 1e-5);
+        assert_eq!(custom_p[2][3], 1.0);
+        assert!((custom_p[3][2] + crate::weather::R_VIEWPORT_NEAR * expected_m22).abs() < 1e-5);
     }
 }

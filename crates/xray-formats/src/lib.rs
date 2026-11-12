@@ -13,14 +13,14 @@
 //! - `lanims`: `$game_data$/lanims.xr` keyframed `LightAnimItem` / `LightAnimLibrary` color anims
 //! - `level`: `level` & `level.geom`/`level.geomx` scene, visuals, sectors, portals, portal/HOM traversal, lights & `D3DVERTEXELEMENT9` VB/IB/SWIS decoders
 //! - `lighting`: Pure-Rust dynamic lights, `SMAP_Allocator`, `ComputeXFS`, spot/point/GI accumulation, `light_vis`/`smapvis`/grass shadows, BRDF/jitter/normal LUTs, `LightMarkerState` & `LightTrack` cache
-//! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, LOD (`ScreenLodThresholds`/`LodImposterHwVertex`/batcher/dsgraph sort), tree (`TreeWindState`), and skeletal mesh + bone/IK parser
-//! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, blending & marks parser
+//! - `ogf`: X-Ray OGF v4 static, progressive, hierarchy, LOD (`ScreenLodThresholds`/`LodImposterHwVertex`/batcher/dsgraph sort & pass schedule), tree (`TreeWindState`), and skeletal mesh + bone/IK parser
+//! - `omf`: X-Ray `.omf` / embedded `OGF_S_MOTIONS` skeletal animation clips, partitions, channels, `CBlend` & key math parser
 //! - `particle_sim`: Pure-Rust PAPI runtime simulator, 3D Perlin noise, `ParticleGroupInstance` timeline & billboard emitter
 //! - `particles`: `particles.xr` / loose `.pe` & `.pg` PAPI bytecode systems + LTX blood wallmark configs (no binary `level.wallmarks` in Anomaly/CoP)
-//! - `postprocess`: Phase-13+ PPE noise UVs, bloom/luminance adaptation, sunshafts/combine constants, SSAO/HDAO/SMAA/SSFX TAA schedules, screen TL/TL2uv quads, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision, SSFX blur/SSS helpers
+//! - `postprocess`: Phase-13+ PPE noise/quads, bloom/luminance adaptation + bloom/combine quads, R4 RT catalog & phase specs, SSAO/HDAO/SMAA/SSFX TAA schedules, screen TL/TL2uv quads, tonemap, gamma LUT, HDR10 params & schedules, DOF, gasmask, NVG/heatvision, SSFX blur/SSS helpers
 //! - `savegames`: Anomaly `.scop` LZO1X ALife savegame reader/writer (`GameDateTime`, spawn header, dynamic objects & 7 binary registries)
 //! - `shaders_xr`: `shaders_xrlc.xr`, `shaders.xr`, `uber_deffer`, R4/internal blender compilers, `level.env_mod`/`.ltx`, `level.ps_static` & `level.fog_vol`
-//! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, OMF pose evaluation & `1W`–`4W` CPU skinning
+//! - `skinning`: Pure-Rust OGF `m2b_transform` bone palette, multi-channel `AnimatedBlendMixer`, OMF pose evaluation & `1W`–`4W` CPU skinning
 //! - `sound_env`: `senvironment.xr` v4/v5, `level.som` BVH acoustic occlusion, `level.snd_env` & `level.snd_static`
 //! - `spawn_overlays`: Anomaly `spawn_overlays.ltx` / `mod_spawn_overlays_*.ltx` DLTX graph links/unlinks, patches & `level_cut` applicators
 //! - `spawns`: `level.game` (`RPoint`/`PatrolPath`), `patrol_paths.ltx`, `level.spawn`, `all.spawn` (`AlifeSpawnArchive`) & ALife `NET_Packet` entity/subclass codecs
@@ -171,21 +171,23 @@ pub use lighting::{
     TEX_MATERIAL_LDOTN, VOLUMETRIC_SLICES,
 };
 pub use ogf::{
-    adjusted_distance_from_camera, bone_shape_flags, calc_ssa, compute_screen_lod_thresholds,
-    deffer_shader_elements, fvf_flags, is_valuable_to_render_dynamic,
-    is_valuable_to_render_static, lod_shader_element_id, lod_shader_elements, matrix_forward_dir,
-    matrix_invert_43, matrix_mul_43, matrix_mul_44, matrix_rotate_x, matrix_rotate_y,
-    matrix_rotate_z, matrix_scale, matrix_set_hpb, matrix_set_xyz_translate,
-    matrix_set_xyzi_translate, matrix_transform_point, matrix_transform_projected, ogf_chunks,
-    pack_lod_imposter_batches, route_dynamic_visual, route_static_visual,
-    select_dynamic_shader_element, select_static_shader_element, skel_vert_type,
-    sort_dsgraph_texture_nodes, sphere_volume, vector_generate_orthonormal_basis, BoneIkData,
-    BoneIkSection, BonePoseMatrices, BoneShape, BoneShapeType, DsgraphTextureNode, LodBatchChunk,
-    LodDrawGroup, LodImposterHwVertex, LodImposterSample, LodRenderInput, OgfBBox, OgfBSphere,
-    OgfBone, OgfBufferRef, OgfDesc, OgfGContainerRef, OgfHeader, OgfLodDef, OgfLodFacet,
-    OgfLodVertex, OgfModel, OgfObb, OgfSkeleton, OgfSlideWindows, OgfTextureLink, OgfTreeDef,
-    OgfVertices, OgfVisualType, RenderPhase, ScreenLodConfig, ScreenLodThresholds, SlideWindow,
-    StaticVertex, StaticVertexLayout, TreeInstanceGpuConstants, TreeLightingColor, TreeWindConfig,
+    adjusted_distance_from_camera, bone_shape_flags, build_custom_fov_projection, calc_ssa,
+    compute_screen_lod_thresholds, deffer_shader_elements, dsgraph_pass_schedule, fvf_flags,
+    is_valuable_to_render_dynamic, is_valuable_to_render_static, lod_shader_element_id,
+    lod_shader_elements, matrix_forward_dir, matrix_invert_43, matrix_mul_43, matrix_mul_44,
+    matrix_rotate_x, matrix_rotate_y, matrix_rotate_z, matrix_scale, matrix_set_hpb,
+    matrix_set_xyz_translate, matrix_set_xyzi_translate, matrix_transform_point,
+    matrix_transform_projected, ogf_chunks, pack_lod_imposter_batches, route_dynamic_visual,
+    route_static_visual, select_dynamic_shader_element, select_static_shader_element,
+    skel_vert_type, sort_dsgraph_texture_nodes, sphere_volume, vector_generate_orthonormal_basis,
+    BoneIkData, BoneIkSection, BonePoseMatrices, BoneShape, BoneShapeType, DsgraphPassGroup,
+    DsgraphProjectionKind, DsgraphQueueBucket, DsgraphQueueStep, DsgraphRt3Slot,
+    DsgraphTextureNode, DsgraphTraverseOrder, LodBatchChunk, LodDrawGroup, LodImposterHwVertex,
+    LodImposterSample, LodRenderInput, OgfBBox, OgfBSphere, OgfBone, OgfBufferRef, OgfDesc,
+    OgfGContainerRef, OgfHeader, OgfLodDef, OgfLodFacet, OgfLodVertex, OgfModel, OgfObb,
+    OgfSkeleton, OgfSlideWindows, OgfTextureLink, OgfTreeDef, OgfVertices, OgfVisualType,
+    RenderPhase, ScreenLodConfig, ScreenLodThresholds, SlideWindow, StaticVertex,
+    StaticVertexLayout, TreeInstanceGpuConstants, TreeLightingColor, TreeWindConfig,
     TreeWindFrame, TreeWindState, UnifiedSkinnedVertex, VertBoned1W, VertBoned2W, VertBoned3W,
     VertBoned4W, VisualOptConfig, VisualPrimaryBucket, VisualRoutingDecision, VisualRoutingFlags,
     XRayMatrix, FTREE_VISUAL_QUANT, FTREE_VISUAL_TILE, LOD_IMPOSTER_QUAD_ORDER, OGF_LODDEF2_SIZE,
@@ -193,10 +195,13 @@ pub use ogf::{
     VISUAL_OPT_DYNAMIC_VOL, VISUAL_OPT_STATIC_DIST, VISUAL_OPT_STATIC_VOL, XRAY_IDENTITY_MATRIX,
 };
 pub use omf::{
-    motion_def_flags, motion_key_flags, slerp_quat_xyzw, BoneKeyframe, BoneMotionTrack,
-    BonePartitionDef, BonePartitionSet, BoneTranslationKeys, MotionClip, MotionDef, MotionMark,
-    MotionPartition, MotionPartitionBone, OmfMotions, QuantizedRotKey, KEY_QUANT, KEY_QUANT_INV,
-    MAX_PARTS, MOTION_QUANTIZER_RANGE_EXT, SAMPLE_FPS, SAMPLE_SPF, XR_OGF_SM_PARAMS_VERSION,
+    motion_def_flags, motion_key_flags, slerp_quat_xyzw, AnimationBlend, AnimationChannels,
+    BlendCurvature, BoneKeyframe, BoneMotionTrack, BonePartitionDef, BonePartitionSet,
+    BoneTranslationKeys, ChannelDef, ChannelMixType, ChannelRule, MotionClip, MotionDef,
+    MotionID, MotionMark, MotionPartition, MotionPartitionBone, OmfMotions, QuantizedRotKey,
+    CHANNEL_RULES, KEY_QUANT, KEY_QUANT_INV, MAX_ANIM_CHANNELS, MAX_ANIM_SLOTS,
+    MAX_BLENDED_PER_CHANNEL, MAX_BLENDED_POOL, MAX_PARTS, MOTION_QUANTIZER_RANGE_EXT, SAMPLE_FPS,
+    SAMPLE_SPF, XR_OGF_SM_PARAMS_VERSION,
 };
 pub use particle_sim::{
     ParticleBillboardDrawBatch, ParticleBillboardInstance, ParticleEffectInstance,
@@ -218,29 +223,35 @@ pub use particles::{
 };
 pub use postprocess::{
     apply_st2084_pq_rgb, apply_vignette_rgb, bloom_build_4tap_uvs, bloom_filter_taps_horizontal,
-    bloom_filter_taps_vertical, build_create_minmax_sm_quad, build_draw_rain_light_quad,
+    bloom_filter_taps_vertical, build_bloom_build_quad, build_bloom_fast_filter_quad,
+    build_bloom_filter_quad_horizontal, build_bloom_filter_quad_vertical, build_combine2_aa_quad,
+    build_combine_volumetric_quad, build_create_minmax_sm_quad, build_draw_rain_light_quad,
     build_draw_rain_mask_quad, build_mark_msaa_edges_quad, build_phase_ssfx_rain_quad,
-    build_postprocess_pass_plan, build_stencil_optimize_quad,
-    build_ui_3d_icons_postprocess_quad, calc_gauss_k7, calc_gauss_wave, combine2_aa_quad_uvs,
-    combine2_shader_element, compute_combine1_params, compute_hdao_dispatch, compute_ssao_params,
-    effects_sun_hdr_blend_factor, luminance_filter_quad_uvs, luminance_filter_taps,
-    luminance_pass0_uvs, lut_pass_desc, phase_blur_schedule, smaa_schedule, ssfx_ao_blur_schedule,
-    ssfx_bloom_lens_blur_schedule, ssfx_il_blur_schedule, ssfx_taa_schedule,
-    ssfx_volumetric_blur_schedule, sunshafts_schedule, sunshafts_uv_bounds,
-    uncharted2_tonemap_curve, BloomAdaptState, BloomConfig, BloomFilterGpuWeights, Combine1Config,
-    Combine1GpuParams, Combine2AaCornerUvs, Combine2Config, Combine2GpuParams, Combine2MotionState,
+    build_postprocess_pass_plan, build_r4_render_target_catalog, build_ssfx_bloom_quad,
+    build_stencil_optimize_quad, build_ui_3d_icons_postprocess_quad, calc_gauss_k7, calc_gauss_wave,
+    combine2_aa_quad_uvs, combine2_shader_element, compute_combine1_params, compute_hdao_dispatch,
+    compute_ssao_params, effects_sun_hdr_blend_factor, luminance_filter_quad_uvs,
+    luminance_filter_taps, luminance_pass0_uvs, lut_pass_desc, phase_blur_schedule, r4_phase_spec,
+    smaa_schedule, ssfx_ao_blur_schedule, ssfx_bloom_lens_blur_schedule, ssfx_bloom_schedule,
+    ssfx_il_blur_schedule, ssfx_taa_schedule, ssfx_volumetric_blur_schedule, sunshafts_schedule,
+    sunshafts_uv_bounds, uncharted2_tonemap_curve, BloomAdaptState, BloomBuildVertex, BloomConfig,
+    BloomFilterGpuWeights, BloomFilterVertex, Combine1Config, Combine1GpuParams,
+    Combine2AaCornerUvs, Combine2AaVertex, Combine2Config, Combine2GpuParams, Combine2MotionState,
     DofConfig, DofGpuParams, GammaControlConfig, GasmaskConfig, GasmaskGpuParams, HdaoDispatch,
     Hdr10Colorspace, Hdr10Config, Hdr10GpuParams, Hdr10PassKind, Hdr10PingPongPass,
     Hdr10TonemapMode, Hdr10Tonemapper, HeatVisionConfig, HeatVisionGpuParams,
     ImageCorrectionConfig, ImageCorrectionGpuParams, LuminanceAdaptState, LuminanceConfig,
     LutPassDesc, NightVisionGen, NightVisionProfile, OcclusionQueryAllocation, OcclusionQueryPool,
-    PostprocessNoiseState, PostprocessPassPlan, ScreenTl2uvVertex, ScreenTlVertex, SmaaPassDesc,
-    SmaaPassKind, SsaoParams, SsfxBloomGpuParams, SsfxBlurPassDesc, SsfxLightingConfig,
-    SsfxLutConfig, SsfxScreenConfig, SsfxSssCandidate, SsfxSssExtSlots, SsfxTaaConfig,
-    SsfxTaaPassDesc, SsfxTaaPassKind, SunshaftsConfig, SunshaftsPassDesc, SunshaftsPassKind,
-    TonemapGpuParams, TonemapParams, BLOOM_SIZE_X, BLOOM_SIZE_Y, HDAO_GROUP_TEXEL_DIMENSION,
-    HDAO_GROUP_TEXEL_OVERLAP, HDAO_GROUP_TEXEL_STEP, LUT_ATLAS_TEXTURE, LUT_NOISE_TEXTURE,
-    LUT_SHADER_NAME, OCCQ_DEFAULT_LIMIT, OCCQ_INVALID_HANDLE, SSFX_SSS_EXT_MAX_SLOTS,
+    PhasePpVertex, PostprocessNoiseState, PostprocessPassPlan, R4DepthSlot, R4PhaseClearSpec,
+    R4PhaseStateOptions, R4RenderPhaseKind, R4RenderPhaseSpec, R4RenderTargetConfig,
+    R4RenderTargetSpec, R4RtSlot, R4TargetFormat, ScreenTl2uvVertex, ScreenTlVertex, SmaaPassDesc,
+    SmaaPassKind, SsaoParams, SsfxBloomGpuParams, SsfxBloomPassDesc, SsfxBloomPassKind,
+    SsfxBlurPassDesc, SsfxLightingConfig, SsfxLutConfig, SsfxScreenConfig, SsfxSssCandidate,
+    SsfxSssExtSlots, SsfxTaaConfig, SsfxTaaPassDesc, SsfxTaaPassKind, SunshaftsConfig,
+    SunshaftsPassDesc, SunshaftsPassKind, TonemapGpuParams, TonemapParams, BLOOM_SIZE_X,
+    BLOOM_SIZE_Y, HDAO_GROUP_TEXEL_DIMENSION, HDAO_GROUP_TEXEL_OVERLAP, HDAO_GROUP_TEXEL_STEP,
+    LUT_ATLAS_TEXTURE, LUT_NOISE_TEXTURE, LUT_SHADER_NAME, OCCQ_DEFAULT_LIMIT,
+    OCCQ_INVALID_HANDLE, SSFX_SSS_EXT_MAX_SLOTS,
 };
 pub use savegames::{
     compress_scop, decompress_scop, validate_scop_header, ActorStatDetail, ActorStatSection,
@@ -265,9 +276,10 @@ pub use shaders_xr::{
 pub use skinning::{
     compute_skinned_aabb, matrix_transform_dir, normalize_vec3, pick_ogf_bone,
     pick_ogf_single_bone, skin_ogf_hierarchy, skin_position_with_links,
-    skin_position_with_wm_sentinel, skin_vertex_pos_and_influences, skin_vertices, BoneMask,
-    BoneMatrix4x3, BonePalette, BonePickHit, SkeletonCollisionIndex, SkeletonLeafInfo,
-    SkinnedMeshPart, SkinnedVertex, SkinnedVertexInfluence,
+    skin_position_with_wm_sentinel, skin_vertex_pos_and_influences, skin_vertices,
+    AnimatedBlendInstance, AnimatedBlendMixer, AnimatedPoseResult, BoneMask, BoneMatrix4x3,
+    BonePalette, BonePickHit, SkeletonCollisionIndex, SkeletonLeafInfo, SkinnedMeshPart,
+    SkinnedVertex, SkinnedVertexInfluence,
 };
 pub use sound_env::{
     LevelSoundEnv, LevelStaticSounds, OggSoundMetadata, OggXRayParams, SomPolygon,
