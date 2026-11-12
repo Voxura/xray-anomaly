@@ -66,6 +66,7 @@ pub struct Dx12Renderer {
     pub current_cmd_list: Option<ID3D12GraphicsCommandList>,
     pub shadow_map: Option<crate::shadow::DirectionalShadowMap>,
     pub particle_renderer: Option<crate::particle::ParticleSystemRenderer>,
+    pub sky_renderer: Option<crate::sky::SkyRenderer>,
     pub ui_canvas_pipeline: Option<crate::ui_canvas::UiCanvasPipeline>,
     pub ui_canvas: crate::ui_canvas::UiCanvas,
     pub(crate) geometry: GeometryState,
@@ -126,6 +127,7 @@ impl Dx12Renderer {
             current_cmd_list: None,
             shadow_map: None,
             particle_renderer: None,
+            sky_renderer: None,
             ui_canvas_pipeline: None,
             ui_canvas: crate::ui_canvas::UiCanvas::default(),
             geometry: GeometryState::default(),
@@ -633,6 +635,40 @@ impl Dx12Renderer {
             Some(&self.bindless_heap),
             Some(&push_constants),
         )
+    }
+
+    /// Record a draw call rendering the infinite skybox with weather cycle texture blending
+    pub fn draw_sky(&mut self, push: &crate::sky::SkyPushConstants) -> WinResult<()> {
+        if self.sky_renderer.is_none() {
+            self.sky_renderer = Some(crate::sky::SkyRenderer::new(&self.device_ctx.device)?);
+        }
+        let sky = self.sky_renderer.as_ref().unwrap();
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let camera_va = self
+            .geometry
+            .camera_gpu_va()
+            .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
+
+        sky.render(
+            cmd,
+            camera_va,
+            &self.bindless_heap,
+            push,
+            rtv,
+            Some(dsv),
+            self.width,
+            self.height,
+        );
+        Ok(())
     }
 
     /// Begin the directional sunlight shadow map rendering pass
