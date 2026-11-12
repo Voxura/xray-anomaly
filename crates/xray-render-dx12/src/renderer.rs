@@ -1241,6 +1241,35 @@ impl Dx12Renderer {
         Ok(())
     }
 
+    /// Draw a shadow caster mesh into a specific 3-split CSM atlas cascade tile `[x, y, w, h]`
+    pub fn draw_csm_shadow_mesh(
+        &mut self,
+        atlas: &crate::shadow::CascadedShadowAtlas,
+        cascade_idx: usize,
+        handle: crate::geometry_abi::MeshHandle,
+        transform_index: u32,
+    ) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let viewport = atlas
+            .plan
+            .as_ref()
+            .and_then(|p| p.slots.get(cascade_idx))
+            .map(|s| s.viewport_px)
+            .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        let dsv = atlas.dsv_handle();
+        self.geometry.draw_depth_viewport(
+            &self.device_ctx.device,
+            cmd,
+            dsv,
+            viewport,
+            handle,
+            transform_index,
+        )
+    }
+
     /// Record a draw call with an albedo texture and bindless shadow map index
     pub fn draw_textured_mesh_with_shadow(
         &mut self,

@@ -3,6 +3,10 @@ name = "xray-engine"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "xray-engine"
+path = "src/main.rs"
+
 [dependencies]
 xray-core = { path = "../xray-core" }
 xray-vfs = { path = "../xray-vfs" }

@@ -631,6 +631,26 @@ impl GeometryState {
         handle: MeshHandle,
         transform_index: u32,
     ) -> WinResult<()> {
+        self.draw_depth_viewport(
+            device,
+            cmd,
+            dsv,
+            [0, 0, width, height],
+            handle,
+            transform_index,
+        )
+    }
+
+    /// Record a fast depth-only prepass or shadow pass draw call into an explicit `[x, y, w, h]` atlas viewport
+    pub fn draw_depth_viewport(
+        &mut self,
+        device: &ID3D12Device,
+        cmd: &ID3D12GraphicsCommandList,
+        dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        viewport: [u32; 4],
+        handle: MeshHandle,
+        transform_index: u32,
+    ) -> WinResult<()> {
         if self.pipeline.is_none() {
             self.pipeline = Some(GeometryPipeline::new(device)?);
         }
@@ -666,6 +686,7 @@ impl GeometryState {
             transform_index,
             ..Default::default()
         };
+        let [vx, vy, vw, vh] = viewport;
         unsafe {
             cmd.SetPipelineState(&pipeline.depth_pso);
             cmd.SetGraphicsRootSignature(&pipeline.root);
@@ -678,16 +699,18 @@ impl GeometryState {
             );
             cmd.SetGraphicsRootShaderResourceView(3, tf_buf.0.GetGPUVirtualAddress());
             cmd.RSSetViewports(&[D3D12_VIEWPORT {
-                Width: width as f32,
-                Height: height as f32,
+                TopLeftX: vx as f32,
+                TopLeftY: vy as f32,
+                Width: vw as f32,
+                Height: vh as f32,
+                MinDepth: 0.0,
                 MaxDepth: 1.0,
-                ..Default::default()
             }]);
             cmd.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
-                left: 0,
-                top: 0,
-                right: width as i32,
-                bottom: height as i32,
+                left: vx as i32,
+                top: vy as i32,
+                right: (vx + vw) as i32,
+                bottom: (vy + vh) as i32,
             }]);
             cmd.OMSetRenderTargets(0, None, false, Some(&dsv));
             cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
