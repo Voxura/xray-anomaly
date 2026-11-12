@@ -3,12 +3,15 @@
 //! Ties together Win32 window event polling, high-precision timing, camera updates,
 //! fixed-timestep simulation ticks (physics/ALife/network), and DirectX 12 frame rendering.
 
+use crate::alife_manager::AlifeManager;
 use crate::camera::FirstPersonCamera;
 use crate::input::{Action, EngineInput};
 use crate::timer::EngineTimer;
 use crate::window::{EngineWindow, WindowConfig};
+use crate::world_loader::{LevelLoadConfig, LoadedWorld, WorldLoader};
 use xray_net::{ClientSession, EntityDelta, HostSession};
 use xray_render_dx12::Dx12Renderer;
+use xray_vfs::VirtualFileSystem;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -45,6 +48,13 @@ impl NetworkSession {
             Self::Client(c) => c.update(),
         }
     }
+
+    pub fn send_entity_delta(&mut self, delta: &EntityDelta) -> std::io::Result<()> {
+        match self {
+            Self::Host(h) => h.send_entity_delta(delta),
+            Self::Client(c) => c.send_entity_delta(delta),
+        }
+    }
 }
 
 pub struct EngineRuntime {
@@ -55,6 +65,8 @@ pub struct EngineRuntime {
     pub camera: FirstPersonCamera,
     pub renderer: Option<Dx12Renderer>,
     pub network: Option<NetworkSession>,
+    pub world: Option<LoadedWorld>,
+    pub alife: Option<AlifeManager>,
     pub running: bool,
 }
 
@@ -85,6 +97,8 @@ impl EngineRuntime {
             camera,
             renderer,
             network: None,
+            world: None,
+            alife: None,
             running: true,
         })
     }
@@ -92,6 +106,49 @@ impl EngineRuntime {
     /// Attach a peer-to-peer co-op multiplayer session
     pub fn attach_network(&mut self, session: NetworkSession) {
         self.network = Some(session);
+    }
+
+    /// Attach a streamed level world bundle
+    pub fn attach_world(&mut self, mut world: LoadedWorld) {
+        if let Some(alife) = &self.alife {
+            world.weather.apply_scop_weather(&alife.weather_snapshot);
+        }
+        self.world = Some(world);
+    }
+
+    /// Attach an ALife simulation manager and synchronize camera & weather initial state
+    pub fn attach_alife(&mut self, alife: AlifeManager) {
+        if let Some(actor) = alife.host_actor() {
+            self.camera.position = actor.position;
+            self.camera.pitch = actor.angle[0];
+            self.camera.yaw = actor.angle[1];
+        }
+        if let Some(world) = &mut self.world {
+            world.weather.apply_scop_weather(&alife.weather_snapshot);
+        }
+        self.alife = Some(alife);
+    }
+
+    /// Stream level world assets and optional `.scop` savegame from `VirtualFileSystem`
+    pub fn load_world_and_save_from_vfs(
+        &mut self,
+        vfs: &VirtualFileSystem,
+        level_config: &LevelLoadConfig,
+        scop_vpath: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let world = WorldLoader::load_from_vfs(vfs, level_config)?;
+        let mut alife = match scop_vpath {
+            Some(path) => AlifeManager::load_from_vfs(vfs, path)?,
+            None => AlifeManager::default(),
+        };
+        if alife.entities.is_empty()
+            && let Some(spawn) = &world.level_spawn
+        {
+            alife.seed_from_level_spawn(&world.level_dir, spawn);
+        }
+        self.attach_world(world);
+        self.attach_alife(alife);
+        Ok(())
     }
 
     /// Advance one frame of the game loop. Returns `false` when window closes or user quits.
@@ -128,6 +185,7 @@ impl EngineRuntime {
             }
         }
 
+        let prev_pos = self.camera.position;
         let intent = self.input.movement_intent();
         let mut speed = self.config.move_speed;
         if self.input.is_action_down(Action::Sprint) {
@@ -137,14 +195,52 @@ impl EngineRuntime {
         }
         self.camera.move_relative(intent, speed, dt);
 
+        if let Some(alife) = &mut self.alife {
+            let inv_dt = if dt > 1e-6 { 1.0 / dt } else { 0.0 };
+            let vel = [
+                (self.camera.position[0] - prev_pos[0]) * inv_dt,
+                (self.camera.position[1] - prev_pos[1]) * inv_dt,
+                (self.camera.position[2] - prev_pos[2]) * inv_dt,
+            ];
+            alife.set_host_camera_transform(
+                self.camera.position,
+                self.camera.yaw,
+                self.camera.pitch,
+                vel,
+            );
+        }
+
         // 5. Fixed-timestep simulation steps (physics, ALife, network sync)
         let fixed_dt = self.config.fixed_dt;
         let net = &mut self.network;
-        self.timer.step_fixed(fixed_dt, |_f_dt| {
-            if let Some(session) = net {
-                let _ = session.update();
+        let alife = &mut self.alife;
+        self.timer.step_fixed(fixed_dt, |f_dt| {
+            if let Some(session) = net.as_mut()
+                && let Ok(deltas) = session.update()
+                && let Some(mgr) = alife.as_mut()
+            {
+                for delta in &deltas {
+                    mgr.apply_network_delta(delta);
+                }
+            }
+            if let Some(mgr) = alife.as_mut() {
+                mgr.step(f_dt);
+                if let Some(session) = net.as_mut() {
+                    for delta in mgr.collect_outgoing_deltas() {
+                        let _ = session.send_entity_delta(&delta);
+                    }
+                }
             }
         });
+
+        if let Some(world) = &mut self.world {
+            world.step_weather(
+                dt,
+                self.camera.position,
+                self.camera.forward(),
+                self.camera.far_z,
+            );
+        }
 
         // 6. Direct3D 12 frame presentation
         if let Some(r) = &mut self.renderer {
