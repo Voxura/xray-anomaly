@@ -29,6 +29,7 @@ pub mod heaps;
 pub mod lighting;
 pub mod particle;
 pub mod pipeline;
+pub mod postprocess;
 pub mod rain;
 pub mod renderer;
 pub mod shaders;
@@ -47,6 +48,11 @@ pub use geometry::PushDrawConstants;
 pub use geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
 pub use lighting::{DynamicLight, GpuLight, LightManager, LightType};
 pub use particle::{GpuParticleInstance, ParticleSystemRenderer};
+pub use postprocess::{
+    BloomAdaptState, BloomConfig, ImageCorrectionConfig, ImageCorrectionGpuParams,
+    PostprocessManager, PostprocessPushConstants, PostprocessRenderer, TonemapGpuParams,
+    TonemapParams,
+};
 pub use rain::{GpuRainDrop, RainManager, RainPushConstants, RainRenderer};
 pub use shadow::DirectionalShadowMap;
 pub use sky::{SkyPushConstants, SkyRenderer};

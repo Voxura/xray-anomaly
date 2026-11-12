@@ -74,6 +74,8 @@ pub struct Dx12Renderer {
     pub wallmarks_manager: Option<crate::wallmarks::WallmarksManager>,
     pub detail_renderer: Option<crate::details::DetailRenderer>,
     pub detail_manager: Option<crate::details::DetailManager>,
+    pub postprocess_renderer: Option<crate::postprocess::PostprocessRenderer>,
+    pub postprocess_manager: Option<crate::postprocess::PostprocessManager>,
     pub ui_canvas_pipeline: Option<crate::ui_canvas::UiCanvasPipeline>,
     pub ui_canvas: crate::ui_canvas::UiCanvas,
     pub(crate) geometry: GeometryState,
@@ -142,6 +144,8 @@ impl Dx12Renderer {
             wallmarks_manager: None,
             detail_renderer: None,
             detail_manager: None,
+            postprocess_renderer: None,
+            postprocess_manager: None,
             ui_canvas_pipeline: None,
             ui_canvas: crate::ui_canvas::UiCanvas::default(),
             geometry: GeometryState::default(),
@@ -904,6 +908,54 @@ impl Dx12Renderer {
             push,
             rtv,
             Some(dsv),
+            self.width,
+            self.height,
+        );
+        Ok(())
+    }
+
+    /// Access mutable reference to post-processing manager
+    pub fn postprocess_manager_mut(&mut self) -> &mut crate::postprocess::PostprocessManager {
+        if self.postprocess_manager.is_none() {
+            self.postprocess_manager = Some(crate::postprocess::PostprocessManager::new());
+        }
+        self.postprocess_manager.as_mut().unwrap()
+    }
+
+    /// Record a draw call rendering the post-processing pass (tonemapping, bloom, vignette)
+    pub fn draw_postprocess(
+        &mut self,
+        push: &crate::postprocess::PostprocessPushConstants,
+    ) -> WinResult<()> {
+        if self.postprocess_renderer.is_none() {
+            self.postprocess_renderer =
+                Some(crate::postprocess::PostprocessRenderer::new(&self.device_ctx.device)?);
+        }
+        if self.postprocess_manager.is_none() {
+            self.postprocess_manager = Some(crate::postprocess::PostprocessManager::new());
+        }
+        let (tonemap_va, img_correct_va) = self
+            .postprocess_manager
+            .as_mut()
+            .unwrap()
+            .upload_constants(&self.device_ctx.device)?;
+        let postprocess = self.postprocess_renderer.as_ref().unwrap();
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let rtv = sc.current_rtv_handle();
+        postprocess.render(
+            cmd,
+            &self.bindless_heap,
+            tonemap_va,
+            img_correct_va,
+            push,
+            rtv,
             self.width,
             self.height,
         );
