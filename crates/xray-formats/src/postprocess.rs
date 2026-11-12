@@ -1,11 +1,12 @@
-//! Pure-Rust X-Ray Phase-13 Post-Processing, Bloom, Luminance, Combine, Tonemapping, Gamma LUT & HDR10 Constants
+//! Pure-Rust X-Ray Phase-13/15 Post-Processing, Bloom, Luminance, Combine, Tonemapping, Volumetric Shafts, Gamma LUT & HDR10 Constants
 //!
 //! Grounds C++ renderer and HLSL shader parameters directly from:
 //! - `src/Layers/xrRenderPC_R3/r3_rendertarget_phase_PP.cpp` (`u_calc_tc_noise`)
 //! - `src/Layers/xrRenderPC_R3/r3_rendertarget_phase_bloom.cpp` (`CalcGauss_k7`, `CalcGauss_wave`, UV/tap builders)
 //! - `src/Layers/xrRenderPC_R4/r4_rendertarget_phase_luminance.cpp` (`phase_luminance` 256->64->8->1 & `MiddleGray`)
 //! - `src/Layers/xrRender/rendertarget_phase_sunshafts.cpp` (`phase_sunshafts` 5-pass schedule)
-//! - `src/Layers/xrRenderPC_R4/r4_rendertarget_phase_combine.cpp` (`combine_1`, `combine_2`, `tnmp_*`, `vignette_control`)
+//! - `src/Layers/xrRender/rendertarget_phase_blur.cpp` (`phase_ssfx_volumetric_blur` & SSFX volumetrics)
+//! - `src/Layers/xrRenderPC_R4/r4_rendertarget_phase_combine.cpp` (`combine_1`, `combine_2`, `tnmp_*`, `vignette_control`, `phase_combine_volumetric`)
 //! - `src/Layers/xrRender/xr_effgamma.cpp` (`CGammaControl::GenLUT`)
 //! - `src/Layers/xrRender/Blender_Recorder_StandartBinding.cpp` (`hdr10_parameters1..10`)
 //! - `src/Layers/xrRender/rendertarget_phase_lut.cpp` & `src/Layers/xrRenderPC_R4/blender_lut.cpp`
@@ -13,7 +14,12 @@
 //! - `gamedata/shaders/r3/{hdr10.h,combine_2_naa.ps,effects_sun.ps}`
 
 use crate::envelopes::{PostprocessGpuParams, PostprocessState};
-use crate::lighting::{compute_u_diffuse2s, GlossConfig, TEX_JITTER_SIZE};
+use crate::lighting::{
+    compute_u_diffuse2s, r2_low_discrepancy_offset, volumetric_raymarch_16_step_offsets,
+    GlossConfig, VolumetricRaymarchConfig, GOLDEN_RATIO_CONJUGATE, HENYEY_GREENSTEIN_MAX_G,
+    SSFX_VOLUMETRIC_DEFAULT_G, SSFX_VOLUMETRIC_JITTER_FRAMES, SSFX_VOLUMETRIC_RAYMARCH_SAMPLES,
+    TEX_JITTER_SIZE,
+};
 use crate::ogf::{
     matrix_mul_44, matrix_transform_point, matrix_transform_projected, XRayMatrix,
     XRAY_IDENTITY_MATRIX,
@@ -3387,6 +3393,148 @@ pub fn build_combine_volumetric_quad() -> [ScreenTlVertex; 4] {
 }
 
 // ============================================================================
+// Phase 15 SSFX Volumetric Light Shafts Constant Buffer & Pass Plan
+// ============================================================================
+
+/// 16-byte-aligned HLSL constant buffer (`cbuffer` = 144 bytes) for Phase 15
+/// SSFX volumetric light shafts + 16-sample raymarcher (`effects_sun.ps` / `ssfx_volumetric`).
+///
+/// Packs `r__ssfx_volumetric`, Henyey-Greenstein anisotropy `g`, extinction/scattering
+/// coefficients, sun direction & intensity, per-frame golden-ratio + R2 jitter offsets,
+/// 1/8-res target dimensions, and the 16 normalized `[0, 1]` raymarch step offsets.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsfxVolumetricShaftsGpuParams {
+    /// `[enable, intensity, quality, far_distance_fade]` matching `r__ssfx_volumetric`.
+    pub ssfx_volumetric: [f32; 4],
+    /// `[g_anisotropy, extinction_sigma_t, scattering_sigma_s, max_distance]`.
+    pub phase_and_march: [f32; 4],
+    /// `[sun_dir.x, sun_dir.y, sun_dir.z, sun_shafts_intensity]`.
+    pub sun_dir_and_intensity: [f32; 4],
+    /// `[temporal_jitter_golden_ratio, r2_x, r2_y, frame_index_mod_16]`.
+    pub frame_jitter_and_res: [f32; 4],
+    /// `[accum_w, accum_h, 1.0 / accum_w, 1.0 / accum_h]` (1/8-res `$user$ssfx_volumetric`).
+    pub target_resolution: [f32; 4],
+    /// 16 normalized `[0, 1]` raymarch step coordinates packed as 4 `float4` vectors (`step_0..step_15`).
+    pub step_offsets: [[f32; 4]; 4],
+}
+const _: () = assert!(std::mem::size_of::<SsfxVolumetricShaftsGpuParams>() == 144);
+
+/// Complete Phase 15 execution plan for SSFX volumetric light shafts:
+/// 1/8-resolution 16-sample raymarch -> 4-pass bilateral blur (`$user$ssfx_volumetric` <-> `_tmp`)
+/// -> fullscreen additive combine quad (`CRenderTarget::phase_combine_volumetric`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SsfxVolumetricPassPlan {
+    pub active: bool,
+    pub accum_width: u32,
+    pub accum_height: u32,
+    pub sample_count: u32,
+    pub blue_noise_texture: &'static str,
+    pub gpu_params: SsfxVolumetricShaftsGpuParams,
+    pub blur_passes: [SsfxBlurPassDesc; 4],
+    pub combine_quad: [ScreenTlVertex; 4],
+}
+
+/// Build the Phase 15 SSFX volumetric light-shafts GPU parameter pack and 1/8-res blur/combine schedule.
+pub fn build_ssfx_volumetric_shafts_plan(
+    screen_w: u32,
+    screen_h: u32,
+    frame_index: u32,
+    sun_dir: [f32; 3],
+    sun_shafts_intensity: f32,
+    screen_cfg: &SsfxScreenConfig,
+    march_cfg: &VolumetricRaymarchConfig,
+) -> SsfxVolumetricPassPlan {
+    let w = screen_w.max(1);
+    let h = screen_h.max(1);
+    let accum_width = (w / 8).max(1);
+    let accum_height = (h / 8).max(1);
+
+    let intensity = if sun_shafts_intensity.is_finite() {
+        sun_shafts_intensity.max(0.0)
+    } else {
+        0.0
+    };
+    let active = screen_cfg.volumetric[0] > 0.0
+        && screen_cfg.volumetric[1] > 0.0
+        && intensity > 0.0
+        && march_cfg.max_distance > march_cfg.min_distance;
+
+    let norm_sun = if dot3(sun_dir, sun_dir) > 1e-12 {
+        normalize_vec3(sun_dir)
+    } else {
+        [0.0, -1.0, 0.0]
+    };
+
+    let g_anisotropy = if march_cfg.g_anisotropy.is_finite() {
+        march_cfg
+            .g_anisotropy
+            .clamp(-HENYEY_GREENSTEIN_MAX_G, HENYEY_GREENSTEIN_MAX_G)
+    } else {
+        SSFX_VOLUMETRIC_DEFAULT_G
+    };
+    let sigma_t = if march_cfg.extinction_sigma_t.is_finite() {
+        march_cfg.extinction_sigma_t.max(0.0)
+    } else {
+        0.0
+    };
+    let sigma_s = if march_cfg.scattering_sigma_s.is_finite() {
+        march_cfg.scattering_sigma_s.max(0.0)
+    } else {
+        0.0
+    };
+    let min_dist = if march_cfg.min_distance.is_finite() {
+        march_cfg.min_distance.max(0.0)
+    } else {
+        0.0
+    };
+    let max_dist = if march_cfg.max_distance.is_finite() {
+        march_cfg.max_distance.max(min_dist)
+    } else {
+        min_dist
+    };
+
+    let frame_wrap = frame_index % SSFX_VOLUMETRIC_JITTER_FRAMES as u32;
+    let base_jitter = if march_cfg.jitter_offset.is_finite() {
+        march_cfg.jitter_offset
+    } else {
+        0.5
+    };
+    let temporal_jitter =
+        (base_jitter + (frame_wrap as f32) * GOLDEN_RATIO_CONJUGATE).rem_euclid(1.0);
+    let r2 = r2_low_discrepancy_offset(frame_wrap);
+
+    let pairs = volumetric_raymarch_16_step_offsets(base_jitter, march_cfg.distribution_power);
+    let step_offsets = [
+        [pairs[0].0, pairs[1].0, pairs[2].0, pairs[3].0],
+        [pairs[4].0, pairs[5].0, pairs[6].0, pairs[7].0],
+        [pairs[8].0, pairs[9].0, pairs[10].0, pairs[11].0],
+        [pairs[12].0, pairs[13].0, pairs[14].0, pairs[15].0],
+    ];
+
+    let aw = accum_width as f32;
+    let ah = accum_height as f32;
+
+    SsfxVolumetricPassPlan {
+        active,
+        accum_width,
+        accum_height,
+        sample_count: SSFX_VOLUMETRIC_RAYMARCH_SAMPLES as u32,
+        blue_noise_texture: LUT_NOISE_TEXTURE,
+        gpu_params: SsfxVolumetricShaftsGpuParams {
+            ssfx_volumetric: screen_cfg.volumetric,
+            phase_and_march: [g_anisotropy, sigma_t, sigma_s, max_dist],
+            sun_dir_and_intensity: [norm_sun[0], norm_sun[1], norm_sun[2], intensity],
+            frame_jitter_and_res: [temporal_jitter, r2[0], r2[1], frame_wrap as f32],
+            target_resolution: [aw, ah, 1.0 / aw, 1.0 / ah],
+            step_offsets,
+        },
+        blur_passes: ssfx_volumetric_blur_schedule(w, h),
+        combine_quad: build_combine_volumetric_quad(),
+    }
+}
+
+// ============================================================================
 // R4 Render Target Allocation Catalog (`CRenderTarget::CRenderTarget`, `r4_rendertarget.cpp`)
 // ============================================================================
 
@@ -4585,5 +4733,63 @@ mod tests {
         let wm = r4_phase_spec(R4RenderPhaseKind::Wallmarks, R4PhaseStateOptions::default());
         assert_eq!(wm.color_write_enable, Some([true, true, true, false]));
         assert_eq!(wm.stencil.unwrap().func, CmpFunc::LessEqual);
+    }
+
+    #[test]
+    fn ssfx_volumetric_shafts_plan_and_gpu_params() {
+        assert_eq!(std::mem::size_of::<SsfxVolumetricShaftsGpuParams>(), 144);
+        let screen_cfg = SsfxScreenConfig::default();
+        let march_cfg = VolumetricRaymarchConfig::default();
+
+        let plan0 = build_ssfx_volumetric_shafts_plan(
+            1920,
+            1080,
+            0,
+            [0.0, -3.0, 4.0],
+            0.85,
+            &screen_cfg,
+            &march_cfg,
+        );
+        assert!(plan0.active);
+        assert_eq!(plan0.accum_width, 240);
+        assert_eq!(plan0.accum_height, 135);
+        assert_eq!(plan0.sample_count, 16);
+        assert_eq!(plan0.blue_noise_texture, LUT_NOISE_TEXTURE);
+        assert_eq!(plan0.gpu_params.ssfx_volumetric, screen_cfg.volumetric);
+        assert!((plan0.gpu_params.sun_dir_and_intensity[1] + 0.6).abs() < 1e-6);
+        assert!((plan0.gpu_params.sun_dir_and_intensity[2] - 0.8).abs() < 1e-6);
+        assert_eq!(plan0.gpu_params.sun_dir_and_intensity[3], 0.85);
+        assert_eq!(plan0.gpu_params.target_resolution[0], 240.0);
+        assert!((plan0.gpu_params.target_resolution[2] - 1.0 / 240.0).abs() < 1e-6);
+        assert!((plan0.gpu_params.step_offsets[0][0] - 0.5 / 16.0).abs() < 1e-6);
+        assert!((plan0.gpu_params.step_offsets[3][3] - 15.5 / 16.0).abs() < 1e-6);
+        assert_eq!(plan0.blur_passes[0].viewport_w, 240.0);
+        assert_eq!(plan0.blur_passes[0].viewport_h, 135.0);
+        assert_eq!(plan0.combine_quad, build_combine_volumetric_quad());
+
+        let plan1 = build_ssfx_volumetric_shafts_plan(
+            1920,
+            1080,
+            17,
+            [0.0, 0.0, 0.0],
+            0.85,
+            &screen_cfg,
+            &march_cfg,
+        );
+        assert_eq!(plan1.gpu_params.frame_jitter_and_res[3], 1.0);
+        assert_ne!(plan1.gpu_params.frame_jitter_and_res[0], plan0.gpu_params.frame_jitter_and_res[0]);
+        assert_ne!(plan1.gpu_params.frame_jitter_and_res[1], plan0.gpu_params.frame_jitter_and_res[1]);
+        assert_eq!(plan1.gpu_params.sun_dir_and_intensity, [0.0, -1.0, 0.0, 0.85]);
+
+        let inactive = build_ssfx_volumetric_shafts_plan(
+            1920,
+            1080,
+            0,
+            [0.0, -1.0, 0.0],
+            0.0,
+            &screen_cfg,
+            &march_cfg,
+        );
+        assert!(!inactive.active);
     }
 }

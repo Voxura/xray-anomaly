@@ -9,6 +9,8 @@
 //! - `src/Layers/xrRender/Light_Package.h` & `Light_Package.cpp`
 //! - `src/Layers/xrRenderPC_R4/light_GI.cpp` & `r2_R_lights.cpp` (`render_indirect`)
 //! - `src/Layers/xrRender/LightTrack.h` & `LightTrack.cpp`
+//! - Phase 15 SSFX volumetric light shafts math: Henyey-Greenstein phase function,
+//!   16-sample raymarching coordinates + CSM projection, and tileable Void-and-Cluster blue noise LUTs.
 
 use std::f32::consts::FRAC_1_SQRT_2;
 
@@ -3139,6 +3141,672 @@ pub fn use_minmax_sm_this_frame(
     }
 }
 
+// ============================================================================
+// Phase 15 SSFX Volumetric Light Shafts: Henyey-Greenstein, 16-Sample
+// Raymarching Coordinates & Tileable Blue Noise Jitter Offset Tables
+// ============================================================================
+
+/// Clamp limit preventing `(1 + g^2 - 2g*mu)^(3/2)` division singularity at `|g| -> 1`.
+pub const HENYEY_GREENSTEIN_MAX_G: f32 = 0.999;
+
+/// Default forward-scattering anisotropy parameter `g` for SSFX atmospheric light shafts.
+pub const SSFX_VOLUMETRIC_DEFAULT_G: f32 = 0.72;
+
+/// Canonical step count (`16`) for Phase 15 SSFX volumetric raymarching.
+pub const SSFX_VOLUMETRIC_RAYMARCH_SAMPLES: usize = 16;
+
+/// Tileable SSFX blue noise LUT resolution (`64x64`, matching `fx\blue_noise`).
+pub const SSFX_BLUE_NOISE_SIZE: usize = 64;
+
+/// 2D blue noise offset table dimension (`16x16` = 256 offsets in `[0.0, 1.0)^2`).
+pub const SSFX_BLUE_NOISE_OFFSET_TABLE_SIZE: usize = 16;
+
+/// Frame cycle length (`16`) for temporal jitter tables.
+pub const SSFX_VOLUMETRIC_JITTER_FRAMES: usize = 16;
+
+/// Golden-ratio conjugate `(sqrt(5) - 1) / 2` for 1D low-discrepancy temporal jitter.
+pub const GOLDEN_RATIO_CONJUGATE: f32 = 0.618_034;
+
+/// Plastic-constant R2 quasi-random 2D step vector `(1/p, 1/p^2)` (`p^3 = p + 1`).
+pub const R2_QUASI_RANDOM_ALPHA: [f32; 2] = [0.754_877_7, 0.569_840_3];
+
+/// Normalized Henyey-Greenstein phase function over the unit sphere:
+/// `P_HG(cos_theta, g) = (1 - g^2) / (4 * pi * (1 + g^2 - 2 * g * cos_theta)^(3/2))`,
+/// where `cos_theta = +1` is pure forward scattering (looking directly toward the light).
+/// Integrates to `1.0` over the unit sphere (`integral d_omega P_HG = 1`).
+#[inline]
+pub fn henyey_greenstein_phase(cos_theta: f32, g: f32) -> f32 {
+    let mu = if cos_theta.is_finite() {
+        cos_theta.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let ga = if g.is_finite() {
+        g.clamp(-HENYEY_GREENSTEIN_MAX_G, HENYEY_GREENSTEIN_MAX_G)
+    } else {
+        0.0
+    };
+    let g2 = ga * ga;
+    let denom = (1.0 + g2 - 2.0 * ga * mu).max(1e-6);
+    ((1.0 - g2) / (4.0 * std::f32::consts::PI * denom * denom.sqrt())).max(0.0)
+}
+
+/// Isotropic-normalized Henyey-Greenstein weight `4 * pi * P_HG(cos_theta, g)`,
+/// equal to `1.0` everywhere for `g == 0.0` for artist-friendly volumetric scaling.
+#[inline]
+pub fn henyey_greenstein_phase_isotropic_normalized(cos_theta: f32, g: f32) -> f32 {
+    4.0 * std::f32::consts::PI * henyey_greenstein_phase(cos_theta, g)
+}
+
+/// Evaluate `henyey_greenstein_phase` from camera-to-point ray `view_dir_cam_to_point` and
+/// light propagation vector `light_propagation_dir` (X-Ray convention: pointing FROM light
+/// TOWARD scene, so forward scattering into the eye peaks when `dot(view_dir, -light_dir) == +1`).
+#[inline]
+pub fn henyey_greenstein_phase_rays(
+    view_dir_cam_to_point: [f32; 3],
+    light_propagation_dir: [f32; 3],
+    g: f32,
+) -> f32 {
+    let v = normalize3_or(view_dir_cam_to_point, [0.0, 0.0, 1.0]);
+    let l = normalize3_or(light_propagation_dir, [0.0, -1.0, 0.0]);
+    let cos_theta = -(dot3(v, l));
+    henyey_greenstein_phase(cos_theta, g)
+}
+
+/// Evaluate `henyey_greenstein_phase` from camera-to-point ray `view_dir_cam_to_point` and
+/// a vector `dir_to_light` pointing TOWARD the light source (`cos_theta = dot(v, dir_to_light)`).
+#[inline]
+pub fn henyey_greenstein_phase_to_light(
+    view_dir_cam_to_point: [f32; 3],
+    dir_to_light: [f32; 3],
+    g: f32,
+) -> f32 {
+    let v = normalize3_or(view_dir_cam_to_point, [0.0, 0.0, 1.0]);
+    let to_l = normalize3_or(dir_to_light, [0.0, 1.0, 0.0]);
+    henyey_greenstein_phase(dot3(v, to_l), g)
+}
+
+/// Two-lobe Henyey-Greenstein blend mixing forward lobe (`g_forward`) and back-scatter lobe (`g_back`).
+#[inline]
+pub fn dual_henyey_greenstein_phase(
+    cos_theta: f32,
+    g_forward: f32,
+    g_back: f32,
+    forward_blend: f32,
+) -> f32 {
+    let alpha = if forward_blend.is_finite() {
+        forward_blend.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let fwd = henyey_greenstein_phase(cos_theta, g_forward);
+    let back = henyey_greenstein_phase(cos_theta, g_back);
+    back + (fwd - back) * alpha
+}
+
+/// Configuration for Phase 15 16-sample SSFX volumetric raymarching.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumetricRaymarchConfig {
+    /// Minimum start distance along the camera ray (meters, default `0.2`).
+    pub min_distance: f32,
+    /// Maximum raymarch reach in meters (default `160.0`, matching Phase 15 far CSM cascade).
+    pub max_distance: f32,
+    /// Henyey-Greenstein anisotropy factor `g` in `[-0.999, 0.999]`.
+    pub g_anisotropy: f32,
+    /// Volume extinction coefficient `sigma_t` (`1 / meter`).
+    pub extinction_sigma_t: f32,
+    /// Volume in-scattering coefficient `sigma_s` (`1 / meter`).
+    pub scattering_sigma_s: f32,
+    /// Per-pixel / per-frame stratified blue noise jitter in `[0.0, 1.0)` (`0.5` = stratum midpoint).
+    pub jitter_offset: f32,
+    /// Normalized step warp exponent (`1.0` = linear steps, `> 1.0` concentrates steps near camera).
+    pub distribution_power: f32,
+}
+
+impl Default for VolumetricRaymarchConfig {
+    fn default() -> Self {
+        Self {
+            min_distance: 0.2,
+            max_distance: 160.0,
+            g_anisotropy: SSFX_VOLUMETRIC_DEFAULT_G,
+            extinction_sigma_t: 0.012,
+            scattering_sigma_s: 0.010,
+            jitter_offset: 0.5,
+            distribution_power: 1.0,
+        }
+    }
+}
+
+/// Single step coordinate emitted by [`compute_volumetric_raymarch_16`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumetricRaymarchSample {
+    pub step_index: u32,
+    /// Normalized march coordinate `t` in `[0.0, 1.0]`.
+    pub t_normalized: f32,
+    /// Normalized width `dt` of stratum `step_index` (sum across all 16 steps = `1.0`).
+    pub step_dt_normalized: f32,
+    /// Distance in meters along `ray_dir` from `ray_origin`.
+    pub ray_distance: f32,
+    /// World-space interval length `ds` represented by this sample (meters).
+    pub step_length: f32,
+    /// World-space sample coordinate `ray_origin + ray_dir * ray_distance`.
+    pub world_pos: [f32; 3],
+}
+
+/// Complete 16-sample raymarch trajectory along a camera pixel ray.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumetricRaymarch16 {
+    pub ray_origin: [f32; 3],
+    pub ray_dir: [f32; 3],
+    pub start_distance: f32,
+    pub end_distance: f32,
+    pub samples: [VolumetricRaymarchSample; SSFX_VOLUMETRIC_RAYMARCH_SAMPLES],
+}
+
+/// 16-sample raymarch coordinate paired with Phase 15 3-split CSM atlas lookup data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumetricCsmSample {
+    pub sample: VolumetricRaymarchSample,
+    pub cascade_index: Option<usize>,
+    /// `[atlas_u, atlas_v, biased_depth]` inside [`crate::sun::CsmAtlasPlan`], or `None` if outside.
+    pub atlas_uv_depth: Option<[f32; 3]>,
+}
+
+/// Compute 16 normalized `(t_sample, dt_interval)` pairs for stratified raymarching.
+///
+/// With `distribution_power == 1.0` and `jitter_offset == 0.5`, each stratum `[i/16, (i+1)/16]`
+/// is sampled at midpoint `(i + 0.5) / 16.0` with exact weight `dt = 1.0 / 16.0`.
+#[inline]
+pub fn volumetric_raymarch_16_step_offsets(
+    jitter_offset: f32,
+    distribution_power: f32,
+) -> [(f32, f32); SSFX_VOLUMETRIC_RAYMARCH_SAMPLES] {
+    let jitter = if jitter_offset.is_finite() {
+        jitter_offset.rem_euclid(1.0)
+    } else {
+        0.5
+    };
+    let power = if distribution_power.is_finite() && distribution_power > 0.01 {
+        distribution_power
+    } else {
+        1.0
+    };
+    let inv_n = 1.0 / SSFX_VOLUMETRIC_RAYMARCH_SAMPLES as f32;
+    std::array::from_fn(|i| {
+        let u0 = i as f32 * inv_n;
+        let u1 = (i + 1) as f32 * inv_n;
+        let u_s = (i as f32 + jitter) * inv_n;
+        let t_sample = if (power - 1.0).abs() <= 1e-6 {
+            u_s
+        } else {
+            u_s.powf(power)
+        };
+        let dt = if (power - 1.0).abs() <= 1e-6 {
+            inv_n
+        } else {
+            u1.powf(power) - u0.powf(power)
+        };
+        (t_sample, dt)
+    })
+}
+
+/// Compute 16 world-space raymarching sample coordinates along `(ray_origin, ray_dir)` up to
+/// `min(max_scene_distance, cfg.max_distance)`.
+pub fn compute_volumetric_raymarch_16_dir(
+    ray_origin: [f32; 3],
+    ray_dir: [f32; 3],
+    max_scene_distance: f32,
+    cfg: &VolumetricRaymarchConfig,
+) -> VolumetricRaymarch16 {
+    let dir = normalize3_or(ray_dir, [0.0, 0.0, 1.0]);
+    let start_distance = if cfg.min_distance.is_finite() {
+        cfg.min_distance.max(0.0)
+    } else {
+        0.0
+    };
+    let max_cfg = if cfg.max_distance.is_finite() {
+        cfg.max_distance.max(start_distance)
+    } else {
+        start_distance
+    };
+    let end_distance = if max_scene_distance.is_finite() {
+        max_scene_distance.clamp(start_distance, max_cfg)
+    } else {
+        max_cfg
+    };
+    let total_len = (end_distance - start_distance).max(0.0);
+    let offsets = volumetric_raymarch_16_step_offsets(cfg.jitter_offset, cfg.distribution_power);
+
+    let samples = std::array::from_fn(|i| {
+        let (t_normalized, step_dt_normalized) = offsets[i];
+        let ray_distance = start_distance + t_normalized * total_len;
+        let step_length = step_dt_normalized * total_len;
+        let world_pos = [
+            ray_origin[0] + dir[0] * ray_distance,
+            ray_origin[1] + dir[1] * ray_distance,
+            ray_origin[2] + dir[2] * ray_distance,
+        ];
+        VolumetricRaymarchSample {
+            step_index: i as u32,
+            t_normalized,
+            step_dt_normalized,
+            ray_distance,
+            step_length,
+            world_pos,
+        }
+    });
+
+    VolumetricRaymarch16 {
+        ray_origin,
+        ray_dir: dir,
+        start_distance,
+        end_distance,
+        samples,
+    }
+}
+
+/// Compute 16 world-space raymarching sample coordinates from `camera_pos` toward `pixel_world_pos`,
+/// automatically clamping travel distance to `[cfg.min_distance, cfg.max_distance]`.
+pub fn compute_volumetric_raymarch_16(
+    camera_pos: [f32; 3],
+    pixel_world_pos: [f32; 3],
+    cfg: &VolumetricRaymarchConfig,
+) -> VolumetricRaymarch16 {
+    let delta = [
+        pixel_world_pos[0] - camera_pos[0],
+        pixel_world_pos[1] - camera_pos[1],
+        pixel_world_pos[2] - camera_pos[2],
+    ];
+    let dist_sq = dot3(delta, delta);
+    let dist = if dist_sq.is_finite() && dist_sq > 0.0 {
+        dist_sq.sqrt()
+    } else {
+        0.0
+    };
+    let dir = normalize3_or(delta, [0.0, 0.0, 1.0]);
+    compute_volumetric_raymarch_16_dir(camera_pos, dir, dist, cfg)
+}
+
+/// Project all 16 raymarching steps into a Phase 15 3-split CSM atlas ([`crate::sun::CsmAtlasPlan`]),
+/// selecting the cascade by camera-forward Z depth and computing clamped `[u, v, biased_depth]` lookups.
+pub fn project_volumetric_raymarch_16_to_csm(
+    march: &VolumetricRaymarch16,
+    csm_plan: &crate::sun::CsmAtlasPlan,
+    view_forward_dir: [f32; 3],
+    extra_depth_bias: f32,
+) -> [VolumetricCsmSample; SSFX_VOLUMETRIC_RAYMARCH_SAMPLES] {
+    let fwd = normalize3_or(view_forward_dir, march.ray_dir);
+    std::array::from_fn(|i| {
+        let sample = march.samples[i];
+        let rel = [
+            sample.world_pos[0] - march.ray_origin[0],
+            sample.world_pos[1] - march.ray_origin[1],
+            sample.world_pos[2] - march.ray_origin[2],
+        ];
+        let view_depth = dot3(rel, fwd);
+        let cascade_index = crate::sun::select_csm_cascade(view_depth, &csm_plan.split_distances);
+        let atlas_uv_depth = cascade_index.and_then(|c_idx| {
+            crate::sun::project_world_to_csm_atlas(
+                sample.world_pos,
+                &csm_plan.slots[c_idx],
+                extra_depth_bias,
+            )
+        });
+        VolumetricCsmSample {
+            sample,
+            cascade_index,
+            atlas_uv_depth,
+        }
+    })
+}
+
+/// Integrate single-scattered volumetric sunlight and Beer-Lambert transmittance `(inscattered_rgb, transmittance)`
+/// across all 16 samples using Henyey-Greenstein phase evaluation and analytic per-step segment integration.
+pub fn integrate_volumetric_raymarch_16<F>(
+    march: &VolumetricRaymarch16,
+    sun_propagation_dir: [f32; 3],
+    sun_radiance_rgb: [f32; 3],
+    cfg: &VolumetricRaymarchConfig,
+    mut shadow_visibility: F,
+) -> ([f32; 3], f32)
+where
+    F: FnMut(&VolumetricRaymarchSample) -> f32,
+{
+    let phase = henyey_greenstein_phase_rays(march.ray_dir, sun_propagation_dir, cfg.g_anisotropy);
+    let sigma_t = if cfg.extinction_sigma_t.is_finite() {
+        cfg.extinction_sigma_t.max(0.0)
+    } else {
+        0.0
+    };
+    let sigma_s = if cfg.scattering_sigma_s.is_finite() {
+        cfg.scattering_sigma_s.max(0.0)
+    } else {
+        0.0
+    };
+
+    let mut transmittance = 1.0f32;
+    let mut accum = [0.0f32; 3];
+    for sample in &march.samples {
+        let ds = sample.step_length.max(0.0);
+        if ds <= 0.0 {
+            continue;
+        }
+        let vis = shadow_visibility(sample).clamp(0.0, 1.0);
+        let step_tr = (-sigma_t * ds).exp();
+        let integ_len = if sigma_t > 1e-6 {
+            (1.0 - step_tr) / sigma_t
+        } else {
+            ds
+        };
+        let coeff = transmittance * vis * sigma_s * phase * integ_len;
+        accum[0] += coeff * sun_radiance_rgb[0];
+        accum[1] += coeff * sun_radiance_rgb[1];
+        accum[2] += coeff * sun_radiance_rgb[2];
+        transmittance *= step_tr;
+    }
+
+    (accum, transmittance)
+}
+
+/// Toroidal Ulichney Void-and-Cluster rank permutation generator on an `N x N` grid (`N >= 2`).
+fn generate_void_and_cluster_ranks<const N: usize>(seed: u32, sigma: f32) -> Vec<u16> {
+    let total = N * N;
+    let init_ones = (total / 10).clamp(1, total.saturating_sub(1));
+
+    // Truncated 2D Gaussian toroidal kernel stored in fixed-point `i64` (`1e9` scale) to avoid drift.
+    let radius: isize = ((sigma * 6.0).ceil() as isize).clamp(1, (N as isize) / 2);
+    let patch_dim = (radius * 2 + 1) as usize;
+    let two_sig_sq = 2.0 * (sigma.max(0.25) as f64) * (sigma.max(0.25) as f64);
+    let mut kernel = vec![0i64; patch_dim * patch_dim];
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let d2 = (dx * dx + dy * dy) as f64;
+            let w = ((-d2 / two_sig_sq).exp() * 1_000_000_000.0).round() as i64;
+            kernel[((dy + radius) as usize) * patch_dim + ((dx + radius) as usize)] = w;
+        }
+    }
+
+    // Seed initial ~10% binary pattern using partial Fisher-Yates shuffle.
+    let mut rng = CrngLcg::new(seed);
+    let mut indices: Vec<usize> = (0..total).collect();
+    let mut pat = vec![false; total];
+    for i in 0..init_ones {
+        let rem = total - i;
+        // Combine two 15-bit LCG draws so indices > 32767 stay uniform if `total` grows.
+        let r_big = ((rng.rand_i() as usize) << 15) ^ (rng.rand_i() as usize);
+        let j = i + (r_big % rem);
+        indices.swap(i, j);
+        pat[indices[i]] = true;
+    }
+
+    let mut energy = vec![0i64; total];
+    let mut row_min_zero = vec![(i64::MAX, u16::MAX); N];
+    let mut row_max_one = vec![(i64::MIN, u16::MAX); N];
+
+    let recompute_row =
+        |r: usize, pat: &[bool], energy: &[i64], min_z: &mut [(i64, u16)], max_o: &mut [(i64, u16)]| {
+            let base = r * N;
+            let mut best_z_e = i64::MAX;
+            let mut best_z_c = u16::MAX;
+            let mut best_o_e = i64::MIN;
+            let mut best_o_c = u16::MAX;
+            for c in 0..N {
+                let e = energy[base + c];
+                if pat[base + c] {
+                    if e > best_o_e {
+                        best_o_e = e;
+                        best_o_c = c as u16;
+                    }
+                } else if e < best_z_e {
+                    best_z_e = e;
+                    best_z_c = c as u16;
+                }
+            }
+            min_z[r] = (best_z_e, best_z_c);
+            max_o[r] = (best_o_e, best_o_c);
+        };
+
+    let add_kernel_at = |idx: usize, sign: i64, energy: &mut [i64]| {
+        let cx = (idx % N) as isize;
+        let cy = (idx / N) as isize;
+        for dy in -radius..=radius {
+            let ny = (cy + dy).rem_euclid(N as isize) as usize;
+            let row_base = ny * N;
+            let k_row = ((dy + radius) as usize) * patch_dim;
+            for dx in -radius..=radius {
+                let nx = (cx + dx).rem_euclid(N as isize) as usize;
+                let w = kernel[k_row + ((dx + radius) as usize)];
+                energy[row_base + nx] += sign * w;
+            }
+        }
+    };
+
+    for (idx, &is_one) in pat.iter().enumerate() {
+        if is_one {
+            add_kernel_at(idx, 1, &mut energy);
+        }
+    }
+    for r in 0..N {
+        recompute_row(r, &pat, &energy, &mut row_min_zero, &mut row_max_one);
+    }
+
+    let toggle_and_refresh = |idx: usize,
+                              new_val: bool,
+                              pat: &mut [bool],
+                              energy: &mut [i64],
+                              min_z: &mut [(i64, u16)],
+                              max_o: &mut [(i64, u16)]| {
+        let sign = if new_val { 1i64 } else { -1i64 };
+        pat[idx] = new_val;
+        add_kernel_at(idx, sign, energy);
+        let cy = (idx / N) as isize;
+        if (radius * 2 + 1) as usize >= N {
+            for r in 0..N {
+                recompute_row(r, pat, energy, min_z, max_o);
+            }
+        } else {
+            for dy in -radius..=radius {
+                let ny = (cy + dy).rem_euclid(N as isize) as usize;
+                recompute_row(ny, pat, energy, min_z, max_o);
+            }
+        }
+    };
+
+    let find_argmax_one = |max_o: &[(i64, u16)]| -> usize {
+        let mut best_e = i64::MIN;
+        let mut best_idx = 0usize;
+        for (r, &(e, c)) in max_o.iter().enumerate() {
+            if c != u16::MAX && e > best_e {
+                best_e = e;
+                best_idx = r * N + c as usize;
+            }
+        }
+        best_idx
+    };
+
+    let find_argmin_zero = |min_z: &[(i64, u16)]| -> usize {
+        let mut best_e = i64::MAX;
+        let mut best_idx = 0usize;
+        for (r, &(e, c)) in min_z.iter().enumerate() {
+            if c != u16::MAX && e < best_e {
+                best_e = e;
+                best_idx = r * N + c as usize;
+            }
+        }
+        best_idx
+    };
+
+    // Phase 1: Relax initial prototype pattern into maximally uniform blue-noise clusters/voids.
+    let max_swaps = total;
+    for _ in 0..max_swaps {
+        let c_idx = find_argmax_one(&row_max_one);
+        toggle_and_refresh(
+            c_idx,
+            false,
+            &mut pat,
+            &mut energy,
+            &mut row_min_zero,
+            &mut row_max_one,
+        );
+        let v_idx = find_argmin_zero(&row_min_zero);
+        toggle_and_refresh(
+            v_idx,
+            true,
+            &mut pat,
+            &mut energy,
+            &mut row_min_zero,
+            &mut row_max_one,
+        );
+        if v_idx == c_idx {
+            break;
+        }
+    }
+
+    let proto_pat = pat.clone();
+    let proto_energy = energy.clone();
+    let proto_min_z = row_min_zero.clone();
+    let proto_max_o = row_max_one.clone();
+
+    let mut ranks = vec![0u16; total];
+
+    // Phase 2: Iteratively rank and clear the tightest remaining 1 down to 0.
+    for rank in (0..init_ones).rev() {
+        let c_idx = find_argmax_one(&row_max_one);
+        ranks[c_idx] = rank as u16;
+        toggle_and_refresh(
+            c_idx,
+            false,
+            &mut pat,
+            &mut energy,
+            &mut row_min_zero,
+            &mut row_max_one,
+        );
+    }
+
+    // Phase 3: Restore prototype and iteratively fill largest void up to N*N - 1.
+    // On the torus, E_zeros = const - E_ones, so argmax_{zeros}(E_zeros) == argmin_{zeros}(E_ones).
+    pat = proto_pat;
+    energy = proto_energy;
+    row_min_zero = proto_min_z;
+    row_max_one = proto_max_o;
+    for rank in init_ones..total {
+        let v_idx = find_argmin_zero(&row_min_zero);
+        ranks[v_idx] = rank as u16;
+        toggle_and_refresh(
+            v_idx,
+            true,
+            &mut pat,
+            &mut energy,
+            &mut row_min_zero,
+            &mut row_max_one,
+        );
+    }
+
+    ranks
+}
+
+/// Generate a tileable `64x64` (`4096` elements) single-channel blue noise LUT in `[0.0, 1.0)`
+/// via Ulichney's Void-and-Cluster method (`sigma = 1.9`).
+///
+/// The returned values form an exact stratified permutation of `{i / 4096.0 | i in 0..4096}`.
+pub fn generate_blue_noise_64x64_f32(seed: u32) -> Vec<f32> {
+    let ranks = generate_void_and_cluster_ranks::<SSFX_BLUE_NOISE_SIZE>(seed, 1.9);
+    let inv = 1.0 / (SSFX_BLUE_NOISE_SIZE * SSFX_BLUE_NOISE_SIZE) as f32;
+    ranks.into_iter().map(|r| r as f32 * inv).collect()
+}
+
+/// Generate a 4-channel `64x64` RGBA8 tileable blue noise texture matching `fx\blue_noise`
+/// (`shaders_xr.rs`), using 4 independently seeded Void-and-Cluster passes.
+pub fn generate_ssfx_blue_noise_rgba8(seed: u32) -> Vec<[u8; 4]> {
+    let r = generate_void_and_cluster_ranks::<SSFX_BLUE_NOISE_SIZE>(seed, 1.9);
+    let g = generate_void_and_cluster_ranks::<SSFX_BLUE_NOISE_SIZE>(seed.wrapping_add(101), 1.9);
+    let b = generate_void_and_cluster_ranks::<SSFX_BLUE_NOISE_SIZE>(seed.wrapping_add(202), 1.9);
+    let a = generate_void_and_cluster_ranks::<SSFX_BLUE_NOISE_SIZE>(seed.wrapping_add(303), 1.9);
+
+    let total = SSFX_BLUE_NOISE_SIZE * SSFX_BLUE_NOISE_SIZE;
+    (0..total)
+        .map(|i| {
+            [
+                (r[i] >> 4) as u8,
+                (g[i] >> 4) as u8,
+                (b[i] >> 4) as u8,
+                (a[i] >> 4) as u8,
+            ]
+        })
+        .collect()
+}
+
+/// Generate a tileable `16x16` (`256` entries) 2D blue noise jitter offset LUT in `[0.0, 1.0)^2`.
+pub fn generate_blue_noise_offset_table_16x16(seed: u32) -> Vec<[f32; 2]> {
+    let x_ranks =
+        generate_void_and_cluster_ranks::<SSFX_BLUE_NOISE_OFFSET_TABLE_SIZE>(seed, 1.5);
+    let y_ranks = generate_void_and_cluster_ranks::<SSFX_BLUE_NOISE_OFFSET_TABLE_SIZE>(
+        seed.wrapping_add(101),
+        1.5,
+    );
+    let inv = 1.0 / (SSFX_BLUE_NOISE_OFFSET_TABLE_SIZE * SSFX_BLUE_NOISE_OFFSET_TABLE_SIZE) as f32;
+    x_ranks
+        .into_iter()
+        .zip(y_ranks)
+        .map(|(x, y)| [x as f32 * inv, y as f32 * inv])
+        .collect()
+}
+
+/// Sample a tileable `64x64` blue noise LUT at `(pixel_x, pixel_y)` and animate across frames
+/// using the golden-ratio sequence `(value + frame_index * phi_conjugate).fract()`.
+#[inline]
+pub fn blue_noise_jitter_at_pixel(
+    blue_noise_64x64: &[f32],
+    pixel_x: u32,
+    pixel_y: u32,
+    frame_index: u32,
+) -> f32 {
+    if blue_noise_64x64.len() < SSFX_BLUE_NOISE_SIZE * SSFX_BLUE_NOISE_SIZE {
+        return (frame_index as f32 * GOLDEN_RATIO_CONJUGATE).fract();
+    }
+    let tx = (pixel_x as usize) & (SSFX_BLUE_NOISE_SIZE - 1);
+    let ty = (pixel_y as usize) & (SSFX_BLUE_NOISE_SIZE - 1);
+    let base = blue_noise_64x64[ty * SSFX_BLUE_NOISE_SIZE + tx];
+    (base + (frame_index as f32) * GOLDEN_RATIO_CONJUGATE).rem_euclid(1.0)
+}
+
+/// Screen-space Interleaved Gradient Noise (Jimenez 2014) with 64-frame temporal pixel cycling,
+/// returning a scalar jitter in `[0.0, 1.0)`.
+#[inline]
+pub fn interleaved_gradient_noise(pixel_x: u32, pixel_y: u32, frame_index: u32) -> f32 {
+    let frame_wrap = (frame_index & 63) as f32;
+    let fx = pixel_x as f32 + 5.588_238 * frame_wrap;
+    let fy = pixel_y as f32 + 5.588_238 * frame_wrap;
+    let d = 0.067_110_56 * fx + 0.005_837_15 * fy;
+    (52.982_918 * d.fract()).rem_euclid(1.0)
+}
+
+/// Low-discrepancy 2D R2 offset `(0.5 + index * alpha).fract()` in `[0.0, 1.0)^2`.
+#[inline]
+pub fn r2_low_discrepancy_offset(sample_index: u32) -> [f32; 2] {
+    let k = (sample_index as f32) + 1.0;
+    [
+        (0.5 + k * R2_QUASI_RANDOM_ALPHA[0]).rem_euclid(1.0),
+        (0.5 + k * R2_QUASI_RANDOM_ALPHA[1]).rem_euclid(1.0),
+    ]
+}
+
+/// Build the 16-frame temporal jitter offset LUT `[scalar_ray_jitter, r2_x, r2_y, frame_index]`
+/// for SSFX volumetric raymarching & TAA temporal accumulation.
+pub fn build_ssfx_volumetric_temporal_jitter_table_16(
+    base_blue_noise_64x64: Option<&[f32]>,
+) -> [[f32; 4]; SSFX_VOLUMETRIC_JITTER_FRAMES] {
+    let origin_seed = base_blue_noise_64x64
+        .and_then(|lut| lut.first().copied())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
+    std::array::from_fn(|frame| {
+        let scalar = (origin_seed + (frame as f32) * GOLDEN_RATIO_CONJUGATE).rem_euclid(1.0);
+        let r2 = r2_low_discrepancy_offset(frame as u32);
+        [scalar, r2[0], r2[1], frame as f32]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3772,5 +4440,227 @@ mod tests {
         assert!(!need_to_render_sunshafts(true, 0, 0.25));
         assert!(use_minmax_sm_this_frame(MinMaxSmMode::AutoDetect, 1920, 1080, 1_000_000, true));
         assert!(!use_minmax_sm_this_frame(MinMaxSmMode::AutoDetect, 800, 600, 1_000_000, true));
+    }
+
+    #[test]
+    fn phase15_henyey_greenstein_and_16_sample_volumetric_raymarch() {
+        // Isotropic limit g = 0 => P_HG = 1 / (4 * pi) everywhere.
+        let iso = 1.0 / (4.0 * std::f32::consts::PI);
+        for &mu in &[-1.0, -0.5, 0.0, 0.5, 1.0] {
+            assert!((henyey_greenstein_phase(mu, 0.0) - iso).abs() < 1e-6);
+            assert!((henyey_greenstein_phase_isotropic_normalized(mu, 0.0) - 1.0).abs() < 1e-6);
+        }
+
+        // Forward anisotropy g > 0 concentrates scattering toward cos_theta = +1.
+        let fwd = henyey_greenstein_phase(1.0, 0.72);
+        let side = henyey_greenstein_phase(0.0, 0.72);
+        let back = henyey_greenstein_phase(-1.0, 0.72);
+        assert!(fwd > side * 5.0 && side > back * 2.0);
+
+        // Unit-sphere normalization: integral_{-1}^{1} 2*pi * P_HG(mu, g) dmu == 1.0.
+        for &g in &[-0.65f32, 0.0, 0.72, 0.9] {
+            let steps = 4000usize;
+            let dmu = 2.0 / steps as f32;
+            let mut integral = 0.0f32;
+            for i in 0..steps {
+                let mu = -1.0 + (i as f32 + 0.5) * dmu;
+                integral += 2.0 * std::f32::consts::PI * henyey_greenstein_phase(mu, g) * dmu;
+            }
+            assert!(
+                (integral - 1.0).abs() < 1e-3,
+                "HG integral for g={g} drifted: {integral}"
+            );
+        }
+
+        // Dual lobe normalization & directional ray alignment
+        let dual_fwd = dual_henyey_greenstein_phase(1.0, 0.75, -0.3, 0.8);
+        let dual_back = dual_henyey_greenstein_phase(-1.0, 0.75, -0.3, 0.8);
+        assert!(dual_fwd > dual_back);
+        assert!(
+            (henyey_greenstein_phase_rays([0.0, 0.0, 1.0], [0.0, 0.0, -1.0], 0.72) - fwd).abs()
+                < 1e-6
+        );
+        assert!(
+            (henyey_greenstein_phase_to_light([0.0, 0.0, 1.0], [0.0, 0.0, 1.0], 0.72) - fwd)
+                .abs()
+                < 1e-6
+        );
+
+        // 16-sample raymarch step offsets & world-space march trajectory
+        let lin_steps = volumetric_raymarch_16_step_offsets(0.5, 1.0);
+        assert_eq!(lin_steps.len(), SSFX_VOLUMETRIC_RAYMARCH_SAMPLES);
+        assert!((lin_steps[0].0 - 0.5 / 16.0).abs() < 1e-6);
+        assert!((lin_steps[15].0 - 15.5 / 16.0).abs() < 1e-6);
+        let dt_sum: f32 = lin_steps.iter().map(|s| s.1).sum();
+        assert!((dt_sum - 1.0).abs() < 1e-6);
+
+        let pow_steps = volumetric_raymarch_16_step_offsets(0.25, 2.0);
+        let pow_dt_sum: f32 = pow_steps.iter().map(|s| s.1).sum();
+        assert!((pow_dt_sum - 1.0).abs() < 1e-6);
+        assert!(pow_steps[15].1 > pow_steps[0].1);
+
+        let cfg = VolumetricRaymarchConfig {
+            min_distance: 0.5,
+            max_distance: 100.5,
+            g_anisotropy: 0.72,
+            extinction_sigma_t: 0.015,
+            scattering_sigma_s: 0.012,
+            jitter_offset: 0.5,
+            distribution_power: 1.0,
+        };
+        let march = compute_volumetric_raymarch_16([0.0, 2.0, 0.0], [0.0, 2.0, 250.0], &cfg);
+        assert_eq!(march.start_distance, 0.5);
+        assert_eq!(march.end_distance, 100.5);
+        assert!((march.samples[0].world_pos[2] - (0.5 + 100.0 * (0.5 / 16.0))).abs() < 1e-4);
+        assert!((march.samples[15].world_pos[2] - (0.5 + 100.0 * (15.5 / 16.0))).abs() < 1e-4);
+        let ds_sum: f32 = march.samples.iter().map(|s| s.step_length).sum();
+        assert!((ds_sum - 100.0).abs() < 1e-4);
+
+        // Analytic Beer-Lambert telescoping verification in uniform unoccluded media
+        let sun_prop = [0.0, 0.0, -1.0];
+        let sun_rad = [4.0, 3.0, 2.0];
+        let (inscatter, tr) =
+            integrate_volumetric_raymarch_16(&march, sun_prop, sun_rad, &cfg, |_| 1.0);
+        let expected_tr = (-cfg.extinction_sigma_t * 100.0).exp();
+        assert!((tr - expected_tr).abs() < 1e-5);
+        let exact_scale =
+            fwd * (cfg.scattering_sigma_s / cfg.extinction_sigma_t) * (1.0 - expected_tr);
+        assert!((inscatter[0] - sun_rad[0] * exact_scale).abs() < 1e-4);
+        assert!((inscatter[1] - sun_rad[1] * exact_scale).abs() < 1e-4);
+
+        // Phase 15 3-split CSM atlas projection along the 16 raymarch steps
+        let cam_pos = [0.0, 2.0, 0.0];
+        let cam_dir = [0.0, 0.0, 1.0];
+        let view = matrix_build_camera_dir(cam_pos, cam_dir, [0.0, 1.0, 0.0]);
+        let proj = matrix_build_projection(67.5f32.to_radians(), 9.0 / 16.0, 0.2, 200.0);
+        let sun_dir = normalize3_or([0.3, -0.8, 0.4], [0.0, -1.0, 0.0]);
+        let sun_pos = [
+            cam_pos[0] - sun_dir[0] * 500.0,
+            cam_pos[1] - sun_dir[1] * 500.0,
+            cam_pos[2] - sun_dir[2] * 500.0,
+        ];
+        let csm = crate::sun::build_3split_csm_atlas(
+            &crate::sun::SunCascadeConfig::default(),
+            cam_pos,
+            cam_dir,
+            &view,
+            &proj,
+            sun_pos,
+            sun_dir,
+            512,
+            crate::sun::CsmAtlasPacking::Row3x1,
+            0.1,
+            true,
+        )
+        .expect("3-split CSM atlas plan");
+        let csm_samples = project_volumetric_raymarch_16_to_csm(&march, &csm, cam_dir, 0.0);
+        assert_eq!(csm_samples.len(), SSFX_VOLUMETRIC_RAYMARCH_SAMPLES);
+        assert_eq!(csm_samples[0].cascade_index, Some(0));
+        assert!(csm_samples.iter().any(|s| s.cascade_index == Some(1)));
+        assert!(csm_samples.iter().any(|s| s.cascade_index == Some(2)));
+        for cs in &csm_samples {
+            if let Some(uvd) = cs.atlas_uv_depth {
+                assert!((0.0..=1.0).contains(&uvd[0]));
+                assert!((0.0..=1.0).contains(&uvd[1]));
+                assert!((0.0..=1.0).contains(&uvd[2]));
+            }
+        }
+    }
+
+    #[test]
+    fn phase15_blue_noise_void_and_cluster_and_jitter_tables() {
+        let bn = generate_blue_noise_64x64_f32(42);
+        assert_eq!(bn.len(), SSFX_BLUE_NOISE_SIZE * SSFX_BLUE_NOISE_SIZE);
+        assert!(bn.iter().all(|&v| (0.0..1.0).contains(&v)));
+
+        // Verify Void-and-Cluster rank permutation covers every quantile 0..4095 exactly once.
+        let mut rank_seen = vec![false; 4096];
+        for &v in &bn {
+            let r = (v * 4096.0).round() as usize;
+            assert!(!rank_seen[r], "duplicate quantile rank {r}");
+            rank_seen[r] = true;
+        }
+
+        // Verify toroidal blue-noise spectrum: high frequencies strongly dominate low frequencies.
+        let mean = 0.5f64 - 0.5 / 4096.0;
+        let dft_mag_sq = |kx: i32, ky: i32| -> f64 {
+            let mut re = 0.0f64;
+            let mut im = 0.0f64;
+            for y in 0..SSFX_BLUE_NOISE_SIZE {
+                for x in 0..SSFX_BLUE_NOISE_SIZE {
+                    let val = bn[y * SSFX_BLUE_NOISE_SIZE + x] as f64 - mean;
+                    let ang = -std::f64::consts::TAU
+                        * ((kx * x as i32 + ky * y as i32) as f64 / SSFX_BLUE_NOISE_SIZE as f64);
+                    let (s, c) = ang.sin_cos();
+                    re += val * c;
+                    im += val * s;
+                }
+            }
+            re * re + im * im
+        };
+        let mut low_power = 0.0f64;
+        let mut low_cnt = 0usize;
+        for ky in -2..=2 {
+            for kx in -2..=2 {
+                if kx != 0 || ky != 0 {
+                    low_power += dft_mag_sq(kx, ky);
+                    low_cnt += 1;
+                }
+            }
+        }
+        let mut high_power = 0.0f64;
+        let mut high_cnt = 0usize;
+        for &(kx, ky) in &[(28, 0), (0, 28), (24, 24), (32, 32), (-24, 28)] {
+            high_power += dft_mag_sq(kx, ky);
+            high_cnt += 1;
+        }
+        let low_avg = low_power / low_cnt as f64;
+        let high_avg = high_power / high_cnt as f64;
+        assert!(
+            low_avg * 4.0 < high_avg,
+            "expected blue noise low_avg ({low_avg:.2}) << high_avg ({high_avg:.2})"
+        );
+
+        // 4-channel RGBA8 fx\blue_noise texture: uniform histogram + pairwise channel decorrelation.
+        let rgba = generate_ssfx_blue_noise_rgba8(7);
+        assert_eq!(rgba.len(), 4096);
+        let mut hist_r = [0u32; 256];
+        let mut cov_rg = 0.0f64;
+        for &[r, g, _, _] in &rgba {
+            hist_r[r as usize] += 1;
+            cov_rg += (r as f64 - 127.5) * (g as f64 - 127.5);
+        }
+        assert!(hist_r.iter().all(|&c| c == 16));
+        let var_u8 = 4096.0 * (256.0 * 256.0 - 1.0) / 12.0;
+        let corr_rg = cov_rg / var_u8;
+        assert!(corr_rg.abs() < 0.08, "R/G channels correlated: {corr_rg}");
+
+        // 16x16 2D blue noise offset table
+        let offsets = generate_blue_noise_offset_table_16x16(13);
+        assert_eq!(offsets.len(), 256);
+        assert!(offsets
+            .iter()
+            .all(|o| (0.0..1.0).contains(&o[0]) && (0.0..1.0).contains(&o[1])));
+
+        // Spatial/temporal helpers & 16-frame table
+        let j0 = blue_noise_jitter_at_pixel(&bn, 129, 65, 0);
+        let j_wrap = blue_noise_jitter_at_pixel(&bn, 1, 1, 0);
+        assert!((j0 - j_wrap).abs() < 1e-6);
+        let j1 = blue_noise_jitter_at_pixel(&bn, 1, 1, 1);
+        assert!(((j1 - j0).rem_euclid(1.0) - GOLDEN_RATIO_CONJUGATE).abs() < 1e-5);
+
+        let ign = interleaved_gradient_noise(120, 340, 5);
+        assert!((0.0..1.0).contains(&ign));
+        let r2 = r2_low_discrepancy_offset(7);
+        assert!((0.0..1.0).contains(&r2[0]) && (0.0..1.0).contains(&r2[1]));
+
+        let tbl16 = build_ssfx_volumetric_temporal_jitter_table_16(Some(&bn));
+        assert_eq!(tbl16.len(), 16);
+        for (idx, row) in tbl16.iter().enumerate() {
+            assert!((0.0..1.0).contains(&row[0]));
+            assert!((0.0..1.0).contains(&row[1]));
+            assert!((0.0..1.0).contains(&row[2]));
+            assert_eq!(row[3], idx as f32);
+        }
     }
 }

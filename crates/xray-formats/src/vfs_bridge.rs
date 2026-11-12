@@ -21,6 +21,7 @@ use crate::particles::{
     BloodWallmarksConfig, ParticleEffectDef, ParticleGroupDef, ParticlesLibrary,
 };
 use crate::savegames::SavegameFile;
+use crate::scoc::ScocFile;
 use crate::shaders_xr::{
     EngineShaderLibrary, LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles,
     ShaderXrlcLibrary,
@@ -634,6 +635,15 @@ pub fn load_scop_from_vfs(
 ) -> Result<SavegameFile, AssetLoadError> {
     let bytes = vfs.read_bytes(virtual_path)?;
     Ok(SavegameFile::parse(&bytes)?)
+}
+
+/// Stream a CoC / Anomaly / xrRazom `.scoc` binary Lua marshal savegame from `VirtualFileSystem`.
+pub fn load_scoc_from_vfs(
+    vfs: &VirtualFileSystem,
+    virtual_path: &str,
+) -> Result<ScocFile, AssetLoadError> {
+    let bytes = vfs.read_bytes(virtual_path)?;
+    Ok(ScocFile::parse(&bytes)?)
 }
 
 fn load_weather_cycles_dir(
@@ -2432,8 +2442,16 @@ mod tests {
         rus_xml.extend_from_slice(b"\xC3\xEE\xF2\xEE\xE2\xEE");
         rus_xml.extend_from_slice(b"</text></string>\n</string_table>");
 
+        let mut scoc_peer = crate::scoc::ScocPeerState::default();
+        scoc_peer
+            .inventory
+            .push(crate::scoc::ScocInventoryItem::new("wpn_pm", 0.88));
+        scoc_peer.mark_level_visited("l01_escape");
+        let scoc_bytes = scoc_peer.to_bytes().unwrap();
+
         let entries = vec![
             ("savedgames\\quicksave.scop", scop_bytes.clone(), scop_bytes),
+            ("savedgames\\quicksave.scoc", scoc_bytes.clone(), scoc_bytes),
             ("configs\\environment\\environment.ltx", env_ltx.to_vec(), env_ltx.to_vec()),
             ("configs\\environment\\weathers\\default_clear.ltx", clear_cycle_ltx.to_vec(), clear_cycle_ltx.to_vec()),
             ("configs\\environment\\weather_effects\\fx_surge.ltx", wfx_surge_ltx.to_vec(), wfx_surge_ltx.to_vec()),
@@ -2453,6 +2471,13 @@ mod tests {
         assert_eq!(loaded_save.spawn_info.level_name.as_deref(), Some("l01_escape"));
         assert!((loaded_save.actor_health().unwrap() - 0.85).abs() < 1e-6);
         assert_eq!(loaded_save.time.date_time().hour, 9);
+
+        let loaded_scoc = load_scoc_from_vfs(&vfs, "savedgames/quicksave.scoc")
+            .unwrap()
+            .extract_peer_state();
+        assert_eq!(loaded_scoc.inventory.len(), 1);
+        assert_eq!(loaded_scoc.inventory[0].section, "wpn_pm");
+        assert!(loaded_scoc.is_level_visited("l01_escape"));
 
         let wlib = load_weather_library_from_vfs(&vfs, None).unwrap();
         assert!((wlib.global_params.second_probability - 0.25).abs() < 1e-6);
