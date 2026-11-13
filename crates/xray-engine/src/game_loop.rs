@@ -20,7 +20,6 @@ use crate::ui_pda::PdaManager;
 use crate::window::{EngineWindow, WindowConfig};
 use crate::world_loader::{LevelLoadConfig, LoadedWorld, WorldLoader};
 use xray_audio::{AudioListener, AudioManager, AudioManagerConfig};
-use xray_formats::cform::CformBvh;
 use xray_formats::scoc::ScocFile;
 use xray_net::{ClientSession, ClientState, EntityDelta, HostSession, LevelChangeNotice};
 use xray_render_dx12::Dx12Renderer;
@@ -501,12 +500,12 @@ impl EngineRuntime {
         ];
         let mut jump_pending = !modal_open && self.input.is_action_just_pressed(Action::Jump);
 
-        // Build BVH acceleration structure for `level.cform` if loaded
+        // Use pre-built BVH acceleration structure from `LoadedWorld`
         let cform_bvh = self
             .world
             .as_ref()
             .and_then(|w| w.cform.as_ref())
-            .map(CformBvh::build);
+            .map(|c| c.build_bvh());
         let gamemtl_ref = self.world.as_ref().and_then(|w| w.gamemtl.as_ref());
 
         // 5. Fixed-timestep simulation steps (capsule physics, footsteps, ALife, network sync)

@@ -434,12 +434,15 @@ fn test_full_dx12_7stage_render_graph_and_capsule_physics_loop() {
         )
         .expect("stream world and .scop onto DX12 runtime");
 
-    runtime
+    let peer_id = runtime
         .alife
         .as_mut()
         .unwrap()
         .attach_peer_scoc_bytes(1, "Falcon", 0xFA1C_0001, &scoc_bytes)
         .expect("attach peer avatar");
+    if let Some(peer) = runtime.alife.as_mut().unwrap().remote_peers.get_mut(&peer_id) {
+        peer.position = [1.5, 0.0, 5.0];
+    }
 
     // Feed wallmark & particle buffers into RenderBridge so Stage (e) covers decals & particles too
     if let Some(rb) = &mut runtime.render_bridge {

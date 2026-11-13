@@ -1433,7 +1433,7 @@ pub enum CsmAtlasPacking {
 }
 
 /// Per-cascade atlas viewport, UV sub-rectangle, and GPU transforms inside a 3-split CSM atlas.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CsmCascadeAtlasSlot {
     pub cascade_index: u32,
     /// Cascade world-space size (`split_distance`, default `[20.0, 40.0, 160.0]`).
@@ -1451,6 +1451,8 @@ pub struct CsmCascadeAtlasSlot {
     pub view_proj: XRayMatrix,
     /// Transposed column-major matrix (`transpose(view_proj)`) for HLSL `mul(M, float4(pos, 1))`.
     pub col_major_view_proj: [[f32; 4]; 4],
+    /// Outward-facing culling planes enclosing this cascade's view slice and light extrusion.
+    pub cull_frustum: crate::hom::ClipFrustum,
 }
 
 /// Result of cross-cascade split selection and boundary cross-fade computation.
@@ -1659,6 +1661,7 @@ pub fn build_3split_csm_atlas(
             ],
             view_proj: c.view_proj,
             col_major_view_proj: crate::camera::matrix_transpose_44(&c.view_proj),
+            cull_frustum: c.cull_frustum.clone(),
         }
     };
 

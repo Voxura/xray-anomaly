@@ -197,6 +197,19 @@ impl Dx12Renderer {
             return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)));
         }
 
+        let required_fence = self
+            .command_mgr
+            .worker(0)
+            .map_or(0, |w| w.required_fence(self.frame_index));
+
+        if required_fence > 0 && unsafe { self.fence.GetCompletedValue() } < required_fence {
+            unsafe {
+                self.fence
+                    .SetEventOnCompletion(required_fence, self.fence_event)?;
+                WaitForSingleObject(self.fence_event, INFINITE);
+            }
+        }
+
         let completed_fence = unsafe { self.fence.GetCompletedValue() };
         self.geometry.retire(completed_fence);
         self.textures.retire(completed_fence);

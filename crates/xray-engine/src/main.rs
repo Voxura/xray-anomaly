@@ -356,6 +356,7 @@ fn run_engine(args: LaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut runtime = EngineRuntime::new(config, !args.headless)?;
     runtime.attach_vfs(Arc::clone(&vfs));
+    eprintln!("[engine] Runtime initialized (headless: {})", args.headless);
 
     if let Some(connect_raw) = &args.connect {
         let addr = parse_connect_addr(connect_raw)?;
@@ -386,18 +387,48 @@ fn run_engine(args: LaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
             level_dir,
             ..Default::default()
         };
+        eprintln!("[engine] Loading level from VFS: {}", level_cfg.level_dir);
         runtime.load_world_and_save_from_vfs(&vfs, &level_cfg, save_vpath.as_deref())?;
+        eprintln!("[engine] Level loaded and synced to GPU successfully");
     }
 
     if let Some(max_frames) = args.max_frames {
+        eprintln!("[engine] Stepping max {} frames...", max_frames);
+        let profile_start = std::time::Instant::now();
+        let mut frame_count = 0usize;
+        let mut total_frame_duration = std::time::Duration::ZERO;
+        let mut max_frame_duration = std::time::Duration::ZERO;
+
         for _ in 0..max_frames {
+            let f_start = std::time::Instant::now();
             if !runtime.step_frame()? {
                 break;
+            }
+            let f_dur = f_start.elapsed();
+            frame_count += 1;
+            total_frame_duration += f_dur;
+            if f_dur > max_frame_duration {
+                max_frame_duration = f_dur;
             }
         }
         if let Some(r) = &mut runtime.renderer {
             let _ = r.wait_for_gpu();
         }
+        let total_wall = profile_start.elapsed();
+        let avg_ms = if frame_count > 0 {
+            total_frame_duration.as_secs_f64() * 1000.0 / frame_count as f64
+        } else {
+            0.0
+        };
+        let fps = if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 };
+        println!(
+            "[profile] Stepped {} frames in {:.2?}: avg {:.2} ms/frame ({:.1} FPS), max frame {:.2} ms",
+            frame_count,
+            total_wall,
+            avg_ms,
+            fps,
+            max_frame_duration.as_secs_f64() * 1000.0
+        );
         return Ok(());
     }
 

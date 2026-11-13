@@ -5,6 +5,8 @@
 //! ray-triangle queries (`OPT_CULL`, `OPT_ONLYFIRST`, `OPT_ONLYNEAREST`), SAT triangle-box
 //! overlap queries (`box_query`), and direct `GameMaterialLibrary` hit material resolution.
 
+use std::borrow::Cow;
+
 use crate::chunk::{ByteCursor, FormatError};
 use crate::gamemtl::{GameMaterial, GameMaterialLibrary};
 use crate::ogf::OgfBBox;
@@ -59,12 +61,20 @@ impl CformTriangle {
     }
 }
 
+/// Precomputed AABB BVH acceleration structure cached inside `CformModel`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CformSpatialIndex {
+    pub nodes: Vec<BvhNode>,
+    pub tri_indices: Vec<u32>,
+}
+
 /// Parsed `level.cform` static world collision mesh.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CformModel {
     pub header: CformHeader,
     pub vertices: Vec<[f32; 3]>,
     pub triangles: Vec<CformTriangle>,
+    pub spatial_index: Option<CformSpatialIndex>,
 }
 
 impl CformModel {
@@ -124,6 +134,7 @@ impl CformModel {
             },
             vertices,
             triangles,
+            spatial_index: None,
         })
     }
 
@@ -167,7 +178,16 @@ impl CformModel {
             },
             vertices,
             triangles,
+            spatial_index: None,
         })
+    }
+
+    /// Build and cache spatial acceleration structure inside the model.
+    pub fn build_spatial_index(&mut self) {
+        if self.spatial_index.is_none() && !self.triangles.is_empty() {
+            let (nodes, tri_indices) = build_bvh_data(&self.vertices, &self.triangles);
+            self.spatial_index = Some(CformSpatialIndex { nodes, tri_indices });
+        }
     }
 
     /// Build a cache-friendly pure-Rust AABB BVH acceleration structure replacing `Opcode`.
@@ -230,176 +250,189 @@ pub struct BoxQueryHit {
     pub sector: u16,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct BvhNode {
-    min: [f32; 3],
-    max: [f32; 3],
-    first: u32,
-    right: u32,
-    count: u32,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BvhNode {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub first: u32,
+    pub right: u32,
+    pub count: u32,
 }
 
 /// Pure-Rust AABB BVH spatial index over a `CformModel` (zero external collision dependencies).
 #[derive(Debug, Clone)]
 pub struct CformBvh<'a> {
     model: &'a CformModel,
-    nodes: Vec<BvhNode>,
-    tri_indices: Vec<u32>,
+    nodes: Cow<'a, [BvhNode]>,
+    tri_indices: Cow<'a, [u32]>,
 }
 
 const MAX_LEAF_TRIS: usize = 4;
 const MAX_BVH_DEPTH: usize = 64;
 
-impl<'a> CformBvh<'a> {
-    pub fn build(model: &'a CformModel) -> Self {
-        let count = model.triangles.len();
-        if count == 0 {
-            return Self {
-                model,
-                nodes: Vec::new(),
-                tri_indices: Vec::new(),
-            };
+/// Build BVH nodes and reordered triangle index array for static mesh triangles.
+pub fn build_bvh_data(
+    vertices: &[[f32; 3]],
+    triangles: &[CformTriangle],
+) -> (Vec<BvhNode>, Vec<u32>) {
+    let count = triangles.len();
+    if count == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut tri_indices: Vec<u32> = (0..(count as u32)).collect();
+    let mut tri_mins = Vec::with_capacity(count);
+    let mut tri_maxs = Vec::with_capacity(count);
+    let mut tri_centroids = Vec::with_capacity(count);
+
+    for tri in triangles {
+        let p0 = vertices[tri.verts[0] as usize];
+        let p1 = vertices[tri.verts[1] as usize];
+        let p2 = vertices[tri.verts[2] as usize];
+        tri_mins.push([
+            p0[0].min(p1[0]).min(p2[0]),
+            p0[1].min(p1[1]).min(p2[1]),
+            p0[2].min(p1[2]).min(p2[2]),
+        ]);
+        tri_maxs.push([
+            p0[0].max(p1[0]).max(p2[0]),
+            p0[1].max(p1[1]).max(p2[1]),
+            p0[2].max(p1[2]).max(p2[2]),
+        ]);
+        tri_centroids.push([
+            (p0[0] + p1[0] + p2[0]) * (1.0 / 3.0),
+            (p0[1] + p1[1] + p2[1]) * (1.0 / 3.0),
+            (p0[2] + p1[2] + p2[2]) * (1.0 / 3.0),
+        ]);
+    }
+
+    let mut nodes = Vec::with_capacity(count * 2);
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_node(
+        start: usize,
+        end: usize,
+        depth: usize,
+        tri_indices: &mut [u32],
+        tri_mins: &[[f32; 3]],
+        tri_maxs: &[[f32; 3]],
+        tri_centroids: &[[f32; 3]],
+        nodes: &mut Vec<BvhNode>,
+    ) -> u32 {
+        let mut bmin = [f32::INFINITY; 3];
+        let mut bmax = [f32::NEG_INFINITY; 3];
+        let mut cmin = [f32::INFINITY; 3];
+        let mut cmax = [f32::NEG_INFINITY; 3];
+
+        for &idx in &tri_indices[start..end] {
+            let i = idx as usize;
+            for axis in 0..3 {
+                bmin[axis] = bmin[axis].min(tri_mins[i][axis]);
+                bmax[axis] = bmax[axis].max(tri_maxs[i][axis]);
+                cmin[axis] = cmin[axis].min(tri_centroids[i][axis]);
+                cmax[axis] = cmax[axis].max(tri_centroids[i][axis]);
+            }
         }
 
-        let mut tri_indices: Vec<u32> = (0..(count as u32)).collect();
-        let mut tri_mins = Vec::with_capacity(count);
-        let mut tri_maxs = Vec::with_capacity(count);
-        let mut tri_centroids = Vec::with_capacity(count);
-
-        for tri in &model.triangles {
-            let p0 = model.vertices[tri.verts[0] as usize];
-            let p1 = model.vertices[tri.verts[1] as usize];
-            let p2 = model.vertices[tri.verts[2] as usize];
-            tri_mins.push([
-                p0[0].min(p1[0]).min(p2[0]),
-                p0[1].min(p1[1]).min(p2[1]),
-                p0[2].min(p1[2]).min(p2[2]),
-            ]);
-            tri_maxs.push([
-                p0[0].max(p1[0]).max(p2[0]),
-                p0[1].max(p1[1]).max(p2[1]),
-                p0[2].max(p1[2]).max(p2[2]),
-            ]);
-            tri_centroids.push([
-                (p0[0] + p1[0] + p2[0]) * (1.0 / 3.0),
-                (p0[1] + p1[1] + p2[1]) * (1.0 / 3.0),
-                (p0[2] + p1[2] + p2[2]) * (1.0 / 3.0),
-            ]);
-        }
-
-        let mut nodes = Vec::with_capacity(count * 2);
-
-        #[allow(clippy::too_many_arguments)]
-        fn build_node(
-            start: usize,
-            end: usize,
-            depth: usize,
-            tri_indices: &mut [u32],
-            tri_mins: &[[f32; 3]],
-            tri_maxs: &[[f32; 3]],
-            tri_centroids: &[[f32; 3]],
-            nodes: &mut Vec<BvhNode>,
-        ) -> u32 {
-            let mut bmin = [f32::INFINITY; 3];
-            let mut bmax = [f32::NEG_INFINITY; 3];
-            let mut cmin = [f32::INFINITY; 3];
-            let mut cmax = [f32::NEG_INFINITY; 3];
-
-            for &idx in &tri_indices[start..end] {
-                let i = idx as usize;
-                for axis in 0..3 {
-                    bmin[axis] = bmin[axis].min(tri_mins[i][axis]);
-                    bmax[axis] = bmax[axis].max(tri_maxs[i][axis]);
-                    cmin[axis] = cmin[axis].min(tri_centroids[i][axis]);
-                    cmax[axis] = cmax[axis].max(tri_centroids[i][axis]);
-                }
-            }
-
-            let node_idx = nodes.len() as u32;
-            let tri_count = end - start;
-            if tri_count <= MAX_LEAF_TRIS || depth >= MAX_BVH_DEPTH {
-                nodes.push(BvhNode {
-                    min: bmin,
-                    max: bmax,
-                    first: start as u32,
-                    right: 0,
-                    count: tri_count as u32,
-                });
-                return node_idx;
-            }
-
-            let extent = [cmax[0] - cmin[0], cmax[1] - cmin[1], cmax[2] - cmin[2]];
-            let axis = if extent[1] > extent[0] && extent[1] >= extent[2] {
-                1
-            } else if extent[2] > extent[0] && extent[2] >= extent[1] {
-                2
-            } else {
-                0
-            };
-
-            let split_val = 0.5 * (cmin[axis] + cmax[axis]);
-            let slice = &mut tri_indices[start..end];
-            let mut mid = partition_slice(slice, |&idx| tri_centroids[idx as usize][axis] < split_val);
-
-            if mid == 0 || mid == tri_count {
-                // Degenerate centroid cluster along this axis: force balanced median split
-                mid = tri_count / 2;
-                slice.select_nth_unstable_by(mid, |&a, &b| {
-                    tri_centroids[a as usize][axis].total_cmp(&tri_centroids[b as usize][axis])
-                });
-            }
-
-            // Placeholder internal node
+        let node_idx = nodes.len() as u32;
+        let tri_count = end - start;
+        if tri_count <= MAX_LEAF_TRIS || depth >= MAX_BVH_DEPTH {
             nodes.push(BvhNode {
                 min: bmin,
                 max: bmax,
-                first: 0,
+                first: start as u32,
                 right: 0,
-                count: 0,
+                count: tri_count as u32,
             });
-
-            let split = start + mid;
-            let left = build_node(
-                start,
-                split,
-                depth + 1,
-                tri_indices,
-                tri_mins,
-                tri_maxs,
-                tri_centroids,
-                nodes,
-            );
-            let right = build_node(
-                split,
-                end,
-                depth + 1,
-                tri_indices,
-                tri_mins,
-                tri_maxs,
-                tri_centroids,
-                nodes,
-            );
-
-            nodes[node_idx as usize].first = left;
-            nodes[node_idx as usize].right = right;
-            node_idx
+            return node_idx;
         }
 
-        build_node(
-            0,
-            count,
-            0,
-            &mut tri_indices,
-            &tri_mins,
-            &tri_maxs,
-            &tri_centroids,
-            &mut nodes,
+        let extent = [cmax[0] - cmin[0], cmax[1] - cmin[1], cmax[2] - cmin[2]];
+        let axis = if extent[1] > extent[0] && extent[1] >= extent[2] {
+            1
+        } else if extent[2] > extent[0] && extent[2] >= extent[1] {
+            2
+        } else {
+            0
+        };
+
+        let split_val = 0.5 * (cmin[axis] + cmax[axis]);
+        let slice = &mut tri_indices[start..end];
+        let mut mid = partition_slice(slice, |&idx| tri_centroids[idx as usize][axis] < split_val);
+
+        if mid == 0 || mid == tri_count {
+            // Degenerate centroid cluster along this axis: force balanced median split
+            mid = tri_count / 2;
+            slice.select_nth_unstable_by(mid, |&a, &b| {
+                tri_centroids[a as usize][axis].total_cmp(&tri_centroids[b as usize][axis])
+            });
+        }
+
+        // Placeholder internal node
+        nodes.push(BvhNode {
+            min: bmin,
+            max: bmax,
+            first: 0,
+            right: 0,
+            count: 0,
+        });
+
+        let split = start + mid;
+        let left = build_node(
+            start,
+            split,
+            depth + 1,
+            tri_indices,
+            tri_mins,
+            tri_maxs,
+            tri_centroids,
+            nodes,
+        );
+        let right = build_node(
+            split,
+            end,
+            depth + 1,
+            tri_indices,
+            tri_mins,
+            tri_maxs,
+            tri_centroids,
+            nodes,
         );
 
-        Self {
-            model,
-            nodes,
-            tri_indices,
+        nodes[node_idx as usize].first = left;
+        nodes[node_idx as usize].right = right;
+        node_idx
+    }
+
+    build_node(
+        0,
+        count,
+        0,
+        &mut tri_indices,
+        &tri_mins,
+        &tri_maxs,
+        &tri_centroids,
+        &mut nodes,
+    );
+
+    (nodes, tri_indices)
+}
+
+impl<'a> CformBvh<'a> {
+    pub fn build(model: &'a CformModel) -> Self {
+        if let Some(idx) = &model.spatial_index {
+            Self {
+                model,
+                nodes: Cow::Borrowed(&idx.nodes),
+                tri_indices: Cow::Borrowed(&idx.tri_indices),
+            }
+        } else {
+            let (nodes, tri_indices) = build_bvh_data(&model.vertices, &model.triangles);
+            Self {
+                model,
+                nodes: Cow::Owned(nodes),
+                tri_indices: Cow::Owned(tri_indices),
+            }
         }
     }
 

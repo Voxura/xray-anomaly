@@ -34,8 +34,8 @@ use crate::world_loader::{LoadedDynamicModel, LoadedWorld};
 use xray_formats::details::{LevelDetails, DETAIL_ID_EMPTY, DETAIL_SLOT_SIZE};
 use xray_formats::hom::{frustum_planes, ClipFrustum};
 use xray_formats::ogf::{
-    matrix_set_xyz_translate, vector_generate_orthonormal_basis, OgfModel, OgfVisualType,
-    StaticVertex, XRAY_IDENTITY_MATRIX,
+    matrix_mul_44, matrix_set_xyz_translate, vector_generate_orthonormal_basis, OgfModel,
+    OgfVisualType, StaticVertex, XRAY_IDENTITY_MATRIX,
 };
 use xray_formats::sun::{build_3split_csm_atlas, CsmAtlasPacking, SunCascadeConfig};
 use xray_formats::thm::{texture_stem_to_dds_vpath, ResolvedTextureLinks};
@@ -600,7 +600,10 @@ impl RenderBridge {
         let cam_constants = camera.to_render_constants();
         renderer.update_camera(&cam_constants)?;
 
-        let frustum = ClipFrustum::from_view_proj_dx(&cam_constants.view_proj, frustum_planes::ALL);
+        let view_mat = camera.view_matrix();
+        let proj_mat = camera.projection_matrix();
+        let vp_xray = matrix_mul_44(&proj_mat, &view_mat);
+        let frustum = ClipFrustum::from_view_proj_dx(&vp_xray, frustum_planes::ALL);
         const MAX_VIS_DIST: f32 = 280.0;
 
         let dynamic_draws = self.prepare_dynamic_draws(
@@ -618,12 +621,15 @@ impl RenderBridge {
         renderer.clear_backbuffer([0.04, 0.05, 0.08, 1.0]);
         for mesh in &self.world_meshes {
             if mesh.bsphere_radius > 1e-4 {
-                if distance_sq(camera.position, mesh.bsphere_center)
-                    > (MAX_VIS_DIST + mesh.bsphere_radius).powi(2)
-                {
+                let dist_sq = distance_sq(camera.position, mesh.bsphere_center);
+                if dist_sq > (MAX_VIS_DIST + mesh.bsphere_radius).powi(2) {
                     continue;
                 }
                 if !frustum.test_sphere(mesh.bsphere_center, mesh.bsphere_radius) {
+                    continue;
+                }
+                // Early-Z occluder filtering: skip distant tiny objects that do not occlude geometry
+                if mesh.bsphere_radius < 0.8 && dist_sq > 40.0 * 40.0 {
                     continue;
                 }
             }
@@ -686,8 +692,6 @@ impl RenderBridge {
             camera.position[1] - sun_dir_to_surface[1] * 500.0,
             camera.position[2] - sun_dir_to_surface[2] * 500.0,
         ];
-        let view_mat = camera.view_matrix();
-        let proj_mat = camera.projection_matrix();
 
         if let Some(plan) = build_3split_csm_atlas(
             &self.config.sun_cascades,
@@ -719,11 +723,24 @@ impl RenderBridge {
                         if !mesh.is_static_caster {
                             continue;
                         }
-                        if mesh.bsphere_radius > 1e-4
-                            && distance_sq(camera.position, mesh.bsphere_center)
-                                > (slot.split_distance + mesh.bsphere_radius + 32.0).powi(2)
-                        {
-                            continue;
+                        if mesh.bsphere_radius > 1e-4 {
+                            let dist_sq = distance_sq(camera.position, mesh.bsphere_center);
+                            if dist_sq > (slot.split_distance + mesh.bsphere_radius + 32.0).powi(2) {
+                                continue;
+                            }
+                            if !slot.cull_frustum.planes.is_empty()
+                                && !slot.cull_frustum.test_sphere(mesh.bsphere_center, mesh.bsphere_radius)
+                            {
+                                continue;
+                            }
+                            // Far cascade detail culling: skip clutter smaller than 2.0m in cascade 2
+                            if cascade_idx == 2 && mesh.bsphere_radius < 2.0 {
+                                continue;
+                            }
+                            // Mid cascade detail culling: skip tiny clutter smaller than 0.5m in cascade 1
+                            if cascade_idx == 1 && mesh.bsphere_radius < 0.5 {
+                                continue;
+                            }
                         }
                         let caster = mesh.fastpath_handle.unwrap_or(mesh.mesh_handle);
                         renderer.draw_csm_shadow_mesh(&self.csm_atlas, cascade_idx, caster, u32::MAX)?;

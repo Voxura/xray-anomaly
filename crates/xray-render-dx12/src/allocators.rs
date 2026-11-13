@@ -67,6 +67,12 @@ impl WorkerCommandRing {
         Ok(allocator)
     }
 
+    /// Return the GPU fence value that this slot must wait for before reuse.
+    pub fn required_fence(&self, frame_index: u64) -> u64 {
+        let slot = (frame_index as usize) % FRAME_BUFFER_COUNT;
+        self.frame_fences[slot].load(Ordering::Acquire)
+    }
+
     /// Tag the current frame slot with the GPU fence value signaled at submission.
     pub fn tag_submission_fence(&self, frame_index: u64, fence_value: u64) {
         let slot = (frame_index as usize) % FRAME_BUFFER_COUNT;

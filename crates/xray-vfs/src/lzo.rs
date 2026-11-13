@@ -30,185 +30,247 @@ pub fn decompress_lzo1x(input: &[u8], output: &mut [u8]) -> Result<usize, LzoErr
         return Err(LzoError::UnexpectedEof);
     }
 
-    let mut in_pos = 0;
-    let mut out_pos = 0;
     let in_len = input.len();
     let out_len = output.len();
+    let mut ip = 0usize;
+    let mut op = 0usize;
 
-    let read_byte = |pos: &mut usize| -> Result<u8, LzoError> {
-        if *pos >= in_len {
-            Err(LzoError::UnexpectedEof)
-        } else {
-            let b = input[*pos];
-            *pos += 1;
-            Ok(b)
-        }
-    };
-
-    let copy_literals = |pos: &mut usize, out_p: &mut usize, count: usize, out: &mut [u8]| -> Result<(), LzoError> {
-        if *pos + count > in_len {
-            return Err(LzoError::UnexpectedEof);
-        }
-        if *out_p + count > out_len {
-            return Err(LzoError::OutputOverrun);
-        }
-        out[*out_p..*out_p + count].copy_from_slice(&input[*pos..*pos + count]);
-        *pos += count;
-        *out_p += count;
-        Ok(())
-    };
-
-    let copy_match = |out_p: &mut usize, dist: usize, len: usize, out: &mut [u8]| -> Result<(), LzoError> {
-        if dist == 0 || dist > *out_p {
-            return Err(LzoError::LookbehindOutOfBounds);
-        }
-        if *out_p + len > out_len {
-            return Err(LzoError::OutputOverrun);
-        }
-        let src_start = *out_p - dist;
-        for i in 0..len {
-            out[*out_p + i] = out[src_start + i];
-        }
-        *out_p += len;
-        Ok(())
-    };
-
-    let first = read_byte(&mut in_pos)?;
-    let mut next_t: Option<usize> = None;
-
-    if first > 17 {
-        let t = (first - 17) as usize;
-        if t < 4 {
-            copy_literals(&mut in_pos, &mut out_pos, t, output)?;
-            next_t = Some(read_byte(&mut in_pos)? as usize);
-        } else {
-            copy_literals(&mut in_pos, &mut out_pos, t, output)?;
-            let t_after = read_byte(&mut in_pos)? as usize;
-            if t_after >= 16 {
-                next_t = Some(t_after);
-            } else {
-                let b = read_byte(&mut in_pos)? as usize;
-                let dist = 1 + (t_after >> 2) + (b << 2);
-                copy_match(&mut out_pos, dist, 2, output)?;
-
-                let lit = input[in_pos - 2] as usize & 3;
-                if lit > 0 {
-                    copy_literals(&mut in_pos, &mut out_pos, lit, output)?;
-                    next_t = Some(read_byte(&mut in_pos)? as usize);
-                }
+    macro_rules! need_ip {
+        ($n:expr) => {
+            if ip + $n > in_len {
+                return Err(LzoError::UnexpectedEof);
             }
-        }
-    } else {
-        next_t = Some(first as usize);
+        };
     }
 
-    'outer: while in_pos < in_len || next_t.is_some() {
-        let mut t = match next_t.take() {
-            Some(val) => val,
-            None => read_byte(&mut in_pos)? as usize,
-        };
-
-        if t < 16 {
-            // Literal run
-            if t == 0 {
-                while in_pos < in_len && input[in_pos] == 0 {
-                    t += 255;
-                    in_pos += 1;
-                }
-                let next = read_byte(&mut in_pos)? as usize;
-                t += 15 + next;
+    macro_rules! need_op {
+        ($n:expr) => {
+            if op + $n > out_len {
+                return Err(LzoError::OutputOverrun);
             }
+        };
+    }
 
-            copy_literals(&mut in_pos, &mut out_pos, t + 3, output)?;
+    let mut t: usize = 0;
+    let mut state_first_lit = false;
+    let mut state_match = false;
 
-            let t_next = read_byte(&mut in_pos)? as usize;
-            if t_next >= 16 {
-                t = t_next;
+    if input[0] > 17 {
+        t = (input[0] - 17) as usize;
+        ip += 1;
+        if t < 4 {
+            // match_next
+            need_op!(t);
+            need_ip!(t + 1);
+            output[op..op + t].copy_from_slice(&input[ip..ip + t]);
+            op += t;
+            ip += t;
+            t = input[ip] as usize;
+            ip += 1;
+            state_match = true;
+        } else {
+            need_op!(t);
+            need_ip!(t);
+            output[op..op + t].copy_from_slice(&input[ip..ip + t]);
+            op += t;
+            ip += t;
+            state_first_lit = true;
+        }
+    }
+
+    'outer: while ip < in_len && op < out_len {
+        if !state_match && !state_first_lit {
+            t = input[ip] as usize;
+            ip += 1;
+
+            if t >= 16 {
+                state_match = true;
             } else {
-                // M1 match
-                let b = read_byte(&mut in_pos)? as usize;
-                let dist = 1 + (t_next >> 2) + (b << 2);
-                copy_match(&mut out_pos, dist, 2, output)?;
+                // Literal run
+                if t == 0 {
+                    need_ip!(1);
+                    while input[ip] == 0 {
+                        t += 255;
+                        ip += 1;
+                        need_ip!(1);
+                    }
+                    t += 15 + input[ip] as usize;
+                    ip += 1;
+                }
+                let lit_len = t + 3;
+                need_op!(lit_len);
+                need_ip!(lit_len);
+                output[op..op + lit_len].copy_from_slice(&input[ip..ip + lit_len]);
+                op += lit_len;
+                ip += lit_len;
+                state_first_lit = true;
+            }
+        }
 
-                let lit = input[in_pos - 2] as usize & 3;
+        if state_first_lit {
+            state_first_lit = false;
+            need_ip!(1);
+            t = input[ip] as usize;
+            ip += 1;
+
+            if t >= 16 {
+                state_match = true;
+            } else {
+                need_ip!(1);
+                let b = input[ip] as usize;
+                ip += 1;
+                let dist = (1 + 0x0800) + (t >> 2) + (b << 2);
+                if dist == 0 || dist > op {
+                    return Err(LzoError::LookbehindOutOfBounds);
+                }
+                need_op!(3);
+                let src_start = op - dist;
+                for i in 0..3 {
+                    output[op + i] = output[src_start + i];
+                }
+                op += 3;
+
+                // match_done
+                let lit = input[ip - 2] as usize & 3;
                 if lit == 0 {
                     continue 'outer;
                 }
-                copy_literals(&mut in_pos, &mut out_pos, lit, output)?;
-                t = read_byte(&mut in_pos)? as usize;
+                need_op!(lit);
+                need_ip!(lit + 1);
+                output[op..op + lit].copy_from_slice(&input[ip..ip + lit]);
+                op += lit;
+                ip += lit;
+                t = input[ip] as usize;
+                ip += 1;
+                state_match = true;
             }
         }
 
+        if !state_match {
+            continue 'outer;
+        }
+
         // Inner match loop
-        loop {
-            let lit = if t >= 64 {
+        'inner: loop {
+            state_match = false;
+            if t >= 64 {
                 // M2 match
-                let b = read_byte(&mut in_pos)? as usize;
+                need_ip!(1);
+                let b = input[ip] as usize;
+                ip += 1;
                 let dist = 1 + ((t >> 2) & 7) + (b << 3);
                 let len = ((t >> 5) - 1) + 2;
-                copy_match(&mut out_pos, dist, len, output)?;
-                input[in_pos - 2] as usize & 3
+                if dist == 0 || dist > op {
+                    return Err(LzoError::LookbehindOutOfBounds);
+                }
+                need_op!(len);
+                let src_start = op - dist;
+                for i in 0..len {
+                    output[op + i] = output[src_start + i];
+                }
+                op += len;
             } else if t >= 32 {
                 // M3 match
                 let mut len = t & 31;
                 if len == 0 {
-                    while in_pos < in_len && input[in_pos] == 0 {
+                    need_ip!(1);
+                    while input[ip] == 0 {
                         len += 255;
-                        in_pos += 1;
+                        ip += 1;
+                        need_ip!(1);
                     }
-                    let next = read_byte(&mut in_pos)? as usize;
-                    len += 31 + next;
+                    len += 31 + input[ip] as usize;
+                    ip += 1;
                 }
-                let b0 = read_byte(&mut in_pos)? as usize;
-                let b1 = read_byte(&mut in_pos)? as usize;
+                need_ip!(2);
+                let b0 = input[ip] as usize;
+                let b1 = input[ip + 1] as usize;
+                ip += 2;
                 let dist = 1 + (b0 >> 2) + (b1 << 6);
-                copy_match(&mut out_pos, dist, len + 2, output)?;
-                b0 & 3
+                let match_len = len + 2;
+                if dist == 0 || dist > op {
+                    return Err(LzoError::LookbehindOutOfBounds);
+                }
+                need_op!(match_len);
+                let src_start = op - dist;
+                for i in 0..match_len {
+                    output[op + i] = output[src_start + i];
+                }
+                op += match_len;
             } else if t >= 16 {
                 // M4 match or EOF
                 let mut dist = (t & 8) << 11;
                 let mut len = t & 7;
                 if len == 0 {
-                    while in_pos < in_len && input[in_pos] == 0 {
+                    need_ip!(1);
+                    while input[ip] == 0 {
                         len += 255;
-                        in_pos += 1;
+                        ip += 1;
+                        need_ip!(1);
                     }
-                    let next = read_byte(&mut in_pos)? as usize;
-                    len += 7 + next;
+                    len += 7 + input[ip] as usize;
+                    ip += 1;
                 }
-                let b0 = read_byte(&mut in_pos)? as usize;
-                let b1 = read_byte(&mut in_pos)? as usize;
+                need_ip!(2);
+                let b0 = input[ip] as usize;
+                let b1 = input[ip + 1] as usize;
+                ip += 2;
                 let offset_lo = (b0 >> 2) + (b1 << 6);
-
                 if dist == 0 && offset_lo == 0 {
                     // Standard EOF found!
-                    break 'outer;
+                    return Ok(op);
                 }
-
                 dist += offset_lo + 0x4000;
-                copy_match(&mut out_pos, dist, len + 2, output)?;
-                b0 & 3
+                let match_len = len + 2;
+                if dist == 0 || dist > op {
+                    return Err(LzoError::LookbehindOutOfBounds);
+                }
+                need_op!(match_len);
+                let src_start = op - dist;
+                for i in 0..match_len {
+                    output[op + i] = output[src_start + i];
+                }
+                op += match_len;
             } else {
                 // M1 match
-                let b = read_byte(&mut in_pos)? as usize;
+                need_ip!(1);
+                let b = input[ip] as usize;
+                ip += 1;
                 let dist = 1 + (t >> 2) + (b << 2);
-                copy_match(&mut out_pos, dist, 2, output)?;
-                input[in_pos - 2] as usize & 3
-            };
-
-            if lit == 0 {
-                break;
+                if dist == 0 || dist > op {
+                    return Err(LzoError::LookbehindOutOfBounds);
+                }
+                need_op!(2);
+                let src_start = op - dist;
+                output[op] = output[src_start];
+                output[op + 1] = output[src_start + 1];
+                op += 2;
             }
 
-            copy_literals(&mut in_pos, &mut out_pos, lit, output)?;
-            if in_pos >= in_len {
+            // match_done
+            let lit = input[ip - 2] as usize & 3;
+            if lit == 0 {
+                break 'inner;
+            }
+
+            // match_next: copy lit literals, then read next t and continue 'inner
+            need_op!(lit);
+            if ip + lit > in_len {
+                return Err(LzoError::UnexpectedEof);
+            }
+            output[op..op + lit].copy_from_slice(&input[ip..ip + lit]);
+            op += lit;
+            ip += lit;
+
+            if ip >= in_len {
                 break 'outer;
             }
-            t = read_byte(&mut in_pos)? as usize;
+            t = input[ip] as usize;
+            ip += 1;
         }
     }
 
-    Ok(out_pos)
+    Ok(op)
 }
 
 /// Pure Rust LZO1X compressor producing bitstreams compatible with `rt_lzo1x_d.ch`.

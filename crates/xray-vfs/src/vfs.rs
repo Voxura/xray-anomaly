@@ -211,6 +211,11 @@ impl VirtualFileSystem {
         self.archives.len()
     }
 
+    /// Access mounted archives.
+    pub fn archives(&self) -> &[Arc<MountedArchive>] {
+        &self.archives
+    }
+
     /// Total unique indexed entries across mounted archives (loose directory files are resolved dynamically).
     pub fn archive_entry_count(&self) -> usize {
         let mut keys = HashSet::new();
@@ -391,13 +396,13 @@ fn collect_archives_with_ext(
             if recursive {
                 collect_archives_with_ext(&path, ext_prefix, true, out)?;
             }
-        } else if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let lower = ext.to_ascii_lowercase();
-                // Matches `.db`, `.db0`, `.dba` or `.xdb`, `.xdb0` etc.
-                if lower.starts_with(ext_prefix) {
-                    out.push(path);
-                }
+        } else if path.is_file()
+            && let Some(ext) = path.extension().and_then(|e| e.to_str())
+        {
+            let lower = ext.to_ascii_lowercase();
+            // Matches `.db`, `.db0`, `.dba` or `.xdb`, `.xdb0` etc.
+            if lower.starts_with(ext_prefix) {
+                out.push(path);
             }
         }
     }

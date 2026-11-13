@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use xray_formats::ai_graph::{LevelCrossTable, LevelGraph};
-use xray_formats::cform::{CformBvh, CformModel, RaycastHit};
+use xray_formats::cform::{CformModel, RaycastHit};
 use xray_formats::chunk::FormatError;
 use xray_formats::details::LevelDetails;
 use xray_formats::gamemtl::GameMaterialLibrary;
@@ -421,7 +421,7 @@ impl LoadedWorld {
         cull_backfaces: bool,
     ) -> Option<RaycastHit> {
         let model = self.cform.as_ref()?;
-        let bvh = CformBvh::build(model);
+        let bvh = model.build_bvh();
         bvh.raycast_nearest(origin, dir, max_dist, cull_backfaces)
     }
 
@@ -440,7 +440,7 @@ impl LoadedWorld {
         proj_matrix: &XRayMatrix,
         options: &PortalTraversalOptions,
     ) -> PortalTraversalResult {
-        let full_transform = matrix_mul_44(view_matrix, proj_matrix);
+        let full_transform = matrix_mul_44(proj_matrix, view_matrix);
         let frustum = ClipFrustum::from_view_proj(&full_transform, frustum_planes::ALL);
         let rasterizer = self.hom.as_ref().map(|hom_mesh| {
             let mut r = OccRasterizer::new();
@@ -448,7 +448,7 @@ impl LoadedWorld {
             r.propagate(&hom_mesh.triangles);
             r
         });
-        let bvh = self.cform.as_ref().map(CformBvh::build);
+        let bvh = self.cform.as_ref().map(CformModel::build_bvh);
         let start_sector = self
             .level_data
             .detect_sector(camera_pos, bvh.as_ref())
@@ -531,7 +531,10 @@ impl WorldLoader {
         } else {
             None
         };
-        let cform = load_optional(|| load_cform_from_vfs(vfs, &config.level_dir))?;
+        let mut cform = load_optional(|| load_cform_from_vfs(vfs, &config.level_dir))?;
+        if let Some(c) = &mut cform {
+            c.build_spatial_index();
+        }
 
         let level_leaf = config
             .level_dir
@@ -575,6 +578,7 @@ impl WorldLoader {
         let visual_meshes = if config.resolve_visual_meshes {
             resolve_level_visuals(
                 vfs,
+                &config.level_dir,
                 &level_data,
                 level_geom.as_ref(),
                 level_geomx.as_ref(),
@@ -632,6 +636,7 @@ fn load_optional<T>(
 
 fn resolve_level_visuals(
     vfs: &VirtualFileSystem,
+    level_dir: &str,
     level_data: &LevelData,
     level_geom: Option<&LevelGeometry>,
     level_geomx: Option<&LevelGeometry>,
@@ -676,7 +681,14 @@ fn resolve_level_visuals(
                     shader: shader_ref.shader.clone(),
                     texture: tex_name.clone(),
                 };
-                texture_links.push(resolve_ogf_texture_links(vfs, &link)?);
+                let mut resolved = resolve_ogf_texture_links(vfs, &link)?;
+                if !vfs.exists(&resolved.diffuse_dds)
+                    && let Some(level_tex) =
+                        resolve_level_texture_vpath(vfs, level_dir, &resolved.diffuse_name)
+                {
+                    resolved.diffuse_dds = level_tex;
+                }
+                texture_links.push(resolved);
             }
         }
 
@@ -693,6 +705,48 @@ fn resolve_level_visuals(
     }
 
     Ok(out)
+}
+
+/// Resolve a level-specific texture path (such as per-level terrain or lightmaps)
+/// when the global `textures/<stem>.dds` path does not exist in VFS.
+pub fn resolve_level_texture_vpath(
+    vfs: &VirtualFileSystem,
+    level_dir: &str,
+    tex_name: &str,
+) -> Option<String> {
+    let clean = tex_name.replace('/', "\\");
+    let stem = clean.trim_matches('\\');
+
+    // Candidate 1: Standard global textures directory `textures\<stem>.dds`
+    let cand_textures = if stem.to_ascii_lowercase().starts_with("textures\\") {
+        format!("{stem}.dds")
+    } else {
+        format!("textures\\{stem}.dds")
+    };
+    if vfs.exists(&cand_textures) {
+        return Some(cand_textures);
+    }
+
+    // Candidate 2: Under level directory `<level_dir>\<stem>.dds` (e.g. `levels\l01_escape\terrain\terrain_escape.dds`)
+    let clean_level = level_dir.trim_matches('\\');
+    let cand_level_stem = format!("{clean_level}\\{stem}.dds");
+    if vfs.exists(&cand_level_stem) {
+        return Some(cand_level_stem);
+    }
+
+    // Candidate 3: Under level directory with stripped prefix (e.g. `terrain\terrain_escape` -> `levels\l01_escape\terrain_escape.dds`)
+    if let Some((_, file_part)) = stem.rsplit_once('\\') {
+        let cand_level_file = format!("{clean_level}\\{file_part}.dds");
+        if vfs.exists(&cand_level_file) {
+            return Some(cand_level_file);
+        }
+        let cand_level_terrain = format!("{clean_level}\\terrain\\{file_part}.dds");
+        if vfs.exists(&cand_level_terrain) {
+            return Some(cand_level_terrain);
+        }
+    }
+
+    None
 }
 
 fn extract_ogf_texture_link(model: &OgfModel) -> Option<OgfTextureLink> {
