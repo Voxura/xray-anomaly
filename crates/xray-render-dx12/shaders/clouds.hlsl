@@ -70,9 +70,8 @@ CloudsVSOutput vs_main(uint vertex_id : SV_VertexID)
         output.ray_dir = float3(local_pos.x * c - local_pos.z * s, local_pos.y, local_pos.x * s + local_pos.z * c);
     }
 
-    float4x4 v = view;
-    v._m30_m31_m32 = float3(0.0, 0.0, 0.0);
-    float4 clip_pos = mul(proj, mul(v, float4(local_pos, 1.0)));
+    float3x3 rot = (float3x3)view;
+    float4 clip_pos = mul(proj, float4(mul(rot, local_pos), 1.0));
     output.position = clip_pos.xyww;
     return output;
 }

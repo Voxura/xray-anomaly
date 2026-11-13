@@ -605,7 +605,7 @@ impl AudioManager {
         }
         if self.wind_voice.is_none() && target_wind > 0.01 {
             let clip = self.resolve_or_synthesize(
-                &["ambient\\wind_01", "nature\\wind_1"],
+                &["ambient\\wind_01", "ambient\\air_1", "ambient\\amb1", "nature\\wind_1"],
                 "weather_wind",
                 synthesize_wind_loop,
             );
@@ -783,8 +783,33 @@ impl AudioManager {
         muzzle_pos: [f32; 3],
         velocity: [f32; 3],
     ) -> VoiceId {
+        let trimmed = sound_ref.trim();
+        let stem = trimmed
+            .strip_prefix("weapons\\")
+            .or_else(|| trimmed.strip_prefix("weapons/"))
+            .unwrap_or(trimmed);
+        let sub_shoot = format!("weapons\\{stem}\\{stem}_shoot");
+        let sub_shoot2 = format!("weapons\\{stem}\\{stem}");
+        let n_shot = format!("weapons\\n_{stem}_shot");
+        let n_shot2 = format!("weapons\\n_{stem}");
+        let cand_pm = "weapons\\pm\\pm_shoot";
+        let cand_n_pm = "weapons\\n_pm_shot";
+        let cand_ak74 = "weapons\\ak74\\ak74_shoot";
+        let cand_n_ak74 = "weapons\\n_ak74_shot";
+
+        let mut candidates: Vec<&str> = Vec::new();
+        candidates.push(trimmed);
+        candidates.push(&sub_shoot);
+        candidates.push(&sub_shoot2);
+        candidates.push(&n_shot);
+        candidates.push(&n_shot2);
+        candidates.push(cand_pm);
+        candidates.push(cand_n_pm);
+        candidates.push(cand_ak74);
+        candidates.push(cand_n_ak74);
+
         let clip = self.resolve_or_synthesize(
-            &[sound_ref, "weapons\\ak74_shoot"],
+            &candidates,
             &format!("weapon_{sound_ref}"),
             synthesize_weapon_shot,
         );

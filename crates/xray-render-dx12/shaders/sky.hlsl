@@ -54,9 +54,8 @@ SkyVSOutput vs_main(uint vertex_id : SV_VertexID)
     float3 local_pos = CUBE_VERTICES[CUBE_INDICES[vertex_id]];
     output.ray_dir = local_pos;
 
-    float4x4 v = view;
-    v._m30_m31_m32 = float3(0.0, 0.0, 0.0);
-    float4 clip_pos = mul(proj, mul(v, float4(local_pos, 1.0)));
+    float3x3 rot = (float3x3)view;
+    float4 clip_pos = mul(proj, float4(mul(rot, local_pos), 1.0));
     output.position = clip_pos.xyww;
     return output;
 }

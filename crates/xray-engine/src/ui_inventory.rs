@@ -711,6 +711,59 @@ impl Default for InventoryManager {
     }
 }
 
+/// Compute normalized texture UV coordinates `[u1, v1, u2, v2]` inside `ui_icon_equipment.dds` (8192x4096 atlas).
+pub fn item_icon_uv(section: &str, category: ItemCategory) -> [f32; 4] {
+    let lower = section.to_ascii_lowercase();
+    let (gx, gy, gw, gh): (u32, u32, u32, u32) = if lower.contains("knife") {
+        (18, 8, 2, 1)
+    } else if lower.contains("pm") {
+        (0, 8, 2, 1)
+    } else if lower.contains("ak74") {
+        (0, 0, 5, 2)
+    } else if lower.contains("mp5") {
+        (5, 0, 3, 2)
+    } else if lower.contains("svd") {
+        (0, 2, 6, 2)
+    } else if lower.contains("bolt") {
+        (19, 8, 1, 1)
+    } else if lower.contains("medkit") {
+        (8, 8, 2, 1)
+    } else if lower.contains("bandage") {
+        (10, 8, 1, 1)
+    } else if lower.contains("antirad") {
+        (11, 8, 1, 1)
+    } else if lower.contains("energy") {
+        (12, 8, 1, 1)
+    } else if lower.contains("bread") || lower.contains("kolbasa") {
+        (13, 8, 1, 1)
+    } else if lower.contains("ammo") {
+        (14, 8, 1, 1)
+    } else if lower.contains("suit") || lower.contains("outfit") {
+        (0, 4, 2, 3)
+    } else if lower.contains("helm") {
+        (2, 4, 2, 2)
+    } else if lower.contains("af_") || category == ItemCategory::Artifact {
+        (17, 8, 1, 1)
+    } else {
+        match category {
+            ItemCategory::Weapon => (0, 8, 2, 1),
+            ItemCategory::Medical => (8, 8, 2, 1),
+            ItemCategory::Consumable => (12, 8, 1, 1),
+            ItemCategory::Ammo => (14, 8, 1, 1),
+            ItemCategory::Outfit => (0, 4, 2, 3),
+            ItemCategory::Helmet => (2, 4, 2, 2),
+            ItemCategory::Artifact => (17, 8, 1, 1),
+            _ => (19, 8, 1, 1),
+        }
+    };
+
+    let u1 = (gx * 50) as f32 / 8192.0;
+    let v1 = (gy * 50) as f32 / 4096.0;
+    let u2 = ((gx + gw) * 50) as f32 / 8192.0;
+    let v2 = ((gy + gh) * 50) as f32 / 4096.0;
+    [u1, v1, u2, v2]
+}
+
 impl InventoryManager {
     pub fn new() -> Self {
         Self {
@@ -1549,6 +1602,8 @@ impl InventoryManager {
         show_crosshair: bool,
         stamina: f32,
         font: Option<&UiFontResource>,
+        hud_tex: Option<DescriptorIndex>,
+        equipment_tex: Option<DescriptorIndex>,
     ) -> u32 {
         let mut drawn = 0u32;
         let fw = (width.max(64)) as f32;
@@ -1564,10 +1619,12 @@ impl InventoryManager {
         let bar_w = (fw * 0.18).clamp(90.0, 260.0);
         let bar_h = (fh * 0.016).clamp(6.0, 14.0);
         let margin = 16.0;
-        renderer.ui_fill_rect(
-            [margin - 6.0, fh - margin - bar_h * 4.4, bar_w + 12.0, bar_h * 4.2 + 8.0],
-            [0.05, 0.06, 0.07, 0.62],
-        );
+        let hud_bg = [margin - 6.0, fh - margin - bar_h * 4.4, bar_w + 12.0, bar_h * 4.2 + 8.0];
+        if let Some(tex) = hud_tex {
+            renderer.ui_draw_textured_rect(hud_bg, [0.0, 0.0, 0.25, 0.125], tex, [0.4, 0.45, 0.5, 0.85]);
+        } else {
+            renderer.ui_fill_rect(hud_bg, [0.05, 0.06, 0.07, 0.62]);
+        }
         drawn += 1;
 
         renderer.ui_draw_meter_bar(
@@ -1612,7 +1669,13 @@ impl InventoryManager {
             renderer.ui_fill_rect([qx, qy, q_size, q_size], [0.07, 0.08, 0.09, 0.75]);
             drawn += 1;
             if let Some(q_item) = self.item_in_slot(EquipmentSlot::QuickSlot(q_idx)) {
-                renderer.ui_fill_rect([qx + 3.0, qy + 3.0, q_size - 6.0, q_size - 6.0], q_item.category.accent_color());
+                let inner = [qx + 3.0, qy + 3.0, q_size - 6.0, q_size - 6.0];
+                if let Some(tex) = equipment_tex {
+                    let uv = item_icon_uv(&q_item.section, q_item.category);
+                    renderer.ui_draw_textured_rect(inner, uv, tex, [1.0, 1.0, 1.0, 0.98]);
+                } else {
+                    renderer.ui_fill_rect(inner, q_item.category.accent_color());
+                }
                 drawn += 1;
             }
         }
@@ -1624,7 +1687,12 @@ impl InventoryManager {
             let ah = 42.0;
             let ax = fw - margin - aw;
             let ay = fh - margin - ah;
-            renderer.ui_fill_rect([ax, ay, aw, ah], [0.05, 0.06, 0.07, 0.68]);
+            let ammo_bg = [ax, ay, aw, ah];
+            if let Some(tex) = hud_tex {
+                renderer.ui_draw_textured_rect(ammo_bg, [0.25, 0.0, 0.5, 0.125], tex, [0.4, 0.45, 0.5, 0.88]);
+            } else {
+                renderer.ui_fill_rect(ammo_bg, [0.05, 0.06, 0.07, 0.68]);
+            }
             drawn += 1;
             let clip_frac = if spec.clip_capacity > 0 {
                 (spec.ammo_in_clip as f32 / spec.clip_capacity as f32).clamp(0.0, 1.0)
@@ -1632,19 +1700,21 @@ impl InventoryManager {
                 1.0
             };
             renderer.ui_draw_meter_bar(
-                [ax + 8.0, ay + ah - 14.0, aw - 16.0, 7.0],
+                [ax + 8.0, ay + ah - 10.0, aw - 16.0, 5.0],
                 clip_frac,
                 [0.10, 0.10, 0.10, 0.85],
                 [0.90, 0.74, 0.25, 0.95],
             );
             drawn += 2;
             if let Some(f) = font {
-                let ammo_txt = if spec.clip_capacity > 0 {
-                    format!("{} {}/{}", spec.section, spec.ammo_in_clip, spec.reserve_ammo)
+                let name_txt = spec.section.to_ascii_uppercase();
+                let count_txt = if spec.clip_capacity > 0 {
+                    format!("{}/{}", spec.ammo_in_clip, spec.reserve_ammo)
                 } else {
-                    spec.section.clone()
+                    "--".to_string()
                 };
-                drawn += f.draw_text(renderer, &ammo_txt, [ax + 8.0, ay + 6.0], 14.0, [0.95, 0.92, 0.85, 0.95]);
+                drawn += f.draw_text(renderer, &name_txt, [ax + 8.0, ay + 4.0], 12.0, [0.85, 0.82, 0.75, 0.95]);
+                drawn += f.draw_text(renderer, &count_txt, [ax + 8.0, ay + 17.0], 16.0, [0.98, 0.88, 0.35, 1.0]);
             }
         }
 
@@ -1694,7 +1764,12 @@ impl InventoryManager {
                     && self.drag.as_ref().is_none_or(|d| d.item_uid != item.uid)
                 {
                     let inner = [rect[0] + 4.0, rect[1] + 4.0, (rect[2] - 8.0).max(4.0), (rect[3] - 12.0).max(4.0)];
-                    renderer.ui_fill_rect(inner, item.category.accent_color());
+                    if let Some(tex) = equipment_tex {
+                        let uv = item_icon_uv(&item.section, item.category);
+                        renderer.ui_draw_textured_rect(inner, uv, tex, [1.0, 1.0, 1.0, 0.98]);
+                    } else {
+                        renderer.ui_fill_rect(inner, item.category.accent_color());
+                    }
                     renderer.ui_draw_meter_bar(
                         [rect[0] + 4.0, rect[1] + rect[3] - 6.0, (rect[2] - 8.0).max(4.0), 3.5],
                         item.condition,
@@ -1741,7 +1816,12 @@ impl InventoryManager {
                     renderer.ui_fill_rect([ix - 1.5, iy - 1.5, iw + 3.0, ih + 3.0], [0.95, 0.78, 0.25, 0.95]);
                     drawn += 1;
                 }
-                renderer.ui_fill_rect([ix, iy, iw, ih], item.category.accent_color());
+                if let Some(tex) = equipment_tex {
+                    let uv = item_icon_uv(&item.section, item.category);
+                    renderer.ui_draw_textured_rect([ix, iy, iw, ih], uv, tex, [1.0, 1.0, 1.0, 0.98]);
+                } else {
+                    renderer.ui_fill_rect([ix, iy, iw, ih], item.category.accent_color());
+                }
                 renderer.ui_draw_meter_bar(
                     [ix + 2.0, iy + ih - 5.0, (iw - 4.0).max(2.0), 3.0],
                     item.condition,
@@ -1806,12 +1886,15 @@ impl InventoryManager {
             {
                 let gw = f32::from(item.grid_size.0) * layout.cell_size;
                 let gh = f32::from(item.grid_size.1) * layout.cell_size;
-                let mut ghost_col = item.category.accent_color();
-                ghost_col[3] = 0.72;
-                renderer.ui_fill_rect(
-                    [drag.current_pointer[0] - gw * 0.5, drag.current_pointer[1] - gh * 0.5, gw, gh],
-                    ghost_col,
-                );
+                let drag_rect = [drag.current_pointer[0] - gw * 0.5, drag.current_pointer[1] - gh * 0.5, gw, gh];
+                if let Some(tex) = equipment_tex {
+                    let uv = item_icon_uv(&item.section, item.category);
+                    renderer.ui_draw_textured_rect(drag_rect, uv, tex, [1.0, 1.0, 1.0, 0.85]);
+                } else {
+                    let mut ghost_col = item.category.accent_color();
+                    ghost_col[3] = 0.72;
+                    renderer.ui_fill_rect(drag_rect, ghost_col);
+                }
                 drawn += 1;
             }
         }

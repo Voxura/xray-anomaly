@@ -25,12 +25,12 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC2_UNORM,
+    DXGI_FORMAT, DXGI_FORMAT_A8_UNORM, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM_SRGB, DXGI_FORMAT_BC2_UNORM,
     DXGI_FORMAT_BC2_UNORM_SRGB, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC3_UNORM_SRGB,
     DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC4_SNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC5_SNORM,
     DXGI_FORMAT_BC7_UNORM, DXGI_FORMAT_BC7_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM,
     DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8X8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 
 use crate::bindless::DescriptorIndex;
@@ -205,6 +205,12 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
         } else {
             return Err(TextureError::UnsupportedFormat);
         }
+    } else if (pf_flags & 0x00000002 != 0 || pf_flags & 0x00000001 != 0) && pf_rgb_bits == 8 {
+        // D3DFMT_A8 (DDPF_ALPHA = 0x2 / DDPF_ALPHAPIXELS = 0x1) 8-bit uncompressed alpha texture
+        (DXGI_FORMAT_A8_UNORM, false, 1)
+    } else if pf_flags & 0x00020000 != 0 && pf_rgb_bits == 8 {
+        // DDPF_LUMINANCE 8-bit texture
+        (DXGI_FORMAT_R8_UNORM, false, 1)
     } else {
         return Err(TextureError::UnsupportedFormat);
     };

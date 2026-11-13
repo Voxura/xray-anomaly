@@ -188,6 +188,8 @@ pub struct RenderBridge {
     default_cube_mesh: MeshHandle,
     ui_font: Option<UiFontResource>,
     ui_font_attempted: bool,
+    ui_hud_tex: Option<DescriptorIndex>,
+    ui_equipment_tex: Option<DescriptorIndex>,
 }
 
 impl RenderBridge {
@@ -232,6 +234,8 @@ impl RenderBridge {
             default_cube_mesh,
             ui_font: None,
             ui_font_attempted: false,
+            ui_hud_tex: None,
+            ui_equipment_tex: None,
         })
     }
 
@@ -1050,6 +1054,8 @@ impl RenderBridge {
             {
                 self.ui_font_attempted = true;
                 self.ui_font = try_load_ui_font(renderer, vfs_ref, height);
+                self.ui_hud_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_hud.dds");
+                self.ui_equipment_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_icon_equipment.dds");
             }
             let font_ref = self.ui_font.as_ref();
 
@@ -1068,6 +1074,8 @@ impl RenderBridge {
                     draw_crosshair,
                     hud.stamina,
                     font_ref,
+                    self.ui_hud_tex,
+                    self.ui_equipment_tex,
                 );
                 if let Some(pda_mgr) = pda {
                     let level_name = alife

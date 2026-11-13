@@ -74,6 +74,11 @@ float4 ps_main(PSInput input) : SV_Target0
     if (input.texture_index != 0xFFFFFFFF)
     {
         tex_color = g_textures[NonUniformResourceIndex(input.texture_index)].Sample(g_sampler, input.uv);
+        // Handle A8 font / alpha mask textures: when RGB is 0.0 and alpha > 0.0, expand RGB to 1.0
+        if (tex_color.r == 0.0 && tex_color.g == 0.0 && tex_color.b == 0.0)
+        {
+            tex_color.rgb = float3(1.0, 1.0, 1.0);
+        }
     }
 
     float4 final_color = tex_color * input.color;

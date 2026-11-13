@@ -429,6 +429,9 @@ fn run_engine(args: LaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
             fps,
             max_frame_duration.as_secs_f64() * 1000.0
         );
+        if let Some(rb) = &runtime.render_bridge {
+            println!("[profile] Last frame stats: {:?}", rb.last_stats);
+        }
         return Ok(());
     }
 

@@ -192,7 +192,7 @@ float4 ps_deferred_combine(VSOutput input) : SV_Target0
     float3 world_pos;
     if (abs(proj[2][3]) > 1e-6) // Perspective projection
     {
-        float view_z = proj[3][2] / max(depth - proj[2][2], 1e-6);
+        float view_z = (-proj[2][3]) / max(proj[2][2] - depth, 1e-6);
         float3 pos_vs = float3(view_x * view_z, view_y * view_z, view_z);
         world_pos = mul(inv_view_rot, pos_vs) + cam_pos.xyz;
     }
@@ -271,8 +271,8 @@ float4 ps_deferred_combine(VSOutput input) : SV_Target0
         }
     }
 
-    // Ambient Lighting
-    float3 ambient = AmbientColor.rgb * albedo_sample.rgb;
+    // Ambient Lighting with safety floor
+    float3 ambient = max(AmbientColor.rgb, float3(0.12, 0.12, 0.14)) * albedo_sample.rgb;
 
     // SSFX Volumetric Light Shafts
     float3 volumetric_shafts = float3(0.0, 0.0, 0.0);
