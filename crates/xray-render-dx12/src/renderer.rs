@@ -1524,7 +1524,13 @@ impl Dx12Renderer {
             return Ok(());
         }
         if self.ui_canvas_pipeline.is_none() {
-            self.ui_canvas_pipeline = Some(crate::ui_canvas::UiCanvasPipeline::new(&self.device_ctx.device)?);
+            match crate::ui_canvas::UiCanvasPipeline::new(&self.device_ctx.device) {
+                Ok(pipeline) => self.ui_canvas_pipeline = Some(pipeline),
+                Err(err) => {
+                    eprintln!("[Dx12Renderer::ui_flush] Failed to initialize UiCanvasPipeline: {:?}", err);
+                    return Err(err);
+                }
+            }
         }
         let cmd = match self.current_cmd_list.as_ref() {
             Some(c) => c,
@@ -1538,6 +1544,8 @@ impl Dx12Renderer {
 
         let quads = &self.ui_canvas.quads;
         let byte_len = std::mem::size_of_val(quads.as_slice());
+        // Direct3D 12 buffer allocations must be minimum 256 bytes and 256-byte aligned
+        let aligned_alloc_size = ((byte_len as u64 + 255) & !255).max(256);
         let heap_props = windows::Win32::Graphics::Direct3D12::D3D12_HEAP_PROPERTIES {
             Type: windows::Win32::Graphics::Direct3D12::D3D12_HEAP_TYPE_UPLOAD,
             CreationNodeMask: 1,
@@ -1546,7 +1554,7 @@ impl Dx12Renderer {
         };
         let desc = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC {
             Dimension: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: byte_len as u64,
+            Width: aligned_alloc_size,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -1556,16 +1564,23 @@ impl Dx12Renderer {
         };
         let mut upload_res: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> = None;
         unsafe {
-            self.device_ctx.device.CreateCommittedResource(
+            let res = self.device_ctx.device.CreateCommittedResource(
                 &heap_props,
                 windows::Win32::Graphics::Direct3D12::D3D12_HEAP_FLAG_NONE,
                 &desc,
                 windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_GENERIC_READ,
                 None,
                 &mut upload_res,
-            )?;
+            );
+            if let Err(e) = res {
+                eprintln!("[Dx12Renderer::ui_flush] CreateCommittedResource failed (size {} bytes): {:?}", aligned_alloc_size, e);
+                return Err(e);
+            }
         }
-        let upload_res = upload_res.ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        let upload_res = upload_res.ok_or_else(|| {
+            eprintln!("[Dx12Renderer::ui_flush] upload_res is null after CreateCommittedResource");
+            windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))
+        })?;
         unsafe {
             let mut mapped = std::ptr::null_mut();
             upload_res.Map(0, None, Some(&mut mapped))?;

@@ -108,7 +108,7 @@ impl UiCanvasPipeline {
 
         let srv_range = D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-            NumDescriptors: u32::MAX,
+            NumDescriptors: 4096,
             BaseShaderRegister: 0,
             RegisterSpace: 0,
             OffsetInDescriptorsFromTableStart: 0,
@@ -169,17 +169,35 @@ impl UiCanvasPipeline {
         let mut signature_blob = None;
         let mut error_blob = None;
         let root_signature: ID3D12RootSignature = unsafe {
-            D3D12SerializeRootSignature(
+            let res = D3D12SerializeRootSignature(
                 &root_desc,
                 D3D_ROOT_SIGNATURE_VERSION_1_0,
                 &mut signature_blob,
                 Some(&mut error_blob),
-            )?;
-            let blob = signature_blob.ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
-            device.CreateRootSignature(
+            );
+            if let Err(e) = res {
+                if let Some(err_b) = &error_blob {
+                    let err_msg = std::ffi::CStr::from_ptr(err_b.GetBufferPointer().cast()).to_string_lossy();
+                    eprintln!("[UiCanvasPipeline] D3D12SerializeRootSignature failed: {:?} - details: {}", e, err_msg);
+                } else {
+                    eprintln!("[UiCanvasPipeline] D3D12SerializeRootSignature failed: {:?}", e);
+                }
+                return Err(e);
+            }
+            let blob = signature_blob.ok_or_else(|| {
+                eprintln!("[UiCanvasPipeline] Serialized root signature blob is null");
+                windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))
+            })?;
+            match device.CreateRootSignature(
                 0,
                 std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()),
-            )?
+            ) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    eprintln!("[UiCanvasPipeline] CreateRootSignature failed: {:?}", e);
+                    return Err(e);
+                }
+            }
         };
 
         // 2. Alpha-blended Pipeline State
@@ -250,7 +268,15 @@ impl UiCanvasPipeline {
             NumElements: 0,
         };
 
-        let pso = unsafe { device.CreateGraphicsPipelineState(&pso_desc)? };
+        let pso = unsafe {
+            match device.CreateGraphicsPipelineState(&pso_desc) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[UiCanvasPipeline] CreateGraphicsPipelineState failed: {:?}", e);
+                    return Err(e);
+                }
+            }
+        };
 
         Ok(Self {
             root_signature,

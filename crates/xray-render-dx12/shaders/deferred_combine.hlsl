@@ -271,8 +271,8 @@ float4 ps_deferred_combine(VSOutput input) : SV_Target0
         }
     }
 
-    // Ambient Lighting with safety floor
-    float3 ambient = max(AmbientColor.rgb, float3(0.12, 0.12, 0.14)) * albedo_sample.rgb;
+    // Ambient Lighting
+    float3 ambient = AmbientColor.rgb * albedo_sample.rgb;
 
     // SSFX Volumetric Light Shafts
     float3 volumetric_shafts = float3(0.0, 0.0, 0.0);

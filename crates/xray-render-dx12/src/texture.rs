@@ -236,6 +236,10 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
 
         let next_offset = current_offset + slice_pitch as usize;
         if next_offset > bytes.len() {
+            if !mips.is_empty() {
+                // Buffer ended before all declared mip levels; keep valid decoded mips
+                break;
+            }
             return Err(TextureError::BufferTooShort);
         }
 
@@ -253,11 +257,12 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
         mip_h = (mip_h / 2).max(1);
     }
 
+    let actual_mip_count = mips.len() as u32;
     Ok(DdsImage {
         width,
         height,
         depth,
-        mip_count,
+        mip_count: actual_mip_count,
         format,
         is_block_compressed: is_bc,
         block_size,
@@ -283,13 +288,14 @@ pub fn upload_dds_texture(
     cmd: &ID3D12GraphicsCommandList,
     dds: &DdsImage,
 ) -> WinResult<(ID3D12Resource, ID3D12Resource)> {
+    let mip_count = dds.mips.len().max(1);
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         Alignment: 0,
         Width: dds.width as u64,
         Height: dds.height,
         DepthOrArraySize: dds.depth as u16,
-        MipLevels: dds.mip_count as u16,
+        MipLevels: mip_count as u16,
         Format: dds.format,
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: 1,
@@ -308,18 +314,27 @@ pub fn upload_dds_texture(
 
     let mut texture_res: Option<ID3D12Resource> = None;
     unsafe {
-        device.CreateCommittedResource(
+        let res = device.CreateCommittedResource(
             &default_heap,
             D3D12_HEAP_FLAG_NONE,
             &desc,
             D3D12_RESOURCE_STATE_COPY_DEST,
             None,
             &mut texture_res,
-        )?;
+        );
+        if let Err(e) = res {
+            eprintln!(
+                "[upload_dds_texture] Failed to allocate texture resource ({}x{}, format {:?}, mips {}): {:?}",
+                dds.width, dds.height, dds.format, mip_count, e
+            );
+            return Err(e);
+        }
     }
-    let texture_res = texture_res.ok_or_else(failure)?;
+    let texture_res = texture_res.ok_or_else(|| {
+        eprintln!("[upload_dds_texture] texture_res is null after CreateCommittedResource");
+        failure()
+    })?;
 
-    let mip_count = dds.mip_count as usize;
     let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); mip_count];
     let mut num_rows = vec![0u32; mip_count];
     let mut row_sizes = vec![0u64; mip_count];
@@ -329,7 +344,7 @@ pub fn upload_dds_texture(
         device.GetCopyableFootprints(
             &desc,
             0,
-            dds.mip_count,
+            mip_count as u32,
             0,
             Some(layouts.as_mut_ptr()),
             Some(num_rows.as_mut_ptr()),
@@ -344,10 +359,11 @@ pub fn upload_dds_texture(
         VisibleNodeMask: 1,
         ..Default::default()
     };
+    let aligned_upload_size = ((total_bytes + 255) & !255).max(256);
     let upload_desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Alignment: 0,
-        Width: total_bytes,
+        Width: aligned_upload_size,
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -362,16 +378,26 @@ pub fn upload_dds_texture(
 
     let mut upload_res: Option<ID3D12Resource> = None;
     unsafe {
-        device.CreateCommittedResource(
+        let res = device.CreateCommittedResource(
             &upload_heap,
             D3D12_HEAP_FLAG_NONE,
             &upload_desc,
             D3D12_RESOURCE_STATE_GENERIC_READ,
             None,
             &mut upload_res,
-        )?;
+        );
+        if let Err(e) = res {
+            eprintln!(
+                "[upload_dds_texture] Failed to allocate upload staging buffer (size {} bytes): {:?}",
+                aligned_upload_size, e
+            );
+            return Err(e);
+        }
     }
-    let upload_res = upload_res.ok_or_else(failure)?;
+    let upload_res = upload_res.ok_or_else(|| {
+        eprintln!("[upload_dds_texture] upload_res is null after CreateCommittedResource");
+        failure()
+    })?;
 
     unsafe {
         let mut mapped_ptr: *mut u8 = std::ptr::null_mut();
@@ -390,9 +416,12 @@ pub fn upload_dds_texture(
             let copy_row_bytes = (row_sizes[i] as usize).min(src_pitch);
 
             for row in 0..rows {
-                let src_row = mip.data.as_ptr().add(row * src_pitch);
-                let dst_row = subresource_dst.add(row * dst_pitch);
-                std::ptr::copy_nonoverlapping(src_row, dst_row, copy_row_bytes);
+                let src_offset = row * src_pitch;
+                if src_offset + copy_row_bytes <= mip.data.len() {
+                    let src_row = mip.data.as_ptr().add(src_offset);
+                    let dst_row = subresource_dst.add(row * dst_pitch);
+                    std::ptr::copy_nonoverlapping(src_row, dst_row, copy_row_bytes);
+                }
             }
         }
 

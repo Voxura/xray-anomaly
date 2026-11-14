@@ -71,7 +71,7 @@ PSInput vs_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID)
 float4 ps_main(PSInput input) : SV_Target0
 {
     float4 tex_color = float4(1.0, 1.0, 1.0, 1.0);
-    if (input.texture_index != 0xFFFFFFFF)
+    if (input.texture_index != 0xFFFFFFFF && input.texture_index < 4096)
     {
         tex_color = g_textures[NonUniformResourceIndex(input.texture_index)].Sample(g_sampler, input.uv);
         // Handle A8 font / alpha mask textures: when RGB is 0.0 and alpha > 0.0, expand RGB to 1.0
