@@ -368,21 +368,47 @@ fn run_engine(args: LaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
         runtime.attach_network(NetworkSession::Host(host));
     }
 
-    if let Some(level_arg) = &args.level {
-        let level_dir = resolve_level_dir(level_arg);
-        let save_vpath = args
-            .save
-            .as_deref()
-            .and_then(|s| resolve_save_vpath(&vfs, s));
+    let save_vpath = args
+        .save
+        .as_deref()
+        .and_then(|s| resolve_save_vpath(&vfs, s));
 
-        if args.save.is_some() && save_vpath.is_none() {
-            return Err(format!(
-                "requested savegame '{}' was not found in mounted VFS",
-                args.save.as_deref().unwrap_or_default()
-            )
-            .into());
+    if args.save.is_some() && save_vpath.is_none() {
+        return Err(format!(
+            "requested savegame '{}' was not found in mounted VFS",
+            args.save.as_deref().unwrap_or_default()
+        )
+        .into());
+    }
+
+    let level_to_load = if let Some(level_arg) = &args.level {
+        Some(resolve_level_dir(level_arg))
+    } else if let Some(scop_path) = &save_vpath {
+        // Auto-resolve level from .scop header, graph mappings, or fallback to l01_escape if -level was not passed
+        if let Ok(scop) = xray_formats::vfs_bridge::load_scop_save_from_vfs(&vfs, scop_path) {
+            let lvl = if !scop.header.level_name.is_empty() {
+                scop.header.level_name
+            } else if let Some(m) = scop
+                .graph_and_quests
+                .graph_mappings
+                .iter()
+                .find(|m| !m.level_name.is_empty())
+            {
+                m.level_name.clone()
+            } else {
+                "l01_escape".to_string()
+            };
+            let resolved = resolve_level_dir(&lvl);
+            eprintln!("[engine] Auto-resolved level from savegame: {}", resolved);
+            Some(resolved)
+        } else {
+            None
         }
+    } else {
+        None
+    };
 
+    if let Some(level_dir) = level_to_load {
         let level_cfg = LevelLoadConfig {
             level_dir,
             ..Default::default()

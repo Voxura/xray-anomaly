@@ -277,3 +277,130 @@ fn test_verify_frustum_culling_against_level_meshes() {
         Err(e) => println!("[diagnostic] failed to load fonts.ltx: {:?}", e),
     }
 }
+
+#[test]
+fn test_diagnose_savegame_and_camera_and_ui() {
+    let games_root = Path::new(r"C:\Games");
+    if !games_root.join("fsgame.ltx").exists() {
+        return;
+    }
+
+    let mut vfs = VirtualFileSystem::mount_game_root(games_root).expect("mount VFS");
+    let app_data = games_root.join("appdata");
+    if app_data.is_dir() {
+        vfs.mount_loose_dir(&app_data);
+    }
+
+    println!("[diagnostic] UI XML existence check:");
+    println!("   configs\\ui\\ui_hud.xml: {}", vfs.exists("configs\\ui\\ui_hud.xml"));
+    println!("   configs\\ui\\ui_common.xml: {}", vfs.exists("configs\\ui\\ui_common.xml"));
+    println!("   configs\\ui\\inventory_new.xml: {}", vfs.exists("configs\\ui\\inventory_new.xml"));
+
+    if let Ok(act_xml) = vfs.read_to_string_lossy("configs\\ui\\actor_menu.xml") {
+        println!("[diagnostic] configs\\ui\\actor_menu.xml length: {} bytes, first 800 chars:\n{}", act_xml.len(), &act_xml[..act_xml.len().min(800)]);
+    }
+    if let Ok(inv_xml) = vfs.read_to_string_lossy("configs\\ui\\inventory_new.xml") {
+        println!("[diagnostic] configs\\ui\\inventory_new.xml length: {} bytes, first 800 chars:\n{}", inv_xml.len(), &inv_xml[..inv_xml.len().min(800)]);
+    }
+    let timer = std::time::Instant::now();
+    let mut item_db: std::collections::BTreeMap<String, (u32, u32, u8, u8)> = std::collections::BTreeMap::new();
+    if let Ok(item_files) = vfs.list_files("configs\\items") {
+        for f in &item_files {
+            if !f.ends_with(".ltx") {
+                continue;
+            }
+            if let Ok(text) = vfs.read_to_string_lossy(f) {
+                let mut current_sec: Option<String> = None;
+                let mut gx = None;
+                let mut gy = None;
+                let mut gw = None;
+                let mut gh = None;
+
+                let commit = |sec: &Option<String>, gx: Option<u32>, gy: Option<u32>, gw: Option<u8>, gh: Option<u8>, db: &mut std::collections::BTreeMap<String, (u32, u32, u8, u8)>| {
+                    if let (Some(s), Some(x), Some(y), Some(w), Some(h)) = (sec, gx, gy, gw, gh) {
+                        db.entry(s.clone()).or_insert((x, y, w, h));
+                    }
+                };
+
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with(';') || trimmed.starts_with("//") {
+                        continue;
+                    }
+                    if trimmed.starts_with('[') && trimmed.contains(']') {
+                        commit(&current_sec, gx, gy, gw, gh, &mut item_db);
+                        let inside = &trimmed[1..trimmed.find(']').unwrap_or(trimmed.len())];
+                        current_sec = Some(inside.trim().to_ascii_lowercase());
+                        gx = None;
+                        gy = None;
+                        gw = None;
+                        gh = None;
+                    } else if let Some((lhs, rhs)) = trimmed.split_once('=') {
+                        let k = lhs.trim().to_ascii_lowercase();
+                        let v = rhs.split(';').next().unwrap_or("").trim();
+                        match k.as_str() {
+                            "inv_grid_x" => gx = v.parse::<u32>().ok(),
+                            "inv_grid_y" => gy = v.parse::<u32>().ok(),
+                            "inv_grid_width" => gw = v.parse::<u8>().ok(),
+                            "inv_grid_height" => gh = v.parse::<u8>().ok(),
+                            _ => {}
+                        }
+                    }
+                }
+                commit(&current_sec, gx, gy, gw, gh, &mut item_db);
+            }
+        }
+    }
+    println!("[diagnostic] Parsed {} items with inv_grid in {:?}", item_db.len(), timer.elapsed());
+    for s in ["wpn_svt40", "wpn_ak74", "wpn_pm", "bandage", "medkit", "novice_outfit", "wpn_toz34_obrez", "wpn_g36k", "monolith_trenchcoat_outfit"] {
+        println!("   [indexed] {} => {:?}", s, item_db.get(s));
+    }
+
+    println!("[diagnostic] Check player - autosave files in VFS:");
+    println!("   savedgames\\player - autosave.scop exists: {}", vfs.exists("savedgames\\player - autosave.scop"));
+    println!("   savedgames\\player - autosave.scoc exists: {}", vfs.exists("savedgames\\player - autosave.scoc"));
+
+    use xray_formats::vfs_bridge::{load_scoc_from_vfs, load_scop_save_from_vfs};
+    if let Ok(scop) = load_scop_save_from_vfs(&vfs, "savedgames\\player - autosave.scop") {
+        println!("[diagnostic] SCOP loaded: header level_id={:?}, level_name='{}', entities={}",
+            scop.header.level_id, scop.header.level_name, scop.entities.len()
+        );
+        println!("[diagnostic] SCOP actor_stats: pos={:?}, angles={:?}, health={}",
+            scop.header.actor_stats.position, scop.header.actor_stats.angles, scop.header.actor_stats.health
+        );
+        let actor = scop.entities.iter().find(|e| e.kind() == xray_formats::scop::ScopAlifeKind::Actor);
+        if let Some(act) = actor {
+            println!("[diagnostic] SCOP actor entity: id={}, pos={:?}, health={:?}, game_vertex_id={}, level_vertex_id={}",
+                act.id(), act.position(), act.health(), act.game_vertex_id(), act.level_vertex_id()
+            );
+        }
+
+
+        let mut owned_count = 0usize;
+        for ent in &scop.entities {
+            if ent.parent_id() == 0 || actor.map_or(false, |a| ent.parent_id() == a.id()) {
+                owned_count += 1;
+                println!("   [owned item #{}] id={}, parent={}, section='{}', name='{}', kind={:?}",
+                    owned_count, ent.id(), ent.parent_id(), ent.section(), ent.name(), ent.kind()
+                );
+            }
+        }
+        println!("[diagnostic] Total owned items in SCOP: {}", owned_count);
+    } else {
+        println!("[diagnostic] Failed to load SCOP from VFS");
+    }
+
+    if let Ok(scoc) = load_scoc_from_vfs(&vfs, "savedgames\\player - autosave.scoc") {
+        let peer = scoc.extract_peer_state();
+        println!("[diagnostic] SCOC loaded: inventory items={}, extra uses={}",
+            peer.inventory.len(), peer.item_remaining_uses_extra.len()
+        );
+        for (i, it) in peer.inventory.iter().enumerate().take(15) {
+            println!("   [scoc item #{}] section='{}', slot={:?}, condition={:?}, uses={:?}",
+                i, it.section, it.slot, it.condition, it.remaining_uses
+            );
+        }
+    } else {
+        println!("[diagnostic] Failed to load SCOC from VFS");
+    }
+}

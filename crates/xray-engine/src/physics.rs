@@ -397,6 +397,15 @@ impl StalkerController {
             return;
         }
 
+        // Prevent unbounded freefall through the bottom of the world
+        let min_world_y = bvh.aabb().min[1] - 5.0;
+        if target_y < min_world_y {
+            self.feet_position[1] = min_world_y + 6.0;
+            self.velocity[1] = 0.0;
+            self.grounded = true;
+            return;
+        }
+
         // Remain airborne and apply vertical drop
         self.feet_position[1] = target_y;
         self.grounded = false;

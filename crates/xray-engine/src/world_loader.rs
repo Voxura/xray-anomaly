@@ -26,7 +26,7 @@ use xray_formats::ogf::{matrix_mul_44, OgfBBox, OgfBSphere, OgfModel, OgfTexture
 use xray_formats::scop::ScopWeatherState;
 use xray_formats::shaders_xr::{LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles};
 use xray_formats::sound_env::{LevelStaticSounds, SoundOcclusionMesh};
-use xray_formats::spawns::{LevelGameData, LevelSpawnData};
+use xray_formats::spawns::{LevelGameData, LevelSpawnData, RPointType};
 use xray_formats::thm::ResolvedTextureLinks;
 use xray_formats::vfs_bridge::{
     load_cform_from_vfs, load_details_from_vfs, load_env_mods_from_vfs, load_fog_volumes_from_vfs,
@@ -410,6 +410,39 @@ impl LoadedWorld {
             .dynamic_models
             .get(&canonical_key)
             .expect("inserted dynamic model must exist"))
+    }
+
+    /// Discard heavy CPU-side vertex and index buffers after uploading to GPU,
+    /// dropping hundreds of megabytes of duplicated RAM.
+    pub fn drop_cpu_geometry_after_gpu_upload(&mut self) {
+        self.level_geom = None;
+        self.level_geomx = None;
+        for visual in &mut self.visual_meshes {
+            visual.mesh.vertices = Vec::new();
+            visual.mesh.indices = Vec::new();
+            if let Some(fp) = &mut visual.fastpath {
+                fp.vertices = Vec::new();
+                fp.indices = Vec::new();
+            }
+        }
+    }
+
+    /// Return the authentic actor spawn position and orientation from static level spawns (`level.spawn` or `level.game`).
+    pub fn default_actor_spawn(&self) -> Option<([f32; 3], [f32; 3])> {
+        if let Some(spawn) = &self.level_spawn {
+            if let Some(actor_pkt) = spawn.spawns.iter().find(|p| {
+                p.section.eq_ignore_ascii_case("actor")
+                    || p.name_replace.to_ascii_lowercase().starts_with("actor")
+            }) {
+                return Some((actor_pkt.position, [actor_pkt.angle[0], actor_pkt.angle[1], actor_pkt.angle[2]]));
+            }
+        }
+        if let Some(game) = &self.level_game {
+            if let Some(rp) = game.rpoints.iter().find(|r| matches!(r.point_type, RPointType::ActorSpawn)) {
+                return Some((rp.pos, [rp.rot[0], rp.rot[1], rp.rot[2]]));
+            }
+        }
+        None
     }
 
     /// Perform an AABB BVH raycast against static `level.cform` world collision geometry.

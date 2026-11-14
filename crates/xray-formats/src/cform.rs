@@ -441,6 +441,16 @@ impl<'a> CformBvh<'a> {
         self.nodes.len()
     }
 
+    #[inline]
+    pub fn model(&self) -> &'a CformModel {
+        self.model
+    }
+
+    #[inline]
+    pub fn aabb(&self) -> OgfBBox {
+        self.model.header.aabb
+    }
+
     /// Execute a raycast query matching `CDB::COLLIDER::ray_query`.
     ///
     /// - `origin`: world-space ray origin

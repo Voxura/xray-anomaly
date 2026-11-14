@@ -15,7 +15,7 @@ use crate::level_transition::{canonical_level_name, LevelTransitionManager};
 use crate::physics::StalkerController;
 use crate::render_bridge::{HudOverlayState, RenderBridge, RenderBridgeConfig};
 use crate::timer::EngineTimer;
-use crate::ui_inventory::InventoryManager;
+use crate::ui_inventory::{InventoryManager, ItemGridIndex};
 use crate::ui_pda::PdaManager;
 use crate::window::{EngineWindow, WindowConfig};
 use crate::world_loader::{LevelLoadConfig, LoadedWorld, WorldLoader};
@@ -120,6 +120,7 @@ pub struct EngineRuntime {
     pub world: Option<LoadedWorld>,
     pub alife: Option<AlifeManager>,
     pub vfs: Option<Arc<VirtualFileSystem>>,
+    pub item_grid_index: Option<Arc<ItemGridIndex>>,
     pub elapsed_sec: f32,
     pub running: bool,
 }
@@ -171,6 +172,7 @@ impl EngineRuntime {
             world: None,
             alife: None,
             vfs: None,
+            item_grid_index: None,
             elapsed_sec: 0.0,
             running: true,
         })
@@ -178,6 +180,9 @@ impl EngineRuntime {
 
     /// Attach a shared [`VirtualFileSystem`] for on-demand dynamic model/texture/audio streaming.
     pub fn attach_vfs(&mut self, vfs: Arc<VirtualFileSystem>) {
+        let grid_index = Arc::new(ItemGridIndex::load_from_vfs(&vfs));
+        self.inventory.set_grid_index(Arc::clone(&grid_index));
+        self.item_grid_index = Some(grid_index);
         self.audio.attach_vfs(Arc::clone(&vfs));
         self.pda.invalidate_map_cache();
         self.pda.ensure_world_maps_loaded(&vfs);
@@ -218,8 +223,13 @@ impl EngineRuntime {
 
     /// Attach an ALife simulation manager and synchronize camera, physics, inventory & weather initial state.
     pub fn attach_alife(&mut self, alife: AlifeManager) {
+        // Hydrate inventory from ALife entities
+        self.inventory
+            .hydrate_from_alife(&alife, self.item_grid_index.as_deref());
+        self.inventory.sync_hud_weapon(&mut self.hud_weapon);
+
         self.inventory.actor_stats = alife.actor_stats.clone();
-        let (pos, angles, hp) = if let Some(actor) = alife.host_actor()
+        let (mut pos, mut angles, hp) = if let Some(actor) = alife.host_actor()
             && actor.position != [0.0, 0.0, 0.0]
         {
             (actor.position, [actor.angle[0], actor.angle[1]], actor.health)
@@ -230,10 +240,51 @@ impl EngineRuntime {
                 alife.actor_stats.health,
             )
         };
+
+        if let Some(world) = &self.world {
+            let current_level = canonical_level_name(&world.level_dir);
+            let save_level = canonical_level_name(&alife.level_name);
+            let level_mismatch = !save_level.is_empty() && current_level != save_level;
+            if level_mismatch {
+                eprintln!(
+                    "[engine] Savegame level mismatch (save on '{}', running '{}'); relocating actor to level spawn",
+                    save_level, current_level
+                );
+                if let Some((spawn_pos, spawn_ang)) = world.default_actor_spawn() {
+                    pos = spawn_pos;
+                    angles = [spawn_ang[0], spawn_ang[1]];
+                }
+            }
+
+            if let Some(cform) = &world.cform {
+                let bvh = cform.build_bvh();
+                let aabb = bvh.aabb();
+                let sky_y = (pos[1] + 50.0).max(aabb.max[1] + 5.0).min(aabb.max[1] + 200.0);
+                let ray_origin = [pos[0], sky_y, pos[2]];
+                let ray_dist = (sky_y - aabb.min[1] + 10.0).max(50.0);
+                if let Some(hit) = bvh.raycast_nearest(ray_origin, [0.0, -1.0, 0.0], ray_dist, false) {
+                    let ground_y = hit.point[1];
+                    if pos[1] < ground_y || pos[1] > ground_y + 30.0 {
+                        pos[1] = ground_y + 1.8;
+                    }
+                }
+            }
+        }
+
         self.camera.position = pos;
         self.camera.pitch = angles[0];
         self.camera.yaw = angles[1];
         self.physics.sync_from_eye(self.camera.position);
+
+        if let Some(world) = &self.world
+            && let Some(cform) = &world.cform
+        {
+            let bvh = cform.build_bvh();
+            if self.physics.snap_to_ground(&bvh, 5.0, 50.0) {
+                self.camera.position = self.physics.eye_position();
+            }
+        }
+
         self.inventory.actor_stats.health = hp.clamp(0.0, 1.0);
         self.hud.health = self.inventory.actor_stats.health.clamp(0.0, 1.0);
         self.hud.stamina = self.inventory.actor_stats.stamina.clamp(0.0, 1.0);
@@ -283,9 +334,10 @@ impl EngineRuntime {
         vfs: Option<&VirtualFileSystem>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let (Some(r), Some(rb), Some(w)) =
-            (&mut self.renderer, &mut self.render_bridge, &self.world)
+            (&mut self.renderer, &mut self.render_bridge, &mut self.world)
         {
             rb.sync_world(r, w, vfs)?;
+            w.drop_cpu_geometry_after_gpu_upload();
         }
         Ok(())
     }
@@ -309,6 +361,23 @@ impl EngineRuntime {
         }
         self.attach_world(world);
         self.attach_alife(alife);
+
+        if let Some(scop_path) = scop_vpath {
+            let scoc_vpath = scop_path.trim_end_matches(".scop").to_string() + ".scoc";
+            if vfs.exists(&scoc_vpath) {
+                if let Ok(scoc) = xray_formats::vfs_bridge::load_scoc_from_vfs(vfs, &scoc_vpath) {
+                    let peer = scoc.extract_peer_state();
+                    if !peer.inventory.is_empty() {
+                        eprintln!(
+                            "[engine] Loaded {} inventory items from companion .scoc state",
+                            peer.inventory.len()
+                        );
+                        self.attach_host_scoc(&scoc);
+                    }
+                }
+            }
+        }
+
         self.sync_world_to_gpu(Some(vfs))?;
         Ok(())
     }

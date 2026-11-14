@@ -14,6 +14,7 @@
 //!   (health, stamina, bleeding/radiation, active weapon ammo/quick-slots), and dialogue overlay.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::alife_manager::{AlifeManager, EntityRole};
 use crate::hud_weapon::{HudWeaponController, WeaponFireMode, WeaponSpec};
@@ -26,6 +27,7 @@ use xray_formats::scop::{ScopActorStats, ScopAlifeKind, ScopSaveFile};
 use xray_render_dx12::bindless::DescriptorIndex;
 use xray_render_dx12::renderer::Dx12Renderer;
 use xray_render_dx12::ui_canvas::GlyphQuad;
+use xray_vfs::VirtualFileSystem;
 
 /// Default backpack grid width in cells (classic X-Ray 10-column grid).
 pub const DEFAULT_GRID_COLS: u8 = 10;
@@ -355,9 +357,18 @@ pub struct InventoryItem {
 }
 
 impl InventoryItem {
-    pub fn from_section(uid: u64, section: impl Into<String>) -> Self {
+    pub fn from_section_indexed(
+        uid: u64,
+        section: impl Into<String>,
+        grid_index: Option<&ItemGridIndex>,
+    ) -> Self {
         let section_str = section.into();
-        let meta = classify_section_meta(&section_str);
+        let mut meta = classify_section_meta(&section_str);
+        if let Some(idx) = grid_index
+            && let Some((_, _, gw, gh)) = idx.get(&section_str)
+        {
+            meta.grid_size = (gw.max(1), gh.max(1));
+        }
         Self {
             uid,
             source_id: Some(uid as i64),
@@ -376,6 +387,10 @@ impl InventoryItem {
             weight_kg: meta.weight_kg,
             source_scoc: None,
         }
+    }
+
+    pub fn from_section(uid: u64, section: impl Into<String>) -> Self {
+        Self::from_section_indexed(uid, section, None)
     }
 
     pub fn from_scoc_item(
@@ -701,6 +716,7 @@ pub struct InventoryManager {
     pub dialogue: Option<DialoguePromptState>,
     pub hud_sync_dirty: bool,
     pub max_carry_weight_kg: f32,
+    pub grid_index: Option<Arc<ItemGridIndex>>,
     next_uid: u64,
     item_uses_extra: Vec<(xray_formats::scoc::ScocValue, xray_formats::scoc::ScocValue)>,
 }
@@ -711,8 +727,125 @@ impl Default for InventoryManager {
     }
 }
 
+/// Precomputed or VFS-loaded item icon coordinate table inside `ui_icon_equipment.dds` (8192x4096).
+/// Maps section -> (inv_grid_x, inv_grid_y, inv_grid_width, inv_grid_height).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ItemGridIndex {
+    pub entries: BTreeMap<String, (u32, u32, u8, u8)>,
+}
+
+impl ItemGridIndex {
+    pub fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// Load and index `inv_grid_x`, `inv_grid_y`, `inv_grid_width`, `inv_grid_height`
+    /// from all `configs/items/**/*.ltx` files mounted in VFS.
+    pub fn load_from_vfs(vfs: &VirtualFileSystem) -> Self {
+        let mut index = Self::new();
+        if let Ok(files) = vfs.list_files("configs\\items") {
+            for f in files {
+                if !f.ends_with(".ltx") {
+                    continue;
+                }
+                if let Ok(content) = vfs.read_to_string_lossy(&f) {
+                    index.parse_ltx(&content);
+                }
+            }
+        }
+        index
+    }
+
+    /// Parse LTX content for item sections and their `inv_grid_*` properties.
+    pub fn parse_ltx(&mut self, text: &str) {
+        let mut current_sec: Option<String> = None;
+        let mut gx = None;
+        let mut gy = None;
+        let mut gw = None;
+        let mut gh = None;
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with(';') || trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.starts_with('[') && trimmed.contains(']') {
+                if let (Some(s), Some(x), Some(y), Some(w), Some(h)) =
+                    (current_sec.take(), gx.take(), gy.take(), gw.take(), gh.take())
+                {
+                    self.entries.entry(s).or_insert((x, y, w, h));
+                }
+                let inside = &trimmed[1..trimmed.find(']').unwrap_or(trimmed.len())];
+                let sec_name = inside
+                    .split(':')
+                    .next()
+                    .unwrap_or(inside)
+                    .trim()
+                    .to_ascii_lowercase();
+                current_sec = Some(sec_name);
+                gx = None;
+                gy = None;
+                gw = None;
+                gh = None;
+            } else if let Some((lhs, rhs)) = trimmed.split_once('=') {
+                let k = lhs.trim().to_ascii_lowercase();
+                let v = rhs.split(';').next().unwrap_or("").trim();
+                match k.as_str() {
+                    "inv_grid_x" => gx = v.parse::<u32>().ok(),
+                    "inv_grid_y" => gy = v.parse::<u32>().ok(),
+                    "inv_grid_width" => gw = v.parse::<u8>().ok(),
+                    "inv_grid_height" => gh = v.parse::<u8>().ok(),
+                    _ => {}
+                }
+            }
+        }
+        if let (Some(s), Some(x), Some(y), Some(w), Some(h)) = (current_sec, gx, gy, gw, gh) {
+            self.entries.entry(s).or_insert((x, y, w, h));
+        }
+    }
+
+    /// Look up `(gx, gy, gw, gh)` for a section, falling back to base section if variant suffix present.
+    pub fn get(&self, section: &str) -> Option<(u32, u32, u8, u8)> {
+        let lower = section.trim().to_ascii_lowercase();
+        if let Some(entry) = self.entries.get(&lower) {
+            return Some(*entry);
+        }
+        // Try stripping standard condition/variant suffixes
+        for suffix in &["_bad", "_verybad", "_worn", "_rusty", "_custom", "_camo", "_alt"] {
+            if let Some(base) = lower.strip_suffix(suffix) {
+                if let Some(entry) = self.entries.get(base) {
+                    return Some(*entry);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Compute normalized texture UV coordinates `[u1, v1, u2, v2]` inside `ui_icon_equipment.dds` (8192x4096 atlas).
 pub fn item_icon_uv(section: &str, category: ItemCategory) -> [f32; 4] {
+    item_icon_uv_indexed(section, category, None)
+}
+
+/// Compute normalized texture UV coordinates `[u1, v1, u2, v2]` inside `ui_icon_equipment.dds` (8192x4096 atlas),
+/// using genuine coordinates parsed from game configs when available.
+pub fn item_icon_uv_indexed(
+    section: &str,
+    category: ItemCategory,
+    grid_index: Option<&ItemGridIndex>,
+) -> [f32; 4] {
+    if let Some(idx) = grid_index
+        && let Some((gx, gy, gw, gh)) = idx.get(section)
+    {
+        let u1 = (gx * 50) as f32 / 8192.0;
+        let v1 = (gy * 50) as f32 / 4096.0;
+        let u2 = ((gx + u32::from(gw)) * 50) as f32 / 8192.0;
+        let v2 = ((gy + u32::from(gh)) * 50) as f32 / 4096.0;
+        return [u1, v1, u2, v2];
+    }
+
     let lower = section.to_ascii_lowercase();
     let (gx, gy, gw, gh): (u32, u32, u32, u32) = if lower.contains("knife") {
         (18, 8, 2, 1)
@@ -778,6 +911,7 @@ impl InventoryManager {
             dialogue: None,
             hud_sync_dirty: false,
             max_carry_weight_kg: 50.0,
+            grid_index: None,
             next_uid: 1,
             item_uses_extra: Vec::new(),
         }
@@ -869,6 +1003,87 @@ impl InventoryManager {
             }
             self.items.push(item);
         }
+        self.hud_sync_dirty = true;
+    }
+
+    /// Set or update the active `ItemGridIndex` and recompute item grid dimensions accordingly.
+    pub fn set_grid_index(&mut self, index: Arc<ItemGridIndex>) {
+        for item in &mut self.items {
+            if let Some((_, _, gw, gh)) = index.get(&item.section) {
+                item.grid_size = (gw.max(1), gh.max(1));
+            }
+        }
+        self.grid_index = Some(index);
+    }
+
+    /// Hydrate actor inventory from loaded `.scop` ALife entities (`parent_id == 0` or `parent_id == actor_id`).
+    pub fn hydrate_from_alife(
+        &mut self,
+        alife: &AlifeManager,
+        grid_index: Option<&ItemGridIndex>,
+    ) {
+        let actor_id = alife.host_actor_id.unwrap_or(0);
+        let owned_entities: Vec<_> = alife
+            .entities
+            .values()
+            .filter(|ent| ent.parent_id == actor_id || (actor_id == 0 && ent.parent_id == 0))
+            .collect();
+
+        if owned_entities.is_empty() {
+            return;
+        }
+
+        self.items.clear();
+        self.drag = None;
+        self.selected_uid = None;
+
+        for ent in owned_entities {
+            let uid = self.allocate_uid();
+            let mut item = InventoryItem::from_section_indexed(uid, &ent.section, grid_index);
+            item.source_id = Some(ent.id as i64);
+
+            // Auto-equip weapon / suit / helmet / quick slots into empty slots
+            match item.category {
+                ItemCategory::Weapon => {
+                    let meta = classify_section_meta(&item.section);
+                    let is_pistol = meta.preferred_slot == Some(EquipmentSlot::Pistol);
+                    if is_pistol && self.item_in_slot(EquipmentSlot::Pistol).is_none() {
+                        item.equipped_slot = Some(EquipmentSlot::Pistol);
+                    } else if !is_pistol && self.item_in_slot(EquipmentSlot::PrimaryWeapon).is_none() {
+                        item.equipped_slot = Some(EquipmentSlot::PrimaryWeapon);
+                    } else if !is_pistol && self.item_in_slot(EquipmentSlot::SecondaryWeapon).is_none() {
+                        item.equipped_slot = Some(EquipmentSlot::SecondaryWeapon);
+                    }
+                }
+                ItemCategory::Outfit => {
+                    if self.item_in_slot(EquipmentSlot::Armor).is_none() {
+                        item.equipped_slot = Some(EquipmentSlot::Armor);
+                    }
+                }
+                ItemCategory::Helmet => {
+                    if self.item_in_slot(EquipmentSlot::Helmet).is_none() {
+                        item.equipped_slot = Some(EquipmentSlot::Helmet);
+                    }
+                }
+                ItemCategory::Medical | ItemCategory::Consumable => {
+                    for slot_idx in 0..QUICK_SLOT_COUNT {
+                        let slot = EquipmentSlot::QuickSlot(slot_idx);
+                        if self.item_in_slot(slot).is_none() {
+                            item.equipped_slot = Some(slot);
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            if item.equipped_slot.is_none() {
+                item.grid_pos = self.find_free_cell(item.grid_size.0, item.grid_size.1, None);
+            }
+
+            self.items.push(item);
+        }
+
         self.hud_sync_dirty = true;
     }
 
@@ -1671,7 +1886,7 @@ impl InventoryManager {
             if let Some(q_item) = self.item_in_slot(EquipmentSlot::QuickSlot(q_idx)) {
                 let inner = [qx + 3.0, qy + 3.0, q_size - 6.0, q_size - 6.0];
                 if let Some(tex) = equipment_tex {
-                    let uv = item_icon_uv(&q_item.section, q_item.category);
+                    let uv = item_icon_uv_indexed(&q_item.section, q_item.category, self.grid_index.as_deref());
                     renderer.ui_draw_textured_rect(inner, uv, tex, [1.0, 1.0, 1.0, 0.98]);
                 } else {
                     renderer.ui_fill_rect(inner, q_item.category.accent_color());
@@ -1765,7 +1980,7 @@ impl InventoryManager {
                 {
                     let inner = [rect[0] + 4.0, rect[1] + 4.0, (rect[2] - 8.0).max(4.0), (rect[3] - 12.0).max(4.0)];
                     if let Some(tex) = equipment_tex {
-                        let uv = item_icon_uv(&item.section, item.category);
+                        let uv = item_icon_uv_indexed(&item.section, item.category, self.grid_index.as_deref());
                         renderer.ui_draw_textured_rect(inner, uv, tex, [1.0, 1.0, 1.0, 0.98]);
                     } else {
                         renderer.ui_fill_rect(inner, item.category.accent_color());
@@ -1817,7 +2032,7 @@ impl InventoryManager {
                     drawn += 1;
                 }
                 if let Some(tex) = equipment_tex {
-                    let uv = item_icon_uv(&item.section, item.category);
+                    let uv = item_icon_uv_indexed(&item.section, item.category, self.grid_index.as_deref());
                     renderer.ui_draw_textured_rect([ix, iy, iw, ih], uv, tex, [1.0, 1.0, 1.0, 0.98]);
                 } else {
                     renderer.ui_fill_rect([ix, iy, iw, ih], item.category.accent_color());
@@ -1888,7 +2103,7 @@ impl InventoryManager {
                 let gh = f32::from(item.grid_size.1) * layout.cell_size;
                 let drag_rect = [drag.current_pointer[0] - gw * 0.5, drag.current_pointer[1] - gh * 0.5, gw, gh];
                 if let Some(tex) = equipment_tex {
-                    let uv = item_icon_uv(&item.section, item.category);
+                    let uv = item_icon_uv_indexed(&item.section, item.category, self.grid_index.as_deref());
                     renderer.ui_draw_textured_rect(drag_rect, uv, tex, [1.0, 1.0, 1.0, 0.85]);
                 } else {
                     let mut ghost_col = item.category.accent_color();

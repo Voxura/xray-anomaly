@@ -1388,7 +1388,11 @@ fn extract_lighting_env(env: Option<&MixedEnvironment>) -> ([f32; 3], [f32; 3], 
         } else {
             [0.45, -0.78, 0.43]
         };
-        (dir, e.sun_color, e.effective_ambient_rgb(0.5))
+        let mut amb = e.effective_ambient_rgb(0.5);
+        amb[0] = amb[0].max(0.08);
+        amb[1] = amb[1].max(0.08);
+        amb[2] = amb[2].max(0.10);
+        (dir, e.sun_color, amb)
     } else {
         ([0.45, -0.78, 0.43], [1.0, 0.94, 0.85], [0.22, 0.25, 0.30])
     }
