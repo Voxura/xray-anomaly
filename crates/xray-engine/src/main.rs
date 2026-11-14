@@ -384,20 +384,44 @@ fn run_engine(args: LaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let level_to_load = if let Some(level_arg) = &args.level {
         Some(resolve_level_dir(level_arg))
     } else if let Some(scop_path) = &save_vpath {
-        // Auto-resolve level from .scop header, graph mappings, or fallback to l01_escape if -level was not passed
+        // Auto-resolve level from .scop header, all.spawn game.graph, graph mappings, or fallback
         if let Ok(scop) = xray_formats::vfs_bridge::load_scop_save_from_vfs(&vfs, scop_path) {
-            let lvl = if !scop.header.level_name.is_empty() {
-                scop.header.level_name
-            } else if let Some(m) = scop
-                .graph_and_quests
-                .graph_mappings
-                .iter()
-                .find(|m| !m.level_name.is_empty())
-            {
-                m.level_name.clone()
-            } else {
-                "l01_escape".to_string()
-            };
+            let mut resolved_lvl = None;
+            if !scop.header.level_name.is_empty() {
+                resolved_lvl = Some(scop.header.level_name.clone());
+            }
+
+            // In authentic S.T.A.L.K.E.R. saves, level name is looked up from game.graph via actor's game_vertex_id
+            if resolved_lvl.is_none() {
+                let spawn_name = if !scop.header.spawn_name.is_empty() {
+                    &scop.header.spawn_name
+                } else {
+                    "all"
+                };
+                if let Ok(spawn) = xray_formats::vfs_bridge::load_all_spawn_from_vfs(&vfs, spawn_name) {
+                    if let Some(actor) = scop.actor() {
+                        let gvid = actor.game_vertex_id() as usize;
+                        if let Some(vertex) = spawn.game_graph.vertices.get(gvid) {
+                            if let Some(info) = spawn.game_graph.header.levels.iter().find(|l| l.id == vertex.level_id) {
+                                eprintln!("[engine] Auto-resolved level from all.spawn game.graph (gvid {}): {}", gvid, info.name);
+                                resolved_lvl = Some(info.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if resolved_lvl.is_none() {
+                if let Some(m) = scop
+                    .graph_and_quests
+                    .graph_mappings
+                    .iter()
+                    .find(|m| !m.level_name.is_empty())
+                {
+                    resolved_lvl = Some(m.level_name.clone());
+                }
+            }
+            let lvl = resolved_lvl.unwrap_or_else(|| "l01_escape".to_string());
             let resolved = resolve_level_dir(&lvl);
             eprintln!("[engine] Auto-resolved level from savegame: {}", resolved);
             Some(resolved)

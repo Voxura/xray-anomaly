@@ -328,8 +328,13 @@ pub fn load_game_graph_from_vfs(
     vfs: &VirtualFileSystem,
     path_override: Option<&str>,
 ) -> Result<GameGraph, AssetLoadError> {
-    let vpath = path_override.unwrap_or("$game_data$/game.graph");
-    let bytes = vfs.read_bytes(vpath)?;
+    let bytes = if let Some(path) = path_override {
+        vfs.read_bytes(path)?
+    } else {
+        vfs.read_bytes("game.graph")
+            .or_else(|_| vfs.read_bytes("gamedata/game.graph"))
+            .or_else(|_| vfs.read_bytes("$game_data$/game.graph"))?
+    };
     Ok(GameGraph::parse(&bytes)?)
 }
 
