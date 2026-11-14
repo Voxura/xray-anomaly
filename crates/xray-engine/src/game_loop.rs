@@ -259,6 +259,14 @@ impl EngineRuntime {
             if let Some(cform) = &world.cform {
                 let bvh = cform.build_bvh();
                 let aabb = bvh.aabb();
+                let in_bounds = pos[0] >= aabb.min[0] && pos[0] <= aabb.max[0] && pos[2] >= aabb.min[2] && pos[2] <= aabb.max[2];
+                if !in_bounds {
+                    eprintln!("[engine] Actor position {:?} outside level bounds; relocating to level spawn", pos);
+                    if let Some((spawn_pos, spawn_ang)) = world.default_actor_spawn() {
+                        pos = spawn_pos;
+                        angles = [spawn_ang[0], spawn_ang[1]];
+                    }
+                }
                 let sky_y = (pos[1] + 50.0).max(aabb.max[1] + 5.0).min(aabb.max[1] + 200.0);
                 let ray_origin = [pos[0], sky_y, pos[2]];
                 let ray_dist = (sky_y - aabb.min[1] + 10.0).max(50.0);
@@ -280,7 +288,7 @@ impl EngineRuntime {
             && let Some(cform) = &world.cform
         {
             let bvh = cform.build_bvh();
-            if self.physics.snap_to_ground(&bvh, 5.0, 50.0) {
+            if self.physics.snap_to_ground(&bvh, 80.0, 80.0) {
                 self.camera.position = self.physics.eye_position();
             }
         }
@@ -354,6 +362,22 @@ impl EngineRuntime {
             Some(path) => AlifeManager::load_from_vfs(vfs, path)?,
             None => AlifeManager::default(),
         };
+
+        // If savegame scop header level_name is blank, resolve from all.spawn game.graph via actor game_vertex_id
+        if alife.level_name.is_empty() {
+            if let Ok(spawn) = xray_formats::vfs_bridge::load_all_spawn_from_vfs(vfs, "all") {
+                if let Some(actor) = alife.host_actor() {
+                    let gvid = actor.game_vertex_id as usize;
+                    if let Some(vertex) = spawn.game_graph.vertices.get(gvid) {
+                        if let Some(info) = spawn.game_graph.header.levels.iter().find(|l| l.id == vertex.level_id) {
+                            alife.level_name = info.name.clone();
+                            eprintln!("[engine] Auto-resolved alife.level_name from game.graph (gvid {}): {}", gvid, alife.level_name);
+                        }
+                    }
+                }
+            }
+        }
+
         if alife.entities.is_empty()
             && let Some(spawn) = &world.level_spawn
         {

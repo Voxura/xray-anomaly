@@ -190,6 +190,8 @@ pub struct RenderBridge {
     ui_font_attempted: bool,
     ui_hud_tex: Option<DescriptorIndex>,
     ui_equipment_tex: Option<DescriptorIndex>,
+    ui_actor_menu_tex: Option<DescriptorIndex>,
+    ui_grid_tex: Option<DescriptorIndex>,
 }
 
 impl RenderBridge {
@@ -236,6 +238,8 @@ impl RenderBridge {
             ui_font_attempted: false,
             ui_hud_tex: None,
             ui_equipment_tex: None,
+            ui_actor_menu_tex: None,
+            ui_grid_tex: None,
         })
     }
 
@@ -786,7 +790,7 @@ impl RenderBridge {
         let light_params = GpuLightParams {
             sun_direction: [
                 -sun_dir_to_surface[0],
-                -sun_dir_to_surface[1],
+                (-sun_dir_to_surface[1]).abs().max(0.35),
                 -sun_dir_to_surface[2],
                 0.0,
             ],
@@ -1056,6 +1060,8 @@ impl RenderBridge {
                 self.ui_font = try_load_ui_font(renderer, vfs_ref, height);
                 self.ui_hud_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_hud.dds");
                 self.ui_equipment_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_icon_equipment.dds");
+                self.ui_actor_menu_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_actor_menu.dds");
+                self.ui_grid_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_grid.dds");
             }
             let font_ref = self.ui_font.as_ref();
 
@@ -1076,6 +1082,8 @@ impl RenderBridge {
                     font_ref,
                     self.ui_hud_tex,
                     self.ui_equipment_tex,
+                    self.ui_actor_menu_tex,
+                    self.ui_grid_tex,
                 );
                 if let Some(pda_mgr) = pda {
                     let level_name = alife
@@ -1389,12 +1397,12 @@ fn extract_lighting_env(env: Option<&MixedEnvironment>) -> ([f32; 3], [f32; 3], 
             [0.45, -0.78, 0.43]
         };
         let mut amb = e.effective_ambient_rgb(0.5);
-        amb[0] = amb[0].max(0.08);
-        amb[1] = amb[1].max(0.08);
-        amb[2] = amb[2].max(0.10);
+        amb[0] = amb[0].max(0.18);
+        amb[1] = amb[1].max(0.18);
+        amb[2] = amb[2].max(0.22);
         (dir, e.sun_color, amb)
     } else {
-        ([0.45, -0.78, 0.43], [1.0, 0.94, 0.85], [0.22, 0.25, 0.30])
+        ([0.45, -0.78, 0.43], [1.0, 0.94, 0.85], [0.24, 0.26, 0.32])
     }
 }
 

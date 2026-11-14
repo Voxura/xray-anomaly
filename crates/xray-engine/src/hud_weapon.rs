@@ -516,11 +516,40 @@ impl HudWeaponController {
         let key = normalize_virtual_path(vpath)
             .unwrap_or_else(|_| vpath.replace('/', "\\").to_ascii_lowercase());
         if !self.ogf_cache.contains_key(&key) {
-            let resolved_vpath = if vfs.exists(&key) || key.starts_with("meshes\\") || key.starts_with('$') {
-                key.clone()
-            } else {
-                format!("meshes\\{key}")
-            };
+            let mut candidates = vec![
+                key.clone(),
+                if key.starts_with("meshes\\") { key.clone() } else { format!("meshes\\{key}") },
+            ];
+            if key.contains("hand") {
+                candidates.push("meshes\\anomaly_weapons\\hands\\wpn_hand_00.ogf".to_string());
+                candidates.push("anomaly_weapons\\hands\\wpn_hand_00.ogf".to_string());
+                candidates.push("meshes\\actors\\stalker_hero\\hand_stalker_hud.ogf".to_string());
+                candidates.push("actors\\stalker_hero\\hand_stalker_hud.ogf".to_string());
+            }
+            if let Some(rest) = key.strip_prefix("dynamics\\weapons\\") {
+                candidates.push(format!("meshes\\anomaly_weapons\\{rest}"));
+                candidates.push(format!("anomaly_weapons\\{rest}"));
+                candidates.push(format!("meshes\\dynamics\\weapons\\{rest}"));
+            } else if let Some(rest) = key.strip_prefix("meshes\\dynamics\\weapons\\") {
+                candidates.push(format!("meshes\\anomaly_weapons\\{rest}"));
+                candidates.push(format!("anomaly_weapons\\{rest}"));
+                candidates.push(format!("dynamics\\weapons\\{rest}"));
+            } else if let Some(rest) = key.strip_prefix("anomaly_weapons\\") {
+                candidates.push(format!("meshes\\dynamics\\weapons\\{rest}"));
+                candidates.push(format!("dynamics\\weapons\\{rest}"));
+                candidates.push(format!("meshes\\anomaly_weapons\\{rest}"));
+            } else if let Some(rest) = key.strip_prefix("meshes\\anomaly_weapons\\") {
+                candidates.push(format!("meshes\\dynamics\\weapons\\{rest}"));
+                candidates.push(format!("dynamics\\weapons\\{rest}"));
+                candidates.push(format!("anomaly_weapons\\{rest}"));
+            }
+            let mut resolved_vpath = key.clone();
+            for c in &candidates {
+                if vfs.exists(c) {
+                    resolved_vpath = c.clone();
+                    break;
+                }
+            }
             let loaded = load_ogf_from_vfs(vfs, &resolved_vpath).ok().map(|model| {
                 let mut texture_links = Vec::new();
                 if let Some(link) = extract_ogf_texture_link(&model)
@@ -592,8 +621,8 @@ impl HudWeaponController {
         };
 
         let local_x = hip[0] + (ads[0] - hip[0]) * t + sway_x;
-        let local_y = hip[1] + (ads[1] - hip[1]) * t + sway_y - state_drop + self.recoil_kick * 0.25;
-        let local_z = hip[2] + (ads[2] - hip[2]) * t - self.recoil_kick;
+        let local_y = (hip[1] + (ads[1] - hip[1]) * t + sway_y - state_drop + self.recoil_kick * 0.25).max(-0.25);
+        let local_z = (hip[2] + (ads[2] - hip[2]) * t - self.recoil_kick + 0.16).max(0.36);
 
         let world_pos = [
             camera.position[0] + right[0] * local_x + cam_up[0] * local_y + forward[0] * local_z,
@@ -601,8 +630,25 @@ impl HudWeaponController {
             camera.position[2] + right[2] * local_x + cam_up[2] * local_y + forward[2] * local_z,
         ];
 
-        let pitch_kick = self.recoil_kick * 0.9 - state_drop * 1.4;
-        matrix_set_xyz_translate([camera.pitch - pitch_kick, camera.yaw, 0.0], world_pos)
+        let pitch_kick = (self.recoil_kick * 0.9 - state_drop * 1.4).clamp(-0.45, 0.45);
+        let (sk, ck) = pitch_kick.sin_cos();
+        let pitched_up = [
+            cam_up[0] * ck - forward[0] * sk,
+            cam_up[1] * ck - forward[1] * sk,
+            cam_up[2] * ck - forward[2] * sk,
+        ];
+        let pitched_fwd = [
+            cam_up[0] * sk + forward[0] * ck,
+            cam_up[1] * sk + forward[1] * ck,
+            cam_up[2] * sk + forward[2] * ck,
+        ];
+
+        [
+            [right[0], right[1], right[2], 0.0],
+            [pitched_up[0], pitched_up[1], pitched_up[2], 0.0],
+            [pitched_fwd[0], pitched_fwd[1], pitched_fwd[2], 0.0],
+            [world_pos[0], world_pos[1], world_pos[2], 1.0],
+        ]
     }
 
     /// Compute world-space muzzle tip position for muzzle-flash light, spark emitter, and 3D gunfire audio.
@@ -697,11 +743,25 @@ impl HudWeaponController {
                 let verts: Vec<XRayVertex> = sp
                     .vertices
                     .into_iter()
-                    .map(|sv| XRayVertex {
-                        position: sv.position,
-                        normal: sv.normal,
-                        uv: sv.uv,
-                        tangent: sv.tangent,
+                    .map(|sv| {
+                        let px = if sv.position[0].is_nan() || sv.position[0].is_infinite() { 0.0 } else { sv.position[0] };
+                        let py = if sv.position[1].is_nan() || sv.position[1].is_infinite() { 0.0 } else { sv.position[1] };
+                        let pz = if sv.position[2].is_nan() || sv.position[2].is_infinite() { 0.0 } else { sv.position[2].max(-0.32) };
+                        let normal = normalize3([
+                            if sv.normal[0].is_nan() { 0.0 } else { sv.normal[0] },
+                            if sv.normal[1].is_nan() { 1.0 } else { sv.normal[1] },
+                            if sv.normal[2].is_nan() { 0.0 } else { sv.normal[2] },
+                        ]);
+                        let (tangent, _) = vector_generate_orthonormal_basis(normal);
+                        XRayVertex {
+                            position: [px, py, pz],
+                            normal,
+                            uv: [
+                                if sv.uv[0].is_nan() { 0.0 } else { sv.uv[0] },
+                                if sv.uv[1].is_nan() { 0.0 } else { sv.uv[1] },
+                            ],
+                            tangent,
+                        }
                     })
                     .collect();
                 let tex = sp
@@ -1268,12 +1328,20 @@ fn collect_static_ogf_parts(
 }
 
 fn static_vertex_to_xray_vertex(v: &StaticVertex) -> XRayVertex {
+    let pos = [
+        if v.position[0].is_nan() { 0.0 } else { v.position[0] },
+        if v.position[1].is_nan() { 0.0 } else { v.position[1] },
+        if v.position[2].is_nan() { 0.0 } else { v.position[2] },
+    ];
     let normal = normalize3(v.normal);
     let (tangent, _) = vector_generate_orthonormal_basis(normal);
     XRayVertex {
-        position: v.position,
+        position: pos,
         normal,
-        uv: v.uv0,
+        uv: [
+            if v.uv0[0].is_nan() { 0.0 } else { v.uv0[0] },
+            if v.uv0[1].is_nan() { 0.0 } else { v.uv0[1] },
+        ],
         tangent,
     }
 }
@@ -1285,14 +1353,14 @@ fn build_fallback_viewmodel_parts(
     root_transform: XRayMatrix,
     out: &mut Vec<HudDrawPart>,
 ) {
-    // Receiver / barrel box sized subtly by slot class
+    // Receiver / barrel box sized subtly by slot class, strictly with positive Z in front of eye
     let barrel_len = match slot {
         1 => 0.22,
         2 => 0.24,
         5 => 0.62,
         _ => 0.44,
     };
-    let (w_verts, w_idx) = make_box_mesh([-0.025, -0.03, -0.05], [0.025, 0.035, barrel_len]);
+    let (w_verts, w_idx) = make_box_mesh([-0.025, -0.03, 0.02], [0.025, 0.035, barrel_len + 0.05]);
     out.push(HudDrawPart {
         key: format!("__hud_fallback_weapon_{slot}"),
         texture_vpath: None,
@@ -1310,7 +1378,7 @@ fn build_fallback_viewmodel_parts(
         indices: lh_i,
         world_transform: root_transform,
     });
-    let (rh_v, rh_i) = make_box_mesh([0.01, -0.08, -0.03], [0.055, -0.015, 0.09]);
+    let (rh_v, rh_i) = make_box_mesh([0.01, -0.08, 0.03], [0.055, -0.015, 0.12]);
     out.push(HudDrawPart {
         key: "__hud_fallback_hand_r".to_string(),
         texture_vpath: None,

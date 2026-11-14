@@ -427,7 +427,8 @@ impl LoadedWorld {
         }
     }
 
-    /// Return the authentic actor spawn position and orientation from static level spawns (`level.spawn` or `level.game`).
+    /// Return the authentic actor spawn position and orientation from static level spawns (`level.spawn` or `level.game`),
+    /// or fallback to canonical S.T.A.L.K.E.R. level entrances raycast-clamped onto `level.cform` terrain.
     pub fn default_actor_spawn(&self) -> Option<([f32; 3], [f32; 3])> {
         if let Some(spawn) = &self.level_spawn {
             if let Some(actor_pkt) = spawn.spawns.iter().find(|p| {
@@ -442,7 +443,53 @@ impl LoadedWorld {
                 return Some((rp.pos, [rp.rot[0], rp.rot[1], rp.rot[2]]));
             }
         }
-        None
+
+        // Authentic S.T.A.L.K.E.R. level canonical entry points for maps without level.spawn actor packets
+        let lvl = self.level_dir.to_ascii_lowercase();
+        let (mut cand_pos, cand_ang) = if lvl.contains("l02_garbage") || lvl.contains("garbage") {
+            ([36.0, 1.8, -305.0], [0.0, 0.0, 0.0])
+        } else if lvl.contains("l01_escape") || lvl.contains("escape") || lvl.contains("cordon") {
+            ([30.43, 1.8, -326.10], [0.0, 0.0, 0.0])
+        } else if lvl.contains("l03_agroprom") || lvl.contains("agroprom") {
+            ([150.0, 1.8, -200.0], [0.0, 0.0, 0.0])
+        } else if lvl.contains("l04_darkvalley") || lvl.contains("darkvalley") {
+            ([-40.0, 1.8, -480.0], [0.0, 0.0, 0.0])
+        } else if lvl.contains("l05_bar") || lvl.contains("bar") {
+            ([120.0, 1.8, 20.0], [0.0, 0.0, 0.0])
+        } else if lvl.contains("l06_rostok") || lvl.contains("rostok") {
+            ([-20.0, 1.8, 0.0], [0.0, 0.0, 0.0])
+        } else if lvl.contains("l07_military") || lvl.contains("military") {
+            ([-150.0, 1.8, -300.0], [0.0, 0.0, 0.0])
+        } else if lvl.contains("l08_yantar") || lvl.contains("yantar") {
+            ([30.0, 1.8, -250.0], [0.0, 0.0, 0.0])
+        } else if lvl.contains("l10_radar") || lvl.contains("radar") {
+            ([382.9, -33.7, 153.8], [0.0, 3.1415, 0.0])
+        } else if lvl.contains("zaton") {
+            ([100.0, 1.8, -100.0], [0.0, 0.0, 0.0])
+        } else if lvl.contains("jupiter") {
+            ([-50.0, 1.8, 200.0], [0.0, 0.0, 0.0])
+        } else if lvl.contains("pripyat") {
+            ([0.0, 1.8, 0.0], [0.0, 0.0, 0.0])
+        } else if let Some(cf) = &self.cform {
+            let aabb = &cf.header.aabb;
+            ([(aabb.min[0] + aabb.max[0]) * 0.5, 1.8, (aabb.min[2] + aabb.max[2]) * 0.5], [0.0, 0.0, 0.0])
+        } else {
+            ([0.0, 1.8, 0.0], [0.0, 0.0, 0.0])
+        };
+
+        // If cform collision is available, raycast downward from above to snap cleanly to ground
+        if let Some(cf) = &self.cform {
+            let bvh = cf.build_bvh();
+            let aabb = bvh.aabb();
+            let sky_y = (aabb.max[1] + 15.0).max(cand_pos[1] + 25.0);
+            let ray_origin = [cand_pos[0], sky_y, cand_pos[2]];
+            let ray_dist = (sky_y - aabb.min[1] + 10.0).max(50.0);
+            if let Some(hit) = bvh.raycast_nearest(ray_origin, [0.0, -1.0, 0.0], ray_dist, false) {
+                cand_pos[1] = hit.point[1] + 1.8;
+            }
+        }
+
+        Some((cand_pos, cand_ang))
     }
 
     /// Perform an AABB BVH raycast against static `level.cform` world collision geometry.

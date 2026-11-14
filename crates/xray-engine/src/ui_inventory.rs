@@ -1819,6 +1819,8 @@ impl InventoryManager {
         font: Option<&UiFontResource>,
         hud_tex: Option<DescriptorIndex>,
         equipment_tex: Option<DescriptorIndex>,
+        actor_menu_tex: Option<DescriptorIndex>,
+        grid_tex: Option<DescriptorIndex>,
     ) -> u32 {
         let mut drawn = 0u32;
         let fw = (width.max(64)) as f32;
@@ -1835,7 +1837,11 @@ impl InventoryManager {
         let bar_h = (fh * 0.016).clamp(6.0, 14.0);
         let margin = 16.0;
         let hud_bg = [margin - 6.0, fh - margin - bar_h * 4.4, bar_w + 12.0, bar_h * 4.2 + 8.0];
-        if let Some(tex) = hud_tex {
+        if let Some(am_tex) = actor_menu_tex {
+            // Authentic brushed-metal status bezel: x=1620, y=1552, w=116, h=10 on 4096x2048 atlas
+            let uv_bar_bg = [1620.0 / 4096.0, 1552.0 / 2048.0, 116.0 / 4096.0, 10.0 / 2048.0];
+            renderer.ui_draw_textured_rect(hud_bg, uv_bar_bg, am_tex, [0.85, 0.88, 0.92, 0.92]);
+        } else if let Some(tex) = hud_tex {
             renderer.ui_draw_textured_rect(hud_bg, [0.0, 0.0, 0.25, 0.125], tex, [0.4, 0.45, 0.5, 0.85]);
         } else {
             renderer.ui_fill_rect(hud_bg, [0.05, 0.06, 0.07, 0.62]);
@@ -1953,26 +1959,64 @@ impl InventoryManager {
         let layout = InventoryLayout::compute(width, height, self.grid_cols, self.grid_rows);
         if self.open {
             // Backdrop dim + main container
-            renderer.ui_fill_rect([0.0, 0.0, fw, fh], [0.02, 0.02, 0.03, 0.45]);
-            renderer.ui_fill_rect(layout.panel_rect, [0.08, 0.09, 0.10, 0.92]);
-            // Header bar & close X button
-            renderer.ui_fill_rect(
-                [layout.panel_rect[0], layout.panel_rect[1], layout.panel_rect[2], 32.0],
-                [0.14, 0.15, 0.17, 0.98],
-            );
+            renderer.ui_fill_rect([0.0, 0.0, fw, fh], [0.01, 0.01, 0.02, 0.65]);
+
+            if let Some(am_tex) = actor_menu_tex {
+                // Split main panel into Left paperdoll (ui_inGame2_left_side) and Right inventory (ui_inGame2_inventory_back)
+                let panel_w = layout.panel_rect[2];
+                let panel_h = layout.panel_rect[3];
+                let left_w = panel_w * 0.44;
+                let right_w = panel_w - left_w;
+                let left_rect = [layout.panel_rect[0], layout.panel_rect[1], left_w, panel_h];
+                let right_rect = [layout.panel_rect[0] + left_w, layout.panel_rect[1], right_w, panel_h];
+
+                // ui_inGame2_left_side: x=2304, y=0, w=682, h=1536 on 4096x2048 atlas
+                let uv_left = [2304.0 / 4096.0, 0.0, 682.0 / 4096.0, 1536.0 / 2048.0];
+                renderer.ui_draw_textured_rect(left_rect, uv_left, am_tex, [1.0, 1.0, 1.0, 0.98]);
+
+                // ui_inGame2_inventory_back: x=1620, y=0, w=684, h=1536 on 4096x2048 atlas
+                let uv_right = [1620.0 / 4096.0, 0.0, 684.0 / 4096.0, 1536.0 / 2048.0];
+                renderer.ui_draw_textured_rect(right_rect, uv_right, am_tex, [1.0, 1.0, 1.0, 0.98]);
+
+                // Header bar (ui_item_picker_background: x=692, y=1724, w=639, h=324)
+                let uv_header = [692.0 / 4096.0, 1724.0 / 2048.0, 639.0 / 4096.0, 324.0 / 2048.0];
+                let header_rect = [layout.panel_rect[0], layout.panel_rect[1], layout.panel_rect[2], 34.0];
+                renderer.ui_draw_textured_rect(header_rect, uv_header, am_tex, [1.0, 1.0, 1.0, 0.95]);
+                drawn += 3;
+            } else {
+                renderer.ui_fill_rect(layout.panel_rect, [0.08, 0.09, 0.10, 0.92]);
+                renderer.ui_fill_rect(
+                    [layout.panel_rect[0], layout.panel_rect[1], layout.panel_rect[2], 32.0],
+                    [0.14, 0.15, 0.17, 0.98],
+                );
+                drawn += 2;
+            }
+
             renderer.ui_fill_rect(layout.close_button_rect, [0.68, 0.20, 0.20, 0.95]);
-            drawn += 4;
+            drawn += 1;
 
             // Equipment Slots
             for (slot, rect) in &layout.slot_rects {
                 let occ = self.item_in_slot(*slot);
                 let is_sel = occ.is_some_and(|i| Some(i.uid) == self.selected_uid);
-                let bg = if is_sel {
-                    [0.24, 0.26, 0.20, 0.95]
+                if let Some(am_tex) = actor_menu_tex {
+                    if is_sel {
+                        // ui_inGame2_quick_item_highlighter: x=410, y=549, w=66, h=59
+                        let uv_high = [410.0 / 4096.0, 549.0 / 2048.0, 66.0 / 4096.0, 59.0 / 2048.0];
+                        renderer.ui_draw_textured_rect(*rect, uv_high, am_tex, [1.0, 0.85, 0.3, 0.98]);
+                    } else {
+                        // ui_item_picker_frame_back: x=1390, y=1731, w=41, h=41
+                        let uv_bezel = [1390.0 / 4096.0, 1731.0 / 2048.0, 41.0 / 4096.0, 41.0 / 2048.0];
+                        renderer.ui_draw_textured_rect(*rect, uv_bezel, am_tex, [0.85, 0.88, 0.92, 0.95]);
+                    }
                 } else {
-                    [0.12, 0.13, 0.15, 0.92]
-                };
-                renderer.ui_fill_rect(*rect, bg);
+                    let bg = if is_sel {
+                        [0.24, 0.26, 0.20, 0.95]
+                    } else {
+                        [0.12, 0.13, 0.15, 0.92]
+                    };
+                    renderer.ui_fill_rect(*rect, bg);
+                }
                 drawn += 1;
 
                 if let Some(item) = occ
@@ -2004,10 +2048,19 @@ impl InventoryManager {
                 for col in 0..self.grid_cols {
                     let cx = layout.grid_origin[0] + f32::from(col) * layout.cell_size;
                     let cy = layout.grid_origin[1] + f32::from(row) * layout.cell_size;
-                    renderer.ui_fill_rect(
-                        [cx + 1.0, cy + 1.0, layout.cell_size - 2.0, layout.cell_size - 2.0],
-                        [0.11, 0.12, 0.13, 0.88],
-                    );
+                    if let Some(g_tex) = grid_tex {
+                        renderer.ui_draw_textured_rect(
+                            [cx, cy, layout.cell_size, layout.cell_size],
+                            [0.0, 0.0, 1.0, 1.0],
+                            g_tex,
+                            [0.85, 0.88, 0.92, 0.88],
+                        );
+                    } else {
+                        renderer.ui_fill_rect(
+                            [cx + 1.0, cy + 1.0, layout.cell_size - 2.0, layout.cell_size - 2.0],
+                            [0.11, 0.12, 0.13, 0.88],
+                        );
+                    }
                     drawn += 1;
                 }
             }
@@ -2157,11 +2210,13 @@ impl InventoryManager {
 fn build_weapon_spec_for_section(slot: u8, section: &str, saved_ammo: Option<i64>) -> WeaponSpec {
     let lower = section.to_ascii_lowercase();
     let defaults = WeaponSpec::default_loadout();
-    let template = if lower.contains("svd") {
+    let template = if lower.contains("ump45") {
+        &defaults[3]
+    } else if lower.contains("svd") {
         &defaults[4]
     } else if lower.contains("mp5") || lower.contains("klin") || lower.contains("kiparis") {
         &defaults[3]
-    } else if lower.contains("ak") || lower.contains("abakan") || lower.contains("lr300") || lower.contains("val") {
+    } else if lower.contains("ak") || lower.contains("abakan") || lower.contains("lr300") || lower.contains("val") || lower.contains("m4") || lower.contains("fn2000") {
         &defaults[2]
     } else if lower.contains("pm") || lower.contains("pb") || lower.contains("usp") || lower.contains("fort") {
         &defaults[1]
@@ -2176,6 +2231,14 @@ fn build_weapon_spec_for_section(slot: u8, section: &str, saved_ammo: Option<i64
     let mut spec = template.clone();
     spec.slot = slot;
     spec.section = section.to_string();
+    spec.hands_hud_ogf = "meshes\\anomaly_weapons\\hands\\wpn_hand_00.ogf".to_string();
+    if lower.contains("ump45") {
+        spec.weapon_hud_ogf = "meshes\\anomaly_weapons\\wpn_ump45\\wpn_ump45_hud.ogf".to_string();
+        spec.clip_capacity = 25;
+        spec.rpm = 600.0;
+    } else if lower.contains("ak74") {
+        spec.weapon_hud_ogf = "meshes\\anomaly_weapons\\wpn_ak74\\wpn_ak74_hud.ogf".to_string();
+    }
     if let Some(ammo) = saved_ammo {
         spec.ammo_in_clip = (ammo.max(0) as u32).min(spec.clip_capacity.max(1));
     }
