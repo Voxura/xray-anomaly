@@ -215,6 +215,15 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
         return Err(TextureError::UnsupportedFormat);
     };
 
+    // In Direct3D 12, block-compressed textures (BC1-BC7) require dimensions to be at least 4x4.
+    // Legacy DDS files from S.T.A.L.K.E.R. sometimes declare 1x1 or 2x2 BC1/BC3 textures with dummy mips,
+    // which causes E_INVALIDARG (0x80070057) when allocated via CreateCommittedResource on discrete GPUs.
+    let (width, height, mip_count) = if is_bc && (width < 4 || height < 4) {
+        (width.max(4), height.max(4), 1)
+    } else {
+        (width, height, mip_count)
+    };
+
     let mut mips = Vec::with_capacity(mip_count as usize);
     let mut current_offset = data_offset;
 
@@ -288,12 +297,17 @@ pub fn upload_dds_texture(
     cmd: &ID3D12GraphicsCommandList,
     dds: &DdsImage,
 ) -> WinResult<(ID3D12Resource, ID3D12Resource)> {
-    let mip_count = dds.mips.len().max(1);
+    let (alloc_w, alloc_h, alloc_mips) = if dds.is_block_compressed && (dds.width < 4 || dds.height < 4) {
+        (dds.width.max(4) as u64, dds.height.max(4), 1)
+    } else {
+        (dds.width as u64, dds.height, dds.mips.len().max(1))
+    };
+    let mip_count = alloc_mips;
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         Alignment: 0,
-        Width: dds.width as u64,
-        Height: dds.height,
+        Width: alloc_w,
+        Height: alloc_h,
         DepthOrArraySize: dds.depth as u16,
         MipLevels: mip_count as u16,
         Format: dds.format,
@@ -407,7 +421,7 @@ pub fn upload_dds_texture(
             Some((&mut mapped_ptr as *mut *mut u8).cast()),
         )?;
 
-        for (i, mip) in dds.mips.iter().enumerate() {
+        for (i, mip) in dds.mips.iter().take(mip_count).enumerate() {
             let layout = &layouts[i];
             let subresource_dst = mapped_ptr.add(layout.Offset as usize);
             let dst_pitch = layout.Footprint.RowPitch as usize;
