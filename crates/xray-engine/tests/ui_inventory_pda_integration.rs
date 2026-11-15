@@ -477,7 +477,7 @@ fn test_phase_c_inventory_pda_dialogue_and_audio_end_to_end() {
     );
 
     // Bonus GPU verification on live DX12 adapter when available: verify HUD -> Inventory -> PDA UI quad counts
-    if let Ok(mut gpu_rt) = EngineRuntime::new(
+    let gpu_runtime = EngineRuntime::new(
         EngineConfig {
             window: WindowConfig {
                 title: "PhaseCDx12Test".to_string(),
@@ -489,7 +489,13 @@ fn test_phase_c_inventory_pda_dialogue_and_audio_end_to_end() {
             ..Default::default()
         },
         true,
-    ) {
+    );
+    // Hardware validation jobs must not report success after skipping the GPU assertions.
+    if std::env::var_os("XRAY_REQUIRE_PHASE_C_GPU").is_some() {
+        assert!(gpu_runtime.is_ok(), "required Phase C DX12 initialization failed");
+    }
+    if let Ok(mut gpu_rt) = gpu_runtime {
+        eprintln!("Phase C DX12 validation: GPU runtime initialized");
         let world = WorldLoader::load_from_vfs(
             &vfs,
             &LevelLoadConfig {
@@ -530,5 +536,6 @@ fn test_phase_c_inventory_pda_dialogue_and_audio_end_to_end() {
         gpu_rt.step_frame().unwrap();
         let pda_quads = gpu_rt.render_bridge.as_ref().unwrap().last_stats.ui_elements_drawn;
         assert!(pda_quads > hud_only_quads + 10, "expected PDA frame + minimap + blips + quests");
+        eprintln!("Phase C DX12 validation passed: HUD={hud_only_quads}, inventory={inv_quads}, PDA={pda_quads} quads");
     }
 }
