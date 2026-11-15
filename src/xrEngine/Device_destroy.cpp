@@ -13,7 +13,8 @@ void CRenderDevice::_Destroy(BOOL bKeepTextures)
 	// before destroy
 	b_is_Ready = FALSE;
 	Statistic->OnDeviceDestroy();
-	m_imgui.OnDeviceDestroy();
+	if (!(strstr(Core.Params, "-use_rust_dx12") || strstr(Core.Params, "-r5")))
+		m_imgui.OnDeviceDestroy();
 	::Render->destroy();
 	m_pRender->OnDeviceDestroy(bKeepTextures);
 	//Resources->OnDeviceDestroy (bKeepTextures);

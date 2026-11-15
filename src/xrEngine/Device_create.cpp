@@ -121,7 +121,8 @@ void CRenderDevice::_Create(LPCSTR shName)
 	_SetupStates();
 
 	m_pRender->OnDeviceCreate(shName);
-	m_imgui.OnDeviceCreate();
+	if (!(strstr(Core.Params, "-use_rust_dx12") || strstr(Core.Params, "-r5")))
+		m_imgui.OnDeviceCreate();
 	dwFrame = 0;
 }
 

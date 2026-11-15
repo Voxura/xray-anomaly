@@ -1642,12 +1642,13 @@ void CApplication::Level_Scan()
 
 
 	xr_vector<char*>* folder = FS.file_list_open("$game_levels$", FS_ListFolders | FS_RootOnly);
-	//. R_ASSERT (folder&&folder->size());
+	if (folder)
+	{
+		for (u32 i = 0; i < folder->size(); ++i)
+			Level_Append((*folder)[i]);
 
-	for (u32 i = 0; i < folder->size(); ++i)
-		Level_Append((*folder)[i]);
-
-	FS.file_list_close(folder);
+		FS.file_list_close(folder);
+	}
 
 	//SECUROM_MARKER_PERFORMANCE_OFF(8)
 }
