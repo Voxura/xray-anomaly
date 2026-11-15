@@ -483,7 +483,12 @@ impl GeometryState {
                 std::mem::size_of::<CameraConstants>(),
             )
         };
-        self.camera = Some(UploadBuffer::new(device, bytes)?);
+        let buffer = UploadBuffer::new(device, bytes)?;
+        // Forward passes bind only a GPU address (unlike mesh draws, which retain
+        // their resources). Keep every camera allocation until its submission
+        // fence completes, including when a later HUD pass replaces the camera.
+        self.recording_resources.push(buffer.0.clone());
+        self.camera = Some(buffer);
         Ok(())
     }
 
@@ -1023,5 +1028,29 @@ impl GeometryState {
             self.submitted_resources
                 .retain(|(fence, _)| *fence > completed);
         }
+    }
+}
+
+#[cfg(test)]
+mod camera_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn forward_camera_survives_replacement_until_submission_retirement() {
+        let renderer = crate::renderer::Dx12Renderer::new(2).expect("DX12 device required");
+        let mut state = GeometryState::default();
+        let camera = CameraConstants::default();
+        state.update_camera(&renderer.device_ctx.device, &camera).unwrap();
+        let sky_camera_va = state.camera_gpu_va().unwrap();
+        state.update_camera(&renderer.device_ctx.device, &camera).unwrap();
+        assert_ne!(state.camera_gpu_va().unwrap(), sky_camera_va);
+        state.prepare_submission();
+        state.tag_submission(7);
+        state.retire(6);
+        assert!(state.submitted_resources.iter().flat_map(|(_, resources)| resources)
+            .any(|r| unsafe { r.GetGPUVirtualAddress() } == sky_camera_va),
+            "forward pass camera address must remain backed by a live resource");
+        state.retire(7);
+        assert!(state.submitted_resources.is_empty());
     }
 }

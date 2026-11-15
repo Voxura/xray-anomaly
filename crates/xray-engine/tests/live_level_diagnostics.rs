@@ -1,15 +1,20 @@
-use std::path::Path;
+use std::path::PathBuf;
+
+fn game_root() -> PathBuf {
+    let root = PathBuf::from(std::env::var_os("XRAY_ANOMALY_ROOT")
+        .expect("set XRAY_ANOMALY_ROOT to the Anomaly game-data root"));
+    assert!(root.join("fsgame.ltx").is_file(), "missing fsgame.ltx in {}", root.display());
+    root
+}
 use xray_engine::world_loader::{LevelLoadConfig, WorldLoader};
 use xray_vfs::VirtualFileSystem;
 
 #[test]
+#[ignore = "requires explicit XRAY_ANOMALY_ROOT and real game assets"]
 fn test_verify_world_loader_resolves_terrain_textures() {
-    let games_root = Path::new(r"C:\Games");
-    if !games_root.join("fsgame.ltx").exists() {
-        return;
-    }
+    let games_root = game_root();
 
-    let vfs = VirtualFileSystem::mount_game_root(games_root).expect("mount VFS");
+    let vfs = VirtualFileSystem::mount_game_root(&games_root).expect("mount VFS");
     let level_cfg = LevelLoadConfig {
         level_dir: "levels\\l01_escape".to_string(),
         resolve_visual_meshes: true,
@@ -106,17 +111,15 @@ fn test_verify_world_loader_resolves_terrain_textures() {
 }
 
 #[test]
+#[ignore = "requires explicit XRAY_ANOMALY_ROOT and real game assets"]
 fn test_verify_frustum_culling_against_level_meshes() {
     use xray_formats::hom::{frustum_planes, ClipFrustum};
     use xray_formats::ogf::matrix_mul_44;
     use xray_engine::camera::FirstPersonCamera;
 
-    let games_root = Path::new(r"C:\Games");
-    if !games_root.join("fsgame.ltx").exists() {
-        return;
-    }
+    let games_root = game_root();
 
-    let vfs = VirtualFileSystem::mount_game_root(games_root).expect("mount VFS");
+    let vfs = VirtualFileSystem::mount_game_root(&games_root).expect("mount VFS");
     let level_cfg = LevelLoadConfig {
         level_dir: "levels\\l01_escape".to_string(),
         resolve_visual_meshes: true,
@@ -279,13 +282,11 @@ fn test_verify_frustum_culling_against_level_meshes() {
 }
 
 #[test]
+#[ignore = "requires explicit XRAY_ANOMALY_ROOT and real game assets"]
 fn test_diagnose_savegame_and_camera_and_ui() {
-    let games_root = Path::new(r"C:\Games");
-    if !games_root.join("fsgame.ltx").exists() {
-        return;
-    }
+    let games_root = game_root();
 
-    let mut vfs = VirtualFileSystem::mount_game_root(games_root).expect("mount VFS");
+    let mut vfs = VirtualFileSystem::mount_game_root(&games_root).expect("mount VFS");
     let app_data = games_root.join("appdata");
     if app_data.is_dir() {
         vfs.mount_loose_dir(&app_data);

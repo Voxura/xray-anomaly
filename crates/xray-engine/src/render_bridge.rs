@@ -1290,12 +1290,47 @@ fn try_load_vfs_texture(
     vfs: Option<&VirtualFileSystem>,
     vpath: &str,
 ) -> Option<DescriptorIndex> {
-    if let Some(existing) = renderer.get_texture(vpath) {
-        return Some(existing.descriptor_index);
+    match load_vfs_texture(renderer, vfs, vpath) {
+        Ok(index) => Some(index),
+        Err(error) => {
+            // Bound diagnostics and report each failed path once, rather than every frame.
+            static REPORTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+                std::sync::Mutex::new(std::collections::BTreeSet::new());
+            if let Ok(mut reported) = REPORTED.lock() {
+                if reported.len() < 32 && reported.insert(vpath.to_owned()) {
+                    eprintln!("[texture] {vpath}: {error}");
+                }
+            }
+            None
+        }
     }
-    let vfs = vfs?;
-    let bytes = vfs.read_bytes(vpath).ok()?;
-    renderer.load_texture_from_dds(vpath, &bytes).ok()
+}
+
+/// Load through the same path as material/sky binding, preserving the failure stage.
+/// Also accepts X-Ray aliases and bare texture stems for diagnostic callers.
+pub fn load_vfs_texture(
+    renderer: &mut Dx12Renderer,
+    vfs: Option<&VirtualFileSystem>,
+    vpath: &str,
+) -> Result<DescriptorIndex, String> {
+    let normalized = xray_vfs::normalize_virtual_path(vpath)
+        .map_err(|e| format!("path normalization: {e:?}"))?;
+    // Level-local lightmaps/terrain paths must retain their levels/ prefix.
+    let key = if normalized.starts_with("levels\\") {
+        normalized
+    } else {
+        texture_stem_to_dds_vpath(&normalized)
+    };
+    if let Some(existing) = renderer.get_texture(&key) {
+        return Ok(existing.descriptor_index);
+    }
+    let vfs = vfs.ok_or_else(|| "VFS not attached".to_owned())?;
+    let source = vfs.resolve(&key).map_err(|e| format!("VFS lookup {key}: {e:?}"))?;
+    let bytes = vfs.read_bytes(&key).map_err(|e| format!("VFS read {source:?}: {e:?}"))?;
+    xray_render_dx12::texture::parse_dds(&bytes)
+        .map_err(|e| format!("DDS decode {key} from {source:?}: {e:?}"))?;
+    renderer.load_texture_from_dds(&key, &bytes)
+        .map_err(|e| format!("GPU upload {key} from {source:?}: {e:?}"))
 }
 
 fn try_load_ui_font(
