@@ -417,6 +417,19 @@ impl LoadedWorld {
     pub fn drop_cpu_geometry_after_gpu_upload(&mut self) {
         self.level_geom = None;
         self.level_geomx = None;
+        // The parsed OGF hierarchy also owns inline geometry, independently of
+        // level.geom and the resolved upload meshes. Keep hierarchy/bounds for
+        // visibility queries, but release these duplicate CPU payloads too.
+        fn drop_visual_geometry(visual: &mut OgfModel) {
+            visual.vertices = None;
+            visual.indices = Vec::new();
+            for child in &mut visual.children {
+                drop_visual_geometry(child);
+            }
+        }
+        for visual in &mut self.level_data.visuals {
+            drop_visual_geometry(visual);
+        }
         for visual in &mut self.visual_meshes {
             visual.mesh.vertices = Vec::new();
             visual.mesh.indices = Vec::new();

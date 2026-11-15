@@ -402,6 +402,20 @@ fn test_world_loader_and_weather_cycle_from_vfs() {
         .step_weather(0.5, [0.0, 4.3, 0.0], [0.0, 0.0, 1.0], 450.0)
         .expect("weather cycle should evaluate");
     assert!((env.sky_color[2] - 1.0).abs() < 0.05);
+
+    // Simulate successful GPU ownership transfer: backing allocations go away,
+    // while collision and material metadata remain available to the runtime.
+    world.drop_cpu_geometry_after_gpu_upload();
+    assert!(world.level_geom.is_none());
+    assert!(world.level_geomx.is_none());
+    assert_eq!(world.visual_meshes[0].mesh.vertices.capacity(), 0);
+    assert_eq!(world.visual_meshes[0].mesh.indices.capacity(), 0);
+    assert!(world.level_data.visuals[0].vertices.is_none());
+    assert_eq!(world.level_data.visuals[0].indices.capacity(), 0);
+    assert!(!world.visual_meshes[0].texture_links.is_empty());
+    assert!((world.ground_height_at([0.0, 10.0, 0.0], 20.0).unwrap() - 2.5).abs() < 1e-4);
+    world.drop_cpu_geometry_after_gpu_upload(); // idempotent cleanup
+
 }
 
 #[test]

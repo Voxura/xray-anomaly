@@ -1182,9 +1182,12 @@ impl LevelTransitionManager {
 
                         *world = staged_world;
                         if let (Some(r), Some(rb), Some(w)) =
-                            (renderer.as_mut(), render_bridge.as_mut(), world.as_ref())
+                            (renderer.as_mut(), render_bridge.as_mut(), world.as_mut())
                         {
-                            let _ = rb.sync_world(r, w, vfs);
+                            // Failed uploads must keep CPU geometry available for retry.
+                            if rb.sync_world(r, w, vfs).is_ok() {
+                                w.drop_cpu_geometry_after_gpu_upload();
+                            }
                         }
                         active.staged_alife = Some(new_mgr);
                         active.load_substep = 2;
