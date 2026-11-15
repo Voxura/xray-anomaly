@@ -25,7 +25,7 @@ use xray_formats::gamemtl::{gamemtl_flags, GameMaterialLibrary};
 use xray_formats::hom::{frustum_planes, ClipFrustum};
 use xray_formats::lanims::pack_argb;
 use xray_formats::ogf::{
-    matrix_mul_43, matrix_mul_44, matrix_set_xyz_translate, vector_generate_orthonormal_basis,
+    matrix_mul_44, vector_generate_orthonormal_basis,
     BonePoseMatrices, OgfModel, OgfTextureLink, StaticVertex, XRayMatrix,
 };
 use xray_formats::particles::{
@@ -621,8 +621,8 @@ impl HudWeaponController {
         };
 
         let local_x = hip[0] + (ads[0] - hip[0]) * t + sway_x;
-        let local_y = (hip[1] + (ads[1] - hip[1]) * t + sway_y - state_drop + self.recoil_kick * 0.25).max(-0.25);
-        let local_z = (hip[2] + (ads[2] - hip[2]) * t - self.recoil_kick + 0.16).max(0.36);
+        let local_y = hip[1] + (ads[1] - hip[1]) * t + sway_y - state_drop + self.recoil_kick * 0.25;
+        let local_z = hip[2] + (ads[2] - hip[2]) * t - self.recoil_kick;
 
         let world_pos = [
             camera.position[0] + right[0] * local_x + cam_up[0] * local_y + forward[0] * local_z,
@@ -662,33 +662,8 @@ impl HudWeaponController {
     pub fn evaluate_asset_bone_palette(&self, asset: &CachedHudOgfAsset) -> Option<BonePalette> {
         let skel = asset.model.skeleton.as_ref()?;
         let bind_poses = asset.bind_poses.as_ref()?;
-        let mut model_transforms: Vec<XRayMatrix> =
+        let model_transforms: Vec<XRayMatrix> =
             bind_poses.iter().map(|b| b.model_bind).collect();
-
-        // Apply state-driven procedural offsets to root and secondary bones (bolt/receiver/mag)
-        if let Some(root_m) = model_transforms.first_mut() {
-            let kick_offset = matrix_set_xyz_translate(
-                [-self.recoil_kick * 0.5, 0.0, 0.0],
-                [0.0, 0.0, -self.recoil_kick * 0.8],
-            );
-            *root_m = matrix_mul_43(root_m, &kick_offset);
-        }
-        for (idx, m) in model_transforms.iter_mut().enumerate().skip(1) {
-            let reload_dip = if self.state == WeaponState::Reloading && idx == 1 {
-                -0.08 * (self.sway_time_sec * 6.0).sin().abs()
-            } else {
-                0.0
-            };
-            let bolt_travel = if self.recoil_kick > 0.001 && idx <= 2 {
-                -self.recoil_kick * 1.2
-            } else {
-                0.0
-            };
-            if reload_dip != 0.0 || bolt_travel != 0.0 {
-                let delta = matrix_set_xyz_translate([0.0, 0.0, 0.0], [0.0, reload_dip, bolt_travel]);
-                *m = matrix_mul_43(m, &delta);
-            }
-        }
 
         BonePalette::from_model_transforms(skel, &model_transforms).ok()
     }
@@ -746,7 +721,7 @@ impl HudWeaponController {
                     .map(|sv| {
                         let px = if sv.position[0].is_nan() || sv.position[0].is_infinite() { 0.0 } else { sv.position[0] };
                         let py = if sv.position[1].is_nan() || sv.position[1].is_infinite() { 0.0 } else { sv.position[1] };
-                        let pz = if sv.position[2].is_nan() || sv.position[2].is_infinite() { 0.0 } else { sv.position[2].max(-0.32) };
+                        let pz = if sv.position[2].is_nan() || sv.position[2].is_infinite() { 0.0 } else { sv.position[2] };
                         let normal = normalize3([
                             if sv.normal[0].is_nan() { 0.0 } else { sv.normal[0] },
                             if sv.normal[1].is_nan() { 1.0 } else { sv.normal[1] },

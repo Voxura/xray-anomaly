@@ -580,14 +580,19 @@ impl Default for Dx12CameraConstants {
 }
 
 impl Dx12CameraConstants {
-    /// Convert X-Ray row-vector `view` and `proj` matrices into DX12 column-major CBV layout
-    /// matching `mul(ViewProjection, float4(pos, 1.0f))`.
+    /// Convert X-Ray row-vector `view` and `proj` matrices into DX12 constant buffer layout
+    /// matching HLSL column_major `mul(ViewProjection, float4(pos, 1.0f))` and `mul(proj, ...)`.
+    ///
+    /// When HLSL declares `column_major float4x4 M`, the GPU loads memory row `r` as column `r` of `M` (an implicit transpose).
+    /// Therefore, uploading untransposed X-Ray matrices (`view`, `proj`, `vp_xray`) ensures that
+    /// HLSL `M` is `transpose(XRAY)`, and `mul(M, v) == transpose(XRAY) * v == v * XRAY`.
+    /// This produces positive clip depth `W_clip = pos.z > 0` and correct NDC coordinates for both left and right screen halves.
     pub fn from_xray_matrices(view: &XRayMatrix, proj: &XRayMatrix, cam_pos: [f32; 3]) -> Self {
         let vp_xray = matrix_mul_44(proj, view);
         Self {
-            view: matrix_transpose_44(view),
-            proj: matrix_transpose_44(proj),
-            view_proj: matrix_transpose_44(&vp_xray),
+            view: *view,
+            proj: *proj,
+            view_proj: vp_xray,
             cam_pos: [cam_pos[0], cam_pos[1], cam_pos[2], 1.0],
             padding: [0.0; 12],
         }
@@ -767,20 +772,18 @@ pub fn reconstruct_world_pos_from_depth_xray(
     ]
 }
 
-/// Reconstruct world-space `[x, y, z]` directly from column-major [`Dx12CameraConstants`].
+/// Reconstruct world-space `[x, y, z]` directly from [`Dx12CameraConstants`].
 #[inline]
 pub fn reconstruct_world_pos_from_dx12_camera(
     uv: [f32; 2],
     ndc_depth: f32,
     cam: &Dx12CameraConstants,
 ) -> [f32; 3] {
-    let xray_view = matrix_transpose_44(&cam.view);
-    let xray_proj = matrix_transpose_44(&cam.proj);
     reconstruct_world_pos_from_depth_xray(
         uv,
         ndc_depth,
-        &xray_view,
-        &xray_proj,
+        &cam.view,
+        &cam.proj,
         [cam.cam_pos[0], cam.cam_pos[1], cam.cam_pos[2]],
     )
 }

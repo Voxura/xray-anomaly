@@ -843,11 +843,15 @@ impl RenderBridge {
                 .and_then(|p| try_load_vfs_texture(renderer, vfs, p))
                 .map(|d| d.0)
                 .unwrap_or(idx0);
+            let mut tint = e.sky_tint_rgba();
+            tint[0] = tint[0].max(0.4);
+            tint[1] = tint[1].max(0.45);
+            tint[2] = tint[2].max(0.55);
             (
                 idx0,
                 idx1,
                 e.weight,
-                e.sky_tint_rgba(),
+                tint,
                 e.sun_glow_rgba(e.sun_shafts_intensity.max(0.15)),
             )
         } else {
@@ -1008,7 +1012,6 @@ impl RenderBridge {
         if let Some(hw) = hud_weapon.as_deref_mut() {
             let hud_parts = hw.collect_hud_draw_parts(camera, vfs);
             if !hud_parts.is_empty() {
-                renderer.clear_depth_stencil(1.0, 0);
                 let hud_cam = hw.build_hud_camera_constants(camera);
                 renderer.update_camera(&hud_cam)?;
 
@@ -1038,7 +1041,7 @@ impl RenderBridge {
 
                 renderer.update_transforms(&hud_matrices)?;
                 for (mesh_handle, tex_idx, tf_idx) in draw_items {
-                    renderer.draw_mesh_with_lights(
+                    renderer.draw_hud_mesh_with_lights(
                         mesh_handle,
                         Some(tex_idx),
                         tf_idx,
@@ -1046,6 +1049,7 @@ impl RenderBridge {
                     )?;
                     stats.hud_weapon_draws += 1;
                 }
+                renderer.restore_normal_viewport();
             }
         }
 
@@ -1397,12 +1401,12 @@ fn extract_lighting_env(env: Option<&MixedEnvironment>) -> ([f32; 3], [f32; 3], 
             [0.45, -0.78, 0.43]
         };
         let mut amb = e.effective_ambient_rgb(0.5);
-        amb[0] = amb[0].max(0.18);
-        amb[1] = amb[1].max(0.18);
-        amb[2] = amb[2].max(0.22);
+        amb[0] = amb[0].max(0.28);
+        amb[1] = amb[1].max(0.30);
+        amb[2] = amb[2].max(0.34);
         (dir, e.sun_color, amb)
     } else {
-        ([0.45, -0.78, 0.43], [1.0, 0.94, 0.85], [0.24, 0.26, 0.32])
+        ([0.45, -0.78, 0.43], [1.0, 0.94, 0.85], [0.28, 0.30, 0.34])
     }
 }
 

@@ -1660,7 +1660,7 @@ pub fn build_3split_csm_atlas(
                 off_v + scale_v - half_v,
             ],
             view_proj: c.view_proj,
-            col_major_view_proj: crate::camera::matrix_transpose_44(&c.view_proj),
+            col_major_view_proj: c.view_proj,
             cull_frustum: c.cull_frustum.clone(),
         }
     };

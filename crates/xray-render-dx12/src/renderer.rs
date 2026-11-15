@@ -670,6 +670,58 @@ impl Dx12Renderer {
         )
     }
 
+    /// Record a first-person HUD mesh draw call with dynamic lighting and rmNear [0.0, 0.02] depth compression
+    pub fn draw_hud_mesh_with_lights(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        albedo_index: Option<crate::bindless::DescriptorIndex>,
+        transform_index: u32,
+        num_lights: u32,
+    ) -> WinResult<()> {
+        let cmd = match self.current_cmd_list.as_ref() {
+            Some(c) => c,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let sc = match self.swapchain.as_ref() {
+            Some(s) => s,
+            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
+        };
+        let rtv = sc.current_rtv_handle();
+        let dsv = sc.dsv_handle();
+        let push_constants = crate::geometry::PushDrawConstants {
+            albedo_index: albedo_index.map(|i| i.0).unwrap_or(u32::MAX),
+            transform_index,
+            custom_param2: num_lights,
+            ..Default::default()
+        };
+        self.geometry.draw_hud(
+            &self.device_ctx.device,
+            cmd,
+            rtv,
+            Some(dsv),
+            self.width,
+            self.height,
+            handle,
+            Some(&self.bindless_heap),
+            Some(&push_constants),
+        )
+    }
+
+    /// Restore standard full-range viewport [0.0, 1.0] after HUD rendering (`rmNormal`)
+    pub fn restore_normal_viewport(&self) {
+        if let Some(cmd) = &self.current_cmd_list {
+            unsafe {
+                cmd.RSSetViewports(&[D3D12_VIEWPORT {
+                    Width: self.width as f32,
+                    Height: self.height as f32,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]);
+            }
+        }
+    }
+
     /// Record a draw call rendering the infinite skybox with weather cycle texture blending
     pub fn draw_sky(&mut self, push: &crate::sky::SkyPushConstants) -> WinResult<()> {
         if self.sky_renderer.is_none() {
