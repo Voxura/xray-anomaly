@@ -414,6 +414,7 @@ impl AudioManager {
         if let Some(existing) = self.clip_cache.get(&skey) {
             return Arc::clone(existing);
         }
+        eprintln!("[audio] no decodable VFS sound among {candidates:?}; using synthetic fallback {synth_key}");
         let generated = Arc::new(synth());
         self.clip_cache.insert(skey, Arc::clone(&generated));
         generated
@@ -792,22 +793,12 @@ impl AudioManager {
         let sub_shoot2 = format!("weapons\\{stem}\\{stem}");
         let n_shot = format!("weapons\\n_{stem}_shot");
         let n_shot2 = format!("weapons\\n_{stem}");
-        let cand_pm = "weapons\\pm\\pm_shoot";
-        let cand_n_pm = "weapons\\n_pm_shot";
-        let cand_ak74 = "weapons\\ak74\\ak74_shoot";
-        let cand_n_ak74 = "weapons\\n_ak74_shot";
-
-        let candidates: Vec<&str> = vec![
-            trimmed,
-            &sub_shoot,
-            &sub_shoot2,
-            &n_shot,
-            &n_shot2,
-            cand_pm,
-            cand_n_pm,
-            cand_ak74,
-            cand_n_ak74,
-        ];
+        // Never substitute a different weapon's report for a missing configured asset.
+        let candidates: Vec<&str> = if trimmed.contains(['\\', '/']) {
+            vec![trimmed]
+        } else {
+            vec![trimmed, &sub_shoot, &sub_shoot2, &n_shot, &n_shot2]
+        };
 
         let clip = self.resolve_or_synthesize(
             &candidates,

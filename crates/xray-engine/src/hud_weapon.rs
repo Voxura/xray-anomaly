@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use xray_core::ltx_loader::OwnedLtxDocument;
 use xray_audio::{resolve_surface_category, AudioManager, SurfaceMaterialCategory};
 use xray_formats::camera::{
     hud_projection_matrix as fmt_hud_projection_matrix, Dx12CameraConstants, DEFAULT_HUD_FOV_FACTOR,
@@ -49,6 +50,34 @@ use crate::world_loader::LoadedWorld;
 pub const DEFAULT_HUD_FAR_PLANE: f32 = 150.0;
 /// Maximum number of material layers a single projectile may penetrate.
 pub const MAX_PENETRATION_STEPS: usize = 4;
+
+/// Resolve X-Ray sound aliases and discard the optional volume/delay CSV fields.
+/// Layered snd_shoot definitions expose the muzzle report as snd_1_layer.
+fn configured_sound(config: &OwnedLtxDocument, section: &str, key: &str) -> Option<String> {
+    let value = config.read_str(section, key)?;
+    let mut path = value.split(',').next()?.trim().trim_matches('"');
+    let mut visited = std::collections::BTreeSet::new();
+    while config.sections.contains_key(path) {
+        if !visited.insert(path) {
+            return None;
+        }
+        path = config.read_str(path, "snd_1_layer")?
+            .split(',').next()?.trim().trim_matches('"');
+    }
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+fn apply_weapon_sound_config(spec: &mut WeaponSpec, config: &OwnedLtxDocument) {
+    for (key, target) in [
+        ("snd_shoot", &mut spec.shoot_sound),
+        ("snd_reload", &mut spec.reload_sound),
+        ("snd_holster", &mut spec.holster_sound),
+    ] {
+        if let Some(path) = configured_sound(config, &spec.section, key) {
+            *target = path;
+        }
+    }
+}
 
 /// High-level firing behavior of a weapon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +385,9 @@ pub struct HudWeaponController {
     pub visible: bool,
 
     pub wallmarks: WallmarksManager,
+    sound_config: Option<OwnedLtxDocument>,
+    sound_config_attempted: bool,
+    applied_sound_specs: [Option<[String; 4]>; 6],
     ogf_cache: BTreeMap<String, Option<CachedHudOgfAsset>>,
     active_sparks: Vec<SparkParticle>,
 
@@ -386,6 +418,9 @@ impl Default for HudWeaponController {
             last_muzzle_world_pos: [0.0, 1.6, 0.5],
             visible: true,
             wallmarks: WallmarksManager::new(),
+            sound_config: None,
+            sound_config_attempted: false,
+            applied_sound_specs: Default::default(),
             ogf_cache: BTreeMap::new(),
             active_sparks: Vec::new(),
             shots_fired: 0,
@@ -575,6 +610,28 @@ impl HudWeaponController {
 
     /// Preload active weapon & hand `.ogf` assets from `vfs` when available.
     pub fn ensure_active_ogfs_loaded(&mut self, vfs: &VirtualFileSystem) {
+        if !self.sound_config_attempted {
+            self.sound_config_attempted = true;
+            self.sound_config = xray_formats::vfs_bridge::load_ltx_tree_from_vfs(
+                vfs, "configs\\system.ltx", &[],
+            ).map_err(|err| eprintln!("[weapon-audio] config unavailable; using default paths: {err:?}")).ok();
+        }
+        if let Some(config) = &self.sound_config {
+            // Inventory synchronization replaces specs, so reapply configuration after it.
+            for (spec, applied) in self.slots.iter_mut().zip(&mut self.applied_sound_specs) {
+                if applied.as_ref().is_some_and(|last| {
+                    last[0] == spec.section && last[1] == spec.shoot_sound
+                        && last[2] == spec.reload_sound && last[3] == spec.holster_sound
+                }) {
+                    continue;
+                }
+                apply_weapon_sound_config(spec, config);
+                *applied = Some([
+                    spec.section.clone(), spec.shoot_sound.clone(),
+                    spec.reload_sound.clone(), spec.holster_sound.clone(),
+                ]);
+            }
+        }
         let w_path = self.active_weapon().weapon_hud_ogf.clone();
         let h_path = self.active_weapon().hands_hud_ogf.clone();
         let _ = self.ensure_ogf_cached(vfs, &w_path);
@@ -1892,6 +1949,50 @@ mod tests {
         let astats = audio.stats();
         assert_eq!(astats.weapon_sounds_triggered, 1);
         assert_eq!(astats.bullet_impacts_triggered, 2);
+    }
+
+    #[test]
+    fn weapon_sounds_follow_inherited_config_and_layer_aliases() {
+        use xray_core::ltx_loader::LoadedLtxSource;
+        let config = OwnedLtxDocument::from_sources(&[LoadedLtxSource {
+            virtual_path: "weapons.ltx".into(), depth: 0,
+            text: r#"
+[base]
+snd_shoot = rifle_report
+snd_reload = weapons\custom_reload, 0.8, 0.1
+[wpn_ak74]:base
+[rifle_report]
+snd_1_layer = weapons\custom_loud_shot, 1.0
+snd_2_layer = weapons\mechanism
+[cycle]
+snd_1_layer = cycle
+[broken]
+snd_shoot = cycle
+"#.into(),
+        }]);
+        let mut spec = WeaponSpec::default_loadout()[2].clone();
+        apply_weapon_sound_config(&mut spec, &config);
+        assert_eq!(spec.shoot_sound, r"weapons\custom_loud_shot");
+        assert_eq!(spec.reload_sound, r"weapons\custom_reload");
+        assert_eq!(configured_sound(&config, "broken", "snd_shoot"), None);
+    }
+
+    #[test]
+    fn weapon_sound_config_loads_from_vfs_and_survives_inventory_resync() {
+        let dir = make_temp_dir("weapon_config");
+        let configs = dir.0.join("configs");
+        fs::create_dir_all(&configs).unwrap();
+        fs::write(configs.join("system.ltx"), "#include \"weapons.ltx\"\n").unwrap();
+        fs::write(configs.join("weapons.ltx"),
+            "[wpn_ak74]\nsnd_shoot = weapons/custom_report, 1.0\n").unwrap();
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_loose_dir(&dir.0);
+        let mut ctrl = HudWeaponController::default();
+        ctrl.ensure_active_ogfs_loaded(&vfs);
+        assert_eq!(ctrl.slots[2].shoot_sound, "weapons/custom_report");
+        ctrl.slots[2] = WeaponSpec::default_loadout()[2].clone();
+        ctrl.ensure_active_ogfs_loaded(&vfs);
+        assert_eq!(ctrl.slots[2].shoot_sound, "weapons/custom_report");
     }
 
     #[test]
