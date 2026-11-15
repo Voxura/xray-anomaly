@@ -797,16 +797,17 @@ impl AudioManager {
         let cand_ak74 = "weapons\\ak74\\ak74_shoot";
         let cand_n_ak74 = "weapons\\n_ak74_shot";
 
-        let mut candidates: Vec<&str> = Vec::new();
-        candidates.push(trimmed);
-        candidates.push(&sub_shoot);
-        candidates.push(&sub_shoot2);
-        candidates.push(&n_shot);
-        candidates.push(&n_shot2);
-        candidates.push(cand_pm);
-        candidates.push(cand_n_pm);
-        candidates.push(cand_ak74);
-        candidates.push(cand_n_ak74);
+        let candidates: Vec<&str> = vec![
+            trimmed,
+            &sub_shoot,
+            &sub_shoot2,
+            &n_shot,
+            &n_shot2,
+            cand_pm,
+            cand_n_pm,
+            cand_ak74,
+            cand_n_ak74,
+        ];
 
         let clip = self.resolve_or_synthesize(
             &candidates,
