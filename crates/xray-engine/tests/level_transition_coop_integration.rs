@@ -597,7 +597,7 @@ fn test_coop_level_transition_loading_screen_and_state_sync() {
     );
 
     // 6. Live DirectX 12 GPU Loading Screen UI Verification (when GPU adapter is available)
-    if let Ok(mut gpu_rt) = EngineRuntime::new(
+    let gpu_runtime = EngineRuntime::new(
         EngineConfig {
             window: WindowConfig {
                 title: "PhaseDDx12Test".to_string(),
@@ -609,7 +609,12 @@ fn test_coop_level_transition_loading_screen_and_state_sync() {
             ..Default::default()
         },
         true,
-    ) {
+    );
+    // Hardware validation must fail rather than silently skip the DX12 assertions.
+    if std::env::var_os("XRAY_REQUIRE_PHASE_D_GPU").is_some() {
+        assert!(gpu_runtime.is_ok(), "required Phase D DX12 initialization failed");
+    }
+    if let Ok(mut gpu_rt) = gpu_runtime {
         gpu_rt.attach_vfs(Arc::clone(&vfs));
         let world1 = WorldLoader::load_from_vfs(&vfs, &esc_cfg).unwrap();
         gpu_rt.level_transition.default_load_config = esc_cfg;

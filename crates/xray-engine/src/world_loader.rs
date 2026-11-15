@@ -463,7 +463,7 @@ impl LoadedWorld {
         } else if lvl.contains("l08_yantar") || lvl.contains("yantar") {
             ([30.0, 1.8, -250.0], [0.0, 0.0, 0.0])
         } else if lvl.contains("l10_radar") || lvl.contains("radar") {
-            ([382.9, -33.7, 153.8], [0.0, 3.1415, 0.0])
+            ([382.9, -33.7, 153.8], [0.0, std::f32::consts::PI, 0.0])
         } else if lvl.contains("zaton") {
             ([100.0, 1.8, -100.0], [0.0, 0.0, 0.0])
         } else if lvl.contains("jupiter") {
