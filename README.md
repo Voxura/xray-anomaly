@@ -39,7 +39,8 @@ All engine code resides in the Cargo workspace under [`crates/Cargo.toml`](crate
 ## Prerequisites
 
 - **OS:** Windows 10 (1903+) / Windows 11 (x86_64) with DirectX 12 (Feature Level 12_0 / Shader Model 6.6 capable GPU) and WASAPI audio.
-- **Toolchain:** Rust stable toolchain (`rustc` / `cargo`, Edition 2024).
+- **Toolchain:** Rust stable with Edition 2024 support (Rust 1.85+; verified here with 1.98.0), the MSVC x64 linker and Windows SDK from Visual Studio Build Tools.
+- **Runtime shaders:** DirectX Shader Compiler (`dxc.exe` and its companion DLLs) from the Windows SDK, discoverable via `DXC_PATH` (full executable path), SDK locations, or `PATH`. Required for rendered execution; headless mode skips DX12.
 - **Game Assets (for live Zone play):** Standard S.T.A.L.K.E.R. Anomaly 1.5.x / Call of Pripyat `fsgame.ltx`, `db/` archives, and/or `gamedata/` directory. *(All workspace unit & integration tests synthesize self-contained in-memory/temp assets and require no external files to pass.)*
 
 ---
@@ -49,10 +50,10 @@ All engine code resides in the Cargo workspace under [`crates/Cargo.toml`](crate
 Build the optimized release executable (`crates/target/release/xray-engine.exe`, thin LTO, `opt-level = 3`):
 
 ```powershell
-cargo build --release --offline --locked --manifest-path crates/Cargo.toml -p xray-engine --bin xray-engine
+cargo build --release --locked --manifest-path crates/Cargo.toml -p xray-engine --bin xray-engine
 ```
 
-*(Note: remove `--offline` on a fresh machine if Cargo has not cached crates locally yet.)*
+From `crates/`, the equivalent short command is `cargo build --release -p xray-engine`. Use `--offline` only with dependencies already cached. Headless execution below exercises the runtime loop without GPU rendering or a loaded game level.
 
 Verify headless execution (60 frames):
 
@@ -104,8 +105,8 @@ crates\target\release\xray-engine.exe -fsltx D:\Anomaly\fsgame.ltx -level l01_es
 # Host a 2+ player co-op session in Zaton on UDP port 5445
 crates\target\release\xray-engine.exe -fsltx D:\Anomaly\fsgame.ltx -level zaton --host 5445 --nickname Falcon
 
-# Join a co-op host over IPv6 or IPv4
-crates\target\release\xray-engine.exe -fsltx D:\Anomaly\fsgame.ltx -level zaton -connect [2001:db8::1]:5445 --nickname Honey
+# Join the current CLI host over IPv4
+crates\target\release\xray-engine.exe -fsltx D:\Anomaly\fsgame.ltx -level zaton -connect 192.168.1.42:5445 --nickname Honey
 ```
 
 ---
@@ -129,9 +130,13 @@ crates\target\release\xray-engine.exe -fsltx D:\Anomaly\fsgame.ltx -level zaton 
 
 `xray-net` provides built-in P2P networking with **zero third-party virtual LAN drivers (no Radmin/Hamachi required)**:
 
-1. **Tier 1 — Native IPv6 Direct P2P**: Dual-stack UDP (`TransportConfig`) connects peers directly over IPv6 with zero NAT traversal overhead.
-2. **Tier 2 — RFC 5389 STUN & UDP Hole Punching**: Discovers reflexive public endpoints (`DEFAULT_STUN_SERVERS`: Google/Cloudflare STUN) via `HolePunchCoordinator` and performs simultaneous UDP hole punching across IPv4 CGNAT/cone NATs.
-3. **Tier 3 — In-Engine XRRL Fallback Relay**: Encapsulates game datagrams in a compact 16-byte `XRRL` header (`RelayServer` / `RelayClient`, up to 1400-byte payload) for strict symmetric NATs without elevated privileges.
+The library exposes three transport tiers; the shipped CLI currently wires direct sessions only:
+
+1. **Tier 1 — IPv6 direct UDP:** supported by `TransportConfig` and the session API. An IPv6 client is selected by an IPv6 `-connect` address, but `--host` currently calls `HostSession::new(port, false)` and binds IPv4. IPv6 hosting requires library integration.
+2. **Tier 2 — STUN / UDP hole punching:** `HolePunchCoordinator` implements endpoint discovery and punching. The binary does not invoke it or expose rendezvous configuration. Success depends on NAT behavior; arbitrary CGNAT traversal is not guaranteed.
+3. **Tier 3 — XRRL relay:** `RelayServer` / `RelayClient` implement relay datagrams. A reachable relay and library integration are required; the binary has no relay flag or automatic fallback.
+
+For the available CLI path, host with `--host 5445` and join with `-connect <host IPv4>:5445`, using reachable UDP endpoints and matching game assets. Internet connectivity may require existing firewall/router configuration; no public rendezvous or relay service is bundled. WAN traversal was not verified by the headless smoke check.
 
 Co-op gameplay synchronization includes:
 - Reliable sequenced & 32-bit ACK-bitmask delivery alongside unreliable entity transform deltas (`EntityDelta`).
@@ -155,5 +160,6 @@ Co-op gameplay synchronization includes:
 
 ## Clean-Room Verification & Legacy Provenance
 
-- **100% Pure-Rust Engine Crates**: Confirmed zero `build.rs` scripts, zero `.c`/`.cpp` compilation units in `crates/`, zero legacy `xr*.dll` / `lua*.dll` / `OpenAL32.dll` imports in `xray-engine.exe`, and zero external crates beyond Microsoft `windows = "0.61"`.
-- **Upstream Provenance**: This repository also retains the historical C++ OpenXRay / Call of Chernobyl / S.T.A.L.K.E.R. Anomaly Monolith Modded Exes heritage as clean-room format reference; any interaction with official GSC Game World game data remains governed by non-commercial usage terms.
+- The standalone dependency graph uses Rust workspace crates and Microsoft's `windows` crate family; `xray-core-ffi` is not an engine dependency. No `build.rs`, `.c`, or `.cpp` files were found under `crates/`. The repository still contains legacy C++ source outside that workspace.
+- These checks establish build/link separation, not clean-room provenance. Establishing independent authorship requires an auditable specification/source-access history; it cannot be inferred from Rust syntax or a successful build. Existing code and documentation reference canonical C++ behavior.
+- Runtime independence still includes Windows system DLLs and DXC for shader compilation; game assets are separate and are not bundled. See the [Phase E verification record](docs/PHASE_E_VERIFICATION.md) for the measured checks and packaging limits.

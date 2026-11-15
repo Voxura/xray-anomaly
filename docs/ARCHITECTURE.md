@@ -1,17 +1,19 @@
 # X-Ray Monolith Pure-Rust Engine — Architecture Guide
 
-This document describes the architecture, subsystem boundaries, data flow, and clean-room guarantees of the **Pure-Rust Standalone X-Ray Monolith Engine** located under [`crates/`](../crates/Cargo.toml).
+This document describes the architecture, subsystem boundaries, data flow, and verification limits of the **Pure-Rust Standalone X-Ray Monolith Engine** located under [`crates/`](../crates/Cargo.toml).
 
 ---
 
 ## 1. Design Principles & Clean-Room Verification
 
-The Rust workspace is a **clean-room, standalone engine implementation** targeting S.T.A.L.K.E.R. Anomaly 1.5.x / Call of Pripyat game assets (`.db*`/`.xdb*`, `gamedata/`, `.ltx`, `level*`, `.ogf`, `.omf`, `.dds`, `.thm`, `.ogg`, `.scop`, `.scoc`) without compiling, linking, or loading any legacy C++ engine DLLs (`xrCore.dll`, `xrEngine.exe`, `xrRender*.dll`, `OpenAL32.dll`, `lua51.dll`).
+The Rust workspace targets a standalone runtime for X-Ray assets. Build separation and clean-room provenance are distinct claims.
 
-Verified clean-room invariants:
-- **Zero C/C++ build scripts or native C/C++ sources inside `crates/`**: no `build.rs`, `.c`, or `.cpp` files exist in any workspace crate.
-- **Minimal dependency footprint**: every external OS/hardware API flows exclusively through Microsoft's official `windows = "0.61"` crate (Win32, DirectX 12, DXGI, WinSock2, COM/WASAPI) plus `std`. All compression (LZO1X, LZHuf), Vorbis decoding, STUN/XRRL networking, collision BVH, skeletal skinning, font rendering, and UI layouts are implemented in pure Rust.
-- **Standalone PE import table**: `xray-engine.exe` imports only standard Windows OS DLLs (`kernel32.dll`, `user32.dll`, `d3d12.dll`, `dxgi.dll`, `ole32.dll`, `oleaut32.dll`, `WS2_32.dll`, `bcryptprimitives.dll`, `ntdll.dll`, and standard UCRT).
+- **Source/build inspection:** no `build.rs`, `.c`, or `.cpp` files were found under `crates/`. The engine dependency graph excludes the optional `xray-core-ffi` wrapper and legacy C++ targets.
+- **Dependencies:** platform bindings use Microsoft's `windows` crate family and Rust `std`. Windows system libraries remain required. Rendered execution invokes external `dxc.exe` to compile HLSL; a standalone executable is not a dependency-free distribution.
+- **Provenance limit:** source and binary checks cannot certify clean-room authorship or licensing. Canonical C++ references occur in implementation history. Independent specification and source-access records would be needed to substantiate that stronger claim.
+- **Networking integration limit:** direct IPv4 hosting is wired in the CLI. IPv6 hosting, STUN coordination and XRRL relay integration are library capabilities, not an automatic CLI fallback chain. See the README for operational constraints.
+
+Current evidence and distribution instructions are recorded in [Phase E verification](PHASE_E_VERIFICATION.md).
 
 ---
 
@@ -68,8 +70,8 @@ Inside `EngineRuntime::step_frame` (`crates/xray-engine/src/game_loop.rs` + `ren
    - **(b) G-Buffer MRT Pass**: writes static world geometry, `LoadedDynamicModel` entities, and remote co-op peer avatars into multiple render targets.
    - **(c) 3-Split Cascaded Shadow Map (CSM) Pass**: builds stabilized frustum cascades (`build_3split_csm_atlas`) into `CascadedShadowAtlas` (`1024` px default per cascade).
    - **(d) Deferred Lighting Combine**: runs full-screen combine (`execute_deferred_combine_csm`) with CSM PCF filtering, 16-sample **SSFX volumetric sun shafts** + Henyey-Greenstein phase, hemispheric sky lighting, and up to 64 active point/spot `GpuLight`s (campfire/muzzle/ALife).
-   - **(f) Filmic Postprocessing Resolve**: applies luminance/bloom adaptation + filmic tonemapping (`Uncharted2`, `ACES`, `Reinhard`) onto the swapchain RTV before transparent forward passes.
-   - **(e) Forward Alpha, Environment & First-Person HUD Weapon Pass**: executes depth-tested `draw_sky`, `draw_clouds`, instanced `draw_details` grass, `draw_wallmarks` bullet holes/blood, `draw_rain` streaks, `draw_particles` sparks, followed by depth-range HUD clear + `hud_projection_matrix` first-person weapon & hands viewmodel pass (preventing near-wall clipping).
+   - **(e) Filmic Postprocessing Resolve**: applies luminance/bloom adaptation + filmic tonemapping (`Uncharted2`, `ACES`, `Reinhard`) onto the swapchain RTV before transparent forward passes.
+   - **(f) Forward Alpha, Environment & First-Person HUD Weapon Pass**: executes depth-tested `draw_sky`, `draw_clouds`, instanced `draw_details` grass, `draw_wallmarks` bullet holes/blood, `draw_rain` streaks, `draw_particles` sparks, followed by depth-range HUD clear + `hud_projection_matrix` first-person weapon & hands viewmodel pass (preventing near-wall clipping).
    - **(g) `UiCanvas` Overlay Pass**: draws crosshair (auto-hidden in ADS or modal UI), health/stamina/bleeding/radiation/ammo HUD meters, Inventory 10x12 grid + equipment/trader dialogue, PDA minimap (`WorldMapsConfig` + co-op peer/quest blips), Level Travel Prompt, or full-screen Loading Splash (`intro_<level>.dds`, level lore, 4-stage progress pips & bar).
 4. **3D Spatial Audio Update (`AudioManager`)**: syncs `AudioListener` to `FirstPersonCamera`, triggers material footsteps, weather wind/rain/3D thunder, ambient static emitters, weapon shots/impacts, and UI sounds via WASAPI.
 
