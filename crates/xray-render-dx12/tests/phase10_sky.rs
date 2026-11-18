@@ -280,13 +280,13 @@ fn test_skybox_dual_texture_blending_readback() {
     renderer.update_camera(&identity_camera()).expect("update_camera failed");
 
     // Texture 0: Pure Red (255, 0, 0, 255)
-    // DDS faces are +X, -X, +Y, -Y, +Z, -Z. The identity camera looks at +Z.
+    // A +90 degree world rotation brings the DDS -X face in front of the +Z camera.
     let mut red_dds = create_solid_color_rgba8_dds(4, 4, 255, 0, 0, 255);
     let front = red_dds.split_off(128);
     red_dds[112..116].copy_from_slice(&0xfe00u32.to_le_bytes());
     let other = create_solid_color_rgba8_dds(4, 4, 0, 255, 0, 255);
     for face in 0..6 {
-        red_dds.extend_from_slice(if face == 4 { &front } else { &other[128..] });
+        red_dds.extend_from_slice(if face == 1 { &front } else { &other[128..] });
     }
     let tex0 = renderer.load_texture_from_dds("sky_red.dds", &red_dds).expect("load red failed");
 
@@ -305,6 +305,7 @@ fn test_skybox_dual_texture_blending_readback() {
         sky_texture1: tex1.0,
         blend_factor: 0.5,
         is_cubemap: 1,
+        sky_rotation: std::f32::consts::FRAC_PI_2,
         sky_color: [1.0, 1.0, 1.0, 1.0],
         ..Default::default()
     };
@@ -343,8 +344,8 @@ fn test_skybox_dual_texture_blending_readback() {
     renderer.end_frame(false).expect("end_frame failed");
     renderer.wait_for_gpu().expect("wait_for_gpu failed");
 
-    let px = readback_rgba8(&readback, 64, 64, 32, 32);
-    println!("Skybox 50% Dual Blend Readback: {:?}", px);
+    let px = readback_rgba8(&readback, 64, 64, 32, 16);
+    println!("Rotated skybox 50% dual blend readback: {:?}", px);
 
     // 50% blend of Red (255, 0, 0) and Blue (0, 0, 255) yields Purple [127, 0, 127, 255]
     assert!((px[0] as i32 - 127).abs() <= 5, "Red channel must be ~127, got {}", px[0]);

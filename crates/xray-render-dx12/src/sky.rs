@@ -30,6 +30,8 @@ pub struct SkyPushConstants {
     pub sky_color: [f32; 4],
     pub sun_color: [f32; 4],
     pub sun_dir: [f32; 4],
+    pub sky_rotation: f32,
+    pub padding: [f32; 3],
 }
 
 impl Default for SkyPushConstants {
@@ -42,8 +44,35 @@ impl Default for SkyPushConstants {
             sky_color: [1.0, 1.0, 1.0, 1.0],
             sun_color: [1.0, 0.9, 0.7, 0.0],
             sun_dir: [0.577, 0.577, 0.577, 0.0],
+            sky_rotation: 0.0,
+            padding: [0.0; 3],
         }
     }
+}
+
+fn sky_shader_source() -> String {
+    use xray_formats::weather::{SKYBOX_HBOX_INDICES, SKYBOX_HBOX_POSITIONS, SKYBOX_HBOX_TEXCOORDS};
+
+    let mut source = String::new();
+    for (name, vertices) in [
+        ("SKY_POSITIONS", SKYBOX_HBOX_POSITIONS),
+        ("SKY_TEXCOORDS", SKYBOX_HBOX_TEXCOORDS),
+    ] {
+        use std::fmt::Write;
+        writeln!(source, "static const float3 {name}[{}] = {{", vertices.len()).unwrap();
+        for [x, y, z] in vertices {
+            writeln!(source, "    float3({x:?}, {y:?}, {z:?}),").unwrap();
+        }
+        source.push_str("};\n");
+    }
+    use std::fmt::Write;
+    writeln!(source, "static const uint SKY_INDICES[{}] = {{", SKYBOX_HBOX_INDICES.len()).unwrap();
+    for triangle in SKYBOX_HBOX_INDICES.chunks_exact(3) {
+        writeln!(source, "    {}, {}, {},", triangle[0], triangle[1], triangle[2]).unwrap();
+    }
+    source.push_str("};\n");
+    source.push_str(include_str!("../shaders/sky.hlsl"));
+    source
 }
 
 /// Pipeline and state for infinite skybox rendering
@@ -151,7 +180,7 @@ impl SkyRenderer {
             }
         };
 
-        let source = include_str!("../shaders/sky.hlsl");
+        let source = sky_shader_source();
         let compiler = match ShaderCompiler::new() {
             Ok(c) => c,
             Err(e) => {
@@ -161,7 +190,7 @@ impl SkyRenderer {
         };
         let vs = compiler
             .compile(&ShaderCompileRequest::new(
-                source,
+                source.as_str(),
                 "vs_main",
                 ShaderTarget::Vertex6_0,
             ))
@@ -171,7 +200,7 @@ impl SkyRenderer {
             })?;
         let ps = compiler
             .compile(&ShaderCompileRequest::new(
-                source,
+                source.as_str(),
                 "ps_main",
                 ShaderTarget::Pixel6_0,
             ))
@@ -303,7 +332,7 @@ impl SkyRenderer {
             let dsv_ptr = dsv.as_ref().map(|d| d as *const D3D12_CPU_DESCRIPTOR_HANDLE);
             cmd.OMSetRenderTargets(1, Some(&rtv), false, dsv_ptr);
             cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            cmd.DrawInstanced(36, 1, 0, 0);
+            cmd.DrawInstanced(xray_formats::weather::SKYBOX_HBOX_INDEX_COUNT as u32, 1, 0, 0);
         }
     }
 }
@@ -314,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_sky_push_constants_size_and_alignment() {
-        assert_eq!(std::mem::size_of::<SkyPushConstants>(), 64);
+        assert_eq!(std::mem::size_of::<SkyPushConstants>(), 80);
         assert_eq!(std::mem::align_of::<SkyPushConstants>(), 16);
     }
 }

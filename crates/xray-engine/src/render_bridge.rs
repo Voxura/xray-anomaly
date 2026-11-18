@@ -840,15 +840,11 @@ impl RenderBridge {
                 .and_then(|p| try_load_vfs_texture(renderer, vfs, p))
                 .map(|d| d.0)
                 .unwrap_or(idx0);
-            let mut tint = e.sky_tint_rgba();
-            tint[0] = tint[0].max(0.4);
-            tint[1] = tint[1].max(0.45);
-            tint[2] = tint[2].max(0.55);
             (
                 idx0,
                 idx1,
                 e.weight,
-                tint,
+                e.sky_tint_rgba(),
                 e.sun_glow_rgba(e.sun_shafts_intensity.max(0.15)),
             )
         } else {
@@ -874,6 +870,8 @@ impl RenderBridge {
                 -sun_dir_to_surface[2],
                 0.0,
             ],
+            sky_rotation: env.map_or(0.0, |e| e.sky_rotation),
+            ..Default::default()
         };
         renderer.draw_sky(&sky_push)?;
         stats.sky_drawn = true;
