@@ -1236,15 +1236,15 @@ impl InventoryManager {
         if !self.can_place_at(col, row, size.0, size.1, Some(uid)) {
             return false;
         }
-        let was_weapon_slot = self
+        let was_hud_slot = self
             .item(uid)
             .and_then(|i| i.equipped_slot)
-            .and_then(|s| s.hud_slot_number());
+            .is_some_and(|s| s == EquipmentSlot::Armor || s.hud_slot_number().is_some());
         if let Some(it) = self.item_mut(uid) {
             it.equipped_slot = None;
             it.grid_pos = Some((col, row));
         }
-        if was_weapon_slot.is_some() {
+        if was_hud_slot {
             self.hud_sync_dirty = true;
         }
         true
@@ -1354,6 +1354,7 @@ impl InventoryManager {
     /// Push equipped `PrimaryWeapon` (slot 3), `SecondaryWeapon` (slot 4), and `Pistol` (slot 2)
     /// into [`HudWeaponController`], updating OGF paths, ammo counts, and weapon stats.
     pub fn sync_hud_weapon(&mut self, hw: &mut HudWeaponController) {
+        hw.set_outfit_section(self.item_in_slot(EquipmentSlot::Armor).map(|item| item.section.as_str()));
         let slot_mappings = [
             (EquipmentSlot::Pistol, 2usize, "wpn_pm"),
             (EquipmentSlot::PrimaryWeapon, 3usize, "wpn_ak74"),

@@ -388,6 +388,7 @@ pub struct HudWeaponController {
     sound_config: Option<OwnedLtxDocument>,
     sound_config_attempted: bool,
     applied_sound_specs: [Option<[String; 4]>; 6],
+    outfit_section: Option<String>,
     ogf_cache: BTreeMap<String, Option<CachedHudOgfAsset>>,
     active_sparks: Vec<SparkParticle>,
 
@@ -420,6 +421,7 @@ impl Default for HudWeaponController {
             wallmarks: WallmarksManager::new(),
             sound_config: None,
             sound_config_attempted: false,
+            outfit_section: None,
             applied_sound_specs: Default::default(),
             ogf_cache: BTreeMap::new(),
             active_sparks: Vec::new(),
@@ -608,7 +610,27 @@ impl HudWeaponController {
         self.ogf_cache.get(&key).and_then(Option::as_ref)
     }
 
-    /// Preload active weapon & hand `.ogf` assets from `vfs` when available.
+    pub(crate) fn set_outfit_section(&mut self, section: Option<&str>) {
+        self.outfit_section = section.map(str::to_owned);
+    }
+
+    fn active_hands_ogf(&self) -> String {
+        if let Some(config) = &self.sound_config {
+            let hud_section = self.outfit_section.as_deref()
+                .and_then(|outfit| config.read_str(outfit, "player_hud_section"))
+                .filter(|section| !section.is_empty())
+                .unwrap_or("actor_hud_05");
+            if let Some(visual) = config.read_str(hud_section, "visual").filter(|visual| !visual.is_empty()) {
+                if visual.to_ascii_lowercase().ends_with(".ogf") {
+                    return visual.to_owned();
+                }
+                return format!("{visual}.ogf");
+            }
+        }
+        self.active_weapon().hands_hud_ogf.clone()
+    }
+
+    /// Preload active weapon and hands OGF assets from the VFS.
     pub fn ensure_active_ogfs_loaded(&mut self, vfs: &VirtualFileSystem) {
         if !self.sound_config_attempted {
             self.sound_config_attempted = true;
@@ -633,7 +655,7 @@ impl HudWeaponController {
             }
         }
         let w_path = self.active_weapon().weapon_hud_ogf.clone();
-        let h_path = self.active_weapon().hands_hud_ogf.clone();
+        let h_path = self.active_hands_ogf();
         let _ = self.ensure_ogf_cached(vfs, &w_path);
         let _ = self.ensure_ogf_cached(vfs, &h_path);
     }
@@ -740,7 +762,7 @@ impl HudWeaponController {
 
         let root_transform = self.compute_hud_root_transform(camera);
         let weapon_key = self.active_weapon().weapon_hud_ogf.clone();
-        let hands_key = self.active_weapon().hands_hud_ogf.clone();
+        let hands_key = self.active_hands_ogf();
 
         let mut parts = Vec::new();
         self.append_ogf_parts(&weapon_key, root_transform, &mut parts);
@@ -1984,12 +2006,18 @@ snd_shoot = cycle
         fs::create_dir_all(&configs).unwrap();
         fs::write(configs.join("system.ltx"), "#include \"weapons.ltx\"\n").unwrap();
         fs::write(configs.join("weapons.ltx"),
-            "[wpn_ak74]\nsnd_shoot = weapons/custom_report, 1.0\n").unwrap();
+            "[wpn_ak74]\nsnd_shoot = weapons/custom_report, 1.0\n[stalker_outfit]\nplayer_hud_section = suit_hud\n[suit_hud]\nvisual = hands/suit\n[actor_hud_05]\nvisual = hands/default.ogf\n").unwrap();
         let mut vfs = VirtualFileSystem::new();
         vfs.mount_loose_dir(&dir.0);
         let mut ctrl = HudWeaponController::default();
         ctrl.ensure_active_ogfs_loaded(&vfs);
         assert_eq!(ctrl.slots[2].shoot_sound, "weapons/custom_report");
+        assert_eq!(ctrl.active_hands_ogf(), "hands/default.ogf");
+        let mut inventory = crate::ui_inventory::InventoryManager::new_starter();
+        inventory.sync_hud_weapon(&mut ctrl);
+        assert_eq!(ctrl.active_hands_ogf(), "hands/suit.ogf");
+        assert!(inventory.unequip_slot(crate::ui_inventory::EquipmentSlot::Armor, Some(&mut ctrl), None));
+        assert_eq!(ctrl.active_hands_ogf(), "hands/default.ogf");
         ctrl.slots[2] = WeaponSpec::default_loadout()[2].clone();
         ctrl.ensure_active_ogfs_loaded(&vfs);
         assert_eq!(ctrl.slots[2].shoot_sound, "weapons/custom_report");
