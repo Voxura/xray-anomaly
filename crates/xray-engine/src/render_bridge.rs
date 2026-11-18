@@ -458,19 +458,14 @@ impl RenderBridge {
             if !frustum.test_sphere(ent.position, 2.5) {
                 continue;
             }
+            let Some(visual_key) = ent.visual_name.as_deref().filter(|name| !name.is_empty()) else {
+                continue;
+            };
             let xf = matrix_set_xyz_translate(ent.angle, ent.position);
             let tf_idx = matrices.len() as u32;
             matrices.push(xf);
 
-            let visual_key = ent
-                .visual_name
-                .as_deref()
-                .unwrap_or("__default_stalker_proxy");
-            let dyn_model = world.and_then(|w| {
-                ent.visual_name
-                    .as_deref()
-                    .and_then(|v| find_dynamic_model(w, v))
-            });
+            let dyn_model = world.and_then(|w| find_dynamic_model(w, visual_key));
             let submeshes = self.ensure_dynamic_ogf_cached(renderer, vfs, visual_key, dyn_model)?;
             draws.push(DynamicDrawInstance {
                 submeshes,
