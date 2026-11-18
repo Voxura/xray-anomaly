@@ -7,7 +7,7 @@ pub mod ltx_loader;
 pub mod string_table;
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 pub const DLTX_DELETE: &str = "DLTX_DELETE";
 
@@ -135,11 +135,7 @@ impl<'a> LtxDocument<'a> {
                             entries: HashMap::new(),
                         });
 
-                        for p in parents {
-                            if !sec.parents.contains(&p) {
-                                sec.parents.push(p);
-                            }
-                        }
+                        sec.parents.extend(parents);
                         continue;
                     }
                 }
@@ -216,13 +212,13 @@ impl<'a> LtxDocument<'a> {
         }
     }
 
-    /// Read string value with multi-parent section inheritance resolution.
+    /// Read a local value first, then search each parent's full inheritance chain
+    /// from last declared parent to first, matching Monolith's merge order.
     pub fn read_str(&self, section: &str, key: &str) -> Option<&'a str> {
         let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back(section);
+        let mut pending = vec![section];
 
-        while let Some(cur) = queue.pop_front() {
+        while let Some(cur) = pending.pop() {
             if !visited.insert(cur) {
                 // Circular inheritance loop detected; safely terminate branch
                 continue;
@@ -232,9 +228,7 @@ impl<'a> LtxDocument<'a> {
                 if let Some(val) = sec.entries.get(key) {
                     return Some(*val);
                 }
-                for parent in &sec.parents {
-                    queue.push_back(*parent);
-                }
+                pending.extend(sec.parents.iter().copied());
             }
         }
 
@@ -442,21 +436,37 @@ mod tests {
         [parent_a]
         val_a = 10
         shared = from_a
+        local = from_a
 
-        [parent_b]
-        val_b = 20
+        [grandparent]
         shared = from_b
+
+        [parent_b]:grandparent
+        val_b = 20
+        local = from_b
 
         [child]:parent_a, parent_b
         child_val = 30
+        local = from_child
+
+        [repeated_parent]:parent_a, parent_b, parent_a
         "#;
 
         let doc = LtxDocument::parse(ltx);
         assert_eq!(doc.read_i32("child", "child_val", 0), 30);
         assert_eq!(doc.read_i32("child", "val_a", 0), 10);
         assert_eq!(doc.read_i32("child", "val_b", 0), 20);
-        // parent_a visited before parent_b in queue order
-        assert_eq!(doc.read_str("child", "shared"), Some("from_a"));
+        assert_eq!(doc.read_str("child", "shared"), Some("from_b"));
+        assert_eq!(doc.read_str("child", "local"), Some("from_child"));
+        assert_eq!(doc.read_str("repeated_parent", "shared"), Some("from_a"));
+
+        let owned = ltx_loader::OwnedLtxDocument::from_sources(&[ltx_loader::LoadedLtxSource {
+            virtual_path: "inheritance.ltx".into(),
+            depth: 0,
+            text: ltx.into(),
+        }]);
+        assert_eq!(owned.read_str("child", "shared"), Some("from_b"));
+        assert_eq!(owned.read_str("child", "local"), Some("from_child"));
     }
 
     #[test]

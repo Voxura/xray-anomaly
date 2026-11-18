@@ -4,7 +4,7 @@
 //! cleanly through an abstract reader/listing callback so `xray-core` remains zero-dependency
 //! and works identically over both `std::fs` and `xray-vfs::VirtualFileSystem`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use crate::LtxDocument;
 
 /// Result of resolving an `#include` directive.
@@ -217,12 +217,12 @@ impl OwnedLtxDocument {
         owned
     }
 
+    /// Resolve inherited values in the same order as `LtxDocument::read_str`.
     pub fn read_str(&self, section: &str, key: &str) -> Option<&str> {
         let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back(section);
+        let mut pending = vec![section];
 
-        while let Some(cur) = queue.pop_front() {
+        while let Some(cur) = pending.pop() {
             if !visited.insert(cur) {
                 continue;
             }
@@ -230,9 +230,7 @@ impl OwnedLtxDocument {
                 if let Some(val) = sec.entries.get(key) {
                     return Some(val.as_str());
                 }
-                for parent in &sec.parents {
-                    queue.push_back(parent.as_str());
-                }
+                pending.extend(sec.parents.iter().map(String::as_str));
             }
         }
         None
