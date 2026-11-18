@@ -397,13 +397,36 @@ pub fn skin_ogf_hierarchy(
     root: &OgfModel,
     palette: &BonePalette,
 ) -> Result<Vec<SkinnedMeshPart>, FormatError> {
+    skin_ogf_hierarchy_visible(root, palette, None)
+}
+
+/// Skip skinned submeshes whose referenced bones are all hidden, as Monolith does.
+pub fn skin_ogf_hierarchy_visible(
+    root: &OgfModel,
+    palette: &BonePalette,
+    visible: Option<&BoneMask>,
+) -> Result<Vec<SkinnedMeshPart>, FormatError> {
+    fn has_visible_bones(verts: &OgfVertices, visible: &BoneMask) -> bool {
+        let any = |ids: &[u16]| ids.iter().any(|id| visible.is_visible(*id));
+        match verts {
+            OgfVertices::Static { .. } => true,
+            OgfVertices::Skinned1W(v) => v.iter().any(|v| visible.is_visible(v.matrix as u16)),
+            OgfVertices::Skinned2W(v) => v.iter().any(|v| any(&[v.matrix0, v.matrix1])),
+            OgfVertices::Skinned3W(v) => v.iter().any(|v| any(&v.matrices)),
+            OgfVertices::Skinned4W(v) => v.iter().any(|v| any(&v.matrices)),
+        }
+    }
+
     fn collect(
         model: &OgfModel,
         child_index: Option<usize>,
         palette: &BonePalette,
+        visible: Option<&BoneMask>,
         out: &mut Vec<SkinnedMeshPart>,
     ) -> Result<(), FormatError> {
-        if let Some(ref verts) = model.vertices {
+        if let Some(ref verts) = model.vertices
+            && visible.is_none_or(|mask| has_visible_bones(verts, mask))
+        {
             out.push(SkinnedMeshPart {
                 child_index,
                 texture: model.texture.clone(),
@@ -412,13 +435,13 @@ pub fn skin_ogf_hierarchy(
             });
         }
         for (idx, child) in model.children.iter().enumerate() {
-            collect(child, Some(idx), palette, out)?;
+            collect(child, Some(idx), palette, visible, out)?;
         }
         Ok(())
     }
 
     let mut out = Vec::new();
-    collect(root, None, palette, &mut out)?;
+    collect(root, None, palette, visible, &mut out)?;
     Ok(out)
 }
 
