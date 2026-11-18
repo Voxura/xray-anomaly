@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use xray_core::ltx_loader::OwnedLtxDocument;
+use xray_core::ltx_loader::{glob_matches_ascii, OwnedLtxDocument};
 use xray_audio::{resolve_surface_category, AudioManager, SurfaceMaterialCategory};
 use xray_formats::camera::{
     hud_projection_matrix as fmt_hud_projection_matrix, Dx12CameraConstants, DEFAULT_HUD_FOV_FACTOR,
@@ -26,7 +26,7 @@ use xray_formats::gamemtl::{gamemtl_flags, GameMaterialLibrary};
 use xray_formats::hom::{frustum_planes, ClipFrustum};
 use xray_formats::lanims::pack_argb;
 use xray_formats::ogf::{
-    matrix_mul_44, vector_generate_orthonormal_basis,
+    matrix_mul_43, matrix_mul_44, matrix_set_hpb, vector_generate_orthonormal_basis,
     BonePoseMatrices, OgfModel, OgfTextureLink, StaticVertex, XRayMatrix,
 };
 use xray_formats::particles::{
@@ -34,7 +34,7 @@ use xray_formats::particles::{
 };
 use xray_formats::skinning::{skin_ogf_hierarchy_visible, BoneMask, BonePalette};
 use xray_formats::thm::ResolvedTextureLinks;
-use xray_formats::vfs_bridge::{load_ogf_from_vfs, resolve_ogf_texture_links};
+use xray_formats::vfs_bridge::{load_ogf_from_vfs, load_omf_from_vfs, resolve_ogf_texture_links};
 use xray_render_dx12::geometry_abi::{CameraConstants, XRayVertex};
 use xray_render_dx12::lighting::GpuLight;
 use xray_render_dx12::particle::GpuParticleInstance;
@@ -50,6 +50,56 @@ use crate::world_loader::LoadedWorld;
 pub const DEFAULT_HUD_FAR_PLANE: f32 = 150.0;
 /// Maximum number of material layers a single projectile may penetrate.
 pub const MAX_PENETRATION_STEPS: usize = 4;
+
+fn hud_measure_vec3(config: &OwnedLtxDocument, section: &str, key: &str) -> Option<[f32; 3]> {
+    let mut values = config.read_str(section, key)?.split(',');
+    let mut result = [0.0f32; 3];
+    for value in &mut result {
+        *value = values.next()?.trim().parse().ok()?;
+    }
+    (values.next().is_none() && result.iter().all(|v| v.is_finite())).then_some(result)
+}
+
+fn hud_measure_transform(position: [f32; 3], orientation_degrees: [f32; 3]) -> XRayMatrix {
+    let [heading, pitch, bank] = orientation_degrees.map(f32::to_radians);
+    let mut transform = matrix_set_hpb(heading, pitch, bank);
+    transform[3] = [position[0], position[1], position[2], 1.0];
+    transform
+}
+
+fn load_hands_idle_pose(
+    vfs: &VirtualFileSystem,
+    asset: &CachedHudOgfAsset,
+    clip: &str,
+) -> Option<BonePalette> {
+    let skeleton = asset.model.skeleton.as_ref()?;
+    let bind_poses = asset.bind_poses.as_ref()?;
+    let sample = |path: &str| {
+        let motions = load_omf_from_vfs(vfs, path).ok()?;
+        let index = motions.clips.iter().position(|motion| motion.name.eq_ignore_ascii_case(clip))?;
+        let pose = motions.evaluate_skeleton_pose(skeleton, index, 0.0).ok()?;
+        BonePalette::from_model_transforms_with_bind(bind_poses, &pose).ok()
+    };
+    for reference in &skeleton.motion_refs {
+        if reference.contains('*') {
+            let Ok(pattern) = normalize_virtual_path(reference) else { continue };
+            let pattern = if pattern.starts_with("meshes\\") { pattern } else { format!("meshes\\{pattern}") };
+            let Some((directory, filename)) = pattern.rsplit_once('\\') else { continue };
+            let prefix = format!("{directory}\\");
+            let Ok(paths) = vfs.list_files(directory) else { continue };
+            for path in paths {
+                if path.strip_prefix(&prefix).is_some_and(|name| !name.contains('\\') && glob_matches_ascii(filename, name))
+                    && let Some(pose) = sample(&path)
+                {
+                    return Some(pose);
+                }
+            }
+        } else if let Some(pose) = sample(reference) {
+            return Some(pose);
+        }
+    }
+    None
+}
 
 /// Resolve X-Ray sound aliases and discard the optional volume/delay CSV fields.
 /// Layered snd_shoot definitions expose the muzzle report as snd_1_layer.
@@ -389,6 +439,7 @@ pub struct HudWeaponController {
     sound_config_attempted: bool,
     applied_sound_specs: [Option<[String; 4]>; 6],
     outfit_section: Option<String>,
+    hands_idle_poses: BTreeMap<(String, String), Option<BonePalette>>,
     ogf_cache: BTreeMap<String, Option<CachedHudOgfAsset>>,
     active_sparks: Vec<SparkParticle>,
 
@@ -422,6 +473,7 @@ impl Default for HudWeaponController {
             sound_config: None,
             sound_config_attempted: false,
             outfit_section: None,
+            hands_idle_poses: BTreeMap::new(),
             applied_sound_specs: Default::default(),
             ogf_cache: BTreeMap::new(),
             active_sparks: Vec::new(),
@@ -614,28 +666,70 @@ impl HudWeaponController {
         self.outfit_section = section.map(str::to_owned);
     }
 
-    fn active_hands_ogfs(&self) -> [String; 2] {
-        fn model_path(visual: &str) -> String {
-            if visual.to_ascii_lowercase().ends_with(".ogf") {
-                visual.to_owned()
-            } else {
-                format!("{visual}.ogf")
-            }
+    fn ogf_path(visual: &str) -> String {
+        if visual.to_ascii_lowercase().ends_with(".ogf") {
+            visual.to_owned()
+        } else {
+            format!("{visual}.ogf")
         }
+    }
+
+    fn player_hud_section<'a>(&'a self, config: &'a OwnedLtxDocument) -> &'a str {
+        self.outfit_section.as_deref()
+            .and_then(|outfit| config.read_str(outfit, "player_hud_section"))
+            .filter(|section| !section.is_empty())
+            .unwrap_or("actor_hud_05")
+    }
+
+    fn weapon_hud_config(&self) -> Option<(&OwnedLtxDocument, &str)> {
+        let config = self.sound_config.as_ref()?;
+        let section = config.read_str(&self.active_weapon().section, "hud")?;
+        Some((config, section))
+    }
+
+    fn active_weapon_ogf(&self) -> String {
+        self.weapon_hud_config()
+            .and_then(|(config, section)| config.read_str(section, "item_visual"))
+            .filter(|visual| !visual.is_empty())
+            .map_or_else(|| self.active_weapon().weapon_hud_ogf.clone(), Self::ogf_path)
+    }
+
+    fn active_hands_ogfs(&self) -> [String; 2] {
         if let Some(config) = &self.sound_config {
-            let hud_section = self.outfit_section.as_deref()
-                .and_then(|outfit| config.read_str(outfit, "player_hud_section"))
-                .filter(|section| !section.is_empty())
-                .unwrap_or("actor_hud_05");
+            let hud_section = self.player_hud_section(config);
             if let Some(visual) = config.read_str(hud_section, "visual").filter(|visual| !visual.is_empty()) {
                 let second = config.read_str(hud_section, "visual_2")
                     .filter(|visual| !visual.is_empty())
                     .unwrap_or(visual);
-                return [model_path(visual), model_path(second)];
+                return [Self::ogf_path(visual), Self::ogf_path(second)];
             }
         }
         let fallback = &self.active_weapon().hands_hud_ogf;
         [fallback.clone(), fallback.clone()]
+    }
+
+    fn idle_pose_key(&self, hands_path: &str) -> Option<(String, String)> {
+        let (config, section) = self.weapon_hud_config()?;
+        let clip = config.read_str(section, "anm_idle")?.split(',').next()?.trim();
+        if clip.is_empty() {
+            return None;
+        }
+        Some((normalize_virtual_path(hands_path).ok()?, clip.to_owned()))
+    }
+
+    fn ensure_hands_idle_pose(&mut self, vfs: &VirtualFileSystem, hands_path: &str) {
+        let Some(key) = self.idle_pose_key(hands_path) else { return };
+        if !self.hands_idle_poses.contains_key(&key) {
+            let pose = self.cached_ogf(hands_path)
+                .and_then(|asset| load_hands_idle_pose(vfs, asset, &key.1));
+            self.hands_idle_poses.insert(key, pose);
+        }
+    }
+
+    fn hands_idle_pose(&self, hands_path: &str) -> Option<(&str, &BonePalette)> {
+        let key = self.idle_pose_key(hands_path)?;
+        let ((_, clip), pose) = self.hands_idle_poses.get_key_value(&key)?;
+        Some((clip, pose.as_ref()?))
     }
 
     /// Preload active weapon and hands OGF assets from the VFS.
@@ -662,18 +756,30 @@ impl HudWeaponController {
                 ]);
             }
         }
-        let w_path = self.active_weapon().weapon_hud_ogf.clone();
+        let w_path = self.active_weapon_ogf();
         let [right, left] = self.active_hands_ogfs();
         let _ = self.ensure_ogf_cached(vfs, &w_path);
         let _ = self.ensure_ogf_cached(vfs, &right);
+        self.ensure_hands_idle_pose(vfs, &right);
         if left != right {
             let _ = self.ensure_ogf_cached(vfs, &left);
+            self.ensure_hands_idle_pose(vfs, &left);
         }
     }
 
     /// Compute world-space HUD root matrix anchored to `camera` with ADS blend, holster dip,
     /// reload tilt, and recoil kickback.
     pub fn compute_hud_root_transform(&self, camera: &FirstPersonCamera) -> XRayMatrix {
+        let spec = self.active_weapon();
+        self.compute_hud_root_with_offsets(camera, spec.hip_offset, spec.ads_offset)
+    }
+
+    fn compute_hud_root_with_offsets(
+        &self,
+        camera: &FirstPersonCamera,
+        hip: [f32; 3],
+        ads: [f32; 3],
+    ) -> XRayMatrix {
         let spec = self.active_weapon();
         let right = camera.right();
         let forward = camera.forward();
@@ -685,8 +791,6 @@ impl HudWeaponController {
         ]);
 
         let t = self.ads_blend.clamp(0.0, 1.0);
-        let hip = spec.hip_offset;
-        let ads = spec.ads_offset;
         let sway_amp = (1.0 - t * 0.78) * 0.004;
         let sway_x = (self.sway_time_sec * 1.9).sin() * sway_amp;
         let sway_y = (self.sway_time_sec * 3.8).cos() * sway_amp * 0.7;
@@ -757,6 +861,39 @@ impl HudWeaponController {
         BonePalette::from_model_transforms_with_bind(bind_poses, &model_transforms).ok()
     }
 
+    fn configured_attachment_transforms(
+        &self,
+        camera: &FirstPersonCamera,
+        hands_path: &str,
+        pose: &BonePalette,
+    ) -> Option<(XRayMatrix, XRayMatrix)> {
+        let (config, section) = self.weapon_hud_config()?;
+        let skeleton = self.cached_ogf(hands_path)?.model.skeleton.as_ref()?;
+        let anchor = config.read_str(self.player_hud_section(config), "ancor_0")?;
+        let anchor = pose.model_transforms.get(skeleton.bone_id(anchor)? as usize)?;
+
+        let wide = camera.aspect < 0.75;
+        let measure = |key, wide_key| {
+            if wide && let Some(value) = hud_measure_vec3(config, section, wide_key) {
+                return Some(value);
+            }
+            hud_measure_vec3(config, section, key)
+        };
+        let hand_pos = measure("hands_position", "hands_position_16x9")?;
+        let hand_rot = measure("hands_orientation", "hands_orientation_16x9")?;
+        let aim_delta = measure("aim_hud_offset_pos", "aim_hud_offset_pos_16x9").unwrap_or([0.0; 3]);
+        let aim_pos = std::array::from_fn(|axis| hand_pos[axis] + aim_delta[axis]);
+        let hand_basis = self.compute_hud_root_with_offsets(camera, hand_pos, aim_pos);
+        let hand_transform = matrix_mul_43(&hand_basis, &hud_measure_transform([0.0; 3], hand_rot));
+        let item_pos = hud_measure_vec3(config, section, "item_position").unwrap_or([0.0; 3]);
+        let item_rot = hud_measure_vec3(config, section, "item_orientation").unwrap_or([0.0; 3]);
+        let item_transform = matrix_mul_43(
+            &matrix_mul_43(&hand_transform, anchor),
+            &hud_measure_transform(item_pos, item_rot),
+        );
+        Some((hand_transform, item_transform))
+    }
+
     /// Gather skinned/posed HUD draw parts for both the active weapon & hands OGF (or clean fallback).
     pub fn collect_hud_draw_parts(
         &mut self,
@@ -771,11 +908,16 @@ impl HudWeaponController {
         }
 
         let root_transform = self.compute_hud_root_transform(camera);
-        let weapon_key = self.active_weapon().weapon_hud_ogf.clone();
+        let weapon_key = self.active_weapon_ogf();
         let [right, left] = self.active_hands_ogfs();
+        let right_pose = self.hands_idle_pose(&right);
+        let left_pose = self.hands_idle_pose(&left);
+        let (hands_transform, weapon_transform) = right_pose
+            .and_then(|(_, pose)| self.configured_attachment_transforms(camera, &right, pose))
+            .unwrap_or((root_transform, root_transform));
 
         let mut parts = Vec::new();
-        self.append_ogf_parts(&weapon_key, root_transform, None, &mut parts);
+        self.append_ogf_parts(&weapon_key, weapon_transform, None, None, &mut parts);
         let can_split = self.cached_ogf(&right)
             .and_then(|asset| asset.model.skeleton.as_ref())
             .is_some_and(|skeleton| {
@@ -785,10 +927,10 @@ impl HudWeaponController {
             });
         let split = right != left || can_split;
         if split {
-            self.append_ogf_parts(&right, root_transform, Some("l_clavicle"), &mut parts);
-            self.append_ogf_parts(&left, root_transform, Some("r_clavicle"), &mut parts);
+            self.append_ogf_parts(&right, hands_transform, Some("l_clavicle"), right_pose, &mut parts);
+            self.append_ogf_parts(&left, hands_transform, Some("r_clavicle"), left_pose, &mut parts);
         } else {
-            self.append_ogf_parts(&right, root_transform, None, &mut parts);
+            self.append_ogf_parts(&right, hands_transform, None, right_pose, &mut parts);
         }
 
         if parts.is_empty() {
@@ -807,6 +949,7 @@ impl HudWeaponController {
         ogf_path: &str,
         root_transform: XRayMatrix,
         hidden_arm: Option<&str>,
+        idle_pose: Option<(&str, &BonePalette)>,
         out: &mut Vec<HudDrawPart>,
     ) {
         let key = normalize_virtual_path(ogf_path)
@@ -830,7 +973,9 @@ impl HudWeaponController {
             Some((visibility, root.parent_id))
         });
 
-        let skinned_parts = self.evaluate_asset_bone_palette(asset).and_then(|mut palette| {
+        let palette = idle_pose.map(|(_, pose)| pose.clone())
+            .or_else(|| self.evaluate_asset_bone_palette(asset));
+        let skinned_parts = palette.and_then(|mut palette| {
             if let Some((mask, parent_id)) = &visibility {
                 // LL_SetBoneVisible collapses each hidden descendant to the visible parent.
                 let mut origin = parent_id
@@ -884,7 +1029,7 @@ impl HudWeaponController {
                     .map(|t| t.texture.clone())
                     .or_else(|| asset.texture_links.first().map(|l| l.diffuse_dds.clone()));
                 out.push(HudDrawPart {
-                    key: format!("{key}#{}sk_{idx}", hidden_arm.unwrap_or_default()),
+                    key: format!("{key}#{}#{}#sk_{idx}", hidden_arm.unwrap_or_default(), idle_pose.map_or("", |(clip, _)| clip)),
                     texture_vpath: tex,
                     vertices: verts,
                     indices: sp.indices,
@@ -2125,5 +2270,45 @@ snd_shoot = cycle
         let parts = ctrl.collect_hud_draw_parts(&camera, Some(&vfs));
         assert_eq!(parts.len(), 1);
         assert!(parts[0].key.starts_with("left.ogf#"));
+    }
+
+    #[test]
+    fn hud_item_uses_configured_visual_and_posed_attachment_bone() {
+        let dir = make_temp_dir("hud_attachment");
+        let configs = dir.0.join("configs");
+        let meshes = dir.0.join("meshes");
+        fs::create_dir_all(&configs).unwrap();
+        fs::create_dir_all(&meshes).unwrap();
+        fs::write(configs.join("system.ltx"), "\
+[wpn_ak74]
+hud = ak_hud
+[ak_hud]
+item_visual = test_weapon
+hands_position = 0, 0, 0
+hands_position_16x9 = 0.1, -0.2, 0.14
+hands_orientation = 0, 0, 0
+hands_orientation_16x9 = 0, 0, 0
+item_position = 0.2, 0, 0
+[actor_hud_05]
+visual = test_hands
+ancor_0 = lead_gun
+").unwrap();
+        let model = build_synthetic_skeletal_ogf_bytes(0, &[("lead_gun", "")]);
+        fs::write(meshes.join("test_hands.ogf"), &model).unwrap();
+        fs::write(meshes.join("test_weapon.ogf"), &model).unwrap();
+        let mut vfs = VirtualFileSystem::new();
+        vfs.mount_loose_dir(&dir.0);
+
+        let mut ctrl = HudWeaponController::default();
+        ctrl.ensure_active_ogfs_loaded(&vfs);
+        assert_eq!(ctrl.active_weapon_ogf(), "test_weapon.ogf");
+        assert!(ctrl.cached_ogf("test_weapon.ogf").is_some());
+        let hands_path = "test_hands.ogf";
+        let mut pose = ctrl.evaluate_asset_bone_palette(ctrl.cached_ogf(hands_path).unwrap()).unwrap();
+        pose.model_transforms[0][3][0] = 0.5;
+        let camera = FirstPersonCamera::new(1280, 720);
+        let (hands, item) = ctrl.configured_attachment_transforms(&camera, hands_path, &pose).unwrap();
+        assert!((hands[3][0] - (camera.position[0] + 0.1)).abs() < 1e-5);
+        assert!((item[3][0] - hands[3][0] - 0.7).abs() < 1e-5);
     }
 }
