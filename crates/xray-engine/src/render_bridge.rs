@@ -30,7 +30,7 @@ use crate::hud_weapon::{HudWeaponController, WeaponState};
 use crate::level_transition::LevelTransitionManager;
 use crate::ui_inventory::{InventoryManager, UiFontResource};
 use crate::ui_pda::PdaManager;
-use crate::world_loader::{LoadedDynamicModel, LoadedWorld};
+use crate::world_loader::{LoadedDynamicModel, LoadedWorld, resolve_level_texture_vpath};
 use xray_formats::details::{LevelDetails, DETAIL_ID_EMPTY, DETAIL_SLOT_SIZE};
 use xray_formats::hom::{frustum_planes, ClipFrustum};
 use xray_formats::ogf::{
@@ -326,7 +326,9 @@ impl RenderBridge {
             for obj in &details.objects {
                 let gpu_verts = DetailManager::build_gpu_mesh(obj);
                 let tex = if !obj.texture.is_empty() {
-                    let vpath = texture_stem_to_dds_vpath(&obj.texture);
+                    let vpath = vfs
+                        .and_then(|vfs| resolve_level_texture_vpath(vfs, &world.level_dir, &obj.texture))
+                        .unwrap_or_else(|| texture_stem_to_dds_vpath(&obj.texture));
                     try_load_vfs_texture(renderer, vfs, &vpath)
                 } else {
                     None

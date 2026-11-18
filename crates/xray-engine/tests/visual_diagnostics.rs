@@ -72,7 +72,23 @@ fn texture_binding_alias_cache_and_failure_stages_on_dx12() {
         index
     );
     assert_eq!(renderer.get_texture_by_index(index).unwrap().width, 4);
+
+    let level_dir = root.join("levels/l02_garbage");
+    std::fs::create_dir_all(&level_dir).unwrap();
+    std::fs::write(level_dir.join("diagnostic.dds"), &dds).unwrap();
+    let local = xray_engine::world_loader::resolve_level_texture_vpath(
+        &vfs,
+        "$game_levels$/l02_garbage",
+        "diagnostic",
+    )
+    .expect("level-local texture takes precedence over global texture");
+    let local_index = load_vfs_texture(&mut renderer, Some(&vfs), &local).unwrap();
+    assert_ne!(local_index, index, "level-local texture must have its own cache key");
+
     renderer.wait_for_gpu().unwrap();
+    std::fs::remove_file(level_dir.join("diagnostic.dds")).unwrap();
+    std::fs::remove_dir(&level_dir).unwrap();
+    std::fs::remove_dir(root.join("levels")).unwrap();
     std::fs::remove_file(textures.join("diagnostic.dds")).unwrap();
     std::fs::remove_dir(&textures).unwrap();
     std::fs::remove_dir(&root).unwrap();

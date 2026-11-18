@@ -809,6 +809,12 @@ pub fn resolve_level_texture_vpath(
 ) -> Option<String> {
     let clean = tex_name.replace('/', "\\");
     let stem = clean.trim_matches('\\');
+    // Monolith checks the current level before the global texture directory.
+    let clean_level = level_dir.trim_matches('\\');
+    let cand_level_stem = format!("{clean_level}\\{stem}.dds");
+    if vfs.exists(&cand_level_stem) {
+        return Some(cand_level_stem);
+    }
 
     // Candidate 1: Standard global textures directory `textures\<stem>.dds`
     let cand_textures = if stem.to_ascii_lowercase().starts_with("textures\\") {
@@ -818,13 +824,6 @@ pub fn resolve_level_texture_vpath(
     };
     if vfs.exists(&cand_textures) {
         return Some(cand_textures);
-    }
-
-    // Candidate 2: Under level directory `<level_dir>\<stem>.dds` (e.g. `levels\l01_escape\terrain\terrain_escape.dds`)
-    let clean_level = level_dir.trim_matches('\\');
-    let cand_level_stem = format!("{clean_level}\\{stem}.dds");
-    if vfs.exists(&cand_level_stem) {
-        return Some(cand_level_stem);
     }
 
     // Candidate 3: Under level directory with stripped prefix (e.g. `terrain\terrain_escape` -> `levels\l01_escape\terrain_escape.dds`)
