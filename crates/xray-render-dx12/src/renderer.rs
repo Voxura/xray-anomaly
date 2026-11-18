@@ -401,6 +401,7 @@ impl Dx12Renderer {
             &texture_res,
             dds.format,
             dds.mip_count,
+            dds.is_cubemap,
             cpu_handle,
         );
 
@@ -410,6 +411,7 @@ impl Dx12Renderer {
             width: dds.width,
             height: dds.height,
             mip_count: dds.mip_count,
+            is_cubemap: dds.is_cubemap,
             format: dds.format,
         };
 

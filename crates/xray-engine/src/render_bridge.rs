@@ -864,7 +864,8 @@ impl RenderBridge {
             sky_texture0: sky_tex0,
             sky_texture1: sky_tex1,
             blend_factor: sky_blend,
-            is_cubemap: 0,
+            is_cubemap: u32::from(renderer.get_texture_by_index(DescriptorIndex(sky_tex0)).is_some_and(|t| t.is_cubemap))
+                | (u32::from(renderer.get_texture_by_index(DescriptorIndex(sky_tex1)).is_some_and(|t| t.is_cubemap)) << 1),
             sky_color,
             sun_color: sun_glow,
             sun_dir: [

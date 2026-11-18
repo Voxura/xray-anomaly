@@ -20,6 +20,7 @@ cbuffer SkyPushConstants : register(b1)
 };
 
 Texture2D g_textures[] : register(t0);
+TextureCube g_cubemaps[] : register(t0, space1);
 SamplerState g_sampler : register(s0);
 
 static const float3 CUBE_VERTICES[8] = {
@@ -60,6 +61,13 @@ SkyVSOutput vs_main(uint vertex_id : SV_VertexID)
     return output;
 }
 
+float4 sample_sky(uint index, bool cube, float3 dir, float2 uv)
+{
+    if (cube)
+        return g_cubemaps[NonUniformResourceIndex(index)].Sample(g_sampler, dir);
+    return g_textures[NonUniformResourceIndex(index)].Sample(g_sampler, uv);
+}
+
 float4 ps_main(SkyVSOutput input) : SV_Target0
 {
     float3 dir = normalize(input.ray_dir);
@@ -70,11 +78,11 @@ float4 ps_main(SkyVSOutput input) : SV_Target0
     float2 uv = float2(atan2(dir.z, dir.x) * 0.15915494 + 0.5, asin(clamp(dir.y, -1.0, 1.0)) * 0.31830988 + 0.5);
     if (sky_texture0 != 0xFFFFFFFF)
     {
-        color0 = g_textures[NonUniformResourceIndex(sky_texture0)].Sample(g_sampler, uv);
+        color0 = sample_sky(sky_texture0, (is_cubemap & 1) != 0, dir, uv);
     }
     if (sky_texture1 != 0xFFFFFFFF)
     {
-        color1 = g_textures[NonUniformResourceIndex(sky_texture1)].Sample(g_sampler, uv);
+        color1 = sample_sky(sky_texture1, (is_cubemap & 2) != 0, dir, uv);
     }
 
     float4 blended = lerp(color0, color1, saturate(blend_factor)) * sky_color;

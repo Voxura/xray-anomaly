@@ -76,6 +76,12 @@ impl SkyRenderer {
             NumDescriptorRanges: 1,
             pDescriptorRanges: &srv_range,
         };
+        let cube_range = D3D12_DESCRIPTOR_RANGE { RegisterSpace: 1, ..srv_range };
+        let mut cubes = textures;
+        cubes.Anonymous.DescriptorTable = D3D12_ROOT_DESCRIPTOR_TABLE {
+            NumDescriptorRanges: 1,
+            pDescriptorRanges: &cube_range,
+        };
 
         let mut push = D3D12_ROOT_PARAMETER::default();
         push.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -86,7 +92,7 @@ impl SkyRenderer {
             Num32BitValues: (std::mem::size_of::<SkyPushConstants>() / 4) as u32,
         };
 
-        let parameters = [camera, textures, push];
+        let parameters = [camera, textures, push, cubes];
 
         let sampler = D3D12_STATIC_SAMPLER_DESC {
             Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -275,6 +281,7 @@ impl SkyRenderer {
                 1,
                 srv_heap.GetGPUDescriptorHandleForHeapStart(),
             );
+            cmd.SetGraphicsRootDescriptorTable(3, srv_heap.GetGPUDescriptorHandleForHeapStart());
             cmd.SetGraphicsRoot32BitConstants(
                 2,
                 (std::mem::size_of::<SkyPushConstants>() / 4) as u32,

@@ -19,6 +19,7 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_TRANSITION_BARRIER,
     D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
     D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_TEX2D_SRV,
+    D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_TEXCUBE_SRV,
     D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
     D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
     D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_TEXTURE_LAYOUT_UNKNOWN,
@@ -92,6 +93,7 @@ pub struct DdsImage<'a> {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
+    pub is_cubemap: bool,
     pub mip_count: u32,
     pub format: DXGI_FORMAT,
     pub is_block_compressed: bool,
@@ -143,6 +145,8 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
     let pf_b_mask = u32::from_le_bytes([bytes[100], bytes[101], bytes[102], bytes[103]]);
     let _pf_a_mask = u32::from_le_bytes([bytes[104], bytes[105], bytes[106], bytes[107]]);
 
+    let caps2 = u32::from_le_bytes(bytes[112..116].try_into().unwrap());
+    let mut is_cubemap = caps2 & 0x200 != 0;
     let mut data_offset = 128;
     let (format, is_bc, block_size) = if pf_flags & DDPF_FOURCC != 0 {
         if pf_fourcc == FOURCC_DX10 {
@@ -150,6 +154,13 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
                 return Err(TextureError::BufferTooShort);
             }
             let dxgi_fmt_raw = u32::from_le_bytes([bytes[128], bytes[129], bytes[130], bytes[131]]);
+            let dimension = u32::from_le_bytes(bytes[132..136].try_into().unwrap());
+            let misc = u32::from_le_bytes(bytes[136..140].try_into().unwrap());
+            let array_size = u32::from_le_bytes(bytes[140..144].try_into().unwrap());
+            is_cubemap = misc & 4 != 0;
+            if is_cubemap && (dimension != 3 || array_size != 1) {
+                return Err(TextureError::InvalidDimensions);
+            }
             data_offset = 148;
             match dxgi_fmt_raw {
                 71 => (DXGI_FORMAT_BC1_UNORM, true, 8),
@@ -215,6 +226,11 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
         return Err(TextureError::UnsupportedFormat);
     };
 
+    if is_cubemap && (width != height || depth != 1 || mip_count > width.ilog2() + 1
+        || (data_offset == 128 && caps2 & 0xfc00 != 0xfc00)) {
+        return Err(TextureError::InvalidDimensions);
+    }
+
     // In Direct3D 12, block-compressed textures (BC1-BC7) require dimensions to be at least 4x4.
     // Legacy DDS files from S.T.A.L.K.E.R. sometimes declare 1x1 or 2x2 BC1/BC3 textures with dummy mips,
     // which causes E_INVALIDARG (0x80070057) when allocated via CreateCommittedResource on discrete GPUs.
@@ -224,13 +240,19 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
         (width, height, mip_count)
     };
 
-    let mut mips = Vec::with_capacity(mip_count as usize);
+    let faces = if is_cubemap { 6 } else { 1 };
+    let mut mips = Vec::new();
     let mut current_offset = data_offset;
 
     let mut mip_w = width;
     let mut mip_h = height;
 
-    for level in 0..mip_count {
+    for subresource in 0..faces * mip_count {
+        let level = subresource % mip_count;
+        if level == 0 {
+            mip_w = width;
+            mip_h = height;
+        }
         let (row_pitch, slice_pitch) = if is_bc {
             let num_blocks_wide = (mip_w + 3) / 4;
             let num_blocks_high = (mip_h + 3) / 4;
@@ -245,7 +267,7 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
 
         let next_offset = current_offset + slice_pitch as usize;
         if next_offset > bytes.len() {
-            if !mips.is_empty() {
+            if !is_cubemap && !mips.is_empty() {
                 // Buffer ended before all declared mip levels; keep valid decoded mips
                 break;
             }
@@ -266,11 +288,12 @@ pub fn parse_dds(bytes: &[u8]) -> Result<DdsImage<'_>, TextureError> {
         mip_h = (mip_h / 2).max(1);
     }
 
-    let actual_mip_count = mips.len() as u32;
+    let actual_mip_count = mips.len() as u32 / faces;
     Ok(DdsImage {
         width,
         height,
         depth,
+        is_cubemap,
         mip_count: actual_mip_count,
         format,
         is_block_compressed: is_bc,
@@ -287,6 +310,7 @@ pub struct GpuTexture {
     pub width: u32,
     pub height: u32,
     pub mip_count: u32,
+    pub is_cubemap: bool,
     pub format: DXGI_FORMAT,
 }
 
@@ -300,7 +324,7 @@ pub fn upload_dds_texture(
     let (alloc_w, alloc_h, alloc_mips) = if dds.is_block_compressed && (dds.width < 4 || dds.height < 4) {
         (dds.width.max(4) as u64, dds.height.max(4), 1)
     } else {
-        (dds.width as u64, dds.height, dds.mips.len().max(1))
+        (dds.width as u64, dds.height, dds.mip_count as usize)
     };
     let mip_count = alloc_mips;
     let desc = D3D12_RESOURCE_DESC {
@@ -308,7 +332,7 @@ pub fn upload_dds_texture(
         Alignment: 0,
         Width: alloc_w,
         Height: alloc_h,
-        DepthOrArraySize: dds.depth as u16,
+        DepthOrArraySize: if dds.is_cubemap { 6 } else { dds.depth as u16 },
         MipLevels: mip_count as u16,
         Format: dds.format,
         SampleDesc: DXGI_SAMPLE_DESC {
@@ -349,16 +373,17 @@ pub fn upload_dds_texture(
         failure()
     })?;
 
-    let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); mip_count];
-    let mut num_rows = vec![0u32; mip_count];
-    let mut row_sizes = vec![0u64; mip_count];
+    let subresource_count = dds.mips.len();
+    let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subresource_count];
+    let mut num_rows = vec![0u32; subresource_count];
+    let mut row_sizes = vec![0u64; subresource_count];
     let mut total_bytes = 0u64;
 
     unsafe {
         device.GetCopyableFootprints(
             &desc,
             0,
-            mip_count as u32,
+            subresource_count as u32,
             0,
             Some(layouts.as_mut_ptr()),
             Some(num_rows.as_mut_ptr()),
@@ -421,7 +446,7 @@ pub fn upload_dds_texture(
             Some((&mut mapped_ptr as *mut *mut u8).cast()),
         )?;
 
-        for (i, mip) in dds.mips.iter().take(mip_count).enumerate() {
+        for (i, mip) in dds.mips.iter().enumerate() {
             let layout = &layouts[i];
             let subresource_dst = mapped_ptr.add(layout.Offset as usize);
             let dst_pitch = layout.Footprint.RowPitch as usize;
@@ -491,9 +516,10 @@ pub fn register_srv(
     texture: &ID3D12Resource,
     format: DXGI_FORMAT,
     mip_count: u32,
+    is_cubemap: bool,
     cpu_handle: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) {
-    let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let mut srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: format,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
@@ -506,6 +532,14 @@ pub fn register_srv(
             },
         },
     };
+    if is_cubemap {
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        srv_desc.Anonymous.TextureCube = D3D12_TEXCUBE_SRV {
+            MostDetailedMip: 0,
+            MipLevels: mip_count,
+            ResourceMinLODClamp: 0.0,
+        };
+    }
     unsafe {
         device.CreateShaderResourceView(Some(texture), Some(&srv_desc), cpu_handle);
     }
