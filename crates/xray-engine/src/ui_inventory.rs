@@ -535,6 +535,7 @@ pub struct InventoryLayout {
     pub cell_size: f32,
     pub grid_cols: u8,
     pub grid_rows: u8,
+    grid_scroll_row: u8,
     pub slot_rects: Vec<(EquipmentSlot, [f32; 4])>,
     pub use_button_rect: [f32; 4],
     pub close_button_rect: [f32; 4],
@@ -659,6 +660,7 @@ impl InventoryLayout {
             cell_size,
             grid_cols: cols,
             grid_rows: rows,
+            grid_scroll_row: 0,
             slot_rects,
             use_button_rect,
             close_button_rect,
@@ -736,7 +738,8 @@ impl InventoryLayout {
     pub fn grid_cell_center(&self, col: u8, row: u8, w: u8, h: u8) -> [f32; 2] {
         [
             self.grid_origin[0] + (f32::from(col) + f32::from(w) * 0.5) * self.cell_size,
-            self.grid_origin[1] + (f32::from(row) + f32::from(h) * 0.5) * self.cell_size,
+            self.grid_origin[1] + (f32::from(row) - f32::from(self.grid_scroll_row)
+                + f32::from(h) * 0.5) * self.cell_size,
         ]
     }
 
@@ -745,6 +748,20 @@ impl InventoryLayout {
             .iter()
             .find(|(s, _)| *s == slot)
             .map(|(_, r)| [r[0] + r[2] * 0.5, r[1] + r[3] * 0.5])
+    }
+
+    fn grid_rect(&self) -> [f32; 4] {
+        [
+            self.grid_origin[0],
+            self.grid_origin[1],
+            f32::from(self.grid_cols) * self.cell_size,
+            f32::from(self.grid_rows) * self.cell_size,
+        ]
+    }
+
+    fn scrollbar_rect(&self) -> [f32; 4] {
+        let [x, y, width, height] = self.grid_rect();
+        [x + width + 1.0, y, 6.0, height]
     }
 
     pub fn hit_slot(&self, px: f32, py: f32) -> Option<EquipmentSlot> {
@@ -767,7 +784,7 @@ impl InventoryLayout {
             && col < i32::from(self.grid_cols)
             && row < i32::from(self.grid_rows)
         {
-            Some((col as u8, row as u8))
+            Some((col as u8, self.grid_scroll_row.saturating_add(row as u8)))
         } else {
             None
         }
@@ -798,12 +815,36 @@ fn xml_inventory_layout_maps_draw_and_hit_rectangles_together() {
     assert_eq!(layout.hit_grid_cell(x, y), Some((2, 3)));
 }
 
+#[cfg(test)]
+#[test]
+fn full_backpack_grows_and_scrolls_to_the_last_item() {
+    let mut inventory = InventoryManager::new();
+    let full_capacity = u16::from(DEFAULT_GRID_ROWS) * u16::from(DEFAULT_GRID_COLS);
+    let last = (0..=full_capacity).map(|_| inventory.add_item("bandage")).last().unwrap();
+    let (col, row) = inventory.item(last).unwrap().grid_pos.unwrap();
+    assert!(row >= DEFAULT_GRID_ROWS);
+
+    inventory.set_open(true, None);
+    let mut input = EngineInput::new();
+    let layout = inventory.layout(1280, 720);
+    let [x, y] = layout.grid_cell_center(0, 0, 1, 1);
+    input.on_mouse_move(x, y);
+    input.on_mouse_wheel(-100.0);
+    inventory.handle_input(&input, 1280, 720, None, None, None);
+
+    let layout = inventory.layout(1280, 720);
+    let [x, y] = layout.grid_cell_center(col, row, 1, 1);
+    assert_eq!(layout.hit_grid_cell(x, y), Some((col, row)));
+    assert_eq!(inventory.item_at_grid_cell(col, row).unwrap().uid, last);
+}
+
 /// Complete runtime inventory, equipment, actor vital stats, and dialogue manager.
 #[derive(Debug, Clone)]
 pub struct InventoryManager {
     pub open: bool,
     pub grid_cols: u8,
     pub grid_rows: u8,
+    grid_scroll_row: u8,
     pub items: Vec<InventoryItem>,
     pub actor_stats: ScopActorStats,
     pub selected_uid: Option<u64>,
@@ -1000,6 +1041,7 @@ impl InventoryManager {
             open: false,
             grid_cols: DEFAULT_GRID_COLS,
             grid_rows: DEFAULT_GRID_ROWS,
+            grid_scroll_row: 0,
             items: Vec::new(),
             actor_stats: ScopActorStats::default(),
             selected_uid: None,
@@ -1055,12 +1097,21 @@ impl InventoryManager {
     }
 
     pub fn layout(&self, width: u32, height: u32) -> InventoryLayout {
-        let mut layout = InventoryLayout::compute(width, height, self.grid_cols, self.grid_rows);
+        let visible_rows = self.grid_rows.min(DEFAULT_GRID_ROWS);
+        let mut layout = InventoryLayout::compute(width, height, self.grid_cols, visible_rows);
+        layout.grid_scroll_row = self.grid_scroll_row.min(self.max_grid_scroll(visible_rows));
         let viewport = UiViewport::new(width as f32, height as f32);
         if let Some(xml) = self.ui_layouts[usize::from(viewport.is_widescreen())].as_ref() {
             layout.apply_xml(xml, viewport);
         }
         layout
+    }
+
+    fn max_grid_scroll(&self, visible_rows: u8) -> u8 {
+        self.items.iter().filter_map(|item| {
+            let (_, row) = item.grid_pos?;
+            Some(row.saturating_add(item.grid_size.1))
+        }).max().unwrap_or(0).saturating_sub(visible_rows)
     }
 
     /// Total carried weight across backpack & equipped items in kilograms.
@@ -1084,6 +1135,7 @@ impl InventoryManager {
         self.open = open;
         if !open {
             self.drag = None;
+            self.grid_scroll_row = 0;
         }
         if let Some(aud) = audio {
             if open {
@@ -1105,6 +1157,7 @@ impl InventoryManager {
         self.items.clear();
         self.drag = None;
         self.selected_uid = None;
+        self.grid_scroll_row = 0;
         self.item_uses_extra = peer.item_remaining_uses_extra.clone();
 
         for raw in &peer.inventory {
@@ -1116,7 +1169,7 @@ impl InventoryManager {
                 item.equipped_slot = None;
             }
             if item.equipped_slot.is_none() {
-                item.grid_pos = self.find_free_cell(item.grid_size.0, item.grid_size.1, None);
+                item.grid_pos = self.find_or_grow_cell(item.grid_size, None);
             }
             self.items.push(item);
         }
@@ -1153,6 +1206,7 @@ impl InventoryManager {
         self.items.clear();
         self.drag = None;
         self.selected_uid = None;
+        self.grid_scroll_row = 0;
 
         for ent in owned_entities {
             let uid = self.allocate_uid();
@@ -1195,7 +1249,7 @@ impl InventoryManager {
             }
 
             if item.equipped_slot.is_none() {
-                item.grid_pos = self.find_free_cell(item.grid_size.0, item.grid_size.1, None);
+                item.grid_pos = self.find_or_grow_cell(item.grid_size, None);
             }
 
             self.items.push(item);
@@ -1248,11 +1302,12 @@ impl InventoryManager {
         if !owned.is_empty() {
             self.items.clear();
             self.drag = None;
+            self.grid_scroll_row = 0;
             for ent in owned {
                 let uid = self.allocate_uid();
                 let mut item = InventoryItem::from_section(uid, ent.section().to_string());
                 item.source_id = Some(i64::from(ent.id()));
-                item.grid_pos = self.find_free_cell(item.grid_size.0, item.grid_size.1, None);
+                item.grid_pos = self.find_or_grow_cell(item.grid_size, None);
                 self.items.push(item);
             }
             self.hud_sync_dirty = true;
@@ -1269,7 +1324,7 @@ impl InventoryManager {
     pub fn add_item(&mut self, section: impl Into<String>) -> u64 {
         let uid = self.allocate_uid();
         let mut item = InventoryItem::from_section(uid, section);
-        item.grid_pos = self.find_free_cell(item.grid_size.0, item.grid_size.1, None);
+        item.grid_pos = self.find_or_grow_cell(item.grid_size, None);
         self.items.push(item);
         uid
     }
@@ -1305,7 +1360,10 @@ impl InventoryManager {
 
     /// Check whether a `w x h` rectangle at `(col, row)` fits within the grid without overlapping.
     pub fn can_place_at(&self, col: u8, row: u8, w: u8, h: u8, ignore_uid: Option<u64>) -> bool {
-        if col.saturating_add(w) > self.grid_cols || row.saturating_add(h) > self.grid_rows {
+        if w == 0 || h == 0
+            || col.checked_add(w).is_none_or(|end| end > self.grid_cols)
+            || row.checked_add(h).is_none_or(|end| end > self.grid_rows)
+        {
             return false;
         }
         let x0 = col;
@@ -1320,8 +1378,8 @@ impl InventoryManager {
             let Some((ox, oy)) = other.grid_pos else {
                 continue;
             };
-            let ox1 = ox + other.grid_size.0;
-            let oy1 = oy + other.grid_size.1;
+            let ox1 = ox.saturating_add(other.grid_size.0);
+            let oy1 = oy.saturating_add(other.grid_size.1);
             let overlaps = x0 < ox1 && x1 > ox && y0 < oy1 && y1 > oy;
             if overlaps {
                 return false;
@@ -1332,17 +1390,46 @@ impl InventoryManager {
 
     /// Find the first free top-left grid coordinate `(col, row)` for an item of size `(w, h)`.
     pub fn find_free_cell(&self, w: u8, h: u8, ignore_uid: Option<u64>) -> Option<(u8, u8)> {
-        if w > self.grid_cols || h > self.grid_rows {
+        if w == 0 || h == 0 || w > self.grid_cols || h > self.grid_rows {
             return None;
+        }
+        let cols = usize::from(self.grid_cols);
+        let mut occupied = vec![false; cols * usize::from(self.grid_rows)];
+        for item in &self.items {
+            if item.equipped_slot.is_some() || Some(item.uid) == ignore_uid {
+                continue;
+            }
+            let Some((x, y)) = item.grid_pos else { continue };
+            let end_col = x.saturating_add(item.grid_size.0).min(self.grid_cols);
+            let end_row = y.saturating_add(item.grid_size.1).min(self.grid_rows);
+            for row in y..end_row {
+                let start = usize::from(row) * cols;
+                occupied[start + usize::from(x.min(end_col))..start + usize::from(end_col)].fill(true);
+            }
         }
         for row in 0..=self.grid_rows - h {
             for col in 0..=self.grid_cols - w {
-                if self.can_place_at(col, row, w, h, ignore_uid) {
+                if (row..row + h).all(|y| {
+                    let start = usize::from(y) * cols + usize::from(col);
+                    !occupied[start..start + usize::from(w)].contains(&true)
+                }) {
                     return Some((col, row));
                 }
             }
         }
         None
+    }
+
+    fn find_or_grow_cell(&mut self, (w, h): (u8, u8), ignore_uid: Option<u64>) -> Option<(u8, u8)> {
+        if let Some(cell) = self.find_free_cell(w, h, ignore_uid) {
+            return Some(cell);
+        }
+        if w == 0 || h == 0 || w > self.grid_cols {
+            return None;
+        }
+        let row = self.grid_rows;
+        self.grid_rows = row.checked_add(h)?;
+        Some((0, row))
     }
 
     /// Move an item (either from another grid cell or unequipping a slot) to backpack cell `(col, row)`.
@@ -1406,10 +1493,10 @@ impl InventoryManager {
             && existing_uid != uid
         {
             let prev_size = self.item(existing_uid).map(|i| i.grid_size).unwrap_or((1, 1));
-            let free_cell = self.find_free_cell(prev_size.0, prev_size.1, Some(uid));
+            let Some(free_cell) = self.find_or_grow_cell(prev_size, Some(uid)) else { return false };
             if let Some(prev) = self.item_mut(existing_uid) {
                 prev.equipped_slot = None;
-                prev.grid_pos = free_cell;
+                prev.grid_pos = Some(free_cell);
             }
         }
 
@@ -1444,7 +1531,7 @@ impl InventoryManager {
         else {
             return false;
         };
-        let Some(free) = self.find_free_cell(size.0, size.1, Some(uid)) else {
+        let Some(free) = self.find_or_grow_cell(size, Some(uid)) else {
             return false;
         };
         if let Some(it) = self.item_mut(uid) {
@@ -1783,7 +1870,7 @@ impl InventoryManager {
         alife: Option<&mut AlifeManager>,
         mut audio: Option<&mut AudioManager>,
     ) {
-        let layout = self.layout(viewport_w, viewport_h);
+        let mut layout = self.layout(viewport_w, viewport_h);
         let (mx, my) = input.mouse_position();
 
         // Dialogue modal interactions
@@ -1825,6 +1912,26 @@ impl InventoryManager {
 
         if !self.open {
             return;
+        }
+
+        let scroll_limit = self.max_grid_scroll(layout.grid_rows);
+        if scroll_limit > 0 {
+            let track = layout.scrollbar_rect();
+            if input.is_mouse_just_pressed(MouseButton::Left) && point_in_rect(mx, my, track) {
+                let fraction = ((my - track[1]) / track[3]).clamp(0.0, 1.0);
+                self.grid_scroll_row = (f32::from(scroll_limit) * fraction).round() as u8;
+                return;
+            }
+            let wheel = input.wheel_delta();
+            if wheel != 0.0 && (point_in_rect(mx, my, layout.grid_rect()) || point_in_rect(mx, my, track)) {
+                let rows = (wheel.abs().ceil() as u8).max(1);
+                self.grid_scroll_row = if wheel > 0.0 {
+                    layout.grid_scroll_row.saturating_sub(rows)
+                } else {
+                    layout.grid_scroll_row.saturating_add(rows).min(scroll_limit)
+                };
+                layout.grid_scroll_row = self.grid_scroll_row;
+            }
         }
 
         // Update active drag cursor
@@ -2154,8 +2261,8 @@ impl InventoryManager {
             }
 
             // 2D Backpack Grid cells
-            for row in 0..self.grid_rows {
-                for col in 0..self.grid_cols {
+            for row in 0..layout.grid_rows {
+                for col in 0..layout.grid_cols {
                     let cx = layout.grid_origin[0] + f32::from(col) * layout.cell_size;
                     let cy = layout.grid_origin[1] + f32::from(row) * layout.cell_size;
                     if let Some(g_tex) = grid_tex.filter(|_| layout.backgrounds.is_empty()) {
@@ -2176,6 +2283,8 @@ impl InventoryManager {
             }
 
             // Backpack Items
+            let [_, top, _, grid_height] = layout.grid_rect();
+            let bottom = top + grid_height;
             for item in &self.items {
                 if item.equipped_slot.is_some()
                     || self.drag.as_ref().is_some_and(|d| d.item_uid == item.uid)
@@ -2186,31 +2295,51 @@ impl InventoryManager {
                     continue;
                 };
                 let ix = layout.grid_origin[0] + f32::from(col) * layout.cell_size + 2.0;
-                let iy = layout.grid_origin[1] + f32::from(row) * layout.cell_size + 2.0;
+                let iy = top + (f32::from(row) - f32::from(layout.grid_scroll_row)) * layout.cell_size + 2.0;
                 let iw = f32::from(item.grid_size.0) * layout.cell_size - 4.0;
                 let ih = f32::from(item.grid_size.1) * layout.cell_size - 4.0;
+                let clipped_top = iy.max(top);
+                let clipped_bottom = (iy + ih).min(bottom);
+                if iw <= 0.0 || clipped_bottom <= clipped_top {
+                    continue;
+                }
+                let rect = [ix, clipped_top, iw, clipped_bottom - clipped_top];
                 let is_sel = Some(item.uid) == self.selected_uid;
                 if is_sel {
-                    renderer.ui_fill_rect([ix - 1.5, iy - 1.5, iw + 3.0, ih + 3.0], [0.95, 0.78, 0.25, 0.95]);
+                    renderer.ui_fill_rect(rect, [0.52, 0.45, 0.22, 0.8]);
                     drawn += 1;
                 }
                 if let Some(tex) = equipment_tex {
-                    let uv = item_icon_uv_indexed(&item.section, item.category, self.grid_index.as_deref());
-                    renderer.ui_draw_textured_rect([ix, iy, iw, ih], uv, tex, [1.0, 1.0, 1.0, 0.98]);
+                    let [u0, v0, u1, v1] = item_icon_uv_indexed(&item.section, item.category, self.grid_index.as_deref());
+                    let uv = [
+                        u0, v0 + (v1 - v0) * (clipped_top - iy) / ih,
+                        u1, v0 + (v1 - v0) * (clipped_bottom - iy) / ih,
+                    ];
+                    renderer.ui_draw_textured_rect(rect, uv, tex, [1.0, 1.0, 1.0, 0.98]);
                 } else {
-                    renderer.ui_fill_rect([ix, iy, iw, ih], item.category.accent_color());
+                    renderer.ui_fill_rect(rect, item.category.accent_color());
                 }
                 drawn += 1;
-                if show_item_condition(item.category) {
+                if show_item_condition(item.category) && iy + ih <= bottom {
                     renderer.ui_draw_meter_bar(
                         [ix + 2.0, iy + ih - 4.0, (iw - 4.0).max(2.0), 2.5],
                         item.condition, [0.05, 0.05, 0.05, 0.85], condition_bar_color(item.condition),
                     );
                     drawn += 2;
                 }
-                if item.quantity > 1 && let Some(f) = font {
+                if item.quantity > 1 && iy >= top && let Some(f) = font {
                     drawn += f.draw_text(renderer, &item.quantity.to_string(), [ix + 3.0, iy + 2.0], 12.0, [0.95, 0.95, 0.92, 1.0]);
                 }
+            }
+            let scroll_limit = self.max_grid_scroll(layout.grid_rows);
+            if scroll_limit > 0 {
+                let [x, y, w, h] = layout.scrollbar_rect();
+                let visible = f32::from(layout.grid_rows);
+                let thumb = (h * visible / (visible + f32::from(scroll_limit))).max(12.0).min(h);
+                let fraction = f32::from(layout.grid_scroll_row) / f32::from(scroll_limit);
+                renderer.ui_fill_rect([x, y, w, h], [0.08, 0.09, 0.09, 0.92]);
+                renderer.ui_fill_rect([x, y + fraction * (h - thumb), w, thumb], [0.46, 0.44, 0.36, 0.90]);
+                drawn += 2;
             }
 
             // Selected Item Info & Use/Equip action button
