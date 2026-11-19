@@ -227,6 +227,8 @@ float4 ps_main(PSInput input) : SV_Target0
     if (albedo_index != 0xFFFFFFFF)
     {
         float4 albedo = g_textures[NonUniformResourceIndex(albedo_index)].Sample(g_sampler, input.uv);
+        if (custom_param3 <= 255 && albedo.a <= (float) custom_param3 / 255.0)
+            discard;
         if (normal_index != 0xFFFFFFFF || custom_param0 != 0xFFFFFFFF || num_lights > 0)
         {
             float3 sun_lit = albedo.rgb * (0.2 + 0.8 * diff * shadow_factor);

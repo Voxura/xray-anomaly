@@ -355,6 +355,7 @@ fn test_skybox_dual_texture_blending_readback() {
 
 #[test]
 fn test_skybox_occlusion_by_foreground_geometry() {
+    use xray_render_dx12::geometry::HudBlend;
     let window = Window(unsafe {
         CreateWindowExW(
             Default::default(),
@@ -420,6 +421,12 @@ fn test_skybox_occlusion_by_foreground_geometry() {
     ];
     let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
     let quad = renderer.create_mesh(&vertices, &indices).expect("create_mesh failed");
+    let closer = vertices.map(|mut v| { v.position[2] = 0.25; v });
+    let farther = vertices.map(|mut v| { v.position[2] = 0.75; v });
+    let front_quad = renderer.create_mesh(&closer, &indices).unwrap();
+    let rear_quad = renderer.create_mesh(&farther, &indices).unwrap();
+    let lens = renderer.load_texture_from_dds("lens", &create_solid_color_rgba8_dds(4, 4, 0, 0, 255, 128)).unwrap();
+    let dot = renderer.load_texture_from_dds("dot", &create_solid_color_rgba8_dds(4, 4, 255, 0, 0, 64)).unwrap();
 
     let readback = create_readback_buffer(&renderer.device_ctx.device, 64, 64);
 
@@ -438,6 +445,10 @@ fn test_skybox_occlusion_by_foreground_geometry() {
         ..Default::default()
     };
     renderer.draw_sky(&push).expect("draw_sky failed");
+    // The cutout rejects low alpha. The lens blends, and the dot behind it still passes depth.
+    renderer.draw_hud_mesh_with_material(front_quad, Some(dot), u32::MAX, 0, HudBlend::Opaque, Some(128)).unwrap();
+    renderer.draw_hud_mesh_with_material(front_quad, Some(lens), u32::MAX, 0, HudBlend::Alpha, Some(0)).unwrap();
+    renderer.draw_hud_mesh_with_material(rear_quad, Some(dot), u32::MAX, 0, HudBlend::Additive, Some(0)).unwrap();
 
     let cmd = renderer.current_cmd_list.as_ref().unwrap();
     let backbuffer = renderer.swapchain.as_ref().unwrap().current_backbuffer_resource();
@@ -472,7 +483,7 @@ fn test_skybox_occlusion_by_foreground_geometry() {
     renderer.end_frame(false).expect("end_frame failed");
     renderer.wait_for_gpu().expect("wait_for_gpu failed");
 
-    // Center pixel (32, 32): Occluded by foreground quad -> MUST be Green [0, 255, 0, 255]
+    // Center: blue lens and red additive dot over the green foreground.
     let center_px = readback_rgba8(&readback, 64, 64, 32, 32);
     // Corner pixel (4, 4): Outside foreground quad -> MUST be Red sky [255, 0, 0, 255]
     let corner_px = readback_rgba8(&readback, 64, 64, 4, 4);
@@ -482,8 +493,9 @@ fn test_skybox_occlusion_by_foreground_geometry() {
         center_px, corner_px
     );
 
-    assert_eq!(center_px[1], 255, "Center pixel must be green foreground quad");
-    assert_eq!(center_px[0], 0, "Center pixel red channel must be 0 (sky occluded)");
+    for (actual, expected) in center_px[..3].iter().zip([64, 127, 128]) {
+        assert!(actual.abs_diff(expected) <= 1, "unexpected HUD blend: {center_px:?}");
+    }
 
     assert_eq!(corner_px[0], 255, "Corner pixel must be red sky");
     assert_eq!(corner_px[1], 0, "Corner pixel green channel must be 0");

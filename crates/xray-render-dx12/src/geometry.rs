@@ -103,11 +103,21 @@ struct Mesh {
     index_count: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HudBlend {
+    #[default]
+    Opaque,
+    Alpha,
+    Additive,
+}
+
 struct GeometryPipeline {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
     depth_pso: ID3D12PipelineState,
     equal_depth_pso: ID3D12PipelineState,
+    hud_alpha_pso: ID3D12PipelineState,
+    hud_additive_pso: ID3D12PipelineState,
     srv_heap: ID3D12DescriptorHeap,
 }
 
@@ -330,6 +340,14 @@ impl GeometryPipeline {
         };
 
         let pso = unsafe { device.CreateGraphicsPipelineState(&desc) };
+        desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        let blend = &mut desc.BlendState.RenderTarget[0];
+        blend.BlendEnable = true.into();
+        blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        let hud_alpha_pso = unsafe { device.CreateGraphicsPipelineState(&desc) };
+        desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+        let hud_additive_pso = unsafe { device.CreateGraphicsPipelineState(&desc) };
         unsafe {
             ManuallyDrop::drop(&mut desc.pRootSignature);
         }
@@ -405,6 +423,8 @@ impl GeometryPipeline {
             pso,
             depth_pso,
             equal_depth_pso,
+            hud_alpha_pso: hud_alpha_pso?,
+            hud_additive_pso: hud_additive_pso?,
             srv_heap,
         })
     }
@@ -645,6 +665,7 @@ impl GeometryState {
         handle: MeshHandle,
         bindless_heap: Option<&ID3D12DescriptorHeap>,
         push_constants: Option<&PushDrawConstants>,
+        blend: HudBlend,
     ) -> WinResult<()> {
         if self.pipeline.is_none() {
             self.pipeline = Some(GeometryPipeline::new(device)?);
@@ -690,7 +711,12 @@ impl GeometryState {
             lt_buf.0.clone(),
         ]);
         unsafe {
-            cmd.SetPipelineState(&pipeline.pso);
+            let pso = match blend {
+                HudBlend::Opaque => &pipeline.pso,
+                HudBlend::Alpha => &pipeline.hud_alpha_pso,
+                HudBlend::Additive => &pipeline.hud_additive_pso,
+            };
+            cmd.SetPipelineState(pso);
             cmd.SetGraphicsRootSignature(&pipeline.root);
             cmd.SetDescriptorHeaps(&[Some(srv_heap.clone())]);
             cmd.SetGraphicsRootConstantBufferView(0, camera.0.GetGPUVirtualAddress());

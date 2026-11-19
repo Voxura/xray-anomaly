@@ -680,6 +680,20 @@ impl Dx12Renderer {
         transform_index: u32,
         num_lights: u32,
     ) -> WinResult<()> {
+        self.draw_hud_mesh_with_material(
+            handle, albedo_index, transform_index, num_lights, crate::geometry::HudBlend::Opaque, None,
+        )
+    }
+
+    pub fn draw_hud_mesh_with_material(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        albedo_index: Option<crate::bindless::DescriptorIndex>,
+        transform_index: u32,
+        num_lights: u32,
+        blend: crate::geometry::HudBlend,
+        alpha_ref: Option<u8>,
+    ) -> WinResult<()> {
         let cmd = match self.current_cmd_list.as_ref() {
             Some(c) => c,
             None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
@@ -694,6 +708,7 @@ impl Dx12Renderer {
             albedo_index: albedo_index.map(|i| i.0).unwrap_or(u32::MAX),
             transform_index,
             custom_param2: num_lights,
+            custom_param3: alpha_ref.map_or(u32::MAX, u32::from),
             ..Default::default()
         };
         self.geometry.draw_hud(
@@ -706,6 +721,7 @@ impl Dx12Renderer {
             handle,
             Some(&self.bindless_heap),
             Some(&push_constants),
+            blend,
         )
     }
 

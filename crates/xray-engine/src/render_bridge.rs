@@ -37,6 +37,7 @@ use xray_formats::ogf::{
     matrix_mul_44, matrix_set_xyz_translate, vector_generate_orthonormal_basis, OgfModel,
     OgfVisualType, StaticVertex, XRAY_IDENTITY_MATRIX,
 };
+use xray_formats::shaders_xr::{EngineShaderLibrary, R4BlenderSpec};
 use xray_formats::sun::{build_3split_csm_atlas, CsmAtlasPacking, SunCascadeConfig};
 use xray_formats::thm::{texture_stem_to_dds_vpath, ResolvedTextureLinks};
 use xray_formats::vfs_bridge::{load_font_from_vfs, load_ltx_tree_from_vfs};
@@ -46,6 +47,7 @@ use xray_render_dx12::clouds::{CloudSimulation, CloudsPushConstants};
 use xray_render_dx12::deferred::GpuLightParams;
 use xray_render_dx12::details::{DetailManager, DetailPushConstants, GpuDetailInstance, GpuDetailVertex};
 use xray_render_dx12::geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
+use xray_render_dx12::geometry::HudBlend;
 use xray_render_dx12::lighting::GpuLight;
 use xray_render_dx12::particle::GpuParticleInstance;
 use xray_render_dx12::postprocess::PostprocessPushConstants;
@@ -164,6 +166,28 @@ struct DynamicDrawInstance {
     transform_index: u32,
 }
 
+#[derive(Clone, Copy, Default)]
+struct HudMaterial {
+    blend: HudBlend,
+    alpha_ref: Option<u8>,
+    priority: i32,
+}
+
+impl HudMaterial {
+    fn from_model(spec: R4BlenderSpec) -> Option<Self> {
+        let R4BlenderSpec::DefferModel { priority, strict_sorting, alpha_blend, alpha_ref, .. } = spec else {
+            return None;
+        };
+        // R4 CBlender_deffer_model::Compile chooses forward blending or an alpha test.
+        let forward = strict_sorting || (alpha_blend && alpha_ref < 16);
+        Some(Self {
+            blend: if forward { HudBlend::Alpha } else { HudBlend::Opaque },
+            alpha_ref: (forward || alpha_blend).then_some(alpha_ref.clamp(0, 255) as u8),
+            priority,
+        })
+    }
+}
+
 /// Bridges streamed world visuals, dynamic ALife entities, weather, and HUD into [`Dx12Renderer`].
 pub struct RenderBridge {
     pub config: RenderBridgeConfig,
@@ -185,6 +209,7 @@ pub struct RenderBridge {
     detail_textures: Vec<Option<DescriptorIndex>>,
     dynamic_ogf_cache: BTreeMap<String, Vec<GpuOgfSubMesh>>,
     hud_mesh_cache: BTreeMap<String, (MeshHandle, DescriptorIndex)>,
+    hud_materials: Option<BTreeMap<String, HudMaterial>>,
     default_cube_mesh: MeshHandle,
     ui_font: Option<UiFontResource>,
     ui_font_attempted: bool,
@@ -233,6 +258,7 @@ impl RenderBridge {
             detail_textures: Vec::new(),
             dynamic_ogf_cache: BTreeMap::new(),
             hud_mesh_cache: BTreeMap::new(),
+            hud_materials: None,
             default_cube_mesh,
             ui_font: None,
             ui_font_attempted: false,
@@ -1008,6 +1034,9 @@ impl RenderBridge {
         if let Some(hw) = hud_weapon.as_deref_mut() {
             let hud_parts = hw.collect_hud_draw_parts(camera, vfs);
             if !hud_parts.is_empty() {
+                if self.hud_materials.is_none() && let Some(vfs) = vfs {
+                    self.hud_materials = Some(load_hud_materials(vfs));
+                }
                 let hud_cam = hw.build_hud_camera_constants(camera);
                 renderer.update_camera(&hud_cam)?;
 
@@ -1016,32 +1045,30 @@ impl RenderBridge {
                 for part in hud_parts {
                     let tf_idx = hud_matrices.len() as u32;
                     hud_matrices.push(part.world_transform);
-                    let tex_idx = part
-                        .texture_vpath
-                        .as_deref()
-                        .and_then(|vpath| {
-                            let dds = texture_stem_to_dds_vpath(vpath);
-                            try_load_vfs_texture(renderer, vfs, &dds)
-                                .or_else(|| try_load_vfs_texture(renderer, vfs, vpath))
-                        })
+                    let tex_idx = part.texture_vpath.as_deref()
+                        .and_then(|vpath| try_load_vfs_texture(renderer, vfs, vpath))
                         .unwrap_or(self.fallback_albedo);
-                    let mesh_handle = if let Some((existing_mesh, _)) = self.hud_mesh_cache.get(&part.key) {
-                        *existing_mesh
+                    let mesh_handle = if let Some(&(cached, _)) = self.hud_mesh_cache.get(&part.key) {
+                        cached
                     } else {
                         let mh = renderer.create_mesh(&part.vertices, &part.indices)?;
-                        self.hud_mesh_cache.insert(part.key.clone(), (mh, tex_idx));
+                        self.hud_mesh_cache.insert(part.key, (mh, tex_idx));
                         mh
                     };
-                    draw_items.push((mesh_handle, tex_idx, tf_idx));
+                    let material = part.shader.as_deref().and_then(|name| self.hud_materials.as_ref()?.get(name)).copied().unwrap_or_default();
+                    draw_items.push((mesh_handle, tex_idx, tf_idx, material));
                 }
 
                 renderer.update_transforms(&hud_matrices)?;
-                for (mesh_handle, tex_idx, tf_idx) in draw_items {
-                    renderer.draw_hud_mesh_with_lights(
+                draw_items.sort_by_key(|(_, _, _, material)| (material.blend != HudBlend::Opaque, material.priority));
+                for (mesh_handle, tex_idx, tf_idx, material) in draw_items {
+                    renderer.draw_hud_mesh_with_material(
                         mesh_handle,
                         Some(tex_idx),
                         tf_idx,
                         active_lights.len() as u32,
+                        material.blend,
+                        material.alpha_ref,
                     )?;
                     stats.hud_weapon_draws += 1;
                 }
@@ -1279,6 +1306,25 @@ fn upload_resolved_mesh(
         .collect();
     let handle = renderer.create_mesh(&gpu_verts, indices)?;
     Ok(Some(handle))
+}
+
+fn load_hud_materials(vfs: &VirtualFileSystem) -> BTreeMap<String, HudMaterial> {
+    let mut materials: BTreeMap<_, _> = vfs.read_bytes("shaders.xr").ok()
+        .and_then(|bytes| EngineShaderLibrary::parse(&bytes).ok())
+        .into_iter()
+        .flat_map(|library| library.blenders)
+        .filter_map(|shader| {
+            let material = HudMaterial::from_model(R4BlenderSpec::from_blender_shader(&shader)?)?;
+            Some((shader.desc.name, material))
+        })
+        .collect();
+    // The installed r3 Lua pass uses srcalpha/one, alpha ref 0 and depth test without writes.
+    materials.insert("models\\lfo_light_dot_weapons_old".to_owned(), HudMaterial {
+        blend: HudBlend::Additive,
+        alpha_ref: Some(0),
+        priority: 2,
+    });
+    materials
 }
 
 fn try_load_vfs_texture(

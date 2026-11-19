@@ -367,6 +367,7 @@ pub struct CachedHudOgfAsset {
 pub struct HudDrawPart {
     pub key: String,
     pub texture_vpath: Option<String>,
+    pub shader: Option<String>,
     pub vertices: Vec<XRayVertex>,
     pub indices: Vec<u16>,
     pub world_transform: XRayMatrix,
@@ -1031,6 +1032,7 @@ impl HudWeaponController {
                 out.push(HudDrawPart {
                     key: format!("{key}#{}#{}#sk_{idx}", hidden_arm.unwrap_or_default(), idle_pose.map_or("", |(clip, _)| clip)),
                     texture_vpath: tex,
+                    shader: sp.texture.map(|link| link.shader),
                     vertices: verts,
                     indices: sp.indices,
                     world_transform: root_transform,
@@ -1576,6 +1578,7 @@ fn collect_static_ogf_parts(
         out.push(HudDrawPart {
             key: format!("{key_prefix}#st_{}", out.len()),
             texture_vpath: tex,
+            shader: model.texture.as_ref().map(|link| link.shader.clone()),
             vertices: gpu_verts,
             indices: model.indices.clone(),
             world_transform,
@@ -1623,6 +1626,7 @@ fn build_fallback_viewmodel_parts(
     out.push(HudDrawPart {
         key: format!("__hud_fallback_weapon_{slot}"),
         texture_vpath: None,
+        shader: None,
         vertices: w_verts,
         indices: w_idx,
         world_transform: root_transform,
@@ -1633,6 +1637,7 @@ fn build_fallback_viewmodel_parts(
     out.push(HudDrawPart {
         key: "__hud_fallback_hand_l".to_string(),
         texture_vpath: None,
+        shader: None,
         vertices: lh_v,
         indices: lh_i,
         world_transform: root_transform,
@@ -1641,6 +1646,7 @@ fn build_fallback_viewmodel_parts(
     out.push(HudDrawPart {
         key: "__hud_fallback_hand_r".to_string(),
         texture_vpath: None,
+        shader: None,
         vertices: rh_v,
         indices: rh_i,
         world_transform: root_transform,
