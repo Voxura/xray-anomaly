@@ -227,6 +227,7 @@ impl SkinnedVertex {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkinnedMeshPart {
     pub child_index: Option<usize>,
+    pub visual_center: [f32; 3],
     pub texture: Option<OgfTextureLink>,
     pub vertices: Vec<SkinnedVertex>,
     pub indices: Vec<u16>,
@@ -429,6 +430,7 @@ pub fn skin_ogf_hierarchy_visible(
         {
             out.push(SkinnedMeshPart {
                 child_index,
+                visual_center: model.header.bsphere.center,
                 texture: model.texture.clone(),
                 vertices: skin_vertices(verts, palette)?,
                 indices: model.indices.clone(),

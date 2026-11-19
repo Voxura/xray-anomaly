@@ -34,7 +34,7 @@ use crate::world_loader::{LoadedDynamicModel, LoadedWorld, resolve_level_texture
 use xray_formats::details::{LevelDetails, DETAIL_ID_EMPTY, DETAIL_SLOT_SIZE};
 use xray_formats::hom::{frustum_planes, ClipFrustum};
 use xray_formats::ogf::{
-    matrix_mul_44, matrix_set_xyz_translate, vector_generate_orthonormal_basis, OgfModel,
+    matrix_mul_44, matrix_set_xyz_translate, matrix_transform_point, vector_generate_orthonormal_basis, OgfModel,
     OgfVisualType, StaticVertex, XRAY_IDENTITY_MATRIX,
 };
 use xray_formats::shaders_xr::{EngineShaderLibrary, R4BlenderSpec};
@@ -170,12 +170,12 @@ struct DynamicDrawInstance {
 struct HudMaterial {
     blend: HudBlend,
     alpha_ref: Option<u8>,
-    priority: i32,
+    strict_sorting: bool,
 }
 
 impl HudMaterial {
     fn from_model(spec: R4BlenderSpec) -> Option<Self> {
-        let R4BlenderSpec::DefferModel { priority, strict_sorting, alpha_blend, alpha_ref, .. } = spec else {
+        let R4BlenderSpec::DefferModel { strict_sorting, alpha_blend, alpha_ref, .. } = spec else {
             return None;
         };
         // R4 CBlender_deffer_model::Compile chooses forward blending or an alpha test.
@@ -183,9 +183,24 @@ impl HudMaterial {
         Some(Self {
             blend: if forward { HudBlend::Alpha } else { HudBlend::Opaque },
             alpha_ref: (forward || alpha_blend).then_some(alpha_ref.clamp(0, 255) as u8),
-            priority,
+            strict_sorting,
         })
     }
+
+    fn sort_order(self, distance_sq: f32) -> (bool, f32) {
+        // r_dsgraph_render_hud traverses mapHUD front-to-back and mapHUDSorted back-to-front.
+        (self.strict_sorting, if self.strict_sorting { -distance_sq } else { distance_sq })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn hud_sort_order_draws_strict_glass_back_to_front_after_opaque() {
+    let opaque = HudMaterial::default();
+    let glass = HudMaterial { strict_sorting: true, ..HudMaterial::default() };
+    assert!(opaque.sort_order(10.0) < glass.sort_order(20.0));
+    assert!(opaque.sort_order(1.0) < opaque.sort_order(2.0));
+    assert!(glass.sort_order(2.0) < glass.sort_order(1.0));
 }
 
 /// Bridges streamed world visuals, dynamic ALife entities, weather, and HUD into [`Dx12Renderer`].
@@ -1053,12 +1068,14 @@ impl RenderBridge {
                         mh
                     };
                     let material = part.shader.as_deref().and_then(|name| self.hud_materials.as_ref()?.get(name)).copied().unwrap_or_default();
-                    draw_items.push((mesh_handle, tex_idx, tf_idx, material));
+                    let center = matrix_transform_point(&part.world_transform, part.visual_center);
+                    let order = material.sort_order(distance_sq(camera.position, center));
+                    draw_items.push((mesh_handle, tex_idx, tf_idx, material, order));
                 }
 
                 renderer.update_transforms(&hud_matrices)?;
-                draw_items.sort_by_key(|(_, _, _, material)| (material.blend != HudBlend::Opaque, material.priority));
-                for (mesh_handle, tex_idx, tf_idx, material) in draw_items {
+                draw_items.sort_by(|a, b| a.4.0.cmp(&b.4.0).then_with(|| a.4.1.total_cmp(&b.4.1)));
+                for (mesh_handle, tex_idx, tf_idx, material, _) in draw_items {
                     renderer.draw_hud_mesh_with_material(
                         mesh_handle,
                         Some(tex_idx),
@@ -1319,7 +1336,7 @@ fn load_hud_materials(vfs: &VirtualFileSystem) -> BTreeMap<String, HudMaterial> 
     materials.insert("models\\lfo_light_dot_weapons_old".to_owned(), HudMaterial {
         blend: HudBlend::Additive,
         alpha_ref: Some(0),
-        priority: 2,
+        strict_sorting: true,
     });
     materials
 }
