@@ -26,10 +26,11 @@ use xray_formats::gamemtl::{gamemtl_flags, GameMaterialLibrary};
 use xray_formats::hom::{frustum_planes, ClipFrustum};
 use xray_formats::lanims::pack_argb;
 use xray_formats::ogf::{
-    matrix_mul_43, matrix_mul_44, matrix_rotate_x, matrix_rotate_y, matrix_rotate_z,
+    matrix_invert_43, matrix_mul_43, matrix_mul_44, matrix_rotate_x, matrix_rotate_y, matrix_rotate_z,
     matrix_set_hpb, vector_generate_orthonormal_basis,
     BonePoseMatrices, OgfModel, OgfTextureLink, StaticVertex, XRayMatrix,
 };
+use xray_formats::omf::OmfMotions;
 use xray_formats::particles::{
     project_static_wallmark_on_cform, StaticWallmarkConfig, StaticWallmarkRecord, WallmarkVertex,
 };
@@ -68,38 +69,55 @@ fn hud_measure_transform(position: [f32; 3], orientation_degrees: [f32; 3]) -> X
     transform
 }
 
-fn load_hands_idle_pose(
+fn load_idle_pose(
     vfs: &VirtualFileSystem,
     asset: &CachedHudOgfAsset,
+    model_path: &str,
     clip: &str,
+    item: bool,
 ) -> Option<BonePalette> {
     let skeleton = asset.model.skeleton.as_ref()?;
     let bind_poses = asset.bind_poses.as_ref()?;
-    let sample = |path: &str| {
-        let motions = load_omf_from_vfs(vfs, path).ok()?;
+    let sample = |motions: &OmfMotions, clip: &str| {
         let index = motions.clips.iter().position(|motion| motion.name.eq_ignore_ascii_case(clip))?;
-        let pose = motions.evaluate_skeleton_pose(skeleton, index, 0.0).ok()?;
+        let mut pose = motions.evaluate_skeleton_pose(skeleton, index, 0.0).ok()?;
+        if item {
+            // attachable_hud_item::anim_play forces an identity root after sampling the item motion.
+            let root_inverse = matrix_invert_43(pose.get(skeleton.root_bone? as usize)?)?;
+            for bone in &mut pose {
+                *bone = matrix_mul_43(&root_inverse, bone);
+            }
+        }
         BonePalette::from_model_transforms_with_bind(bind_poses, &pose).ok()
     };
-    for reference in &skeleton.motion_refs {
-        if reference.contains('*') {
-            let Ok(pattern) = normalize_virtual_path(reference) else { continue };
-            let pattern = if pattern.starts_with("meshes\\") { pattern } else { format!("meshes\\{pattern}") };
-            let Some((directory, filename)) = pattern.rsplit_once('\\') else { continue };
-            let prefix = format!("{directory}\\");
-            let Ok(paths) = vfs.list_files(directory) else { continue };
-            for path in paths {
-                if path.strip_prefix(&prefix).is_some_and(|name| !name.contains('\\') && glob_matches_ascii(filename, name))
-                    && let Some(pose) = sample(&path)
-                {
-                    return Some(pose);
+    let find_pose = |clip: &str| {
+        let sample_file = |path: &str| sample(&load_omf_from_vfs(vfs, path).ok()?, clip);
+        for reference in &skeleton.motion_refs {
+            if reference.contains('*') {
+                let Ok(pattern) = normalize_virtual_path(reference) else { continue };
+                let pattern = if pattern.starts_with("meshes\\") { pattern } else { format!("meshes\\{pattern}") };
+                let Some((directory, filename)) = pattern.rsplit_once('\\') else { continue };
+                let prefix = format!("{directory}\\");
+                let Ok(paths) = vfs.list_files(directory) else { continue };
+                for path in paths {
+                    if path.strip_prefix(&prefix).is_some_and(|name| !name.contains('\\') && glob_matches_ascii(filename, name))
+                        && let Some(pose) = sample_file(&path)
+                    {
+                        return Some(pose);
+                    }
                 }
+            } else if let Some(pose) = sample_file(reference) {
+                return Some(pose);
             }
-        } else if let Some(pose) = sample(reference) {
-            return Some(pose);
         }
+        let bytes = vfs.read_bytes(model_path).ok()?;
+        sample(&OmfMotions::parse_if_present(&bytes).ok()??, clip)
+    };
+    let pose = find_pose(clip);
+    if pose.is_none() && item && clip != "idle" {
+        return find_pose("idle");
     }
-    None
+    pose
 }
 
 /// Resolve X-Ray sound aliases and discard the optional volume/delay CSV fields.
@@ -443,7 +461,7 @@ pub struct HudWeaponController {
     sound_config_attempted: bool,
     applied_sound_specs: [Option<[String; 4]>; 6],
     outfit_section: Option<String>,
-    hands_idle_poses: BTreeMap<(String, String), Option<BonePalette>>,
+    idle_poses: BTreeMap<(String, String, bool), Option<BonePalette>>,
     ogf_cache: BTreeMap<String, Option<CachedHudOgfAsset>>,
     active_sparks: Vec<SparkParticle>,
 
@@ -478,7 +496,7 @@ impl Default for HudWeaponController {
             sound_config: None,
             sound_config_attempted: false,
             outfit_section: None,
-            hands_idle_poses: BTreeMap::new(),
+            idle_poses: BTreeMap::new(),
             applied_sound_specs: Default::default(),
             ogf_cache: BTreeMap::new(),
             active_sparks: Vec::new(),
@@ -722,30 +740,36 @@ impl HudWeaponController {
         [fallback.clone(), fallback.clone()]
     }
 
-    fn idle_pose_key(&self, hands_path: &str, alias: &str) -> Option<(String, String)> {
+    fn idle_pose_key(&self, path: &str, alias: &str, item: bool) -> Option<(String, String, bool)> {
         let (config, section) = self.weapon_hud_config()?;
-        let clip = config.read_str(section, alias)?.split(',').next()?.trim();
+        let mut clips = config.read_str(section, alias)?.split(',').map(str::trim);
+        let hands_clip = clips.next()?;
+        let clip = if item {
+            clips.next().filter(|clip| !clip.is_empty()).unwrap_or(hands_clip)
+        } else {
+            hands_clip
+        };
         if clip.is_empty() {
             return None;
         }
-        Some((normalize_virtual_path(hands_path).ok()?, clip.to_owned()))
+        Some((normalize_virtual_path(path).ok()?, clip.to_owned(), item))
     }
 
-    fn ensure_hands_idle_pose(&mut self, vfs: &VirtualFileSystem, hands_path: &str) {
+    fn ensure_idle_poses(&mut self, vfs: &VirtualFileSystem, path: &str, item: bool) {
         for alias in ["anm_idle", "anm_idle_aim"] {
-            let Some(key) = self.idle_pose_key(hands_path, alias) else { continue };
-            if !self.hands_idle_poses.contains_key(&key) {
-                let pose = self.cached_ogf(hands_path)
-                    .and_then(|asset| load_hands_idle_pose(vfs, asset, &key.1));
-                self.hands_idle_poses.insert(key, pose);
+            let Some(key) = self.idle_pose_key(path, alias, item) else { continue };
+            if !self.idle_poses.contains_key(&key) {
+                let pose = self.cached_ogf(path)
+                    .and_then(|asset| load_idle_pose(vfs, asset, &key.0, &key.1, item));
+                self.idle_poses.insert(key, pose);
             }
         }
     }
 
-    fn hands_idle_pose(&self, hands_path: &str) -> Option<(&str, &BonePalette)> {
+    fn idle_pose(&self, path: &str, item: bool) -> Option<(&str, &BonePalette)> {
         let lookup = |alias| {
-            let key = self.idle_pose_key(hands_path, alias)?;
-            let ((_, clip), pose) = self.hands_idle_poses.get_key_value(&key)?;
+            let key = self.idle_pose_key(path, alias, item)?;
+            let ((_, clip, _), pose) = self.idle_poses.get_key_value(&key)?;
             Some((clip.as_str(), pose.as_ref()?))
         };
         if self.aim_requested && let Some(pose) = lookup("anm_idle_aim") {
@@ -781,11 +805,12 @@ impl HudWeaponController {
         let w_path = self.active_weapon_ogf();
         let [right, left] = self.active_hands_ogfs();
         let _ = self.ensure_ogf_cached(vfs, &w_path);
+        self.ensure_idle_poses(vfs, &w_path, true);
         let _ = self.ensure_ogf_cached(vfs, &right);
-        self.ensure_hands_idle_pose(vfs, &right);
+        self.ensure_idle_poses(vfs, &right, false);
         if left != right {
             let _ = self.ensure_ogf_cached(vfs, &left);
-            self.ensure_hands_idle_pose(vfs, &left);
+            self.ensure_idle_poses(vfs, &left, false);
         }
     }
 
@@ -944,14 +969,15 @@ impl HudWeaponController {
         let root_transform = self.compute_hud_root_transform(camera);
         let weapon_key = self.active_weapon_ogf();
         let [right, left] = self.active_hands_ogfs();
-        let right_pose = self.hands_idle_pose(&right);
-        let left_pose = self.hands_idle_pose(&left);
+        let right_pose = self.idle_pose(&right, false);
+        let left_pose = self.idle_pose(&left, false);
         let (hands_transform, weapon_transform) = right_pose
             .and_then(|(_, pose)| self.configured_attachment_transforms(camera, &right, pose))
             .unwrap_or((root_transform, root_transform));
 
         let mut parts = Vec::new();
-        self.append_ogf_parts(&weapon_key, weapon_transform, None, None, &mut parts);
+        let weapon_pose = self.idle_pose(&weapon_key, true);
+        self.append_ogf_parts(&weapon_key, weapon_transform, None, weapon_pose, &mut parts);
         let can_split = self.cached_ogf(&right)
             .and_then(|asset| asset.model.skeleton.as_ref())
             .is_some_and(|skeleton| {
@@ -2341,7 +2367,7 @@ hands_orientation = 0, 0, 0
 hands_orientation_16x9 = 0, 0, 0
 aim_hud_offset_rot_16x9 = 0, 1.570796327, 0
 anm_idle = custom_idle
-anm_idle_aim = custom_aim
+anm_idle_aim = custom_aim, item_aim, 1
 item_position = 0.2, 0, 0
 [actor_hud_05]
 visual = test_hands
@@ -2366,14 +2392,15 @@ ancor_0 = lead_gun
         assert!((item[3][0] - hands[3][0] - 0.7).abs() < 1e-5);
 
         for (alias, expected) in [("anm_idle", "custom_idle"), ("anm_idle_aim", "custom_aim")] {
-            let key = ctrl.idle_pose_key(hands_path, alias).unwrap();
+            let key = ctrl.idle_pose_key(hands_path, alias, false).unwrap();
             assert_eq!(key.1, expected);
-            ctrl.hands_idle_poses.insert(key, Some(pose.clone()));
+            ctrl.idle_poses.insert(key, Some(pose.clone()));
         }
-        assert_eq!(ctrl.hands_idle_pose(hands_path).unwrap().0, "custom_idle");
+        assert_eq!(ctrl.idle_pose(hands_path, false).unwrap().0, "custom_idle");
+        assert_eq!(ctrl.idle_pose_key(hands_path, "anm_idle_aim", true).unwrap().1, "item_aim");
         ctrl.aim_requested = true;
         ctrl.ads_blend = 1.0;
-        assert_eq!(ctrl.hands_idle_pose(hands_path).unwrap().0, "custom_aim");
+        assert_eq!(ctrl.idle_pose(hands_path, false).unwrap().0, "custom_aim");
         let (hands, item) = ctrl.configured_attachment_transforms(&camera, hands_path, &pose).unwrap();
         assert!((item[3][0] - hands[3][0]).abs() < 1e-5);
         assert!((item[3][2] - hands[3][2] + 0.7).abs() < 1e-5);
