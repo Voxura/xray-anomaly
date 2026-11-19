@@ -740,7 +740,9 @@ impl RenderBridge {
             self.csm_atlas.update_plan(plan.clone())?;
             if let Some(cmd) = renderer.current_cmd_list.clone() {
                 self.csm_atlas.begin_atlas_pass(&cmd);
+                let mut shadow_draws = Vec::new();
                 for (cascade_idx, slot) in plan.slots.iter().enumerate() {
+                    shadow_draws.clear();
                     let csm_cam = CameraConstants {
                         view: XRAY_IDENTITY_MATRIX,
                         proj: slot.view_proj,
@@ -774,20 +776,15 @@ impl RenderBridge {
                             }
                         }
                         let caster = mesh.fastpath_handle.unwrap_or(mesh.mesh_handle);
-                        renderer.draw_csm_shadow_mesh(&self.csm_atlas, cascade_idx, caster, u32::MAX)?;
-                        stats.csm_cascade_draws[cascade_idx] += 1;
+                        shadow_draws.push((caster, u32::MAX));
                     }
                     for inst in &dynamic_draws {
                         for sub in &inst.submeshes {
-                            renderer.draw_csm_shadow_mesh(
-                                &self.csm_atlas,
-                                cascade_idx,
-                                sub.mesh_handle,
-                                inst.transform_index,
-                            )?;
-                            stats.csm_cascade_draws[cascade_idx] += 1;
+                            shadow_draws.push((sub.mesh_handle, inst.transform_index));
                         }
                     }
+                    renderer.draw_csm_shadow_batch(&self.csm_atlas, cascade_idx, &shadow_draws)?;
+                    stats.csm_cascade_draws[cascade_idx] = shadow_draws.len() as u32;
                 }
                 self.csm_atlas.end_atlas_pass(&cmd);
                 // Restore main player camera CBV before deferred combine & forward stages

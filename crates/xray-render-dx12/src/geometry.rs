@@ -787,11 +787,25 @@ impl GeometryState {
         handle: MeshHandle,
         transform_index: u32,
     ) -> WinResult<()> {
+        self.draw_depth_viewport_batch(device, cmd, dsv, viewport, &[(handle, transform_index)])
+    }
+
+    /// Record a sequence of depth draws sharing camera, target and viewport state.
+    pub fn draw_depth_viewport_batch(
+        &mut self,
+        device: &ID3D12Device,
+        cmd: &ID3D12GraphicsCommandList,
+        dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
+        viewport: [u32; 4],
+        draws: &[(MeshHandle, u32)],
+    ) -> WinResult<()> {
+        if draws.is_empty() {
+            return Ok(());
+        }
         if self.pipeline.is_none() {
             self.pipeline = Some(GeometryPipeline::new(device)?);
         }
         let pipeline = self.pipeline.as_ref().unwrap();
-        let mesh = self.meshes.get(handle).unwrap();
         let camera = self.camera.as_ref().unwrap();
 
         if self.default_transform.is_none() {
@@ -812,27 +826,12 @@ impl GeometryState {
         let default_tf = self.default_transform.as_ref().unwrap();
         let tf_buf = self.transforms.as_ref().unwrap_or(default_tf);
 
-        self.recording_resources.extend([
-            mesh.vertices.0.clone(),
-            mesh.indices.0.clone(),
-            camera.0.clone(),
-            tf_buf.0.clone(),
-        ]);
-        let push = PushDrawConstants {
-            transform_index,
-            ..Default::default()
-        };
+        self.recording_resources.extend([camera.0.clone(), tf_buf.0.clone()]);
         let [vx, vy, vw, vh] = viewport;
         unsafe {
             cmd.SetPipelineState(&pipeline.depth_pso);
             cmd.SetGraphicsRootSignature(&pipeline.root);
             cmd.SetGraphicsRootConstantBufferView(0, camera.0.GetGPUVirtualAddress());
-            cmd.SetGraphicsRoot32BitConstants(
-                2,
-                8,
-                (&push as *const PushDrawConstants).cast(),
-                0,
-            );
             cmd.SetGraphicsRootShaderResourceView(3, tf_buf.0.GetGPUVirtualAddress());
             cmd.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: vx as f32,
@@ -850,9 +849,19 @@ impl GeometryState {
             }]);
             cmd.OMSetRenderTargets(0, None, false, Some(&dsv));
             cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            cmd.IASetVertexBuffers(0, Some(&[mesh.vertex_view]));
-            cmd.IASetIndexBuffer(Some(&mesh.index_view));
-            cmd.DrawIndexedInstanced(mesh.index_count, 1, 0, 0, 0);
+            let mut current_transform = None;
+            for &(handle, transform_index) in draws {
+                if current_transform != Some(transform_index) {
+                    let push = PushDrawConstants { transform_index, ..Default::default() };
+                    cmd.SetGraphicsRoot32BitConstants(2, 8, (&push as *const PushDrawConstants).cast(), 0);
+                    current_transform = Some(transform_index);
+                }
+                let mesh = self.meshes.get(handle).unwrap();
+                self.recording_resources.extend([mesh.vertices.0.clone(), mesh.indices.0.clone()]);
+                cmd.IASetVertexBuffers(0, Some(&[mesh.vertex_view]));
+                cmd.IASetIndexBuffer(Some(&mesh.index_view));
+                cmd.DrawIndexedInstanced(mesh.index_count, 1, 0, 0, 0);
+            }
         }
         Ok(())
     }

@@ -1332,6 +1332,15 @@ impl Dx12Renderer {
         handle: crate::geometry_abi::MeshHandle,
         transform_index: u32,
     ) -> WinResult<()> {
+        self.draw_csm_shadow_batch(atlas, cascade_idx, &[(handle, transform_index)])
+    }
+
+    pub fn draw_csm_shadow_batch(
+        &mut self,
+        atlas: &crate::shadow::CascadedShadowAtlas,
+        cascade_idx: usize,
+        draws: &[(crate::geometry_abi::MeshHandle, u32)],
+    ) -> WinResult<()> {
         let cmd = match self.current_cmd_list.as_ref() {
             Some(c) => c,
             None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
@@ -1343,13 +1352,12 @@ impl Dx12Renderer {
             .map(|s| s.viewport_px)
             .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
         let dsv = atlas.dsv_handle();
-        self.geometry.draw_depth_viewport(
+        self.geometry.draw_depth_viewport_batch(
             &self.device_ctx.device,
             cmd,
             dsv,
             viewport,
-            handle,
-            transform_index,
+            draws,
         )
     }
 
