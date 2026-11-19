@@ -40,8 +40,9 @@ use xray_formats::ogf::{
 use xray_formats::shaders_xr::{EngineShaderLibrary, R4BlenderSpec};
 use xray_formats::sun::{build_3split_csm_atlas, CsmAtlasPacking, SunCascadeConfig};
 use xray_formats::thm::{texture_stem_to_dds_vpath, ResolvedTextureLinks};
-use xray_formats::vfs_bridge::{load_font_from_vfs, load_ltx_tree_from_vfs};
+use xray_formats::vfs_bridge::{load_font_from_vfs, load_ltx_tree_from_vfs, load_ui_texture_atlases_from_vfs, load_xml_from_vfs};
 use xray_formats::weather::MixedEnvironment;
+use xray_formats::xml_ui::UiTextureAtlasMap;
 use xray_render_dx12::bindless::DescriptorIndex;
 use xray_render_dx12::clouds::{CloudSimulation, CloudsPushConstants};
 use xray_render_dx12::deferred::GpuLightParams;
@@ -232,6 +233,7 @@ pub struct RenderBridge {
     ui_equipment_tex: Option<DescriptorIndex>,
     ui_actor_menu_tex: Option<DescriptorIndex>,
     ui_grid_tex: Option<DescriptorIndex>,
+    inventory_atlas: Option<UiTextureAtlasMap>,
 }
 
 impl RenderBridge {
@@ -281,6 +283,7 @@ impl RenderBridge {
             ui_equipment_tex: None,
             ui_actor_menu_tex: None,
             ui_grid_tex: None,
+            inventory_atlas: None,
         })
     }
 
@@ -1060,30 +1063,37 @@ impl RenderBridge {
                     let tex_idx = part.texture_vpath.as_deref()
                         .and_then(|vpath| try_load_vfs_texture(renderer, vfs, vpath))
                         .unwrap_or(self.fallback_albedo);
-                    let mesh_handle = if let Some(&(cached, _)) = self.hud_mesh_cache.get(&part.key) {
-                        cached
-                    } else {
-                        let mh = renderer.create_mesh(&part.vertices, &part.indices)?;
-                        self.hud_mesh_cache.insert(part.key, (mh, tex_idx));
-                        mh
-                    };
                     let material = part.shader.as_deref().and_then(|name| self.hud_materials.as_ref()?.get(name)).copied().unwrap_or_default();
                     let center = matrix_transform_point(&part.world_transform, part.visual_center);
                     let order = material.sort_order(distance_sq(camera.position, center));
-                    draw_items.push((mesh_handle, tex_idx, tf_idx, material, order));
+                    draw_items.push((part, tex_idx, tf_idx, material, order));
                 }
 
                 renderer.update_transforms(&hud_matrices)?;
                 draw_items.sort_by(|a, b| a.4.0.cmp(&b.4.0).then_with(|| a.4.1.total_cmp(&b.4.1)));
-                for (mesh_handle, tex_idx, tf_idx, material, _) in draw_items {
-                    renderer.draw_hud_mesh_with_material(
+                for (part, tex_idx, tf_idx, material, _) in draw_items {
+                    let mesh_handle = if part.transient {
+                        renderer.create_mesh(&part.vertices, &part.indices)?
+                    } else if let Some(&(cached, _)) = self.hud_mesh_cache.get(&part.key) {
+                        cached
+                    } else {
+                        let handle = renderer.create_mesh(&part.vertices, &part.indices)?;
+                        self.hud_mesh_cache.insert(part.key, (handle, tex_idx));
+                        handle
+                    };
+                    let result = renderer.draw_hud_mesh_with_material(
                         mesh_handle,
                         Some(tex_idx),
                         tf_idx,
                         active_lights.len() as u32,
                         material.blend,
                         material.alpha_ref,
-                    )?;
+                    );
+                    if part.transient {
+                        // Draw recording retains the resources until the submission fence completes.
+                        renderer.destroy_mesh(mesh_handle);
+                    }
+                    result?;
                     stats.hud_weapon_draws += 1;
                 }
                 renderer.restore_normal_viewport();
@@ -1103,6 +1113,12 @@ impl RenderBridge {
                 self.ui_equipment_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_icon_equipment.dds");
                 self.ui_actor_menu_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_actor_menu.dds");
                 self.ui_grid_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_grid.dds");
+                self.inventory_atlas = load_ui_texture_atlases_from_vfs(vfs_ref).ok().or_else(|| {
+                    let doc = load_xml_from_vfs(vfs_ref, "configs/ui/textures_descr/ui_actor_menu.xml").ok()?;
+                    let mut map = UiTextureAtlasMap::default();
+                    map.merge_doc(&doc);
+                    Some(map)
+                });
             }
             let font_ref = self.ui_font.as_ref();
 
@@ -1125,6 +1141,8 @@ impl RenderBridge {
                     self.ui_equipment_tex,
                     self.ui_actor_menu_tex,
                     self.ui_grid_tex,
+                    self.inventory_atlas.as_ref(),
+                    vfs,
                 );
                 if let Some(pda_mgr) = pda {
                     let level_name = alife

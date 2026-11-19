@@ -182,6 +182,7 @@ impl EngineRuntime {
     pub fn attach_vfs(&mut self, vfs: Arc<VirtualFileSystem>) {
         let grid_index = Arc::new(ItemGridIndex::load_from_vfs(&vfs));
         self.inventory.set_grid_index(Arc::clone(&grid_index));
+        self.inventory.load_ui_layouts(&vfs);
         self.item_grid_index = Some(grid_index);
         self.audio.attach_vfs(Arc::clone(&vfs));
         self.pda.invalidate_map_cache();
@@ -506,13 +507,18 @@ impl EngineRuntime {
             return Ok(true);
         }
 
-        // Toggle Inventory (`Tab` / `I`), PDA (`P`), or handle `Esc` closing active UI modal
-        if self.input.is_action_just_pressed(Action::Menu) {
+        // Ignore modal and gameplay bindings until the backpack transition is complete.
+        let inventory_was_transitioning = self.hud_weapon.backpack_blocks_input();
+        if self.hud_weapon.advance_backpack(self.timer.raw_delta_time()) {
+            self.inventory.set_open(true, None);
+        }
+        if !inventory_was_transitioning && self.input.is_action_just_pressed(Action::Menu) {
             if self.inventory.dialogue.is_some() {
                 self.inventory.dialogue = None;
                 self.audio.play_ui_close();
             } else if self.inventory.open {
-                self.inventory.set_open(false, Some(&mut self.audio));
+                let animated = self.hud_weapon.close_backpack(&mut self.audio);
+                self.inventory.set_open(false, (!animated).then_some(&mut self.audio));
             } else if self.pda.open {
                 self.pda.set_open(false, Some(&mut self.audio));
             } else if self.level_transition.active_prompt.is_some() {
@@ -521,29 +527,41 @@ impl EngineRuntime {
                 self.running = false;
                 return Ok(false);
             }
-        }
-        if self.input.is_action_just_pressed(Action::Inventory) {
+        } else if !inventory_was_transitioning && self.input.is_action_just_pressed(Action::Inventory) {
             if self.inventory.dialogue.is_some() {
                 self.inventory.dialogue = None;
             }
             if !self.inventory.open && self.pda.open {
                 self.pda.open = false;
             }
-            self.inventory.toggle(Some(&mut self.audio));
-        }
-        if self.input.is_action_just_pressed(Action::Pda) {
-            if !self.pda.open && (self.inventory.open || self.inventory.dialogue.is_some()) {
-                self.inventory.open = false;
-                self.inventory.dialogue = None;
-                self.inventory.drag = None;
+            if self.inventory.open {
+                let animated = self.hud_weapon.close_backpack(&mut self.audio);
+                self.inventory.set_open(false, (!animated).then_some(&mut self.audio));
+            } else if !self.vfs.as_deref().is_some_and(|vfs| {
+                self.hud_weapon.start_backpack(vfs, self.inventory.actor_stats.community_index, &mut self.audio)
+            }) {
+                self.inventory.set_open(true, Some(&mut self.audio));
             }
-            self.pda.toggle(Some(&mut self.audio));
+        } else if !inventory_was_transitioning && self.input.is_action_just_pressed(Action::Pda) {
+            if !self.pda.open && (self.inventory.open || self.inventory.dialogue.is_some()) {
+                if self.inventory.open && self.hud_weapon.close_backpack(&mut self.audio) {
+                    self.inventory.set_open(false, None);
+                } else {
+                    self.inventory.set_open(false, None);
+                    self.pda.toggle(Some(&mut self.audio));
+                }
+                self.inventory.dialogue = None;
+            } else {
+                self.pda.toggle(Some(&mut self.audio));
+            }
         }
 
+        let inventory_input_locked = inventory_was_transitioning || self.hud_weapon.backpack_blocks_input();
         let modal_open = self.inventory.is_modal_open()
             || self.pda.open
-            || self.level_transition.is_modal_open();
-        self.input.set_cursor_locked(!modal_open);
+            || self.level_transition.is_modal_open()
+            || inventory_input_locked;
+        self.input.set_cursor_locked(inventory_input_locked || !modal_open);
 
         // 4. Update camera orientation from mouse delta & compute world-space XZ wish vector
         if !modal_open && self.input.is_cursor_locked() {
@@ -696,7 +714,7 @@ impl EngineRuntime {
         let vh = self.window.height();
 
         // Check level changer trigger volumes & travel confirmation prompt when no Inventory/PDA is open
-        if !self.inventory.is_modal_open() && !self.pda.open && !self.level_transition.is_loading()
+        if !inventory_input_locked && !self.inventory.is_modal_open() && !self.pda.open && !self.level_transition.is_loading()
         {
             let local_slot = self.network.as_ref().map_or(0, NetworkSession::local_slot);
             let networked = self
@@ -732,7 +750,7 @@ impl EngineRuntime {
         }
 
         // Proximity `'E'` (`Action::Use`) NPC/Trader dialogue & ground item pickup, plus modal UI input
-        if !self.inventory.is_modal_open()
+        if !inventory_input_locked && !self.inventory.is_modal_open()
             && !self.pda.open
             && !self.level_transition.is_modal_open()
         {
@@ -742,7 +760,7 @@ impl EngineRuntime {
                 self.alife.as_ref(),
             );
         }
-        if self.input.is_action_just_pressed(Action::Use)
+        if !inventory_input_locked && self.input.is_action_just_pressed(Action::Use)
             && !self.inventory.open
             && !self.pda.open
             && !self.level_transition.is_modal_open()
@@ -752,7 +770,7 @@ impl EngineRuntime {
                 .interact_with_target(self.alife.as_mut(), Some(&mut self.audio));
         }
 
-        if self.inventory.is_modal_open() {
+        if !inventory_input_locked && self.inventory.is_modal_open() {
             self.inventory.handle_input(
                 &self.input,
                 vw,
@@ -806,9 +824,10 @@ impl EngineRuntime {
         let ui_open_after = self.inventory.is_modal_open()
             || self.pda.open
             || self.level_transition.is_modal_open();
-        self.input.set_cursor_locked(!ui_open_after);
+        let backpack_transition = self.hud_weapon.backpack_blocks_input();
+        self.input.set_cursor_locked(backpack_transition || !ui_open_after);
         self.hud.show_crosshair =
-            !ui_open_after && self.hud_weapon.state != WeaponState::Aiming;
+            !ui_open_after && !backpack_transition && self.hud_weapon.state != WeaponState::Aiming;
 
         // Keep host ALife actor orientation & 3D audio listener synced every frame
         if let Some(mgr) = &mut self.alife {
@@ -893,10 +912,12 @@ impl EngineRuntime {
 
         // 6. Direct3D 12 7-stage render graph presentation + first-person HUD weapon + UI Canvas pass
         if let (Some(r), Some(rb)) = (&mut self.renderer, &mut self.render_bridge) {
+            let animated_camera = self.hud_weapon.backpack_camera_offset()
+                .map(|offset| self.camera.with_render_offset(&offset));
             r.begin_frame()?;
             rb.render_frame_with_transition(
                 r,
-                &self.camera,
+                animated_camera.as_ref().unwrap_or(&self.camera),
                 self.world.as_ref(),
                 self.alife.as_ref(),
                 self.vfs.as_deref(),

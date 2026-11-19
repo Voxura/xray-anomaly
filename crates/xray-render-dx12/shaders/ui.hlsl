@@ -15,7 +15,7 @@ struct GpuUiQuad
     float4 uv;          // [u1, v1, u2, v2] normalized texture coordinates
     float4 color;       // [r, g, b, a] tint / vertex color multiplier
     uint texture_index; // Bindless SRV descriptor index in g_textures, or 0xFFFFFFFF for solid color
-    uint pad0;
+    uint flags;
     uint pad1;
     uint pad2;
 };
@@ -39,6 +39,7 @@ struct PSInput
     float2 uv : TEXCOORD0;
     float4 color : COLOR0;
     nointerpolation uint texture_index : TEXCOORD1;
+    nointerpolation uint flags : TEXCOORD2;
 };
 
 PSInput vs_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID)
@@ -62,9 +63,11 @@ PSInput vs_main(uint vertex_id : SV_VertexID, uint instance_id : SV_InstanceID)
     float ndc_y = 1.0 - (pixel_pos.y / (float)screen_height) * 2.0;
 
     output.position = float4(ndc_x, ndc_y, 0.0, 1.0);
-    output.uv = lerp(quad.uv.xy, quad.uv.zw, corner);
+    float2 uv_corner = (quad.flags & 1) ? float2(1.0 - corner.y, corner.x) : corner;
+    output.uv = lerp(quad.uv.xy, quad.uv.zw, uv_corner);
     output.color = quad.color;
     output.texture_index = quad.texture_index;
+    output.flags = quad.flags;
     return output;
 }
 
@@ -75,7 +78,7 @@ float4 ps_main(PSInput input) : SV_Target0
     {
         tex_color = g_textures[NonUniformResourceIndex(input.texture_index)].Sample(g_sampler, input.uv);
         // Handle A8 font / alpha mask textures: when RGB is 0.0 and alpha > 0.0, expand RGB to 1.0
-        if (tex_color.r == 0.0 && tex_color.g == 0.0 && tex_color.b == 0.0)
+        if ((input.flags & 2) && all(tex_color.rgb == 0.0))
         {
             tex_color.rgb = float3(1.0, 1.0, 1.0);
         }

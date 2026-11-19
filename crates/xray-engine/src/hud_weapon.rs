@@ -46,6 +46,7 @@ use xray_vfs::{normalize_virtual_path, VirtualFileSystem};
 use crate::alife_manager::{AlifeManager, EntityRole};
 use crate::camera::{FirstPersonCamera, DEFAULT_FOV_DEG};
 use crate::input::{Action, EngineInput};
+use crate::inventory_animation::{BackpackPhase, BackpackSequence};
 use crate::world_loader::LoadedWorld;
 
 /// Far clipping plane for first-person HUD geometry (`hud_projection_matrix`).
@@ -69,55 +70,61 @@ fn hud_measure_transform(position: [f32; 3], orientation_degrees: [f32; 3]) -> X
     transform
 }
 
-fn load_idle_pose(
+fn load_hud_motion(
     vfs: &VirtualFileSystem,
     asset: &CachedHudOgfAsset,
     model_path: &str,
     clip: &str,
+) -> Option<(OmfMotions, usize)> {
+    let skeleton = asset.model.skeleton.as_ref()?;
+    let find_clip = |motions: OmfMotions| {
+        let index = motions.clips.iter().position(|motion| motion.name.eq_ignore_ascii_case(clip))?;
+        let bones = motions.map_bones_to_skeleton(skeleton).ok()?;
+        if motions.clips[index].tracks.len() != bones.len() {
+            return None;
+        }
+        Some((motions, index))
+    };
+    let load_file = |path: &str| find_clip(load_omf_from_vfs(vfs, path).ok()?);
+    for reference in &skeleton.motion_refs {
+        if reference.contains('*') {
+            let Ok(pattern) = normalize_virtual_path(reference) else { continue };
+            let pattern = if pattern.starts_with("meshes\\") { pattern } else { format!("meshes\\{pattern}") };
+            let Some((directory, filename)) = pattern.rsplit_once('\\') else { continue };
+            let prefix = format!("{directory}\\");
+            let Ok(paths) = vfs.list_files(directory) else { continue };
+            for path in paths {
+                if path.strip_prefix(&prefix).is_some_and(|name| !name.contains('\\') && glob_matches_ascii(filename, name))
+                    && let Some(motion) = load_file(&path)
+                {
+                    return Some(motion);
+                }
+            }
+        } else if let Some(motion) = load_file(reference) {
+            return Some(motion);
+        }
+    }
+    let bytes = vfs.read_bytes(model_path).ok()?;
+    find_clip(OmfMotions::parse_if_present(&bytes).ok()??)
+}
+
+fn sample_hud_pose(
+    asset: &CachedHudOgfAsset,
+    (motions, index): &(OmfMotions, usize),
+    time: f32,
     item: bool,
 ) -> Option<BonePalette> {
     let skeleton = asset.model.skeleton.as_ref()?;
     let bind_poses = asset.bind_poses.as_ref()?;
-    let sample = |motions: &OmfMotions, clip: &str| {
-        let index = motions.clips.iter().position(|motion| motion.name.eq_ignore_ascii_case(clip))?;
-        let mut pose = motions.evaluate_skeleton_pose(skeleton, index, 0.0).ok()?;
-        if item {
-            // attachable_hud_item::anim_play forces an identity root after sampling the item motion.
-            let root_inverse = matrix_invert_43(pose.get(skeleton.root_bone? as usize)?)?;
-            for bone in &mut pose {
-                *bone = matrix_mul_43(&root_inverse, bone);
-            }
+    let mut pose = motions.evaluate_skeleton_pose(skeleton, *index, time).ok()?;
+    if item {
+        // player_hud forces the animated item root to identity before updating its child bones.
+        let root_inverse = matrix_invert_43(pose.get(skeleton.root_bone? as usize)?)?;
+        for bone in &mut pose {
+            *bone = matrix_mul_43(&root_inverse, bone);
         }
-        BonePalette::from_model_transforms_with_bind(bind_poses, &pose).ok()
-    };
-    let find_pose = |clip: &str| {
-        let sample_file = |path: &str| sample(&load_omf_from_vfs(vfs, path).ok()?, clip);
-        for reference in &skeleton.motion_refs {
-            if reference.contains('*') {
-                let Ok(pattern) = normalize_virtual_path(reference) else { continue };
-                let pattern = if pattern.starts_with("meshes\\") { pattern } else { format!("meshes\\{pattern}") };
-                let Some((directory, filename)) = pattern.rsplit_once('\\') else { continue };
-                let prefix = format!("{directory}\\");
-                let Ok(paths) = vfs.list_files(directory) else { continue };
-                for path in paths {
-                    if path.strip_prefix(&prefix).is_some_and(|name| !name.contains('\\') && glob_matches_ascii(filename, name))
-                        && let Some(pose) = sample_file(&path)
-                    {
-                        return Some(pose);
-                    }
-                }
-            } else if let Some(pose) = sample_file(reference) {
-                return Some(pose);
-            }
-        }
-        let bytes = vfs.read_bytes(model_path).ok()?;
-        sample(&OmfMotions::parse_if_present(&bytes).ok()??, clip)
-    };
-    let pose = find_pose(clip);
-    if pose.is_none() && item && clip != "idle" {
-        return find_pose("idle");
     }
-    pose
+    BonePalette::from_model_transforms_with_bind(bind_poses, &pose).ok()
 }
 
 /// Resolve X-Ray sound aliases and discard the optional volume/delay CSV fields.
@@ -391,6 +398,7 @@ pub struct HudDrawPart {
     pub vertices: Vec<XRayVertex>,
     pub indices: Vec<u16>,
     pub world_transform: XRayMatrix,
+    pub transient: bool,
 }
 
 /// Single projectile impact result along a ballistic ray trace.
@@ -462,6 +470,8 @@ pub struct HudWeaponController {
     applied_sound_specs: [Option<[String; 4]>; 6],
     outfit_section: Option<String>,
     idle_poses: BTreeMap<(String, String, bool), Option<BonePalette>>,
+    backpack: Option<BackpackSequence>,
+    backpack_motions: BTreeMap<(String, String), Option<(OmfMotions, usize)>>,
     ogf_cache: BTreeMap<String, Option<CachedHudOgfAsset>>,
     active_sparks: Vec<SparkParticle>,
 
@@ -497,6 +507,8 @@ impl Default for HudWeaponController {
             sound_config_attempted: false,
             outfit_section: None,
             idle_poses: BTreeMap::new(),
+            backpack: None,
+            backpack_motions: BTreeMap::new(),
             applied_sound_specs: Default::default(),
             ogf_cache: BTreeMap::new(),
             active_sparks: Vec::new(),
@@ -528,6 +540,9 @@ impl HudWeaponController {
     /// Current HUD FOV factor interpolated smoothly between hip and ADS framing.
     #[inline]
     pub fn current_hud_fov_factor(&self) -> f32 {
+        if self.backpack.as_ref().is_some_and(|sequence| sequence.motion().is_some()) {
+            return 0.45;
+        }
         if let Some((config, _)) = self.weapon_hud_config() {
             let section = &self.active_weapon().section;
             let base_override = config.read_f32(section, "hud_fov", 0.0);
@@ -759,8 +774,13 @@ impl HudWeaponController {
         for alias in ["anm_idle", "anm_idle_aim"] {
             let Some(key) = self.idle_pose_key(path, alias, item) else { continue };
             if !self.idle_poses.contains_key(&key) {
-                let pose = self.cached_ogf(path)
-                    .and_then(|asset| load_idle_pose(vfs, asset, &key.0, &key.1, item));
+                let pose = self.cached_ogf(path).and_then(|asset| {
+                    let motion = load_hud_motion(vfs, asset, &key.0, &key.1)
+                        .or_else(|| if item && key.1 != "idle" {
+                            load_hud_motion(vfs, asset, &key.0, "idle")
+                        } else { None })?;
+                    sample_hud_pose(asset, &motion, 0.0, item)
+                });
                 self.idle_poses.insert(key, pose);
             }
         }
@@ -953,17 +973,178 @@ impl HudWeaponController {
         Some((hand_transform, item_transform))
     }
 
+    pub(crate) fn start_backpack(
+        &mut self,
+        vfs: &VirtualFileSystem,
+        community_index: i32,
+        audio: &mut AudioManager,
+    ) -> bool {
+        let Some(sequence) = BackpackSequence::load(vfs, community_index) else { return false };
+        if let Some(sound) = &sequence.opening.sound {
+            audio.play_ui_click(sound);
+        }
+        self.backpack = Some(sequence);
+        true
+    }
+
+    pub(crate) fn close_backpack(&mut self, audio: &mut AudioManager) -> bool {
+        let Some(sequence) = &mut self.backpack else { return false };
+        if sequence.phase == BackpackPhase::Open {
+            sequence.close();
+            if let Some(sound) = &sequence.closing.sound {
+                audio.play_ui_click(sound);
+            }
+        }
+        true
+    }
+
+    pub(crate) fn backpack_blocks_input(&self) -> bool {
+        self.backpack.as_ref().is_some_and(|sequence| sequence.phase != BackpackPhase::Open)
+    }
+
+    pub(crate) fn backpack_camera_offset(&self) -> Option<XRayMatrix> {
+        self.backpack.as_ref()?.camera_offset()
+    }
+
+    pub(crate) fn advance_backpack(&mut self, dt: f32) -> bool {
+        let Some(sequence) = &mut self.backpack else { return false };
+        let opened = sequence.advance(dt);
+        if sequence.ready_to_restore() {
+            self.backpack = None;
+        }
+        opened
+    }
+
+    fn collect_backpack_parts(
+        &mut self, camera: &FirstPersonCamera, vfs: &VirtualFileSystem,
+    ) -> Vec<HudDrawPart> {
+        let Some(sequence) = &self.backpack else { return Vec::new() };
+        let Some((cue, alias)) = sequence.motion() else { return Vec::new() };
+        let config = &sequence.config;
+        let section = &cue.section;
+        let Some((hands_clip, item_clip)) = config.read_str(section, alias).and_then(|clips| {
+            let mut clips = clips.split(',').map(str::trim);
+            let hands = clips.next()?;
+            Some((hands.to_owned(), clips.next().unwrap_or(hands).to_owned()))
+        }) else { return Vec::new() };
+        let Some(item_path) = config.read_str(section, "item_visual").map(Self::ogf_path)
+            else { return Vec::new() };
+        let measure = |key, wide_key| {
+            if camera.aspect < 0.75 && let Some(value) = hud_measure_vec3(config, section, wide_key) {
+                return value;
+            }
+            hud_measure_vec3(config, section, key).unwrap_or([0.0; 3])
+        };
+        let hands_offset = hud_measure_transform(
+            measure("hands_position", "hands_position_16x9"),
+            measure("hands_orientation", "hands_orientation_16x9"),
+        );
+        let item_offset = hud_measure_transform(
+            hud_measure_vec3(config, section, "item_position").unwrap_or([0.0; 3]),
+            hud_measure_vec3(config, section, "item_orientation").unwrap_or([0.0; 3]),
+        );
+        let item_attached = config.read_str(section, "item_attached").is_none_or(|value| value != "false" && value != "0");
+        let loop_motion = sequence.phase == BackpackPhase::Open;
+        let time = sequence.elapsed * if loop_motion { 1.0 } else { cue.speed };
+        let [right, left] = self.active_hands_ogfs();
+        let right_pose = self.sample_backpack_motion(vfs, &right, &hands_clip, time, loop_motion, false);
+        let left_pose = if right == left { right_pose.clone() } else {
+            self.sample_backpack_motion(vfs, &left, &hands_clip, time, loop_motion, false)
+        };
+        let item_pose = self.sample_backpack_motion(vfs, &item_path, &item_clip, time, loop_motion, true);
+        let view = camera.view_matrix();
+        let Some(camera_world) = matrix_invert_43(&view) else { return Vec::new() };
+        let hands_transform = matrix_mul_43(&camera_world, &hands_offset);
+        let item_transform = if item_attached {
+            let anchor_name = self.sound_config.as_ref()
+                .and_then(|config| config.read_str(self.player_hud_section(config), "ancor_0"))
+                .unwrap_or("lead_gun");
+            let anchor = self.cached_ogf(&right).and_then(|asset| {
+                let id = asset.model.skeleton.as_ref()?.bone_id(anchor_name)?;
+                right_pose.as_ref()?.model_transforms.get(usize::from(id))
+            });
+            anchor.map_or_else(|| matrix_mul_43(&hands_transform, &item_offset), |anchor| {
+                matrix_mul_43(&matrix_mul_43(&hands_transform, anchor), &item_offset)
+            })
+        } else {
+            matrix_mul_43(&camera_world, &item_offset)
+        };
+        let mut parts = Vec::new();
+        self.append_hands(
+            [&right, &left], hands_transform,
+            [right_pose.as_ref().map(|p| (hands_clip.as_str(), p)), left_pose.as_ref().map(|p| (hands_clip.as_str(), p))],
+            &mut parts,
+        );
+        self.append_ogf_parts(
+            &item_path, item_transform, None, item_pose.as_ref().map(|p| (item_clip.as_str(), p)), &mut parts,
+        );
+        for part in &mut parts {
+            part.transient = true;
+        }
+        parts
+    }
+
+    fn sample_backpack_motion(
+        &mut self, vfs: &VirtualFileSystem, path: &str, clip: &str, time: f32,
+        loop_motion: bool, item: bool,
+    ) -> Option<BonePalette> {
+        let key = (normalize_virtual_path(path).ok()?, clip.to_owned());
+        if !self.backpack_motions.contains_key(&key) {
+            let addon_hands_motion = || {
+                // The addon ships a shared motion library for the player hands.
+                let motions = load_omf_from_vfs(vfs, "anomaly_weapons/hud_hands_animation/zzzz_ea_backpack").ok()?;
+                let index = motions.clips.iter().position(|motion| motion.name.eq_ignore_ascii_case(clip))?;
+                Some((motions, index))
+            };
+            let loaded = self.ensure_ogf_cached(vfs, path).and_then(|asset| {
+                if item {
+                    load_hud_motion(vfs, asset, &key.0, clip)
+                        .or_else(|| load_hud_motion(vfs, asset, &key.0, "idle"))
+                } else {
+                    addon_hands_motion().filter(|motion| sample_hud_pose(asset, motion, 0.0, false).is_some())
+                        .or_else(|| load_hud_motion(vfs, asset, &key.0, clip))
+                }
+            });
+            self.backpack_motions.insert(key.clone(), loaded);
+        }
+        let motion = self.backpack_motions.get(&key)?.as_ref()?;
+        let clip = &motion.0.clips[motion.1];
+        let duration = clip.duration_seconds();
+        let speed = motion.0.defs.iter().find(|definition| definition.name == clip.name)
+            .map_or(1.0, |definition| definition.speed);
+        let time = time * speed;
+        let time = if loop_motion && duration > 0.0 { time % duration } else { time.min(duration) };
+        sample_hud_pose(self.cached_ogf(path)?, motion, time, item)
+    }
+
+    fn append_hands(
+        &self, [right, left]: [&str; 2], transform: XRayMatrix,
+        [right_pose, left_pose]: [Option<(&str, &BonePalette)>; 2], parts: &mut Vec<HudDrawPart>,
+    ) {
+        let can_split = self.cached_ogf(right).and_then(|asset| asset.model.skeleton.as_ref())
+            .is_some_and(|skeleton| ["l_clavicle", "r_clavicle"].iter().all(|name| skeleton.bone_id(name).is_some()));
+        if right != left || can_split {
+            self.append_ogf_parts(right, transform, Some("l_clavicle"), right_pose, parts);
+            self.append_ogf_parts(left, transform, Some("r_clavicle"), left_pose, parts);
+        } else {
+            self.append_ogf_parts(right, transform, None, right_pose, parts);
+        }
+    }
+
     /// Gather skinned/posed HUD draw parts for both the active weapon & hands OGF (or clean fallback).
     pub fn collect_hud_draw_parts(
         &mut self,
         camera: &FirstPersonCamera,
         vfs: Option<&VirtualFileSystem>,
     ) -> Vec<HudDrawPart> {
-        if !self.visible {
-            return Vec::new();
-        }
         if let Some(vfs) = vfs {
             self.ensure_active_ogfs_loaded(vfs);
+        }
+        if self.backpack.is_some() {
+            return vfs.map_or_else(Vec::new, |vfs| self.collect_backpack_parts(camera, vfs));
+        }
+        if !self.visible {
+            return Vec::new();
         }
 
         let root_transform = self.compute_hud_root_transform(camera);
@@ -978,20 +1159,7 @@ impl HudWeaponController {
         let mut parts = Vec::new();
         let weapon_pose = self.idle_pose(&weapon_key, true);
         self.append_ogf_parts(&weapon_key, weapon_transform, None, weapon_pose, &mut parts);
-        let can_split = self.cached_ogf(&right)
-            .and_then(|asset| asset.model.skeleton.as_ref())
-            .is_some_and(|skeleton| {
-                ["l_clavicle", "r_clavicle"].iter().all(|name| {
-                    skeleton.bones.iter().any(|bone| bone.name == *name)
-                })
-            });
-        let split = right != left || can_split;
-        if split {
-            self.append_ogf_parts(&right, hands_transform, Some("l_clavicle"), right_pose, &mut parts);
-            self.append_ogf_parts(&left, hands_transform, Some("r_clavicle"), left_pose, &mut parts);
-        } else {
-            self.append_ogf_parts(&right, hands_transform, None, right_pose, &mut parts);
-        }
+        self.append_hands([&right, &left], hands_transform, [right_pose, left_pose], &mut parts);
 
         if parts.is_empty() {
             build_fallback_viewmodel_parts(self.active_slot, root_transform, &mut parts);
@@ -1096,6 +1264,7 @@ impl HudWeaponController {
                     vertices: verts,
                     indices: sp.indices,
                     world_transform: root_transform,
+                    transient: false,
                 });
             }
             return;
@@ -1650,6 +1819,7 @@ fn collect_static_ogf_parts(
             vertices: gpu_verts,
             indices: indices.to_vec(),
             world_transform,
+            transient: false,
         });
     }
     for child in &model.children {
@@ -1699,6 +1869,7 @@ fn build_fallback_viewmodel_parts(
         vertices: w_verts,
         indices: w_idx,
         world_transform: root_transform,
+        transient: false,
     });
 
     // Left support hand & right grip sleeve proxies
@@ -1711,6 +1882,7 @@ fn build_fallback_viewmodel_parts(
         vertices: lh_v,
         indices: lh_i,
         world_transform: root_transform,
+        transient: false,
     });
     let (rh_v, rh_i) = make_box_mesh([0.01, -0.08, 0.03], [0.055, -0.015, 0.12]);
     out.push(HudDrawPart {
@@ -1721,6 +1893,7 @@ fn build_fallback_viewmodel_parts(
         vertices: rh_v,
         indices: rh_i,
         world_transform: root_transform,
+        transient: false,
     });
 }
 

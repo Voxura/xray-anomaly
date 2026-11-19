@@ -7,7 +7,7 @@ use std::f32::consts::FRAC_PI_2;
 use xray_formats::camera::{
     matrix_build_camera_dir, matrix_build_projection, Dx12CameraConstants,
 };
-use xray_formats::ogf::XRayMatrix;
+use xray_formats::ogf::{matrix_invert_43, matrix_mul_43, XRayMatrix};
 use xray_render_dx12::CameraConstants;
 
 pub const PITCH_LIMIT: f32 = FRAC_PI_2 - 0.01; // ~89.4 degrees
@@ -24,6 +24,7 @@ pub struct FirstPersonCamera {
     pub aspect: f32, // X-Ray convention: height / width
     pub near_z: f32,
     pub far_z: f32,
+    render_basis: Option<XRayMatrix>,
 }
 
 impl Default for FirstPersonCamera {
@@ -44,6 +45,7 @@ impl FirstPersonCamera {
             aspect: h / w,
             near_z: DEFAULT_NEAR_Z,
             far_z: DEFAULT_FAR_Z,
+            render_basis: None,
         }
     }
 
@@ -70,6 +72,9 @@ impl FirstPersonCamera {
     /// Forward unit vector
     #[inline]
     pub fn forward(&self) -> [f32; 3] {
+        if let Some(basis) = self.render_basis {
+            return basis[2][..3].try_into().unwrap();
+        }
         let cos_pitch = self.pitch.cos();
         [
             cos_pitch * self.yaw.sin(),
@@ -81,13 +86,30 @@ impl FirstPersonCamera {
     /// Right unit vector (horizontal plane)
     #[inline]
     pub fn right(&self) -> [f32; 3] {
+        if let Some(basis) = self.render_basis {
+            return basis[0][..3].try_into().unwrap();
+        }
         [self.yaw.cos(), 0.0, -self.yaw.sin()]
     }
 
     /// Up unit vector
     #[inline]
     pub fn up(&self) -> [f32; 3] {
+        if let Some(basis) = self.render_basis {
+            return basis[1][..3].try_into().unwrap();
+        }
         [0.0, 1.0, 0.0]
+    }
+
+    /// Compose a local camera animation for rendering without changing the actor's aim.
+    pub(crate) fn with_render_offset(&self, local: &XRayMatrix) -> Self {
+        let mut camera = self.clone();
+        if let Some(world) = matrix_invert_43(&self.view_matrix()) {
+            let basis = matrix_mul_43(&world, local);
+            camera.position = [basis[3][0], basis[3][1], basis[3][2]];
+            camera.render_basis = Some(basis);
+        }
+        camera
     }
 
     /// Move camera relative to view direction (intent: [x: right, z: forward])

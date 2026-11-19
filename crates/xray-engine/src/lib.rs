@@ -21,6 +21,7 @@ pub mod camera;
 pub mod game_loop;
 pub mod hud_weapon;
 pub mod input;
+mod inventory_animation;
 pub mod level_transition;
 pub mod physics;
 pub mod render_bridge;

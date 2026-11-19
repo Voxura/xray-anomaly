@@ -685,6 +685,10 @@ impl Dx12Renderer {
         )
     }
 
+    pub fn destroy_mesh(&mut self, handle: crate::geometry_abi::MeshHandle) {
+        self.geometry.destroy_mesh(handle);
+    }
+
     pub fn draw_hud_mesh_with_material(
         &mut self,
         handle: crate::geometry_abi::MeshHandle,
@@ -1557,6 +1561,16 @@ impl Dx12Renderer {
         color: [f32; 4],
     ) {
         self.ui_canvas.draw_textured_rect(rect, uv, texture_index, color);
+    }
+
+    pub fn ui_draw_rotated_rect(
+        &mut self,
+        rect: [f32; 4],
+        uv: [f32; 4],
+        texture_index: crate::bindless::DescriptorIndex,
+        color: [f32; 4],
+    ) {
+        self.ui_canvas.draw_rotated_rect(rect, uv, texture_index, color);
     }
 
     /// Queue a 2D crosshair centered at `center`

@@ -18,6 +18,9 @@ fn failure() -> windows::core::Error {
     windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))
 }
 
+const UI_ROTATE_UV_90: u32 = 1;
+const UI_FONT_MASK: u32 = 2;
+
 /// 64-byte GPU UI quad instance record aligned to 16 bytes
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C, align(16))]
@@ -30,6 +33,7 @@ pub struct GpuUiQuad {
     pub color: [f32; 4],
     /// Bindless SRV descriptor index, or `u32::MAX` for solid untextured color
     pub texture_index: u32,
+    /// UV rotation and font alpha-mask sampling flags.
     pub pad0: u32,
     pub pad1: u32,
     pub pad2: u32,
@@ -330,11 +334,33 @@ impl UiCanvas {
         texture_index: DescriptorIndex,
         color: [f32; 4],
     ) {
+        self.draw_textured_rect_with_flags(rect, uv, texture_index, color, 0);
+    }
+
+    pub fn draw_rotated_rect(
+        &mut self,
+        rect: [f32; 4],
+        uv: [f32; 4],
+        texture_index: DescriptorIndex,
+        color: [f32; 4],
+    ) {
+        self.draw_textured_rect_with_flags(rect, uv, texture_index, color, UI_ROTATE_UV_90);
+    }
+
+    fn draw_textured_rect_with_flags(
+        &mut self,
+        rect: [f32; 4],
+        uv: [f32; 4],
+        texture_index: DescriptorIndex,
+        color: [f32; 4],
+        flags: u32,
+    ) {
         self.quads.push(GpuUiQuad {
             rect,
             uv,
             color,
             texture_index: texture_index.0,
+            pad0: flags,
             ..Default::default()
         });
     }
@@ -411,11 +437,12 @@ impl UiCanvas {
         color: [f32; 4],
     ) {
         for glyph in glyphs {
-            self.draw_textured_rect(
+            self.draw_textured_rect_with_flags(
                 glyph.screen_rect,
                 glyph.uv_rect,
                 font_texture_index,
                 color,
+                UI_FONT_MASK,
             );
         }
     }

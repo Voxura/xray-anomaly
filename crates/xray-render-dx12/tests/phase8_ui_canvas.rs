@@ -274,6 +274,11 @@ fn test_ui_canvas_textured_atlas_region_readback() {
         atlas_idx,
         [1.0, 1.0, 1.0, 1.0],
     );
+    let black = renderer.load_texture_from_dds(
+        "ui_black_test.dds", &create_custom_rgba8_dds(1, 1, &[[0, 0, 0, 255]]),
+    ).unwrap();
+    renderer.ui_draw_textured_rect([0.0, 0.0, 16.0, 16.0], [0.0, 0.0, 1.0, 1.0], black, [1.0; 4]);
+    renderer.ui_draw_rotated_rect([16.0, 0.0, 16.0, 16.0], [0.0, 0.0, 1.0, 1.0], atlas_idx, [1.0; 4]);
 
     renderer.ui_flush(0, 0).expect("ui_flush failed");
 
@@ -312,6 +317,8 @@ fn test_ui_canvas_textured_atlas_region_readback() {
 
     let left_px = readback_rgba8(&readback, 64, 64, 16, 32);
     let right_px = readback_rgba8(&readback, 64, 64, 48, 32);
+    assert_eq!(readback_rgba8(&readback, 64, 64, 8, 8), [0, 0, 0, 255]);
+    assert_eq!(readback_rgba8(&readback, 64, 64, 20, 4), [0, 255, 0, 255]);
 
     println!("UI Atlas Readback: left = {:?}, right = {:?}", left_px, right_px);
     assert_eq!(left_px[0], 255, "Left half red channel must be 255");

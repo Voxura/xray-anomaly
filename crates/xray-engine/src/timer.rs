@@ -11,6 +11,7 @@ pub struct EngineTimer {
     start_time: i64,
     prev_time: i64,
     current_time: i64,
+    raw_delta_time: f32,
     delta_time: f32,
     total_time: f64,
     frame_count: u64,
@@ -36,6 +37,7 @@ impl EngineTimer {
             start_time: now,
             prev_time: now,
             current_time: now,
+            raw_delta_time: 1.0 / 60.0,
             delta_time: 1.0 / 60.0,
             total_time: 0.0,
             frame_count: 0,
@@ -56,9 +58,10 @@ impl EngineTimer {
         let elapsed_ticks = now - self.prev_time;
         self.prev_time = now;
 
-        let raw_dt = elapsed_ticks as f64 / self.frequency as f64;
+        let raw_dt = (elapsed_ticks as f64 / self.frequency as f64) as f32;
+        self.raw_delta_time = raw_dt.max(0.0);
         // Clamp delta time to maximum of 100ms (prevents large spiral on debugger pause)
-        let clamped_dt = (raw_dt as f32).clamp(0.0001, 0.1);
+        let clamped_dt = raw_dt.clamp(0.0001, 0.1);
         self.delta_time = clamped_dt;
         self.total_time = (now - self.start_time) as f64 / self.frequency as f64;
         self.frame_count += 1;
@@ -99,6 +102,11 @@ impl EngineTimer {
     #[inline]
     pub fn delta_time(&self) -> f32 {
         self.delta_time
+    }
+
+    /// Actual frame interval for animation and UI clocks independent of the physics clamp.
+    pub fn raw_delta_time(&self) -> f32 {
+        self.raw_delta_time
     }
 
     #[inline]

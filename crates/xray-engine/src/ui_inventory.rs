@@ -24,6 +24,8 @@ use xray_formats::fonts::{FontAlignment, FontAtlas, FontDrawParams};
 use xray_formats::spawns::INVALID_OBJECT_ID;
 use xray_formats::scoc::{ScocFile, ScocInventoryItem, ScocPeerState};
 use xray_formats::scop::{ScopActorStats, ScopAlifeKind, ScopSaveFile};
+use xray_formats::vfs_bridge::load_ui_xml_for_viewport_from_vfs;
+use xray_formats::xml_ui::{UiTextureAtlasMap, UiViewport, XmlDocument, XmlNode};
 use xray_render_dx12::bindless::DescriptorIndex;
 use xray_render_dx12::renderer::Dx12Renderer;
 use xray_render_dx12::ui_canvas::GlyphQuad;
@@ -538,6 +540,10 @@ pub struct InventoryLayout {
     pub close_button_rect: [f32; 4],
     pub dialogue_rect: [f32; 4],
     pub dialogue_option_rects: Vec<[f32; 4]>,
+    backgrounds: Vec<([f32; 4], String)>,
+    rotated_slots: Vec<EquipmentSlot>,
+    weight_rect: Option<[f32; 4]>,
+    money_rect: Option<[f32; 4]>,
 }
 
 impl InventoryLayout {
@@ -549,8 +555,8 @@ impl InventoryLayout {
         let grid_w = f32::from(cols) * cell_size;
         let grid_h = f32::from(rows) * cell_size;
 
-        let panel_w = (fw * 0.84).clamp(grid_w + 300.0, fw - 32.0);
-        let panel_h = (fh * 0.84).clamp(grid_h + 76.0, fh - 32.0);
+        let panel_w = (fw * 0.84).max(grid_w + 300.0).min(fw - 32.0);
+        let panel_h = (fh * 0.84).max(grid_h + 76.0).min(fh - 32.0);
         let panel_x = (fw - panel_w) * 0.5;
         let panel_y = (fh - panel_h) * 0.5;
         let panel_rect = [panel_x, panel_y, panel_w, panel_h];
@@ -658,7 +664,73 @@ impl InventoryLayout {
             close_button_rect,
             dialogue_rect,
             dialogue_option_rects,
+            backgrounds: Vec::new(),
+            rotated_slots: Vec::new(),
+            weight_rect: None,
+            money_rect: None,
         }
+    }
+
+    fn apply_xml(&mut self, xml: &XmlDocument, viewport: UiViewport) -> Option<()> {
+        let player = xml.navigate("player", 0)?;
+        let equipment = xml.navigate("equipment", 0)?;
+        let relative = |parent: &XmlNode, origin: [f32; 2]| {
+            [
+                origin[0] + parent.attr_f32("x", 0.0),
+                origin[1] + parent.attr_f32("y", 0.0),
+                parent.attr_f32("width", 0.0),
+                parent.attr_f32("height", 0.0),
+            ]
+        };
+        let player_rect = relative(player, [0.0; 2]);
+        let equipment_rect = relative(equipment, [0.0; 2]);
+        let player_origin = [player_rect[0], player_rect[1]];
+        let equipment_origin = [equipment_rect[0], equipment_rect[1]];
+        let bag = relative(player.navigate("cont_bag", 0)?, player_origin);
+        if bag[2] <= 0.0 || bag[3] <= 0.0 {
+            return None;
+        }
+        let [x, y, w, h] = viewport.virtual_to_screen_rect(bag);
+        // Anomaly's UICellContainer uses a 41-unit icon and a 2-unit gap, with aspect correction.
+        let pitch = (43.0 * viewport.scale()[1])
+            .min(w / f32::from(self.grid_cols.max(1)))
+            .min(h / f32::from(self.grid_rows.max(1)));
+        self.grid_origin = [x, y];
+        self.cell_size = pitch;
+        self.backgrounds = [(equipment, equipment_origin), (player, player_origin)].into_iter()
+            .filter_map(|(node, origin)| {
+                let background = node.navigate("background", 0)?;
+                let texture = background.navigate("texture", 0)?.read_text()?.trim().to_owned();
+                Some((viewport.virtual_to_screen_rect(relative(background, origin)), texture))
+            }).collect();
+        self.weight_rect = player.navigate("weight_caption", 0)
+            .map(|node| viewport.virtual_to_screen_rect(relative(node, player_origin)));
+        self.money_rect = player.navigate("money", 0)
+            .map(|node| viewport.virtual_to_screen_rect(relative(node, player_origin)));
+        for (slot, rect) in &mut self.slot_rects {
+            let (container, id) = match slot {
+                EquipmentSlot::Pistol => ("cont_equ", 2),
+                EquipmentSlot::PrimaryWeapon => ("cont_equ", 3),
+                EquipmentSlot::SecondaryWeapon => ("cont_equ", 1),
+                EquipmentSlot::Armor => ("cont_equ", 7),
+                EquipmentSlot::Helmet => ("cont_equ", 12),
+                EquipmentSlot::Backpack => ("cont_equ", 13),
+                EquipmentSlot::Artifact(index) => ("cont_belt", *index + 1),
+                EquipmentSlot::QuickSlot(index) => ("cont_quick", *index + 1),
+            };
+            let Some(container) = equipment.navigate(container, 0) else { continue };
+            let container_rect = relative(container, equipment_origin);
+            let Some(cell) = container.navigate(&format!("cell_{id}"), 0) else { continue };
+            *rect = viewport.virtual_to_screen_rect(relative(cell, [container_rect[0], container_rect[1]]));
+            if cell.navigate("pic", 0).is_some_and(|pic| {
+                pic.attr_bool("heading", false) && pic.attr_f32("heading_angle", 0.0).abs() == 90.0
+            }) {
+                self.rotated_slots.push(*slot);
+            }
+        }
+        self.use_button_rect = viewport.virtual_to_screen_rect([16.0, 160.0, 115.0, 29.0]);
+        self.close_button_rect = [0.0; 4];
+        Some(())
     }
 
     pub fn grid_cell_center(&self, col: u8, row: u8, w: u8, h: u8) -> [f32; 2] {
@@ -702,6 +774,30 @@ impl InventoryLayout {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn xml_inventory_layout_maps_draw_and_hit_rectangles_together() {
+    let xml = XmlDocument::parse(r#"
+        <w>
+            <player x="600"><background width="400" height="768"><texture>bag</texture></background>
+                <cont_bag x="20" y="80" width="350" height="620"/>
+            </player>
+            <equipment x="320" y="15">
+                <cont_equ x="10" y="5"><cell_2 x="40" y="70" width="70" height="160">
+                    <pic heading="1" heading_angle="90"/>
+                </cell_2></cont_equ>
+            </equipment>
+        </w>
+    "#).unwrap();
+    let mut layout = InventoryLayout::compute(1280, 720, 10, 12);
+    assert!(layout.apply_xml(&xml, UiViewport::new(1280.0, 720.0)).is_some());
+    assert_eq!(layout.grid_origin, [775.0, 75.0]);
+    assert_eq!(layout.hit_slot(500.0, 100.0), Some(EquipmentSlot::Pistol));
+    assert!(layout.rotated_slots.contains(&EquipmentSlot::Pistol));
+    let [x, y] = layout.grid_cell_center(2, 3, 1, 1);
+    assert_eq!(layout.hit_grid_cell(x, y), Some((2, 3)));
+}
+
 /// Complete runtime inventory, equipment, actor vital stats, and dialogue manager.
 #[derive(Debug, Clone)]
 pub struct InventoryManager {
@@ -717,6 +813,7 @@ pub struct InventoryManager {
     pub hud_sync_dirty: bool,
     pub max_carry_weight_kg: f32,
     pub grid_index: Option<Arc<ItemGridIndex>>,
+    ui_layouts: [Option<Arc<XmlDocument>>; 2],
     next_uid: u64,
     item_uses_extra: Vec<(xray_formats::scoc::ScocValue, xray_formats::scoc::ScocValue)>,
 }
@@ -912,6 +1009,7 @@ impl InventoryManager {
             hud_sync_dirty: false,
             max_carry_weight_kg: 50.0,
             grid_index: None,
+            ui_layouts: [None, None],
             next_uid: 1,
             item_uses_extra: Vec::new(),
         }
@@ -944,6 +1042,25 @@ impl InventoryManager {
     #[inline]
     pub fn is_modal_open(&self) -> bool {
         self.open || self.dialogue.is_some()
+    }
+
+    pub(crate) fn load_ui_layouts(&mut self, vfs: &VirtualFileSystem) {
+        self.ui_layouts = [
+            UiViewport::new(1024.0, 768.0),
+            UiViewport::new(1366.0, 768.0),
+        ].map(|viewport| {
+            load_ui_xml_for_viewport_from_vfs(vfs, "configs/ui/ui_inventory.xml", &viewport)
+                .ok().map(Arc::new)
+        });
+    }
+
+    pub fn layout(&self, width: u32, height: u32) -> InventoryLayout {
+        let mut layout = InventoryLayout::compute(width, height, self.grid_cols, self.grid_rows);
+        let viewport = UiViewport::new(width as f32, height as f32);
+        if let Some(xml) = self.ui_layouts[usize::from(viewport.is_widescreen())].as_ref() {
+            layout.apply_xml(xml, viewport);
+        }
+        layout
     }
 
     /// Total carried weight across backpack & equipped items in kilograms.
@@ -1666,7 +1783,7 @@ impl InventoryManager {
         alife: Option<&mut AlifeManager>,
         mut audio: Option<&mut AudioManager>,
     ) {
-        let layout = InventoryLayout::compute(viewport_w, viewport_h, self.grid_cols, self.grid_rows);
+        let layout = self.layout(viewport_w, viewport_h);
         let (mx, my) = input.mouse_position();
 
         // Dialogue modal interactions
@@ -1738,8 +1855,10 @@ impl InventoryManager {
 
         // Left press -> Close button, Use Selected button, or begin Drag
         if input.is_mouse_just_pressed(MouseButton::Left) {
-            if point_in_rect(mx, my, layout.close_button_rect) {
-                self.set_open(false, audio);
+            if layout.close_button_rect[2] > 0.0 && point_in_rect(mx, my, layout.close_button_rect) {
+                let animated = hud_weapon.as_deref_mut().zip(audio.as_deref_mut())
+                    .is_some_and(|(hud, audio)| hud.close_backpack(audio));
+                self.set_open(false, if animated { None } else { audio });
                 return;
             }
             if point_in_rect(mx, my, layout.use_button_rect)
@@ -1822,6 +1941,8 @@ impl InventoryManager {
         equipment_tex: Option<DescriptorIndex>,
         actor_menu_tex: Option<DescriptorIndex>,
         grid_tex: Option<DescriptorIndex>,
+        atlas: Option<&UiTextureAtlasMap>,
+        vfs: Option<&VirtualFileSystem>,
     ) -> u32 {
         let mut drawn = 0u32;
         let fw = (width.max(64)) as f32;
@@ -1943,6 +2064,7 @@ impl InventoryManager {
         // Center interaction prompt when looking at NPC/Trader/Item
         if let Some(target) = &self.hover_target
             && !self.is_modal_open()
+            && !hud_weapon.is_some_and(HudWeaponController::backpack_blocks_input)
         {
             let pw = 280.0;
             let ph = 28.0;
@@ -1957,68 +2079,49 @@ impl InventoryManager {
         }
 
         // 2. Open Inventory Modal
-        let layout = InventoryLayout::compute(width, height, self.grid_cols, self.grid_rows);
+        let layout = self.layout(width, height);
         if self.open {
-            // Backdrop dim + main container
-            renderer.ui_fill_rect([0.0, 0.0, fw, fh], [0.01, 0.01, 0.02, 0.65]);
-
-            if let Some(am_tex) = actor_menu_tex {
-                // Split main panel into Left paperdoll (ui_inGame2_left_side) and Right inventory (ui_inGame2_inventory_back)
-                let panel_w = layout.panel_rect[2];
-                let panel_h = layout.panel_rect[3];
-                let left_w = panel_w * 0.44;
-                let right_w = panel_w - left_w;
-                let left_rect = [layout.panel_rect[0], layout.panel_rect[1], left_w, panel_h];
-                let right_rect = [layout.panel_rect[0] + left_w, layout.panel_rect[1], right_w, panel_h];
-
-                // ui_inGame2_left_side: x=2304, y=0, w=682, h=1536 on 4096x2048 atlas
-                let uv_left = [2304.0 / 4096.0, 0.0, 682.0 / 4096.0, 1536.0 / 2048.0];
-                renderer.ui_draw_textured_rect(left_rect, uv_left, am_tex, [1.0, 1.0, 1.0, 0.98]);
-
-                // ui_inGame2_inventory_back: x=1620, y=0, w=684, h=1536 on 4096x2048 atlas
-                let uv_right = [1620.0 / 4096.0, 0.0, 684.0 / 4096.0, 1536.0 / 2048.0];
-                renderer.ui_draw_textured_rect(right_rect, uv_right, am_tex, [1.0, 1.0, 1.0, 0.98]);
-
-                // Header bar (ui_item_picker_background: x=692, y=1724, w=639, h=324)
-                let uv_header = [692.0 / 4096.0, 1724.0 / 2048.0, 639.0 / 4096.0, 324.0 / 2048.0];
-                let header_rect = [layout.panel_rect[0], layout.panel_rect[1], layout.panel_rect[2], 34.0];
-                renderer.ui_draw_textured_rect(header_rect, uv_header, am_tex, [1.0, 1.0, 1.0, 0.95]);
-                drawn += 3;
-            } else {
-                renderer.ui_fill_rect(layout.panel_rect, [0.08, 0.09, 0.10, 0.92]);
-                renderer.ui_fill_rect(
-                    [layout.panel_rect[0], layout.panel_rect[1], layout.panel_rect[2], 32.0],
-                    [0.14, 0.15, 0.17, 0.98],
-                );
-                drawn += 2;
-            }
-
-            renderer.ui_fill_rect(layout.close_button_rect, [0.68, 0.20, 0.20, 0.95]);
+            renderer.ui_fill_rect([0.0, 0.0, fw, fh], [0.01, 0.01, 0.02, 0.40]);
             drawn += 1;
+            if layout.backgrounds.is_empty() {
+                renderer.ui_fill_rect(layout.panel_rect, [0.08, 0.09, 0.10, 0.92]);
+                drawn += 1;
+            }
+            for (rect, texture) in &layout.backgrounds {
+                let sprite = atlas.and_then(|atlas| atlas.get(texture)).and_then(|region| {
+                    let index = crate::render_bridge::load_vfs_texture(renderer, vfs, &region.dds_vpath()).ok()?;
+                    let texture = renderer.get_texture_by_index(index)?;
+                    Some((index, region.uv_rect(texture.width as f32, texture.height as f32)))
+                });
+                if let Some((index, uv)) = sprite {
+                    renderer.ui_draw_textured_rect(*rect, uv, index, [1.0; 4]);
+                } else {
+                    renderer.ui_fill_rect(*rect, [0.08, 0.09, 0.10, 0.94]);
+                }
+                drawn += 1;
+            }
+            if layout.close_button_rect[2] > 0.0 {
+                renderer.ui_fill_rect(layout.close_button_rect, [0.23, 0.24, 0.22, 0.95]);
+                drawn += 1;
+                if let Some(f) = font {
+                    let [x, y, _, _] = layout.close_button_rect;
+                    drawn += f.draw_text(renderer, "X", [x + 8.0, y + 4.0], 14.0, [0.92, 0.90, 0.84, 1.0]);
+                }
+            }
 
             // Equipment Slots
             for (slot, rect) in &layout.slot_rects {
                 let occ = self.item_in_slot(*slot);
                 let is_sel = occ.is_some_and(|i| Some(i.uid) == self.selected_uid);
-                if let Some(am_tex) = actor_menu_tex {
-                    if is_sel {
-                        // ui_inGame2_quick_item_highlighter: x=410, y=549, w=66, h=59
-                        let uv_high = [410.0 / 4096.0, 549.0 / 2048.0, 66.0 / 4096.0, 59.0 / 2048.0];
-                        renderer.ui_draw_textured_rect(*rect, uv_high, am_tex, [1.0, 0.85, 0.3, 0.98]);
-                    } else {
-                        // ui_item_picker_frame_back: x=1390, y=1731, w=41, h=41
-                        let uv_bezel = [1390.0 / 4096.0, 1731.0 / 2048.0, 41.0 / 4096.0, 41.0 / 2048.0];
-                        renderer.ui_draw_textured_rect(*rect, uv_bezel, am_tex, [0.85, 0.88, 0.92, 0.95]);
-                    }
-                } else {
+                if is_sel || layout.backgrounds.is_empty() {
                     let bg = if is_sel {
                         [0.24, 0.26, 0.20, 0.95]
                     } else {
                         [0.12, 0.13, 0.15, 0.92]
                     };
                     renderer.ui_fill_rect(*rect, bg);
+                    drawn += 1;
                 }
-                drawn += 1;
 
                 if let Some(item) = occ
                     && self.drag.as_ref().is_none_or(|d| d.item_uid != item.uid)
@@ -2026,21 +2129,27 @@ impl InventoryManager {
                     let inner = [rect[0] + 4.0, rect[1] + 4.0, (rect[2] - 8.0).max(4.0), (rect[3] - 12.0).max(4.0)];
                     if let Some(tex) = equipment_tex {
                         let uv = item_icon_uv_indexed(&item.section, item.category, self.grid_index.as_deref());
-                        renderer.ui_draw_textured_rect(inner, uv, tex, [1.0, 1.0, 1.0, 0.98]);
+                        let rotated = layout.rotated_slots.contains(slot);
+                        let (w, h) = item.grid_size;
+                        let aspect = if rotated { f32::from(h) / f32::from(w.max(1)) }
+                            else { f32::from(w) / f32::from(h.max(1)) };
+                        let icon = fit_inventory_icon(inner, aspect);
+                        if rotated {
+                            renderer.ui_draw_rotated_rect(icon, uv, tex, [1.0; 4]);
+                        } else {
+                            renderer.ui_draw_textured_rect(icon, uv, tex, [1.0; 4]);
+                        }
                     } else {
                         renderer.ui_fill_rect(inner, item.category.accent_color());
                     }
-                    renderer.ui_draw_meter_bar(
-                        [rect[0] + 4.0, rect[1] + rect[3] - 6.0, (rect[2] - 8.0).max(4.0), 3.5],
-                        item.condition,
-                        [0.05, 0.05, 0.05, 0.85],
-                        condition_bar_color(item.condition),
-                    );
-                    drawn += 3;
-                }
-                if let Some(f) = font {
-                    let lbl = occ.map(|i| i.display_name.as_str()).unwrap_or(slot.label());
-                    drawn += f.draw_text(renderer, lbl, [rect[0] + 6.0, rect[1] + 6.0], 13.0, [0.92, 0.92, 0.90, 0.95]);
+                    drawn += 1;
+                    if show_item_condition(item.category) {
+                        renderer.ui_draw_meter_bar(
+                            [rect[0] + 4.0, rect[1] + rect[3] - 5.0, (rect[2] - 8.0).max(4.0), 2.5],
+                            item.condition, [0.05, 0.05, 0.05, 0.85], condition_bar_color(item.condition),
+                        );
+                        drawn += 2;
+                    }
                 }
             }
 
@@ -2049,7 +2158,7 @@ impl InventoryManager {
                 for col in 0..self.grid_cols {
                     let cx = layout.grid_origin[0] + f32::from(col) * layout.cell_size;
                     let cy = layout.grid_origin[1] + f32::from(row) * layout.cell_size;
-                    if let Some(g_tex) = grid_tex {
+                    if let Some(g_tex) = grid_tex.filter(|_| layout.backgrounds.is_empty()) {
                         renderer.ui_draw_textured_rect(
                             [cx, cy, layout.cell_size, layout.cell_size],
                             [0.0, 0.0, 1.0, 1.0],
@@ -2059,7 +2168,7 @@ impl InventoryManager {
                     } else {
                         renderer.ui_fill_rect(
                             [cx + 1.0, cy + 1.0, layout.cell_size - 2.0, layout.cell_size - 2.0],
-                            [0.11, 0.12, 0.13, 0.88],
+                            [0.11, 0.12, 0.13, 0.43],
                         );
                     }
                     drawn += 1;
@@ -2091,15 +2200,16 @@ impl InventoryManager {
                 } else {
                     renderer.ui_fill_rect([ix, iy, iw, ih], item.category.accent_color());
                 }
-                renderer.ui_draw_meter_bar(
-                    [ix + 2.0, iy + ih - 5.0, (iw - 4.0).max(2.0), 3.0],
-                    item.condition,
-                    [0.05, 0.05, 0.05, 0.85],
-                    condition_bar_color(item.condition),
-                );
-                drawn += 3;
-                if let Some(f) = font {
-                    drawn += f.draw_text(renderer, &item.display_name, [ix + 4.0, iy + 3.0], 12.0, [0.95, 0.95, 0.92, 0.96]);
+                drawn += 1;
+                if show_item_condition(item.category) {
+                    renderer.ui_draw_meter_bar(
+                        [ix + 2.0, iy + ih - 4.0, (iw - 4.0).max(2.0), 2.5],
+                        item.condition, [0.05, 0.05, 0.05, 0.85], condition_bar_color(item.condition),
+                    );
+                    drawn += 2;
+                }
+                if item.quantity > 1 && let Some(f) = font {
+                    drawn += f.draw_text(renderer, &item.quantity.to_string(), [ix + 3.0, iy + 2.0], 12.0, [0.95, 0.95, 0.92, 1.0]);
                 }
             }
 
@@ -2113,19 +2223,20 @@ impl InventoryManager {
                 renderer.ui_fill_rect(layout.use_button_rect, btn_col);
                 drawn += 1;
                 if let Some(f) = font {
-                    let info = format!(
-                        "{} | {:.1}kg | {}%",
-                        sel.display_name,
-                        sel.weight_kg,
-                        (sel.condition * 100.0).round() as u32
-                    );
+                    let action = if matches!(sel.category, ItemCategory::Medical | ItemCategory::Consumable) {
+                        "Use"
+                    } else { "Equip" };
+                    let [x, y, _, _] = layout.use_button_rect;
+                    drawn += f.draw_text(renderer, action, [x + 8.0, y + 5.0], 14.0, [0.98, 0.96, 0.89, 1.0]);
+                    let info = format!("{:.1} kg  •  {:.0}%", sel.weight_kg, sel.condition * 100.0);
                     drawn += f.draw_text(
                         renderer,
-                        &info,
-                        [layout.use_button_rect[0] + 140.0, layout.use_button_rect[1] + 7.0],
-                        14.0,
-                        [0.92, 0.92, 0.88, 0.95],
+                        &sel.display_name,
+                        [x + 3.0, y - 45.0],
+                        17.0,
+                        [0.96, 0.94, 0.87, 1.0],
                     );
+                    drawn += f.draw_text(renderer, &info, [x + 3.0, y - 24.0], 13.0, [0.78, 0.78, 0.73, 1.0]);
                 }
             }
 
@@ -2136,18 +2247,27 @@ impl InventoryManager {
             } else {
                 [0.78, 0.68, 0.28, 0.95]
             };
-            renderer.ui_draw_meter_bar(
-                [
-                    layout.grid_origin[0],
-                    layout.panel_rect[1] + layout.panel_rect[3] - 26.0,
-                    f32::from(self.grid_cols) * layout.cell_size,
-                    10.0,
-                ],
-                weight_frac,
-                [0.06, 0.06, 0.06, 0.9],
-                weight_color,
-            );
-            drawn += 2;
+            if let Some([x, y, _, h]) = layout.weight_rect {
+                if let Some(f) = font {
+                    let weight = format!("{:.1} / {:.0} kg", self.total_weight_kg(), self.max_carry_weight_kg);
+                    drawn += f.draw_text(renderer, &weight, [x, y], h.max(9.0), weight_color);
+                    if let Some([x, y, _, h]) = layout.money_rect {
+                        let money = format!("{} RU", self.actor_stats.money);
+                        drawn += f.draw_text(renderer, &money, [x, y], h.min(18.0), [0.92, 0.86, 0.70, 1.0]);
+                    }
+                }
+            } else {
+                renderer.ui_draw_meter_bar(
+                    [
+                        layout.grid_origin[0],
+                        layout.panel_rect[1] + layout.panel_rect[3] - 26.0,
+                        f32::from(self.grid_cols) * layout.cell_size,
+                        10.0,
+                    ],
+                    weight_frac, [0.06, 0.06, 0.06, 0.9], weight_color,
+                );
+                drawn += 2;
+            }
 
             // Floating Drag Ghost following mouse cursor
             if let Some(drag) = &self.drag
@@ -2255,6 +2375,16 @@ fn point_in_rect(px: f32, py: f32, rect: [f32; 4]) -> bool {
 }
 
 #[inline]
+fn show_item_condition(category: ItemCategory) -> bool {
+    matches!(category, ItemCategory::Weapon | ItemCategory::Outfit | ItemCategory::Helmet)
+}
+
+fn fit_inventory_icon([x, y, w, h]: [f32; 4], aspect: f32) -> [f32; 4] {
+    let width = w.min(h * aspect);
+    let height = h.min(w / aspect);
+    [x + (w - width) * 0.5, y + (h - height) * 0.5, width, height]
+}
+
 fn condition_bar_color(cond: f32) -> [f32; 4] {
     if cond >= 0.65 {
         [0.24, 0.82, 0.34, 0.95]

@@ -46,6 +46,66 @@ fn make_temp_dir(tag: &str) -> TempDirGuard {
     TempDirGuard(dir)
 }
 
+#[test]
+fn backpack_sequence_delays_inventory_and_blocks_other_actions_until_recovered() {
+    let dir = make_temp_dir("backpack");
+    let config = dir.0.join("configs/items/items");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("ea_addon_backpack.ltx"),
+        "[backpack_open]\nanm = bag_open\ntm = 1600\n[backpack_close]\nanm = bag_close\ntm = 1000\n").unwrap();
+    fs::write(config.join("items_anm_backpack.ltx"),
+        "[bag_open_hud]\nanm_ea_show = open\nanm_ea_idle = idle\n[bag_close_hud]\nanm_ea_show = close\n").unwrap();
+    let mut vfs = VirtualFileSystem::new();
+    vfs.mount_loose_dir(&dir.0);
+    let mut runtime = EngineRuntime::new(EngineConfig {
+        window: WindowConfig { visible: false, ..Default::default() },
+        ..Default::default()
+    }, false).unwrap();
+    runtime.attach_vfs(Arc::new(vfs));
+    let step = |runtime: &mut EngineRuntime| {
+        runtime.timer.simulate_elapsed(0.1);
+        assert!(runtime.step_frame().unwrap());
+    };
+    let press = |runtime: &mut EngineRuntime, key| {
+        runtime.window.push_synthetic_event(WindowEvent::KeyDown { vk: key });
+        step(runtime);
+        runtime.window.push_synthetic_event(WindowEvent::KeyUp { vk: key });
+        step(runtime);
+    };
+
+    press(&mut runtime, EngineInput::VK_TAB);
+    assert!(!runtime.inventory.open);
+    press(&mut runtime, EngineInput::VK_KEY_P);
+    assert!(!runtime.pda.open);
+    press(&mut runtime, EngineInput::VK_ESCAPE);
+    runtime.window.push_synthetic_event(WindowEvent::MouseDown { button: MouseButton::Left });
+    step(&mut runtime);
+    runtime.window.push_synthetic_event(WindowEvent::MouseUp { button: MouseButton::Left });
+    step(&mut runtime);
+    assert_eq!(runtime.hud_weapon.shots_fired, 0);
+    for _ in 0..7 {
+        step(&mut runtime);
+    }
+    assert!(!runtime.inventory.open);
+    for _ in 0..2 {
+        step(&mut runtime);
+    }
+    assert!(runtime.inventory.open);
+    assert!(!runtime.input.is_cursor_locked());
+
+    press(&mut runtime, EngineInput::VK_TAB);
+    assert!(!runtime.inventory.open);
+    press(&mut runtime, EngineInput::VK_TAB);
+    assert!(!runtime.inventory.open);
+    for _ in 0..11 {
+        step(&mut runtime);
+    }
+    press(&mut runtime, EngineInput::VK_KEY_P);
+    assert!(!runtime.pda.open);
+    press(&mut runtime, EngineInput::VK_KEY_P);
+    assert!(runtime.pda.open);
+}
+
 fn make_solid_4x4_rgba_dds() -> Vec<u8> {
     let mut dds = vec![0u8; 128 + 16 * 4];
     dds[0..4].copy_from_slice(b"DDS ");
