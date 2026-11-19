@@ -393,7 +393,7 @@ pub fn skin_vertices(
     }
 }
 
-/// Recursively skin an OGF visual (root and any child meshes) into `SkinnedMeshPart` surfaces.
+/// Recursively skin an OGF visual into surfaces using its highest-detail inline index window.
 pub fn skin_ogf_hierarchy(
     root: &OgfModel,
     palette: &BonePalette,
@@ -433,7 +433,7 @@ pub fn skin_ogf_hierarchy_visible(
                 visual_center: model.header.bsphere.center,
                 texture: model.texture.clone(),
                 vertices: skin_vertices(verts, palette)?,
-                indices: model.indices.clone(),
+                indices: model.progressive_indices(1.0, &[]).to_vec(),
             });
         }
         for (idx, child) in model.children.iter().enumerate() {
@@ -2238,6 +2238,8 @@ mod tests {
         assert_eq!(index.bone_child_faces[1][0], vec![1]);
 
         let bind_pal = BonePalette::bind_pose(index.skeleton).unwrap();
+        let parts = skin_ogf_hierarchy(&model, &bind_pal).unwrap();
+        assert_eq!(parts[0].indices, [0, 1, 2, 3, 4, 5]);
         let all_vis = BoneMask::all(2);
         let parent_xform = matrix_set_xyz_translate([0.0, 0.0, 0.0], [10.0, 0.0, 0.0]);
 

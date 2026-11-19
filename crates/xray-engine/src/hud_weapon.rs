@@ -1628,8 +1628,9 @@ fn collect_static_ogf_parts(
     fallback_tex: Option<&str>,
     out: &mut Vec<HudDrawPart>,
 ) {
+    let indices = model.progressive_indices(1.0, &[]);
     if let Some(verts) = &model.vertices
-        && !model.indices.is_empty()
+        && !indices.is_empty()
     {
         let static_verts = verts.to_static_attributes();
         let gpu_verts: Vec<XRayVertex> = static_verts
@@ -1647,7 +1648,7 @@ fn collect_static_ogf_parts(
             shader: model.texture.as_ref().map(|link| link.shader.clone()),
             visual_center: model.header.bsphere.center,
             vertices: gpu_verts,
-            indices: model.indices.clone(),
+            indices: indices.to_vec(),
             world_transform,
         });
     }
