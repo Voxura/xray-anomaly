@@ -26,7 +26,8 @@ use xray_formats::gamemtl::{gamemtl_flags, GameMaterialLibrary};
 use xray_formats::hom::{frustum_planes, ClipFrustum};
 use xray_formats::lanims::pack_argb;
 use xray_formats::ogf::{
-    matrix_mul_43, matrix_mul_44, matrix_set_hpb, vector_generate_orthonormal_basis,
+    matrix_mul_43, matrix_mul_44, matrix_rotate_x, matrix_rotate_y, matrix_rotate_z,
+    matrix_set_hpb, vector_generate_orthonormal_basis,
     BonePoseMatrices, OgfModel, OgfTextureLink, StaticVertex, XRayMatrix,
 };
 use xray_formats::particles::{
@@ -429,6 +430,7 @@ pub struct HudWeaponController {
     pub fire_cooldown_sec: f32,
     pub pending_slot: Option<u8>,
     pub ads_blend: f32,
+    aim_requested: bool,
     pub recoil_kick: f32,
     pub sway_time_sec: f32,
     pub muzzle_flash_timer_sec: f32,
@@ -465,6 +467,7 @@ impl Default for HudWeaponController {
             fire_cooldown_sec: 0.0,
             pending_slot: None,
             ads_blend: 0.0,
+            aim_requested: false,
             recoil_kick: 0.0,
             sway_time_sec: 0.0,
             muzzle_flash_timer_sec: 0.0,
@@ -506,6 +509,15 @@ impl HudWeaponController {
     /// Current HUD FOV factor interpolated smoothly between hip and ADS framing.
     #[inline]
     pub fn current_hud_fov_factor(&self) -> f32 {
+        if let Some((config, _)) = self.weapon_hud_config() {
+            let section = &self.active_weapon().section;
+            let base_override = config.read_f32(section, "hud_fov", 0.0);
+            let base = if base_override > 0.0 { base_override } else { self.base_hud_fov_factor };
+            let addition = config.read_f32(section, "hud_fov_addition_modifier", 0.0);
+            // Monolith's default hud_fov_aim_factor is disabled, leaving HUD projection
+            // independent of world zoom for configured weapons.
+            return base + addition;
+        }
         let target_ads = (self.base_hud_fov_factor * 0.82).max(0.28);
         self.base_hud_fov_factor + (target_ads - self.base_hud_fov_factor) * self.ads_blend
     }
@@ -709,9 +721,9 @@ impl HudWeaponController {
         [fallback.clone(), fallback.clone()]
     }
 
-    fn idle_pose_key(&self, hands_path: &str) -> Option<(String, String)> {
+    fn idle_pose_key(&self, hands_path: &str, alias: &str) -> Option<(String, String)> {
         let (config, section) = self.weapon_hud_config()?;
-        let clip = config.read_str(section, "anm_idle")?.split(',').next()?.trim();
+        let clip = config.read_str(section, alias)?.split(',').next()?.trim();
         if clip.is_empty() {
             return None;
         }
@@ -719,18 +731,26 @@ impl HudWeaponController {
     }
 
     fn ensure_hands_idle_pose(&mut self, vfs: &VirtualFileSystem, hands_path: &str) {
-        let Some(key) = self.idle_pose_key(hands_path) else { return };
-        if !self.hands_idle_poses.contains_key(&key) {
-            let pose = self.cached_ogf(hands_path)
-                .and_then(|asset| load_hands_idle_pose(vfs, asset, &key.1));
-            self.hands_idle_poses.insert(key, pose);
+        for alias in ["anm_idle", "anm_idle_aim"] {
+            let Some(key) = self.idle_pose_key(hands_path, alias) else { continue };
+            if !self.hands_idle_poses.contains_key(&key) {
+                let pose = self.cached_ogf(hands_path)
+                    .and_then(|asset| load_hands_idle_pose(vfs, asset, &key.1));
+                self.hands_idle_poses.insert(key, pose);
+            }
         }
     }
 
     fn hands_idle_pose(&self, hands_path: &str) -> Option<(&str, &BonePalette)> {
-        let key = self.idle_pose_key(hands_path)?;
-        let ((_, clip), pose) = self.hands_idle_poses.get_key_value(&key)?;
-        Some((clip, pose.as_ref()?))
+        let lookup = |alias| {
+            let key = self.idle_pose_key(hands_path, alias)?;
+            let ((_, clip), pose) = self.hands_idle_poses.get_key_value(&key)?;
+            Some((clip.as_str(), pose.as_ref()?))
+        };
+        if self.aim_requested && let Some(pose) = lookup("anm_idle_aim") {
+            return Some(pose);
+        }
+        lookup("anm_idle")
     }
 
     /// Preload active weapon and hands OGF assets from the VFS.
@@ -883,9 +903,21 @@ impl HudWeaponController {
         let hand_pos = measure("hands_position", "hands_position_16x9")?;
         let hand_rot = measure("hands_orientation", "hands_orientation_16x9")?;
         let aim_delta = measure("aim_hud_offset_pos", "aim_hud_offset_pos_16x9").unwrap_or([0.0; 3]);
-        let aim_pos = std::array::from_fn(|axis| hand_pos[axis] + aim_delta[axis]);
-        let hand_basis = self.compute_hud_root_with_offsets(camera, hand_pos, aim_pos);
-        let hand_transform = matrix_mul_43(&hand_basis, &hud_measure_transform([0.0; 3], hand_rot));
+        let aim_rot = measure("aim_hud_offset_rot", "aim_hud_offset_rot_16x9").unwrap_or([0.0; 3]);
+        let blend = self.ads_blend.clamp(0.0, 1.0);
+        // UpdateHudAdditional rotates and translates the camera-local aim offset before
+        // player_hud::update composes the hands attachment in that adjusted space.
+        let [x, y, z] = aim_rot.map(|value| value * blend);
+        let mut aim_transform = matrix_mul_43(
+            &matrix_rotate_z(z),
+            &matrix_mul_43(&matrix_rotate_y(y), &matrix_rotate_x(x)),
+        );
+        aim_transform[3] = [aim_delta[0] * blend, aim_delta[1] * blend, aim_delta[2] * blend, 1.0];
+        let hand_basis = self.compute_hud_root_with_offsets(camera, [0.0; 3], [0.0; 3]);
+        let hand_transform = matrix_mul_43(
+            &matrix_mul_43(&hand_basis, &aim_transform),
+            &hud_measure_transform(hand_pos, hand_rot),
+        );
         let item_pos = hud_measure_vec3(config, section, "item_position").unwrap_or([0.0; 3]);
         let item_rot = hud_measure_vec3(config, section, "item_orientation").unwrap_or([0.0; 3]);
         let item_transform = matrix_mul_43(
@@ -1205,13 +1237,19 @@ impl HudWeaponController {
     }
 
     fn update_fov_and_ads(&mut self, dt: f32, aiming: bool, camera: &mut FirstPersonCamera) {
+        self.aim_requested = aiming;
         let ads_speed = self.active_weapon().ads_zoom_speed.max(1.0);
         let alpha = 1.0 - (-ads_speed * dt).exp();
         let target_blend = if aiming { 1.0 } else { 0.0 };
         self.ads_blend += (target_blend - self.ads_blend) * alpha;
 
+        let config_zoom = self.weapon_hud_config().and_then(|(config, _)| {
+            let factor = config.read_f32(&self.active_weapon().section, "scope_zoom_factor", 0.0);
+            (factor.is_finite() && factor > 0.0).then_some(factor * 0.75)
+        });
+        let aim_fov = config_zoom.unwrap_or(self.active_weapon().ads_fov_deg);
         let target_fov = self.base_world_fov_deg
-            + (self.active_weapon().ads_fov_deg - self.base_world_fov_deg) * self.ads_blend;
+            + (aim_fov - self.base_world_fov_deg) * self.ads_blend;
         camera.fov_deg = target_fov;
     }
 
@@ -2288,12 +2326,16 @@ snd_shoot = cycle
         fs::write(configs.join("system.ltx"), "\
 [wpn_ak74]
 hud = ak_hud
+scope_zoom_factor = 20
 [ak_hud]
 item_visual = test_weapon
 hands_position = 0, 0, 0
 hands_position_16x9 = 0.1, -0.2, 0.14
 hands_orientation = 0, 0, 0
 hands_orientation_16x9 = 0, 0, 0
+aim_hud_offset_rot_16x9 = 0, 1.570796327, 0
+anm_idle = custom_idle
+anm_idle_aim = custom_aim
 item_position = 0.2, 0, 0
 [actor_hud_05]
 visual = test_hands
@@ -2316,5 +2358,22 @@ ancor_0 = lead_gun
         let (hands, item) = ctrl.configured_attachment_transforms(&camera, hands_path, &pose).unwrap();
         assert!((hands[3][0] - (camera.position[0] + 0.1)).abs() < 1e-5);
         assert!((item[3][0] - hands[3][0] - 0.7).abs() < 1e-5);
+
+        for (alias, expected) in [("anm_idle", "custom_idle"), ("anm_idle_aim", "custom_aim")] {
+            let key = ctrl.idle_pose_key(hands_path, alias).unwrap();
+            assert_eq!(key.1, expected);
+            ctrl.hands_idle_poses.insert(key, Some(pose.clone()));
+        }
+        assert_eq!(ctrl.hands_idle_pose(hands_path).unwrap().0, "custom_idle");
+        ctrl.aim_requested = true;
+        ctrl.ads_blend = 1.0;
+        assert_eq!(ctrl.hands_idle_pose(hands_path).unwrap().0, "custom_aim");
+        let (hands, item) = ctrl.configured_attachment_transforms(&camera, hands_path, &pose).unwrap();
+        assert!((item[3][0] - hands[3][0]).abs() < 1e-5);
+        assert!((item[3][2] - hands[3][2] + 0.7).abs() < 1e-5);
+        let mut camera = camera;
+        ctrl.update_fov_and_ads(1.0, true, &mut camera);
+        assert!((camera.fov_deg - 15.0).abs() < 1e-5);
+        assert_eq!(ctrl.current_hud_fov_factor(), ctrl.base_hud_fov_factor);
     }
 }
