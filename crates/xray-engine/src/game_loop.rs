@@ -230,6 +230,9 @@ impl EngineRuntime {
         self.inventory
             .hydrate_from_alife(&alife, self.item_grid_index.as_deref());
         self.inventory.sync_hud_weapon(&mut self.hud_weapon);
+        if let Some(native) = &self.inventory.native_inventory {
+            self.hud_weapon.active_slot = native.active_slot;
+        }
 
         self.inventory.actor_stats = alife.actor_stats.clone();
         let (mut pos, mut angles, hp) = if let Some(actor) = alife.host_actor()
@@ -400,6 +403,8 @@ impl EngineRuntime {
                             peer.inventory.len()
                         );
                         self.attach_host_scoc(&scoc);
+                    } else {
+                        self.inventory.restore_saved_item_uses(&peer);
                     }
                 }
             }

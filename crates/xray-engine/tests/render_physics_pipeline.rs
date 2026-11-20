@@ -228,6 +228,61 @@ fn build_gpu_test_level_bytes() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (level_bytes, geom_bytes, cform_bytes)
 }
 
+#[test]
+fn native_save_restores_equipped_items_and_quick_slot_references() {
+    use xray_engine::ui_inventory::{EquipmentSlot, InventoryManager};
+    use xray_formats::spawns::{AlifeInventoryItemState, AlifeItemAmmoState};
+
+    let (mut save, _) = build_test_save_and_scoc();
+    let actor = &mut save.entities[0];
+    let ScopAlifePayload::Actor(actor_state) = &actor.payload else { unreachable!() };
+    let base_item = AlifeInventoryItemState {
+        base: actor_state.creature.base.clone(),
+        condition: 1.0,
+        upgrades: Vec::new(),
+        trailing: Vec::new(),
+    };
+    // Physics and alive flags, conditions with one wound, and one timed booster.
+    let mut client = vec![2, 1];
+    client.extend([0; 16]);
+    client.push(1);
+    client.extend([0; 12 + 46]);
+    client.push(1);
+    client.extend([0; 9]);
+    client.extend(b"\x03\0Player\0\0\0\0\0\0\x01\x01\x01\x01bandage\0\0\0\0");
+    actor.spawn.client_data = client;
+
+    let held_item = |id, section: &str, place: u16| {
+        let mut item = ScopAlifeEntity::new(
+            id, section, "", [0.0; 3], [0.0; 3], ScopAlifePayload::InventoryItem(base_item.clone()),
+        );
+        item.spawn.parent_id = 0;
+        item.spawn.client_data.push(2);
+        item.spawn.client_data.extend(place.to_le_bytes());
+        item.spawn.client_data.extend(0.75f32.to_le_bytes());
+        item.spawn.client_data.push(0);
+        item
+    };
+    let rifle = held_item(2, "wpn_ak74", 0x0c31);
+    let pistol = held_item(3, "wpn_pb", 0x0823);
+    let bandage = held_item(4, "bandage", 3);
+    let mut ammo = held_item(5, "ammo_5.45x39_fmj", 3);
+    ammo.spawn.state_payload = AlifeItemAmmoState {
+        item: base_item.clone(), ammo_left: 17, trailing: Vec::new(),
+    }.to_bytes();
+    save.entities.extend([rifle, pistol, bandage, ammo]);
+
+    let mut inventory = InventoryManager::new_starter();
+    inventory.load_from_scop(&save);
+    assert_eq!(inventory.items.len(), 4);
+    assert_eq!(inventory.item_in_slot(EquipmentSlot::PrimaryWeapon).unwrap().section, "wpn_ak74");
+    assert!(inventory.item_in_slot(EquipmentSlot::Pistol).is_none());
+    assert!(inventory.items.iter().any(|item| item.condition == 0.75 && item.ammo_elapsed == Some(17)));
+    assert!(inventory.items.iter().any(|item| item.section == "bandage" && item.grid_pos.is_some()));
+    assert!(inventory.use_quick_slot(0, None, None, None).is_some());
+    assert!(inventory.use_quick_slot(0, None, None, None).is_none());
+}
+
 fn build_test_save_and_scoc() -> (ScopSaveFile, ScocFile) {
     let sample_alife = |gvid, lvid, story_id| AlifeObjectState {
         game_vertex_id: gvid,

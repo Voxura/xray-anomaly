@@ -611,7 +611,82 @@ pub struct ScopAlifeEntity {
     pub payload: ScopAlifePayload,
 }
 
+/// `SInvItemPlace` from the native inventory item's client save packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopItemPlace {
+    Undefined,
+    Slot(u8),
+    Belt,
+    Ruck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopActorInventory {
+    pub active_slot: u8,
+    pub quick_slots: [String; 4],
+}
+
 impl ScopAlifeEntity {
+    /// `CPhysicsShellHolder::save` followed by `CInventoryItem::save` for a held item.
+    pub fn inventory_item_client_state(&self) -> Option<(ScopItemPlace, f32)> {
+        let mut packet = ByteCursor::new(&self.spawn.client_data);
+        if packet.read_u8().ok()? > 2 {
+            return None;
+        }
+        let packed_place = packet.read_u16().ok()?;
+        let place = match packed_place & 0xf {
+            0 => ScopItemPlace::Undefined,
+            1 => ScopItemPlace::Slot(((packed_place >> 4) & 0x3f) as u8),
+            2 => ScopItemPlace::Belt,
+            3 => ScopItemPlace::Ruck,
+            _ => return None,
+        };
+        let condition = packet.read_f32().ok()?;
+        (condition.is_finite() && packet.read_u8().ok()? == 0)
+            .then_some((place, condition.clamp(0.0, 1.0)))
+    }
+
+    /// Read `CInventoryOwner::save` and the quick-use references from `CActor::save`.
+    pub fn actor_inventory_client_state(&self) -> Option<ScopActorInventory> {
+        if self.kind() != ScopAlifeKind::Actor {
+            return None;
+        }
+        let mut packet = ByteCursor::new(&self.spawn.client_data);
+        if packet.read_u8().ok()? > 2 {
+            return None;
+        }
+        match packet.read_u8().ok()? {
+            0 => {}
+            1 => {
+                packet.read_bytes(4 * size_of::<f32>()).ok()?;
+                let wounds = usize::from(packet.read_u8().ok()?);
+                // CWound saves one bone byte and 11 quantized hit-type values.
+                packet.read_bytes(wounds * (1 + 11)).ok()?;
+            }
+            _ => return None,
+        }
+        // CActorCondition saves alcohol, flags, satiety, medicine and timed boosters.
+        packet.read_bytes(2 + 11 * size_of::<f32>()).ok()?;
+        let boosters = usize::from(packet.read_u8().ok()?);
+        packet.read_bytes(boosters * (1 + 2 * size_of::<f32>())).ok()?;
+        let active_slot = packet.read_u8().ok()?;
+        packet.read_zstring().ok()?; // CCharacterInfo start dialog
+        packet.read_zstring().ok()?; // actor name
+        packet.read_u32().ok()?; // money
+        if packet.read_bytes(5).ok()?.iter().any(|&flag| flag > 1) {
+            return None;
+        }
+        let mut quick_slots = std::array::from_fn(|_| String::new());
+        for slot in &mut quick_slots {
+            let start = packet.position();
+            *slot = packet.read_zstring().ok()?;
+            let end = packet.position();
+            if end == start || end - start > 32 || self.spawn.client_data[end - 1] != 0 {
+                return None;
+            }
+        }
+        Some(ScopActorInventory { active_slot, quick_slots })
+    }
     /// Construct a new typed `.scop` entity from high-level fields and an explicit `ScopAlifePayload`.
     pub fn new(
         id: u16,

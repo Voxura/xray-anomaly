@@ -24,7 +24,8 @@ use xray_core::ltx_loader::OwnedLtxDocument;
 use xray_formats::fonts::{FontAlignment, FontAtlas, FontDrawParams};
 use xray_formats::spawns::INVALID_OBJECT_ID;
 use xray_formats::scoc::{ScocFile, ScocInventoryItem, ScocPeerState};
-use xray_formats::scop::{ScopActorStats, ScopAlifeKind, ScopAlifePayload, ScopSaveFile};
+use xray_formats::scop::{ScopActorInventory, ScopActorStats, ScopAlifeEntity, ScopAlifeKind, ScopAlifePayload, ScopItemPlace, ScopSaveFile};
+use xray_formats::spawns::AlifeItemAmmoState;
 use xray_formats::vfs_bridge::{load_ltx_tree_from_vfs, load_ui_xml_for_viewport_from_vfs, load_xml_from_vfs};
 use xray_formats::xml_ui::{UiTextureAtlasMap, UiViewport, XmlDocument, XmlNode};
 use xray_render_dx12::bindless::DescriptorIndex;
@@ -98,6 +99,7 @@ pub enum EquipmentSlot {
     Armor,
     Helmet,
     Backpack,
+    NativeSlot(u8),
     Artifact(usize),
     QuickSlot(usize),
 }
@@ -127,6 +129,7 @@ impl EquipmentSlot {
     /// Corresponding X-Ray `HUD` slot index (`1..=6`) if this is a weapon slot.
     pub fn hud_slot_number(self) -> Option<u8> {
         match self {
+            Self::NativeSlot(1) => Some(1),
             Self::Pistol => Some(2),
             Self::PrimaryWeapon => Some(3),
             Self::SecondaryWeapon => Some(4),
@@ -143,6 +146,14 @@ impl EquipmentSlot {
             Self::Armor => "SUIT",
             Self::Helmet => "HELMET",
             Self::Backpack => "PACK",
+            Self::NativeSlot(1) => "KNIFE",
+            Self::NativeSlot(4) => "GRENADE",
+            Self::NativeSlot(5) => "BINOCULARS",
+            Self::NativeSlot(6) => "BOLT",
+            Self::NativeSlot(8) => "PDA",
+            Self::NativeSlot(9) => "DETECTOR",
+            Self::NativeSlot(10) => "TORCH",
+            Self::NativeSlot(_) => "SLOT",
             Self::Artifact(_) => "ART",
             Self::QuickSlot(_) => "QUICK",
         }
@@ -750,6 +761,7 @@ impl InventoryLayout {
                 EquipmentSlot::Armor => ("cont_equ", 7),
                 EquipmentSlot::Helmet => ("cont_equ", 12),
                 EquipmentSlot::Backpack => ("cont_equ", 13),
+                EquipmentSlot::NativeSlot(id) => ("cont_equ", usize::from(*id)),
                 EquipmentSlot::Artifact(index) => ("cont_belt", *index + 1),
                 EquipmentSlot::QuickSlot(index) => ("cont_quick", *index + 1),
             };
@@ -923,6 +935,7 @@ pub struct InventoryManager {
     item_settings: Option<Arc<OwnedLtxDocument>>,
     actor_profiles: BTreeMap<String, String>,
     specific_profile: Option<String>,
+    pub(crate) native_inventory: Option<ScopActorInventory>,
     community_ids: Vec<String>,
     next_uid: u64,
     item_uses_extra: Vec<(xray_formats::scoc::ScocValue, xray_formats::scoc::ScocValue)>,
@@ -1125,6 +1138,7 @@ impl InventoryManager {
             item_settings: None,
             actor_profiles: BTreeMap::new(),
             specific_profile: None,
+            native_inventory: None,
             community_ids: Vec::new(),
             next_uid: 1,
             item_uses_extra: Vec::new(),
@@ -1225,12 +1239,19 @@ impl InventoryManager {
     fn carry_limit_kg(&self) -> f32 {
         let Some(settings) = &self.item_settings else { return self.max_carry_weight_kg };
         let gear_bonus: f32 = self.items.iter().filter_map(|item| {
-            let multiplier = match item.equipped_slot? {
-                EquipmentSlot::Armor | EquipmentSlot::Backpack => 1.0,
-                EquipmentSlot::Artifact(_) => item.condition,
+            let (key, multiplier) = match item.equipped_slot? {
+                // Anomaly's scripted actor menu uses GetAdditionalMaxWeight for equipment.
+                EquipmentSlot::Armor | EquipmentSlot::Backpack if self.native_inventory.is_some() => {
+                    ("additional_inventory_weight2", 1.0)
+                }
+                EquipmentSlot::Armor | EquipmentSlot::Backpack => ("additional_inventory_weight", 1.0),
+                EquipmentSlot::Artifact(_) => {
+                    let condition = if self.native_inventory.is_some() { 1.0 } else { item.condition };
+                    ("additional_inventory_weight", condition)
+                }
                 _ => return None,
             };
-            Some(settings.read_f32(&item.section, "additional_inventory_weight", 0.0) * multiplier)
+            Some(settings.read_f32(&item.section, key, 0.0) * multiplier)
         }).sum();
         (self.max_carry_weight_kg + gear_bonus).max(1.0)
     }
@@ -1244,10 +1265,16 @@ impl InventoryManager {
         let visible_rows = self.grid_rows.min(DEFAULT_GRID_ROWS);
         let mut layout = InventoryLayout::compute(width, height, self.grid_cols, visible_rows);
         layout.grid_scroll_row = self.grid_scroll_row.min(self.max_grid_scroll(visible_rows));
+        if self.native_inventory.is_some() {
+            layout.slot_rects.retain(|(slot, _)| *slot != EquipmentSlot::SecondaryWeapon);
+            layout.slot_rects.extend([1, 4, 5, 6, 8, 9, 10, 11, 14, 15, 16, 17, 18]
+                .into_iter().map(|id| (EquipmentSlot::NativeSlot(id), [0.0; 4])));
+        }
         let viewport = UiViewport::new(width as f32, height as f32);
         if let Some(xml) = self.ui_layouts[usize::from(viewport.is_widescreen())].as_ref() {
             layout.apply_xml(xml, viewport);
         }
+        layout.slot_rects.retain(|(_, rect)| rect[2] > 0.0 && rect[3] > 0.0);
         layout
     }
 
@@ -1312,8 +1339,25 @@ impl InventoryManager {
         self.load_from_scoc_peer_state(&peer);
     }
 
+    pub(crate) fn restore_saved_item_uses(&mut self, peer: &ScocPeerState) {
+        self.item_uses_extra = peer.item_remaining_uses_extra.clone();
+        for item in &mut self.items {
+            if let Some(uses) = item.source_id.and_then(|id| peer.item_remaining_uses.get(&id)) {
+                item.remaining_uses = Some(*uses);
+            }
+        }
+        // Repack so differently used items from the same section retain separate cells.
+        for mut item in std::mem::take(&mut self.items) {
+            if item.equipped_slot.is_none() {
+                item.grid_pos = self.place_in_bag(&item);
+            }
+            self.items.push(item);
+        }
+    }
+
     /// Hydrate from extracted [`ScocPeerState`] (`inventory` + `item_remaining_uses`).
     pub fn load_from_scoc_peer_state(&mut self, peer: &ScocPeerState) {
+        self.native_inventory = None;
         self.items.clear();
         self.drag = None;
         self.selected_uid = None;
@@ -1364,6 +1408,12 @@ impl InventoryManager {
         alife: &AlifeManager,
         grid_index: Option<&ItemGridIndex>,
     ) {
+        self.native_inventory = None;
+        if let Some(actor) = alife.host_actor().and_then(|actor| actor.source_scop.as_ref())
+            && self.hydrate_native_inventory(actor, alife.entities.values().filter_map(|entity| entity.source_scop.as_ref()), grid_index)
+        {
+            return;
+        }
         self.specific_profile = alife.host_actor().and_then(|actor| {
             let source = actor.source_scop.as_ref()?;
             if let ScopAlifePayload::Actor(saved) = &source.payload {
@@ -1450,6 +1500,87 @@ impl InventoryManager {
         self.hud_sync_dirty = true;
     }
 
+    fn hydrate_native_inventory<'a>(
+        &mut self,
+        actor: &ScopAlifeEntity,
+        entities: impl Iterator<Item = &'a ScopAlifeEntity>,
+        grid_index: Option<&ItemGridIndex>,
+    ) -> bool {
+        let Some(native) = actor.actor_inventory_client_state() else {
+            return false;
+        };
+        self.native_inventory = Some(native);
+        self.specific_profile = match &actor.payload {
+            ScopAlifePayload::Actor(state) => Some(state.trader.specific_character.clone()),
+            _ => None,
+        };
+        self.items.clear();
+        self.drag = None;
+        self.selected_uid = None;
+        self.grid_scroll_row = 0;
+        self.grid_rows = DEFAULT_GRID_ROWS;
+
+        let mut items = Vec::new();
+        let mut belt_slot = 0;
+        for entity in entities.filter(|entity| entity.id() != actor.id() && entity.parent_id() == actor.id()) {
+            let mut item = InventoryItem::from_section_indexed(self.allocate_uid(), entity.section(), grid_index);
+            item.source_id = Some(i64::from(entity.id()));
+            self.apply_item_metadata(&mut item);
+            if let ScopAlifePayload::Weapon(weapon) = &entity.payload {
+                item.ammo_elapsed = Some(i64::from(weapon.ammo_elapsed));
+                item.ammo_type = Some(i64::from(weapon.ammo_type));
+            }
+            if item.category == ItemCategory::Ammo
+                && let Ok(ammo) = AlifeItemAmmoState::parse(entity.spawn.version, &entity.spawn.state_payload)
+            {
+                item.ammo_elapsed = Some(i64::from(ammo.ammo_left));
+                if let Some(settings) = &self.item_settings {
+                    let box_size = settings.read_f32(&item.section, "box_size", 0.0);
+                    if box_size > 0.0 {
+                        item.weight_kg *= f32::from(ammo.ammo_left) / box_size;
+                    }
+                }
+            }
+            if let Some((place, condition)) = entity.inventory_item_client_state() {
+                item.condition = condition;
+                item.equipped_slot = match place {
+                    ScopItemPlace::Slot(2) => Some(EquipmentSlot::Pistol),
+                    ScopItemPlace::Slot(3) => Some(EquipmentSlot::PrimaryWeapon),
+                    ScopItemPlace::Slot(7) => Some(EquipmentSlot::Armor),
+                    ScopItemPlace::Slot(12) => Some(EquipmentSlot::Helmet),
+                    ScopItemPlace::Slot(13) => Some(EquipmentSlot::Backpack),
+                    ScopItemPlace::Slot(id @ (1 | 4..=6 | 8..=11 | 14..=18)) => Some(EquipmentSlot::NativeSlot(id)),
+                    ScopItemPlace::Belt if belt_slot < ARTIFACT_SLOT_COUNT => {
+                        let slot = belt_slot;
+                        belt_slot += 1;
+                        Some(EquipmentSlot::Artifact(slot))
+                    }
+                    _ => None,
+                };
+            } else if let ScopAlifePayload::InventoryItem(saved) = &entity.payload {
+                item.condition = saved.condition.clamp(0.0, 1.0);
+            }
+            items.push(item);
+        }
+
+        // InventoryUtilities::GreaterRoomInRuck fits wide and tall items first.
+        items.sort_by(|left, right| {
+            (right.grid_size, right.section.as_str(), right.source_id)
+                .cmp(&(left.grid_size, left.section.as_str(), left.source_id))
+        });
+        for mut item in items {
+            if item.equipped_slot.is_some_and(|slot| self.item_in_slot(slot).is_some()) {
+                item.equipped_slot = None;
+            }
+            if item.equipped_slot.is_none() {
+                item.grid_pos = self.place_in_bag(&item);
+            }
+            self.items.push(item);
+        }
+        self.hud_sync_dirty = true;
+        true
+    }
+
     /// Export live inventory items and `item_remaining_uses` into a [`ScocPeerState`].
     pub fn write_to_scoc_peer_state(&self, peer: &mut ScocPeerState) {
         peer.inventory.clear();
@@ -1475,6 +1606,13 @@ impl InventoryManager {
     /// Hydrate actor stats and actor-owned inventory entities (`parent_id == actor_id`) from a [`ScopSaveFile`].
     pub fn load_from_scop(&mut self, scop: &ScopSaveFile) {
         self.actor_stats = scop.header.actor_stats.clone();
+        self.native_inventory = None;
+        let grid_index = self.grid_index.clone();
+        if let Some(actor) = scop.entities.iter().find(|entity| entity.kind() == ScopAlifeKind::Actor)
+            && self.hydrate_native_inventory(actor, scop.entities.iter(), grid_index.as_deref())
+        {
+            return;
+        }
         let actor_id = scop
             .entities
             .iter()
@@ -1636,7 +1774,7 @@ impl InventoryManager {
             && left.grid_size == right.grid_size
             && (left.condition - right.condition).abs() < 0.01
             && left.remaining_uses == right.remaining_uses
-            && left.ammo_elapsed == right.ammo_elapsed
+            && (left.category == ItemCategory::Ammo || left.ammo_elapsed == right.ammo_elapsed)
             && left.ammo_type == right.ammo_type
             && left.ammo_section == right.ammo_section
     }
@@ -1666,7 +1804,12 @@ impl InventoryManager {
             }
             let Some(pos) = item.grid_pos else { continue };
             let stack = stacks.entry(pos).or_insert((item, 0));
-            stack.1 = stack.1.saturating_add(item.quantity.max(1));
+            let count = if item.category == ItemCategory::Ammo {
+                item.ammo_elapsed.and_then(|rounds| u32::try_from(rounds).ok()).unwrap_or(1)
+            } else {
+                1
+            };
+            stack.1 = stack.1.saturating_add(count.saturating_mul(item.quantity.max(1)));
         }
         stacks
     }
@@ -1702,6 +1845,8 @@ impl InventoryManager {
             EquipmentSlot::Armor => category == ItemCategory::Outfit,
             EquipmentSlot::Helmet => category == ItemCategory::Helmet,
             EquipmentSlot::Backpack => category == ItemCategory::Backpack,
+            EquipmentSlot::NativeSlot(1 | 4) => category == ItemCategory::Weapon,
+            EquipmentSlot::NativeSlot(_) => false,
             EquipmentSlot::Artifact(idx) => {
                 idx < ARTIFACT_SLOT_COUNT && category == ItemCategory::Artifact
             }
@@ -1725,6 +1870,10 @@ impl InventoryManager {
         };
         if !Self::is_compatible(cat, slot) {
             return false;
+        }
+        if let EquipmentSlot::QuickSlot(index) = slot && let Some(native) = &mut self.native_inventory {
+            native.quick_slots[index] = section;
+            return true;
         }
 
         // If slot is already occupied by a different item, move occupant back into free grid cell
@@ -1803,6 +1952,9 @@ impl InventoryManager {
             (EquipmentSlot::PrimaryWeapon, 3usize, "wpn_ak74"),
             (EquipmentSlot::SecondaryWeapon, 4usize, "wpn_mp5"),
         ];
+        if let Some(knife) = self.item_in_slot(EquipmentSlot::NativeSlot(1)) {
+            hw.slots[0] = build_weapon_spec_for_section(1, &knife.section, knife.ammo_elapsed);
+        }
         for (eq_slot, hud_idx, default_sec) in slot_mappings {
             let slot_arr_idx = hud_idx - 1;
             if let Some(item) = self.item_in_slot(eq_slot).cloned() {
@@ -1944,7 +2096,12 @@ impl InventoryManager {
         alife: Option<&mut AlifeManager>,
         audio: Option<&mut AudioManager>,
     ) -> Option<ItemUseEffect> {
-        let uid = self.item_in_slot(EquipmentSlot::QuickSlot(slot_idx))?.uid;
+        let uid = if let Some(native) = &self.native_inventory {
+            let section = native.quick_slots.get(slot_idx)?;
+            self.items.iter().find(|item| item.section == *section)?.uid
+        } else {
+            self.item_in_slot(EquipmentSlot::QuickSlot(slot_idx))?.uid
+        };
         self.use_item(uid, hud_weapon, alife, audio)
     }
 
@@ -2445,6 +2602,19 @@ impl InventoryManager {
 
             // Equipment Slots
             for (slot, rect) in &layout.slot_rects {
+                if let EquipmentSlot::QuickSlot(index) = slot && let Some(native) = &self.native_inventory {
+                    let section = &native.quick_slots[*index];
+                    if let Some(tex) = equipment_tex
+                        && let Some((_, _, w, h)) = self.grid_index.as_ref().and_then(|icons| icons.get(section))
+                        && w > 0 && h > 0
+                    {
+                        let uv = item_icon_uv_indexed(section, ItemCategory::Consumable, self.grid_index.as_deref());
+                        let icon = fit_inventory_icon([rect[0] + 4.0, rect[1] + 4.0, rect[2] - 8.0, rect[3] - 13.0], f32::from(w) / f32::from(h));
+                        let opacity = if self.items.iter().any(|item| item.section == *section) { 1.0 } else { 0.35 };
+                        renderer.ui_draw_textured_rect(icon, uv, tex, [1.0, 1.0, 1.0, opacity]);
+                        drawn += 1;
+                    }
+                }
                 let occ = self.item_in_slot(*slot);
                 let is_sel = occ.is_some_and(|i| Some(i.uid) == self.selected_uid);
                 if is_sel || layout.backgrounds.is_empty() {
@@ -2548,7 +2718,9 @@ impl InventoryManager {
                         18, item.condition, condition_bar_color(item.condition),
                     );
                 }
-                if count > 1 && iy >= top && iy + 12.0 <= bottom && let Some(f) = font {
+                if (count > 1 || (item.category == ItemCategory::Ammo && item.ammo_elapsed.is_some()))
+                    && iy >= top && iy + 12.0 <= bottom && let Some(f) = font
+                {
                     let text = format!("x{count}");
                     renderer.ui_fill_rect([ix, iy, 7.0 * text.len() as f32 + 3.0, 12.0], [0.10, 0.14, 0.09, 0.94]);
                     drawn += 1 + f.draw_text(renderer, &text, [ix + 2.0, iy], 11.0, [0.88, 0.91, 0.73, 1.0]);
