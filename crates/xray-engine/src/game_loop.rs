@@ -427,6 +427,12 @@ impl EngineRuntime {
             return Ok(false);
         }
 
+        // Monolith continues simulation while inactive and skips submitting frames.
+        let render_active = !self.config.window.visible || self.window.is_foreground();
+        if !render_active {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
         // 2. Handle window resize
         if self.camera.aspect != (self.window.height() as f32 / self.window.width() as f32) {
             self.camera.resize(self.window.width(), self.window.height());
@@ -493,7 +499,7 @@ impl EngineRuntime {
                 self.input.set_cursor_locked(true);
             }
 
-            if let (Some(r), Some(rb)) = (&mut self.renderer, &mut self.render_bridge) {
+            if render_active && let (Some(r), Some(rb)) = (&mut self.renderer, &mut self.render_bridge) {
                 r.begin_frame()?;
                 rb.render_frame_with_transition(
                     r,
@@ -925,7 +931,7 @@ impl EngineRuntime {
         }
 
         // 6. Direct3D 12 7-stage render graph presentation + first-person HUD weapon + UI Canvas pass
-        if let (Some(r), Some(rb)) = (&mut self.renderer, &mut self.render_bridge) {
+        if render_active && let (Some(r), Some(rb)) = (&mut self.renderer, &mut self.render_bridge) {
             let animated_camera = self.hud_weapon.backpack_camera_offset()
                 .map(|offset| self.camera.with_render_offset(&offset));
             r.begin_frame()?;

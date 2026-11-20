@@ -561,7 +561,8 @@ fn test_full_dx12_7stage_render_graph_and_capsule_physics_loop() {
         .expect("render bridge present")
         .last_stats;
 
-    assert!(stats.early_z_draws >= 3, "expected Early-Z static + dynamic draws, got {:?}", stats);
+    assert!(stats.scene_depth_copied, "expected opaque scene depth to be reused by forward effects");
+    assert_eq!(stats.early_z_draws, 0, "expected one geometry pass to fill scene depth");
     assert!(stats.gbuffer_static_draws >= 1, "expected G-Buffer static draw");
     assert!(
         stats.gbuffer_dynamic_draws >= 2,

@@ -1,13 +1,13 @@
 //! DirectX 12 Render Graph Pipeline Bridge (`xray-engine`)
 //!
 //! Coordinates [`WorldLoader`] (`LoadedWorld`) and [`AlifeManager`] geometry/textures/lighting/weather
-//! into the 7-stage [`Dx12Renderer`] frame pass sequence inside `EngineRuntime::step_frame`:
-//!   a) Early-Z Depth Prepass (`draw_depth_prepass`)
+//! into the [`Dx12Renderer`] frame pass sequence inside `EngineRuntime::step_frame`:
+//!   a) Static visibility and target clear
 //!   b) G-Buffer MRT Pass (`begin_gbuffer_pass` -> `draw_gbuffer_mesh` -> `end_gbuffer_pass`)
 //!   c) 3-Split Cascaded Shadow Map Pass (`build_3split_csm_atlas` + `CascadedShadowAtlas` + `draw_csm_shadow_mesh`)
 //!   d) Deferred Lighting Combine (`execute_deferred_combine_csm` with CSM PCF, SSFX volumetrics & dynamic lights)
 //!   f) Filmic Postprocessing Resolve (`draw_postprocess`: bloom, exposure, Uncharted2/ACES tonemapping -> backbuffer)
-//!   e) Forward Alpha & Environment Effects (Early-Z occluded `draw_sky`, `draw_clouds`, `draw_details`,
+//!   e) Forward Alpha & Environment Effects (scene-depth occluded `draw_sky`, `draw_clouds`, `draw_details`,
 //!      `draw_wallmarks`, `draw_rain`, `draw_particles`)
 //!   g) UI Canvas HUD Overlay (`ui_draw_crosshair`, health/stamina `ui_draw_meter_bar`, `ui_flush`)
 //!
@@ -15,9 +15,9 @@
 //! `PostprocessRenderer`'s pipeline outputs opaque fullscreen HDR->LDR (`BlendEnable = false`,
 //! `DepthEnable = false`) onto the swapchain RTV, while all forward renderers (`SkyRenderer`,
 //! `CloudRenderer`, `DetailRenderer`, `WallmarkRenderer`, `RainRenderer`, `ParticleSystemRenderer`)
-//! render directly to the swapchain RTV tested against Stage (a)'s Early-Z depth buffer (`sc.dsv_handle()`).
+//! render directly to the swapchain RTV using the depth copied from the G-Buffer.
 //! Resolving the deferred HDR target to the backbuffer right before forward passes ensures opaque
-//! deferred geometry is properly tonemapped AND preserves Early-Z sky/rain/foliage occlusion without
+//! deferred geometry is properly tonemapped and preserves sky/rain/foliage occlusion without
 //! wiping forward effects.
 
 use std::collections::BTreeMap;
@@ -125,6 +125,7 @@ impl Default for HudOverlayState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameRenderStats {
     pub early_z_draws: u32,
+    pub scene_depth_copied: bool,
     pub gbuffer_static_draws: u32,
     pub gbuffer_dynamic_draws: u32,
     pub csm_cascade_draws: [u32; 3],
@@ -661,34 +662,9 @@ impl RenderBridge {
         )?;
 
         // ---------------------------------------------------------------------
-        // Stage (a): Early-Z Depth Prepass -> primes swapchain DSV for sky/FX occlusion
+        // Stage (a): Clear the swapchain targets
         // ---------------------------------------------------------------------
         renderer.clear_backbuffer([0.04, 0.05, 0.08, 1.0]);
-        for mesh in &self.world_meshes {
-            if mesh.bsphere_radius > 1e-4 {
-                let dist_sq = distance_sq(camera.position, mesh.bsphere_center);
-                if dist_sq > (MAX_VIS_DIST + mesh.bsphere_radius).powi(2) {
-                    continue;
-                }
-                if !frustum.test_sphere(mesh.bsphere_center, mesh.bsphere_radius) {
-                    continue;
-                }
-                // Early-Z occluder filtering: skip distant tiny objects that do not occlude geometry
-                if mesh.bsphere_radius < 0.8 && dist_sq > 40.0 * 40.0 {
-                    continue;
-                }
-            }
-            let handle = mesh.fastpath_handle.unwrap_or(mesh.mesh_handle);
-            renderer.draw_depth_prepass(handle, u32::MAX)?;
-            stats.early_z_draws += 1;
-        }
-        for inst in &dynamic_draws {
-            for sub in &inst.submeshes {
-                renderer.draw_depth_prepass(sub.mesh_handle, inst.transform_index)?;
-                stats.early_z_draws += 1;
-            }
-        }
-
         // ---------------------------------------------------------------------
         // Stage (b): G-Buffer MRT Pass (Albedo, Normal, Material + Depth)
         // ---------------------------------------------------------------------
@@ -726,6 +702,9 @@ impl RenderBridge {
             }
         }
         renderer.end_gbuffer_pass()?;
+        // R4 reuses the opaque scene depth for forward rendering.
+        renderer.copy_scene_depth_to_backbuffer()?;
+        stats.scene_depth_copied = true;
 
         // ---------------------------------------------------------------------
         // Stage (c): 3-Split Cascaded Shadow Map (CSM) Pass
@@ -862,7 +841,7 @@ impl RenderBridge {
         stats.postprocess_executed = true;
 
         // ---------------------------------------------------------------------
-        // Stage (e): Forward Alpha & Atmospheric Effects (Early-Z Depth Occluded)
+        // Stage (e): Forward Alpha & Atmospheric Effects (scene depth occlusion)
         // ---------------------------------------------------------------------
         // e.1 Sky Dome
         let (sky_tex0, sky_tex1, sky_blend, sky_color, sun_glow) = if let Some(e) = env {

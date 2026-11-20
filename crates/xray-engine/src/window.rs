@@ -10,7 +10,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetWindowLongPtrW, PeekMessageW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW,
+    GetForegroundWindow, GetWindowLongPtrW, PeekMessageW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW,
     ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, MSG,
     PM_REMOVE, SW_HIDE, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
@@ -179,6 +179,10 @@ impl EngineWindow {
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.state.is_closed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_foreground(&self) -> bool {
+        unsafe { GetForegroundWindow() == self.hwnd }
     }
 
     /// Enqueue a synthetic window event into the pending queue (useful for automated runtime tests).

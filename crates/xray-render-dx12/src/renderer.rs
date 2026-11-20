@@ -1146,6 +1146,20 @@ impl Dx12Renderer {
         Ok(())
     }
 
+    /// Preserve opaque scene depth for forward effects on the swapchain.
+    /// Call after `end_gbuffer_pass` and before drawing any forward geometry.
+    pub fn copy_scene_depth_to_backbuffer(&self) -> WinResult<()> {
+        let (Some(cmd), Some(targets), Some(depth)) = (
+            self.current_cmd_list.as_ref(),
+            self.gbuffer.as_ref().and_then(|buffer| buffer.targets.as_ref()),
+            self.swapchain.as_ref().and_then(SwapChainManager::depth_buffer_resource),
+        ) else {
+            return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        };
+        targets.copy_scene_depth(cmd, depth);
+        Ok(())
+    }
+
     /// Execute the deferred lighting combine pass into the HDR accumulation target and return its bindless SRV
     pub fn execute_deferred_combine(
         &mut self,

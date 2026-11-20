@@ -30,7 +30,8 @@ fn transition_barrier(
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                pResource: ManuallyDrop::new(Some(resource.clone())),
+                // The caller holds the resource through command recording.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
                 Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                 StateBefore: before,
                 StateAfter: after,
@@ -535,6 +536,23 @@ impl GBufferTargets {
         ];
         unsafe {
             cmd.ResourceBarrier(&barriers);
+        }
+    }
+
+    pub(crate) fn copy_scene_depth(&self, cmd: &ID3D12GraphicsCommandList, destination: &ID3D12Resource) {
+        let to_copy = [
+            transition_barrier(&self.depth, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition_barrier(destination, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_DEST),
+        ];
+        let from_copy = [
+            transition_barrier(&self.depth, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            transition_barrier(destination, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+        ];
+        unsafe {
+            cmd.ResourceBarrier(&to_copy);
+            // Both textures are single-sample and belong to the R32 format family.
+            cmd.CopyResource(destination, &self.depth);
+            cmd.ResourceBarrier(&from_copy);
         }
     }
 
