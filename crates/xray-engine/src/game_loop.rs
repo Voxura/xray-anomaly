@@ -180,9 +180,11 @@ impl EngineRuntime {
 
     /// Attach a shared [`VirtualFileSystem`] for on-demand dynamic model/texture/audio streaming.
     pub fn attach_vfs(&mut self, vfs: Arc<VirtualFileSystem>) {
-        let grid_index = Arc::new(ItemGridIndex::load_from_vfs(&vfs));
-        self.inventory.set_grid_index(Arc::clone(&grid_index));
         self.inventory.load_ui_layouts(&vfs);
+        let mut grid_index = ItemGridIndex::load_from_vfs(&vfs);
+        self.inventory.resolve_inventory_icons(&mut grid_index);
+        let grid_index = Arc::new(grid_index);
+        self.inventory.set_grid_index(Arc::clone(&grid_index));
         self.item_grid_index = Some(grid_index);
         self.audio.attach_vfs(Arc::clone(&vfs));
         self.pda.invalidate_map_cache();
@@ -562,6 +564,13 @@ impl EngineRuntime {
             || self.level_transition.is_modal_open()
             || inventory_input_locked;
         self.input.set_cursor_locked(inventory_input_locked || !modal_open);
+        if !modal_open {
+            for slot in 0..crate::ui_inventory::QUICK_SLOT_COUNT {
+                if self.input.is_key_just_pressed(EngineInput::VK_F1 + slot) {
+                    self.inventory.use_quick_slot(slot, None, self.alife.as_mut(), Some(&mut self.audio));
+                }
+            }
+        }
 
         // 4. Update camera orientation from mouse delta & compute world-space XZ wish vector
         if !modal_open && self.input.is_cursor_locked() {

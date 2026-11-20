@@ -229,9 +229,7 @@ pub struct RenderBridge {
     default_cube_mesh: MeshHandle,
     ui_font: Option<UiFontResource>,
     ui_font_attempted: bool,
-    ui_hud_tex: Option<DescriptorIndex>,
     ui_equipment_tex: Option<DescriptorIndex>,
-    ui_actor_menu_tex: Option<DescriptorIndex>,
     ui_grid_tex: Option<DescriptorIndex>,
     inventory_atlas: Option<UiTextureAtlasMap>,
 }
@@ -279,9 +277,7 @@ impl RenderBridge {
             default_cube_mesh,
             ui_font: None,
             ui_font_attempted: false,
-            ui_hud_tex: None,
             ui_equipment_tex: None,
-            ui_actor_menu_tex: None,
             ui_grid_tex: None,
             inventory_atlas: None,
         })
@@ -1109,9 +1105,7 @@ impl RenderBridge {
             {
                 self.ui_font_attempted = true;
                 self.ui_font = try_load_ui_font(renderer, vfs_ref, height);
-                self.ui_hud_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_hud.dds");
                 self.ui_equipment_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_icon_equipment.dds");
-                self.ui_actor_menu_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_actor_menu.dds");
                 self.ui_grid_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_grid.dds");
                 self.inventory_atlas = load_ui_texture_atlases_from_vfs(vfs_ref).ok().or_else(|| {
                     let doc = load_xml_from_vfs(vfs_ref, "configs/ui/textures_descr/ui_actor_menu.xml").ok()?;
@@ -1137,9 +1131,7 @@ impl RenderBridge {
                     draw_crosshair,
                     hud.stamina,
                     font_ref,
-                    self.ui_hud_tex,
                     self.ui_equipment_tex,
-                    self.ui_actor_menu_tex,
                     self.ui_grid_tex,
                     self.inventory_atlas.as_ref(),
                     vfs,

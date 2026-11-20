@@ -20,11 +20,12 @@ use crate::alife_manager::{AlifeManager, EntityRole};
 use crate::hud_weapon::{HudWeaponController, WeaponFireMode, WeaponSpec};
 use crate::input::{EngineInput, MouseButton};
 use xray_audio::AudioManager;
+use xray_core::ltx_loader::OwnedLtxDocument;
 use xray_formats::fonts::{FontAlignment, FontAtlas, FontDrawParams};
 use xray_formats::spawns::INVALID_OBJECT_ID;
 use xray_formats::scoc::{ScocFile, ScocInventoryItem, ScocPeerState};
-use xray_formats::scop::{ScopActorStats, ScopAlifeKind, ScopSaveFile};
-use xray_formats::vfs_bridge::load_ui_xml_for_viewport_from_vfs;
+use xray_formats::scop::{ScopActorStats, ScopAlifeKind, ScopAlifePayload, ScopSaveFile};
+use xray_formats::vfs_bridge::{load_ltx_tree_from_vfs, load_ui_xml_for_viewport_from_vfs, load_xml_from_vfs};
 use xray_formats::xml_ui::{UiTextureAtlasMap, UiViewport, XmlDocument, XmlNode};
 use xray_render_dx12::bindless::DescriptorIndex;
 use xray_render_dx12::renderer::Dx12Renderer;
@@ -545,6 +546,12 @@ pub struct InventoryLayout {
     rotated_slots: Vec<EquipmentSlot>,
     weight_rect: Option<[f32; 4]>,
     money_rect: Option<[f32; 4]>,
+    name_rect: Option<[f32; 4]>,
+    faction_rect: Option<[f32; 4]>,
+    portrait_rect: Option<[f32; 4]>,
+    health_rect: Option<[f32; 4]>,
+    condition_rects: BTreeMap<EquipmentSlot, [f32; 4]>,
+    filter_buttons: Vec<(usize, [f32; 4], String)>,
 }
 
 impl InventoryLayout {
@@ -670,6 +677,12 @@ impl InventoryLayout {
             rotated_slots: Vec::new(),
             weight_rect: None,
             money_rect: None,
+            name_rect: None,
+            faction_rect: None,
+            portrait_rect: None,
+            health_rect: None,
+            condition_rects: BTreeMap::new(),
+            filter_buttons: Vec::new(),
         }
     }
 
@@ -705,10 +718,30 @@ impl InventoryLayout {
                 let texture = background.navigate("texture", 0)?.read_text()?.trim().to_owned();
                 Some((viewport.virtual_to_screen_rect(relative(background, origin)), texture))
             }).collect();
-        self.weight_rect = player.navigate("weight_caption", 0)
+        let player_control = |path| player.navigate(path, 0)
             .map(|node| viewport.virtual_to_screen_rect(relative(node, player_origin)));
-        self.money_rect = player.navigate("money", 0)
-            .map(|node| viewport.virtual_to_screen_rect(relative(node, player_origin)));
+        self.weight_rect = player_control("weight_caption");
+        self.money_rect = player_control("money");
+        self.name_rect = player_control("name");
+        self.faction_rect = player_control("community");
+        self.portrait_rect = player_control("icon");
+        self.health_rect = equipment.navigate("actor_state_info", 0).and_then(|state| {
+            let [x, y, _, _] = relative(state, equipment_origin);
+            let sensor = state.navigate("health_sensor", 0)?;
+            let [x, y, _, _] = relative(sensor, [x, y]);
+            let progress = sensor.navigate("state_progress", 0)?;
+            Some(viewport.virtual_to_screen_rect(relative(progress, [x, y])))
+        });
+        if let Some(sorter) = equipment.navigate("sorter", 0) {
+            let [x, y, _, _] = relative(sorter, equipment_origin);
+            for index in 0..8 {
+                if let Some(button) = sorter.navigate(&format!("btn_{}", index + 1), 0)
+                    && let Some(texture) = button.navigate("texture", 0).and_then(XmlNode::read_text)
+                {
+                    self.filter_buttons.push((index, viewport.virtual_to_screen_rect(relative(button, [x, y])), texture.trim().to_owned()));
+                }
+            }
+        }
         for (slot, rect) in &mut self.slot_rects {
             let (container, id) = match slot {
                 EquipmentSlot::Pistol => ("cont_equ", 2),
@@ -723,7 +756,11 @@ impl InventoryLayout {
             let Some(container) = equipment.navigate(container, 0) else { continue };
             let container_rect = relative(container, equipment_origin);
             let Some(cell) = container.navigate(&format!("cell_{id}"), 0) else { continue };
-            *rect = viewport.virtual_to_screen_rect(relative(cell, [container_rect[0], container_rect[1]]));
+            let [x, y, w, h] = relative(cell, [container_rect[0], container_rect[1]]);
+            *rect = viewport.virtual_to_screen_rect([x, y, w, h]);
+            if let Some(bar) = cell.navigate("bar", 0) {
+                self.condition_rects.insert(*slot, viewport.virtual_to_screen_rect(relative(bar, [x, y])));
+            }
             if cell.navigate("pic", 0).is_some_and(|pic| {
                 pic.attr_bool("heading", false) && pic.attr_f32("heading_angle", 0.0).abs() == 90.0
             }) {
@@ -838,6 +875,33 @@ fn full_backpack_grows_and_scrolls_to_the_last_item() {
     assert_eq!(inventory.item_at_grid_cell(col, row).unwrap().uid, last);
 }
 
+#[cfg(test)]
+#[test]
+fn configured_weight_and_display_stacks_preserve_individual_items() {
+    use xray_core::ltx_loader::LoadedLtxSource;
+
+    let mut inventory = InventoryManager::new();
+    inventory.ui_layouts[0] = Some(Arc::new(XmlDocument::parse("<w/>").unwrap()));
+    inventory.item_settings = Some(Arc::new(OwnedLtxDocument::from_sources(&[LoadedLtxSource {
+        virtual_path: "items.ltx".to_owned(),
+        depth: 0,
+        text: "[base_food]\ninv_weight = 0.1\n[bandage]:base_food\n[stalker_outfit]\nadditional_inventory_weight = 12\n".to_owned(),
+    }])));
+    let first = inventory.add_item("bandage");
+    let second = inventory.add_item("bandage");
+    let cell = inventory.item(first).unwrap().grid_pos.unwrap();
+    assert_eq!(inventory.item(second).unwrap().grid_pos, Some(cell));
+    assert_eq!(inventory.visible_bag_stacks()[&cell].1, 2);
+    assert!((inventory.total_weight_kg() - 0.2).abs() < 1e-5);
+
+    let outfit = inventory.add_item("stalker_outfit");
+    assert!(inventory.equip_item(outfit, EquipmentSlot::Armor, None, None));
+    assert_eq!(inventory.carry_limit_kg(), 62.0);
+    assert!(inventory.move_item_to_grid(first, cell.0 + 1, cell.1));
+    assert_eq!(inventory.visible_bag_stacks()[&cell].1, 1);
+    assert_eq!(inventory.item_at_grid_cell(cell.0, cell.1).unwrap().uid, second);
+}
+
 /// Complete runtime inventory, equipment, actor vital stats, and dialogue manager.
 #[derive(Debug, Clone)]
 pub struct InventoryManager {
@@ -845,6 +909,7 @@ pub struct InventoryManager {
     pub grid_cols: u8,
     pub grid_rows: u8,
     grid_scroll_row: u8,
+    bag_filter: usize,
     pub items: Vec<InventoryItem>,
     pub actor_stats: ScopActorStats,
     pub selected_uid: Option<u64>,
@@ -855,6 +920,10 @@ pub struct InventoryManager {
     pub max_carry_weight_kg: f32,
     pub grid_index: Option<Arc<ItemGridIndex>>,
     ui_layouts: [Option<Arc<XmlDocument>>; 2],
+    item_settings: Option<Arc<OwnedLtxDocument>>,
+    actor_profiles: BTreeMap<String, String>,
+    specific_profile: Option<String>,
+    community_ids: Vec<String>,
     next_uid: u64,
     item_uses_extra: Vec<(xray_formats::scoc::ScocValue, xray_formats::scoc::ScocValue)>,
 }
@@ -1042,6 +1111,7 @@ impl InventoryManager {
             grid_cols: DEFAULT_GRID_COLS,
             grid_rows: DEFAULT_GRID_ROWS,
             grid_scroll_row: 0,
+            bag_filter: 0,
             items: Vec::new(),
             actor_stats: ScopActorStats::default(),
             selected_uid: None,
@@ -1052,6 +1122,10 @@ impl InventoryManager {
             max_carry_weight_kg: 50.0,
             grid_index: None,
             ui_layouts: [None, None],
+            item_settings: None,
+            actor_profiles: BTreeMap::new(),
+            specific_profile: None,
+            community_ids: Vec::new(),
             next_uid: 1,
             item_uses_extra: Vec::new(),
         }
@@ -1094,6 +1168,76 @@ impl InventoryManager {
             load_ui_xml_for_viewport_from_vfs(vfs, "configs/ui/ui_inventory.xml", &viewport)
                 .ok().map(Arc::new)
         });
+        self.item_settings = load_ltx_tree_from_vfs(vfs, "configs/system.ltx", &[]).ok().map(Arc::new);
+        if let Some(settings) = &self.item_settings {
+            self.max_carry_weight_kg = settings.read_f32("inventory", "max_weight", self.max_carry_weight_kg);
+            for item in &mut self.items {
+                item.weight_kg = settings.read_f32(&item.section, "inv_weight", item.weight_kg);
+            }
+        }
+        self.actor_profiles.clear();
+        if let Ok(doc) = load_xml_from_vfs(vfs, "configs/gameplay/character_desc_general_actor.xml") {
+            let profiles = doc.roots.iter().flat_map(|node| {
+                std::iter::once(node)
+                    .filter(|root| root.name == "specific_character")
+                    .chain(node.children_named("specific_character"))
+            });
+            for profile in profiles {
+                if let Some(id) = profile.attr("id")
+                    && let Some(icon) = profile.navigate("icon", 0).and_then(XmlNode::read_text)
+                {
+                    self.actor_profiles.insert(id.to_owned(), icon.trim().to_owned());
+                }
+            }
+        }
+        self.community_ids = load_ltx_tree_from_vfs(vfs, "configs/creatures/game_relations.ltx", &[])
+            .ok().and_then(|doc| {
+                Some(doc.read_str("game_relations", "communities")?.split(',').step_by(2)
+                    .map(|id| id.trim().to_owned()).collect())
+            }).unwrap_or_default();
+    }
+
+    fn apply_item_metadata(&self, item: &mut InventoryItem) {
+        if let Some(settings) = &self.item_settings {
+            item.weight_kg = settings.read_f32(&item.section, "inv_weight", item.weight_kg);
+        }
+        if let Some((_, _, width, height)) = self.grid_index.as_ref().and_then(|index| index.get(&item.section)) {
+            item.grid_size = (width.max(1), height.max(1));
+        }
+    }
+
+    pub(crate) fn resolve_inventory_icons(&self, grid: &mut ItemGridIndex) {
+        let Some(settings) = &self.item_settings else { return };
+        for section in settings.sections.keys() {
+            let layout = || {
+                let x = settings.read_str(section, "inv_grid_x")?.parse::<u32>().ok()?;
+                let y = settings.read_str(section, "inv_grid_y")?.parse::<u32>().ok()?;
+                let width = settings.read_str(section, "inv_grid_width")?.parse::<u8>().ok()?;
+                let height = settings.read_str(section, "inv_grid_height")?.parse::<u8>().ok()?;
+                (width > 0 && height > 0).then_some((x, y, width, height))
+            };
+            if let Some(rect) = layout() {
+                grid.entries.insert(section.to_ascii_lowercase(), rect);
+            }
+        }
+    }
+
+    fn carry_limit_kg(&self) -> f32 {
+        let Some(settings) = &self.item_settings else { return self.max_carry_weight_kg };
+        let gear_bonus: f32 = self.items.iter().filter_map(|item| {
+            let multiplier = match item.equipped_slot? {
+                EquipmentSlot::Armor | EquipmentSlot::Backpack => 1.0,
+                EquipmentSlot::Artifact(_) => item.condition,
+                _ => return None,
+            };
+            Some(settings.read_f32(&item.section, "additional_inventory_weight", 0.0) * multiplier)
+        }).sum();
+        (self.max_carry_weight_kg + gear_bonus).max(1.0)
+    }
+
+    fn actor_community(&self) -> Option<&str> {
+        let index = usize::try_from(self.actor_stats.community_index).ok()?;
+        self.community_ids.get(index).map(String::as_str)
     }
 
     pub fn layout(&self, width: u32, height: u32) -> InventoryLayout {
@@ -1108,10 +1252,25 @@ impl InventoryManager {
     }
 
     fn max_grid_scroll(&self, visible_rows: u8) -> u8 {
-        self.items.iter().filter_map(|item| {
+        self.items.iter().filter(|item| self.matches_bag_filter(item)).filter_map(|item| {
             let (_, row) = item.grid_pos?;
             Some(row.saturating_add(item.grid_size.1))
         }).max().unwrap_or(0).saturating_sub(visible_rows)
+    }
+
+    fn matches_bag_filter(&self, item: &InventoryItem) -> bool {
+        let utility = item.category == ItemCategory::Misc
+            && ["tool", "repair", "kit"].iter().any(|word| item.section.contains(word));
+        match self.bag_filter {
+            1 => item.category == ItemCategory::Weapon,
+            2 => matches!(item.category, ItemCategory::Outfit | ItemCategory::Helmet | ItemCategory::Backpack),
+            3 => item.category == ItemCategory::Ammo,
+            4 => item.category == ItemCategory::Artifact,
+            5 => utility,
+            6 => matches!(item.category, ItemCategory::Medical | ItemCategory::Consumable),
+            7 => item.category == ItemCategory::Misc && !utility,
+            _ => true,
+        }
     }
 
     /// Total carried weight across backpack & equipped items in kilograms.
@@ -1136,6 +1295,7 @@ impl InventoryManager {
         if !open {
             self.drag = None;
             self.grid_scroll_row = 0;
+            self.bag_filter = 0;
         }
         if let Some(aud) = audio {
             if open {
@@ -1163,13 +1323,14 @@ impl InventoryManager {
         for raw in &peer.inventory {
             let uid = self.allocate_uid();
             let mut item = InventoryItem::from_scoc_item(uid, raw, &peer.item_remaining_uses);
+            self.apply_item_metadata(&mut item);
             if let Some(slot) = item.equipped_slot
                 && self.item_in_slot(slot).is_some()
             {
                 item.equipped_slot = None;
             }
             if item.equipped_slot.is_none() {
-                item.grid_pos = self.find_or_grow_cell(item.grid_size, None);
+                item.grid_pos = self.place_in_bag(&item);
             }
             self.items.push(item);
         }
@@ -1178,12 +1339,23 @@ impl InventoryManager {
 
     /// Set or update the active `ItemGridIndex` and recompute item grid dimensions accordingly.
     pub fn set_grid_index(&mut self, index: Arc<ItemGridIndex>) {
+        let mut changed = false;
         for item in &mut self.items {
             if let Some((_, _, gw, gh)) = index.get(&item.section) {
-                item.grid_size = (gw.max(1), gh.max(1));
+                let size = (gw.max(1), gh.max(1));
+                changed |= item.grid_size != size;
+                item.grid_size = size;
             }
         }
         self.grid_index = Some(index);
+        if changed {
+            for mut item in std::mem::take(&mut self.items) {
+                if item.equipped_slot.is_none() {
+                    item.grid_pos = self.place_in_bag(&item);
+                }
+                self.items.push(item);
+            }
+        }
     }
 
     /// Hydrate actor inventory from loaded `.scop` ALife entities (`parent_id == 0` or `parent_id == actor_id`).
@@ -1192,6 +1364,14 @@ impl InventoryManager {
         alife: &AlifeManager,
         grid_index: Option<&ItemGridIndex>,
     ) {
+        self.specific_profile = alife.host_actor().and_then(|actor| {
+            let source = actor.source_scop.as_ref()?;
+            if let ScopAlifePayload::Actor(saved) = &source.payload {
+                Some(saved.trader.specific_character.clone())
+            } else {
+                None
+            }
+        });
         let actor_id = alife.host_actor_id.unwrap_or(0);
         let owned_entities: Vec<_> = alife
             .entities
@@ -1212,6 +1392,18 @@ impl InventoryManager {
             let uid = self.allocate_uid();
             let mut item = InventoryItem::from_section_indexed(uid, &ent.section, grid_index);
             item.source_id = Some(ent.id as i64);
+            self.apply_item_metadata(&mut item);
+            if let Some(source) = &ent.source_scop {
+                match &source.payload {
+                    ScopAlifePayload::InventoryItem(saved) => item.condition = saved.condition.clamp(0.0, 1.0),
+                    ScopAlifePayload::Weapon(saved) => {
+                        item.condition = saved.item.condition.clamp(0.0, 1.0);
+                        item.ammo_elapsed = Some(i64::from(saved.ammo_elapsed));
+                        item.ammo_type = Some(i64::from(saved.ammo_type));
+                    }
+                    _ => {}
+                }
+            }
 
             // Auto-equip weapon / suit / helmet / quick slots into empty slots
             match item.category {
@@ -1249,7 +1441,7 @@ impl InventoryManager {
             }
 
             if item.equipped_slot.is_none() {
-                item.grid_pos = self.find_or_grow_cell(item.grid_size, None);
+                item.grid_pos = self.place_in_bag(&item);
             }
 
             self.items.push(item);
@@ -1307,7 +1499,8 @@ impl InventoryManager {
                 let uid = self.allocate_uid();
                 let mut item = InventoryItem::from_section(uid, ent.section().to_string());
                 item.source_id = Some(i64::from(ent.id()));
-                item.grid_pos = self.find_or_grow_cell(item.grid_size, None);
+                self.apply_item_metadata(&mut item);
+                item.grid_pos = self.place_in_bag(&item);
                 self.items.push(item);
             }
             self.hud_sync_dirty = true;
@@ -1324,7 +1517,8 @@ impl InventoryManager {
     pub fn add_item(&mut self, section: impl Into<String>) -> u64 {
         let uid = self.allocate_uid();
         let mut item = InventoryItem::from_section(uid, section);
-        item.grid_pos = self.find_or_grow_cell(item.grid_size, None);
+        self.apply_item_metadata(&mut item);
+        item.grid_pos = self.place_in_bag(&item);
         self.items.push(item);
         uid
     }
@@ -1356,6 +1550,10 @@ impl InventoryManager {
                 false
             }
         })
+    }
+
+    fn visible_bag_item_at(&self, col: u8, row: u8) -> Option<&InventoryItem> {
+        self.item_at_grid_cell(col, row).filter(|item| self.matches_bag_filter(item))
     }
 
     /// Check whether a `w x h` rectangle at `(col, row)` fits within the grid without overlapping.
@@ -1430,6 +1628,47 @@ impl InventoryManager {
         let row = self.grid_rows;
         self.grid_rows = row.checked_add(h)?;
         Some((0, row))
+    }
+
+    fn compatible_stack(left: &InventoryItem, right: &InventoryItem) -> bool {
+        matches!(left.category, ItemCategory::Ammo | ItemCategory::Medical | ItemCategory::Consumable)
+            && left.section == right.section
+            && left.grid_size == right.grid_size
+            && (left.condition - right.condition).abs() < 0.01
+            && left.remaining_uses == right.remaining_uses
+            && left.ammo_elapsed == right.ammo_elapsed
+            && left.ammo_type == right.ammo_type
+            && left.ammo_section == right.ammo_section
+    }
+
+    fn place_in_bag(&mut self, item: &InventoryItem) -> Option<(u8, u8)> {
+        if self.ui_layouts.iter().any(Option::is_some)
+            && let Some(cell) = self.items.iter().find_map(|other| {
+                if other.equipped_slot.is_none() && Self::compatible_stack(item, other) {
+                    other.grid_pos
+                } else {
+                    None
+                }
+            })
+        {
+            return Some(cell);
+        }
+        self.find_or_grow_cell(item.grid_size, None)
+    }
+
+    fn visible_bag_stacks(&self) -> BTreeMap<(u8, u8), (&InventoryItem, u32)> {
+        let mut stacks = BTreeMap::<_, (&InventoryItem, u32)>::new();
+        for item in &self.items {
+            if item.equipped_slot.is_some() || !self.matches_bag_filter(item)
+                || self.drag.as_ref().is_some_and(|drag| drag.item_uid == item.uid)
+            {
+                continue;
+            }
+            let Some(pos) = item.grid_pos else { continue };
+            let stack = stacks.entry(pos).or_insert((item, 0));
+            stack.1 = stack.1.saturating_add(item.quantity.max(1));
+        }
+        stacks
     }
 
     /// Move an item (either from another grid cell or unequipping a slot) to backpack cell `(col, row)`.
@@ -1680,6 +1919,18 @@ impl InventoryManager {
             if self.selected_uid == Some(uid) {
                 self.selected_uid = None;
             }
+        } else if let Some(item) = self.item(uid)
+            && let Some(cell) = item.grid_pos
+            && self.items.iter().any(|other| {
+                other.uid != uid && other.grid_pos == Some(cell) && !Self::compatible_stack(item, other)
+            })
+        {
+            let size = item.grid_size;
+            if let Some(new_cell) = self.find_or_grow_cell(size, Some(uid))
+                && let Some(item) = self.item_mut(uid)
+            {
+                item.grid_pos = Some(new_cell);
+            }
         }
 
         Some(effect)
@@ -1914,6 +2165,16 @@ impl InventoryManager {
             return;
         }
 
+        if input.is_mouse_just_pressed(MouseButton::Left)
+            && let Some(&(index, _, _)) = layout.filter_buttons.iter().find(|(_, rect, _)| point_in_rect(mx, my, *rect))
+        {
+            self.bag_filter = index;
+            self.grid_scroll_row = 0;
+            self.selected_uid = None;
+            self.drag = None;
+            return;
+        }
+
         let scroll_limit = self.max_grid_scroll(layout.grid_rows);
         if scroll_limit > 0 {
             let track = layout.scrollbar_rect();
@@ -1953,7 +2214,7 @@ impl InventoryManager {
                 return;
             }
             if let Some((col, row)) = layout.hit_grid_cell(mx, my)
-                && let Some(uid) = self.item_at_grid_cell(col, row).map(|i| i.uid)
+                && let Some(uid) = self.visible_bag_item_at(col, row).map(|i| i.uid)
             {
                 let _ = self.use_item(uid, hud_weapon, alife, audio);
                 return;
@@ -1988,7 +2249,7 @@ impl InventoryManager {
                 return;
             }
             if let Some((col, row)) = layout.hit_grid_cell(mx, my)
-                && let Some(item) = self.item_at_grid_cell(col, row)
+                && let Some(item) = self.visible_bag_item_at(col, row)
             {
                 let uid = item.uid;
                 let origin_cell = item.grid_pos;
@@ -2044,9 +2305,7 @@ impl InventoryManager {
         show_crosshair: bool,
         stamina: f32,
         font: Option<&UiFontResource>,
-        hud_tex: Option<DescriptorIndex>,
         equipment_tex: Option<DescriptorIndex>,
-        actor_menu_tex: Option<DescriptorIndex>,
         grid_tex: Option<DescriptorIndex>,
         atlas: Option<&UiTextureAtlasMap>,
         vfs: Option<&VirtualFileSystem>,
@@ -2055,119 +2314,50 @@ impl InventoryManager {
         let fw = (width.max(64)) as f32;
         let fh = (height.max(64)) as f32;
 
-        // 1. Always-on Stalker HUD (Crosshair when no modal is open, Health/Stamina/Bleeding, Ammo & Quick Slots)
-        if show_crosshair && !self.is_modal_open() {
-            renderer.ui_draw_crosshair([fw * 0.5, fh * 0.5], 10.0, 4.0, 2.0, [0.95, 0.95, 0.95, 0.85]);
-            drawn += 4;
-        }
-
-        // Bottom-left Health, Stamina, Bleeding & Radiation bars
-        let bar_w = (fw * 0.18).clamp(90.0, 260.0);
-        let bar_h = (fh * 0.016).clamp(6.0, 14.0);
-        let margin = 16.0;
-        let hud_bg = [margin - 6.0, fh - margin - bar_h * 4.4, bar_w + 12.0, bar_h * 4.2 + 8.0];
-        if let Some(am_tex) = actor_menu_tex {
-            // Authentic brushed-metal status bezel: x=1620, y=1552, w=116, h=10 on 4096x2048 atlas
-            let uv_bar_bg = [1620.0 / 4096.0, 1552.0 / 2048.0, 116.0 / 4096.0, 10.0 / 2048.0];
-            renderer.ui_draw_textured_rect(hud_bg, uv_bar_bg, am_tex, [0.85, 0.88, 0.92, 0.92]);
-        } else if let Some(tex) = hud_tex {
-            renderer.ui_draw_textured_rect(hud_bg, [0.0, 0.0, 0.25, 0.125], tex, [0.4, 0.45, 0.5, 0.85]);
-        } else {
-            renderer.ui_fill_rect(hud_bg, [0.05, 0.06, 0.07, 0.62]);
-        }
-        drawn += 1;
-
-        renderer.ui_draw_meter_bar(
-            [margin, fh - margin - bar_h * 3.8, bar_w, bar_h],
-            self.actor_stats.health.clamp(0.0, 1.0),
-            [0.08, 0.08, 0.08, 0.82],
-            [0.84, 0.18, 0.18, 0.96],
-        );
-        renderer.ui_draw_meter_bar(
-            [margin, fh - margin - bar_h * 2.2, bar_w, bar_h * 0.78],
-            stamina.clamp(0.0, 1.0),
-            [0.08, 0.08, 0.08, 0.82],
-            [0.20, 0.70, 0.94, 0.96],
-        );
-        drawn += 4;
-
-        // Bleeding / Radiation indicator pips above health
-        if self.actor_stats.bleeding > 0.02 {
-            renderer.ui_draw_meter_bar(
-                [margin, fh - margin - bar_h * 5.0, bar_w * 0.48, 5.0],
-                self.actor_stats.bleeding.clamp(0.0, 1.0),
-                [0.12, 0.04, 0.04, 0.7],
-                [0.95, 0.15, 0.10, 0.95],
-            );
-            drawn += 2;
-        }
-        if self.actor_stats.radiation > 0.02 {
-            renderer.ui_draw_meter_bar(
-                [margin + bar_w * 0.52, fh - margin - bar_h * 5.0, bar_w * 0.48, 5.0],
-                self.actor_stats.radiation.clamp(0.0, 1.0),
-                [0.10, 0.10, 0.04, 0.7],
-                [0.92, 0.85, 0.15, 0.95],
-            );
-            drawn += 2;
-        }
-
-        // Quick-slot mini strip (bottom-center-left)
-        let q_size = 26.0;
-        for q_idx in 0..QUICK_SLOT_COUNT {
-            let qx = margin + bar_w + 18.0 + (q_idx as f32) * (q_size + 6.0);
-            let qy = fh - margin - q_size - 4.0;
-            renderer.ui_fill_rect([qx, qy, q_size, q_size], [0.07, 0.08, 0.09, 0.75]);
-            drawn += 1;
-            if let Some(q_item) = self.item_in_slot(EquipmentSlot::QuickSlot(q_idx)) {
-                let inner = [qx + 3.0, qy + 3.0, q_size - 6.0, q_size - 6.0];
-                if let Some(tex) = equipment_tex {
-                    let uv = item_icon_uv_indexed(&q_item.section, q_item.category, self.grid_index.as_deref());
-                    renderer.ui_draw_textured_rect(inner, uv, tex, [1.0, 1.0, 1.0, 0.98]);
-                } else {
-                    renderer.ui_fill_rect(inner, q_item.category.accent_color());
-                }
+        // The first-person overlay yields to the actor menu and backpack transitions.
+        if !self.open && !hud_weapon.is_some_and(HudWeaponController::backpack_blocks_input) {
+            if show_crosshair && !self.is_modal_open() {
+                renderer.ui_fill_rect([fw * 0.5 - 1.0, fh * 0.5 - 1.0, 2.0, 2.0], [0.95; 4]);
                 drawn += 1;
             }
-        }
-
-        // Bottom-right Weapon Ammo HUD strip
-        if let Some(hw) = hud_weapon {
-            let spec = hw.active_weapon();
-            let aw = 148.0;
-            let ah = 42.0;
-            let ax = fw - margin - aw;
-            let ay = fh - margin - ah;
-            let ammo_bg = [ax, ay, aw, ah];
-            if let Some(tex) = hud_tex {
-                renderer.ui_draw_textured_rect(ammo_bg, [0.25, 0.0, 0.5, 0.125], tex, [0.4, 0.45, 0.5, 0.88]);
-            } else {
-                renderer.ui_fill_rect(ammo_bg, [0.05, 0.06, 0.07, 0.68]);
+            let scale = (fh / 768.0).max(0.5);
+            let y = fh - 36.0 * scale;
+            let meter = |row: f32| [16.0 * scale, y + row * 8.0 * scale, 184.0 * scale, 3.0 * scale];
+            drawn += draw_segments(renderer, meter(0.0), 32, self.actor_stats.health, [0.83, 0.70, 0.44, 0.96]);
+            drawn += draw_segments(renderer, meter(1.0), 32, stamina, [0.46, 0.76, 0.88, 0.96]);
+            if self.actor_stats.bleeding > 0.02 {
+                drawn += draw_segments(renderer, meter(2.0), 32, self.actor_stats.bleeding, [0.94, 0.22, 0.13, 0.95]);
             }
-            drawn += 1;
-            let clip_frac = if spec.clip_capacity > 0 {
-                (spec.ammo_in_clip as f32 / spec.clip_capacity as f32).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            renderer.ui_draw_meter_bar(
-                [ax + 8.0, ay + ah - 10.0, aw - 16.0, 5.0],
-                clip_frac,
-                [0.10, 0.10, 0.10, 0.85],
-                [0.90, 0.74, 0.25, 0.95],
-            );
-            drawn += 2;
-            if let Some(f) = font {
-                let name_txt = spec.section.to_ascii_uppercase();
-                let count_txt = if spec.clip_capacity > 0 {
-                    format!("{}/{}", spec.ammo_in_clip, spec.reserve_ammo)
-                } else {
-                    "--".to_string()
-                };
-                drawn += f.draw_text(renderer, &name_txt, [ax + 8.0, ay + 4.0], 12.0, [0.85, 0.82, 0.75, 0.95]);
-                drawn += f.draw_text(renderer, &count_txt, [ax + 8.0, ay + 17.0], 16.0, [0.98, 0.88, 0.35, 1.0]);
+            if self.actor_stats.radiation > 0.02 {
+                drawn += draw_segments(renderer, meter(3.0), 32, self.actor_stats.radiation, [0.91, 0.82, 0.23, 0.95]);
+            }
+
+            if let Some(hw) = hud_weapon && let Some(f) = font {
+                let spec = hw.active_weapon();
+                if spec.clip_capacity > 0 && !spec.section.starts_with("unequipped_") && !spec.section.is_empty() {
+                    let mode = match spec.fire_mode {
+                        WeaponFireMode::FullAuto => "A",
+                        WeaponFireMode::SemiAuto | WeaponFireMode::BoltAction => "1",
+                        WeaponFireMode::Melee => "",
+                    };
+                    let x = fw - 68.0 * scale;
+                    let color = [0.94, 0.77, 0.36, 1.0];
+                    drawn += f.draw_text(renderer, &spec.ammo_in_clip.to_string(), [x, fh - 52.0 * scale], 14.0 * scale, color);
+                    drawn += f.draw_text(renderer, mode, [x - 36.0 * scale, y], 12.0 * scale, color);
+                    let fallback_ammo = self.item_settings.as_ref().and_then(|settings| {
+                        let ammo = settings.read_str(&spec.section, "ammo_class")?;
+                        ammo.split(',').next().map(str::trim)
+                    });
+                    if let (Some(texture), Some(section)) = (equipment_tex, fallback_ammo)
+                        && self.grid_index.as_ref().is_some_and(|index| index.get(section).is_some())
+                    {
+                        let uv = item_icon_uv_indexed(section, ItemCategory::Ammo, self.grid_index.as_deref());
+                        renderer.ui_draw_textured_rect([x, y - 2.0 * scale, 43.0 * scale, 22.0 * scale], uv, texture, [1.0; 4]);
+                        drawn += 1;
+                    }
+                }
             }
         }
-
         // Center interaction prompt when looking at NPC/Trader/Item
         if let Some(target) = &self.hover_target
             && !self.is_modal_open()
@@ -2195,17 +2385,54 @@ impl InventoryManager {
                 drawn += 1;
             }
             for (rect, texture) in &layout.backgrounds {
-                let sprite = atlas.and_then(|atlas| atlas.get(texture)).and_then(|region| {
-                    let index = crate::render_bridge::load_vfs_texture(renderer, vfs, &region.dds_vpath()).ok()?;
-                    let texture = renderer.get_texture_by_index(index)?;
-                    Some((index, region.uv_rect(texture.width as f32, texture.height as f32)))
-                });
-                if let Some((index, uv)) = sprite {
-                    renderer.ui_draw_textured_rect(*rect, uv, index, [1.0; 4]);
-                } else {
+                if !draw_atlas_region(renderer, vfs, atlas, texture, *rect) {
                     renderer.ui_fill_rect(*rect, [0.08, 0.09, 0.10, 0.94]);
                 }
                 drawn += 1;
+            }
+            let community = self.actor_community();
+            let portrait = self.specific_profile.as_ref().and_then(|id| self.actor_profiles.get(id))
+                .or_else(|| community.and_then(|id| self.actor_profiles.get(id)))
+                .or_else(|| self.actor_profiles.get(&self.actor_stats.profile_name));
+            if let (Some(icon), Some(rect)) = (portrait, layout.portrait_rect) {
+                drawn += u32::from(draw_atlas_region(renderer, vfs, atlas, icon, rect));
+            }
+            if let Some(f) = font {
+                if let Some([x, y, _, h]) = layout.name_rect {
+                    drawn += f.draw_text(renderer, &self.actor_stats.actor_name, [x, y], h, [0.94, 0.88, 0.74, 1.0]);
+                }
+                if let (Some(id), Some([x, y, _, h])) = (community, layout.faction_rect) {
+                    let faction = id.strip_prefix("actor_").unwrap_or(id);
+                    let label = match faction {
+                        "stalker" => "Loner".to_owned(),
+                        "csky" => "Clear Sky".to_owned(),
+                        "dolg" => "Duty".to_owned(),
+                        "ecolog" => "Ecologist".to_owned(),
+                        "killer" => "Mercenary".to_owned(),
+                        id => prettify_section(id),
+                    };
+                    drawn += f.draw_text(renderer, &label, [x, y], h, [0.72, 0.72, 0.68, 1.0]);
+                }
+            }
+            if let Some(rect) = layout.health_rect {
+                drawn += draw_segments(renderer, rect, 50, self.actor_stats.health, [0.52, 0.52, 0.49, 0.92]);
+            }
+            let filter_labels = ["All", "Arms", "Gear", "Ammo", "Arts", "Tools", "Use", "Misc"];
+            for (index, rect, texture) in &layout.filter_buttons {
+                if !draw_atlas_region(renderer, vfs, atlas, texture, *rect)
+                    && !draw_atlas_region(renderer, vfs, atlas, &format!("{texture}_e"), *rect)
+                {
+                    renderer.ui_fill_rect(*rect, [0.11, 0.12, 0.12, 0.9]);
+                    if let Some(f) = font {
+                        drawn += f.draw_text(renderer, filter_labels[*index], [rect[0] + 2.0, rect[1] + 5.0],
+                            9.0, [0.82, 0.82, 0.77, 1.0]);
+                    }
+                }
+                drawn += 1;
+                if *index == self.bag_filter {
+                    renderer.ui_fill_rect([rect[0], rect[1] + rect[3] - 2.0, rect[2], 2.0], [0.67, 0.64, 0.46, 1.0]);
+                    drawn += 1;
+                }
             }
             if layout.close_button_rect[2] > 0.0 {
                 renderer.ui_fill_rect(layout.close_button_rect, [0.23, 0.24, 0.22, 0.95]);
@@ -2251,12 +2478,14 @@ impl InventoryManager {
                     }
                     drawn += 1;
                     if show_item_condition(item.category) {
-                        renderer.ui_draw_meter_bar(
-                            [rect[0] + 4.0, rect[1] + rect[3] - 5.0, (rect[2] - 8.0).max(4.0), 2.5],
-                            item.condition, [0.05, 0.05, 0.05, 0.85], condition_bar_color(item.condition),
-                        );
-                        drawn += 2;
+                        let bar = layout.condition_rects.get(slot).copied()
+                            .unwrap_or([rect[0] + 4.0, rect[1] + rect[3] - 5.0, (rect[2] - 8.0).max(4.0), 3.0]);
+                        drawn += draw_segments(renderer, bar, 18, item.condition, condition_bar_color(item.condition));
                     }
+                }
+                if let EquipmentSlot::QuickSlot(index) = slot && let Some(f) = font {
+                    drawn += f.draw_text(renderer, &format!("F{}", index + 1),
+                        [rect[0], rect[1] + rect[3] - 11.0], 10.0, [0.91, 0.90, 0.85, 1.0]);
                 }
             }
 
@@ -2285,15 +2514,7 @@ impl InventoryManager {
             // Backpack Items
             let [_, top, _, grid_height] = layout.grid_rect();
             let bottom = top + grid_height;
-            for item in &self.items {
-                if item.equipped_slot.is_some()
-                    || self.drag.as_ref().is_some_and(|d| d.item_uid == item.uid)
-                {
-                    continue;
-                }
-                let Some((col, row)) = item.grid_pos else {
-                    continue;
-                };
+            for ((col, row), (item, count)) in self.visible_bag_stacks() {
                 let ix = layout.grid_origin[0] + f32::from(col) * layout.cell_size + 2.0;
                 let iy = top + (f32::from(row) - f32::from(layout.grid_scroll_row)) * layout.cell_size + 2.0;
                 let iw = f32::from(item.grid_size.0) * layout.cell_size - 4.0;
@@ -2320,15 +2541,17 @@ impl InventoryManager {
                     renderer.ui_fill_rect(rect, item.category.accent_color());
                 }
                 drawn += 1;
-                if show_item_condition(item.category) && iy + ih <= bottom {
-                    renderer.ui_draw_meter_bar(
+                if show_item_condition(item.category) && iy + ih - 4.0 >= top && iy + ih <= bottom {
+                    drawn += draw_segments(
+                        renderer,
                         [ix + 2.0, iy + ih - 4.0, (iw - 4.0).max(2.0), 2.5],
-                        item.condition, [0.05, 0.05, 0.05, 0.85], condition_bar_color(item.condition),
+                        18, item.condition, condition_bar_color(item.condition),
                     );
-                    drawn += 2;
                 }
-                if item.quantity > 1 && iy >= top && let Some(f) = font {
-                    drawn += f.draw_text(renderer, &item.quantity.to_string(), [ix + 3.0, iy + 2.0], 12.0, [0.95, 0.95, 0.92, 1.0]);
+                if count > 1 && iy >= top && iy + 12.0 <= bottom && let Some(f) = font {
+                    let text = format!("x{count}");
+                    renderer.ui_fill_rect([ix, iy, 7.0 * text.len() as f32 + 3.0, 12.0], [0.10, 0.14, 0.09, 0.94]);
+                    drawn += 1 + f.draw_text(renderer, &text, [ix + 2.0, iy], 11.0, [0.88, 0.91, 0.73, 1.0]);
                 }
             }
             let scroll_limit = self.max_grid_scroll(layout.grid_rows);
@@ -2370,16 +2593,20 @@ impl InventoryManager {
             }
 
             // Weight bar at bottom of grid
-            let weight_frac = (self.total_weight_kg() / self.max_carry_weight_kg.max(1.0)).clamp(0.0, 1.0);
-            let weight_color = if weight_frac > 0.9 {
+            let weight = self.total_weight_kg();
+            let capacity = self.carry_limit_kg();
+            let weight_frac = (weight / capacity.max(1.0)).clamp(0.0, 1.0);
+            let weight_color = if weight > capacity {
                 [0.88, 0.26, 0.18, 0.95]
+            } else if weight + 10.0 > capacity {
+                [0.82, 0.72, 0.38, 0.95]
             } else {
-                [0.78, 0.68, 0.28, 0.95]
+                [0.87, 0.85, 0.80, 0.95]
             };
             if let Some([x, y, _, h]) = layout.weight_rect {
                 if let Some(f) = font {
-                    let weight = format!("{:.1} / {:.0} kg", self.total_weight_kg(), self.max_carry_weight_kg);
-                    drawn += f.draw_text(renderer, &weight, [x, y], h.max(9.0), weight_color);
+                    let line = format!("Weight  {weight:.1} kg  (max {capacity:.0} kg)");
+                    drawn += f.draw_text(renderer, &line, [x - 16.0, y], (h * 0.76).max(9.0), weight_color);
                     if let Some([x, y, _, h]) = layout.money_rect {
                         let money = format!("{} RU", self.actor_stats.money);
                         drawn += f.draw_text(renderer, &money, [x, y], h.min(18.0), [0.92, 0.86, 0.70, 1.0]);
@@ -2504,6 +2731,38 @@ fn point_in_rect(px: f32, py: f32, rect: [f32; 4]) -> bool {
 }
 
 #[inline]
+fn draw_atlas_region(
+    renderer: &mut Dx12Renderer,
+    vfs: Option<&VirtualFileSystem>,
+    atlas: Option<&UiTextureAtlasMap>,
+    id: &str,
+    rect: [f32; 4],
+) -> bool {
+    let Some(region) = atlas.and_then(|atlas| atlas.get(id)) else { return false };
+    let Ok(index) = crate::render_bridge::load_vfs_texture(renderer, vfs, &region.dds_vpath()) else {
+        return false;
+    };
+    let Some(texture) = renderer.get_texture_by_index(index) else { return false };
+    let uv = region.uv_rect(texture.width as f32, texture.height as f32);
+    renderer.ui_draw_textured_rect(rect, uv, index, [1.0; 4]);
+    true
+}
+
+fn draw_segments(
+    renderer: &mut Dx12Renderer,
+    [x, y, width, height]: [f32; 4],
+    segments: u32,
+    value: f32,
+    color: [f32; 4],
+) -> u32 {
+    let pitch = width / segments as f32;
+    let filled = (value.clamp(0.0, 1.0) * segments as f32).round() as u32;
+    for segment in 0..filled {
+        renderer.ui_fill_rect([x + pitch * segment as f32, y, pitch * 0.62, height], color);
+    }
+    filled
+}
+
 fn show_item_condition(category: ItemCategory) -> bool {
     matches!(category, ItemCategory::Weapon | ItemCategory::Outfit | ItemCategory::Helmet)
 }
