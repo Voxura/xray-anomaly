@@ -785,6 +785,11 @@ impl AudioManager {
         velocity: [f32; 3],
     ) -> VoiceId {
         let trimmed = sound_ref.trim();
+        let file = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
+        // Monolith uses $no_sound.ogg as its silent fallback asset.
+        if file.eq_ignore_ascii_case("$no_sound") || file.eq_ignore_ascii_case("$no_sound.ogg") {
+            return VoiceId(0);
+        }
         let stem = trimmed
             .strip_prefix("weapons\\")
             .or_else(|| trimmed.strip_prefix("weapons/"))
@@ -1317,6 +1322,15 @@ mod tests {
         let mixed = audio.mix_headless_frames(1024);
         let total_energy: f32 = mixed.iter().map(|x| x * x).sum();
         assert!(total_energy > 0.05, "storm audio mix must be non-silent");
+    }
+
+    #[test]
+    fn silent_weapon_alias_does_not_create_a_voice() {
+        let mut manager = AudioManager::new_headless();
+        for alias in ["$no_sound", "sounds\\$NO_SOUND.ogg"] {
+            assert_eq!(manager.trigger_weapon_sound(alias, [0.0; 3], [0.0; 3]), VoiceId(0));
+        }
+        assert_eq!(manager.stats().weapon_sounds_triggered, 0);
     }
 
     #[test]
