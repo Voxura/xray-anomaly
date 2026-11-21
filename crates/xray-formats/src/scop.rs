@@ -646,6 +646,12 @@ impl ScopAlifeEntity {
             .then_some((place, condition.clamp(0.0, 1.0)))
     }
 
+    /// `CEatableItem::save` appends its remaining uses to the held-item client state.
+    pub fn eatable_item_remaining_uses(&self) -> Option<u8> {
+        self.inventory_item_client_state()?;
+        self.spawn.client_data.get(8).copied()
+    }
+
     /// Read `CInventoryOwner::save` and the quick-use references from `CActor::save`.
     pub fn actor_inventory_client_state(&self) -> Option<ScopActorInventory> {
         if self.kind() != ScopAlifeKind::Actor {

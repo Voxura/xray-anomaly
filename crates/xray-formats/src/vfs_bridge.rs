@@ -91,6 +91,29 @@ pub fn load_ltx_tree_from_vfs(
     Ok(OwnedLtxDocument::from_sources(&sources))
 }
 
+/// Load the effective `system.ltx` configuration with the root DLTX mods Monolith applies.
+pub fn load_system_ltx_from_vfs(vfs: &VirtualFileSystem) -> Result<OwnedLtxDocument, VfsError> {
+    let provider = VfsLtxProvider(vfs);
+    let sibling_roots = provider.list_ltx_matches("configs", "system_*.ltx")?;
+    let mut mods = provider.list_ltx_matches("configs", "mod_system_*.ltx")?;
+    // E.g. mod_system_other_extra.ltx belongs to system_other.ltx when it exists.
+    mods.retain(|path| {
+        let Some(stem) = path.rsplit('\\').next()
+            .and_then(|name| name.strip_prefix("mod_")?.strip_suffix(".ltx"))
+        else {
+            return false;
+        };
+        !sibling_roots.iter().any(|root| {
+            root.rsplit('\\').next()
+                .and_then(|root_name| stem.strip_prefix(root_name.strip_suffix(".ltx")?))
+                .and_then(|suffix| suffix.strip_prefix('_'))
+                .is_some_and(|suffix| !suffix.is_empty())
+        })
+    });
+    let mod_refs: Vec<_> = mods.iter().map(String::as_str).collect();
+    load_ltx_tree_from_vfs(vfs, "configs/system.ltx", &mod_refs)
+}
+
 #[derive(Debug)]
 pub enum AssetLoadError {
     Vfs(VfsError),

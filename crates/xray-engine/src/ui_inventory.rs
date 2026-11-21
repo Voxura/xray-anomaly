@@ -26,7 +26,7 @@ use xray_formats::spawns::INVALID_OBJECT_ID;
 use xray_formats::scoc::{ScocFile, ScocInventoryItem, ScocPeerState};
 use xray_formats::scop::{ScopActorInventory, ScopActorStats, ScopAlifeEntity, ScopAlifeKind, ScopAlifePayload, ScopItemPlace, ScopSaveFile};
 use xray_formats::spawns::AlifeItemAmmoState;
-use xray_formats::vfs_bridge::{load_ltx_tree_from_vfs, load_ui_xml_for_viewport_from_vfs, load_xml_from_vfs};
+use xray_formats::vfs_bridge::{load_ltx_tree_from_vfs, load_system_ltx_from_vfs, load_ui_xml_for_viewport_from_vfs, load_xml_from_vfs};
 use xray_formats::xml_ui::{UiTextureAtlasMap, UiViewport, XmlDocument, XmlNode};
 use xray_render_dx12::bindless::DescriptorIndex;
 use xray_render_dx12::renderer::Dx12Renderer;
@@ -146,6 +146,30 @@ pub enum EquipmentSlot {
 }
 
 impl EquipmentSlot {
+    fn from_native_index(index: u8) -> Option<Self> {
+        Some(match index {
+            2 => Self::Pistol,
+            3 => Self::PrimaryWeapon,
+            7 => Self::Armor,
+            12 => Self::Helmet,
+            13 => Self::Backpack,
+            1 | 4..=6 | 8..=11 | 14..=18 => Self::NativeSlot(index),
+            _ => return None,
+        })
+    }
+
+    fn native_index(self) -> Option<u8> {
+        match self {
+            Self::Pistol => Some(2),
+            Self::PrimaryWeapon => Some(3),
+            Self::Armor => Some(7),
+            Self::Helmet => Some(12),
+            Self::Backpack => Some(13),
+            Self::NativeSlot(index) => Some(index),
+            _ => None,
+        }
+    }
+
     /// All slots in deterministic display order.
     pub fn all_slots() -> [Self; 15] {
         [
@@ -370,6 +394,18 @@ fn classify_section_meta(section: &str) -> SectionItemMeta {
     }
 }
 
+fn inventory_picker_enabled(script: &str) -> bool {
+    script.lines().find_map(|line| {
+        let line = line.split("--").next()?;
+        let (binding, value) = line.split_once('=')?;
+        let mut binding = binding.split_whitespace();
+        if binding.next() != Some("local") || binding.next() != Some("enable_item_picker") || binding.next().is_some() {
+            return None;
+        }
+        Some(value.trim().trim_end_matches(';').trim() == "true")
+    }).unwrap_or(false)
+}
+
 fn prettify_section(section: &str) -> String {
     let trimmed = section
         .strip_prefix("wpn_")
@@ -590,6 +626,7 @@ pub struct InventoryLayout {
     pub grid_origin: [f32; 2],
     pub cell_size: f32,
     bag_viewport: Option<[f32; 4]>,
+    picker_rect: Option<[f32; 4]>,
     pub grid_cols: u8,
     pub grid_rows: u8,
     grid_scroll_row: u8,
@@ -724,6 +761,7 @@ impl InventoryLayout {
             grid_origin,
             cell_size,
             bag_viewport: None,
+            picker_rect: None,
             grid_cols: cols,
             grid_rows: rows,
             grid_scroll_row: 0,
@@ -768,6 +806,9 @@ impl InventoryLayout {
         self.cell_size = pitch;
         self.grid_rows = (h / pitch).floor().max(1.0) as u8;
         self.bag_viewport = Some([x, y, w, h]);
+        self.picker_rect = equipment.navigate("cont_picker", 0)
+            .map(|node| viewport.virtual_to_screen_rect(relative(node, equipment_origin)))
+            .filter(|rect| rect[2] > 0.0 && rect[3] > 0.0);
         self.backgrounds = [(equipment, equipment_origin), (player, player_origin)].into_iter()
             .filter_map(|(node, origin)| {
                 let background = node.navigate("background", 0)?;
@@ -969,7 +1010,7 @@ fn configured_weight_and_display_stacks_preserve_individual_items() {
     inventory.item_settings = Some(Arc::new(OwnedLtxDocument::from_sources(&[LoadedLtxSource {
         virtual_path: "items.ltx".to_owned(),
         depth: 0,
-        text: "[base_food]\ninv_weight = 0.1\n[bandage]:base_food\n[stalker_outfit]\nadditional_inventory_weight = 12\n[repair_kit]\nmax_uses = 3\n[prt_i_ammo]\n[unique_supply]\ndont_stack = true\n".to_owned(),
+        text: "[base_food]\ninv_weight = 0.1\n[bandage]:base_food\n[stalker_outfit]\nadditional_inventory_weight = 12\n[repair_kit]\nclass = II_FOOD\nuse_condition = true\nmax_uses = 3\n[prt_i_ammo]\n[unique_supply]\ndont_stack = true\n".to_owned(),
     }])));
     let first = inventory.add_item("bandage");
     let second = inventory.add_item("bandage");
@@ -998,6 +1039,74 @@ fn configured_weight_and_display_stacks_preserve_individual_items() {
     let unique = inventory.add_item("unique_supply");
     let other = inventory.add_item("unique_supply");
     assert_ne!(inventory.item(unique).unwrap().grid_pos, inventory.item(other).unwrap().grid_pos);
+
+    // The native item picker bypasses the strict per-instance checks for the backpack.
+    inventory.stack_all_sections = inventory_picker_enabled("-- local enable_item_picker = false\nlocal enable_item_picker\t= true -- stock setting");
+    inventory.repack_bag();
+    assert_eq!(inventory.item(used).unwrap().grid_pos, inventory.item(full).unwrap().grid_pos);
+    assert_eq!(inventory.item(unique).unwrap().grid_pos, inventory.item(other).unwrap().grid_pos);
+    assert_eq!(inventory.item(used).unwrap().remaining_uses, Some(2));
+    assert_eq!(inventory.item(full).unwrap().remaining_uses, Some(3));
+    assert!(!inventory_picker_enabled("local enable_item_picker = false"));
+
+    let xml = Arc::new(XmlDocument::parse(
+        r#"<w><player x="600"><cont_bag width="350" height="575"/></player>
+        <equipment x="350"><cont_picker y="565" width="255" height="162"/></equipment></w>"#,
+    ).unwrap());
+    inventory.ui_layouts = [Some(xml.clone()), Some(xml)];
+    inventory.set_open(true, None);
+    let (col, row) = inventory.item(full).unwrap().grid_pos.unwrap();
+    let mut pointer = EngineInput::new();
+    let [x, y] = inventory.layout(1366, 768).grid_cell_center(col, row, 1, 1);
+    pointer.on_mouse_move(x, y);
+    pointer.on_mouse_down(MouseButton::Left);
+    inventory.handle_input(&pointer, 1366, 768, None, None, None);
+    pointer.begin_frame();
+    pointer.on_mouse_up(MouseButton::Left);
+    inventory.handle_input(&pointer, 1366, 768, None, None, None);
+
+    let picker = inventory.picker_cells(&inventory.layout(1366, 768)).unwrap();
+    let ([x, y, w, h], _) = picker.cells.into_iter().find(|(_, item)| item.uid == full).unwrap();
+    pointer.begin_frame();
+    pointer.on_mouse_move(x + w * 0.5, y + h * 0.5);
+    pointer.on_mouse_down(MouseButton::Left);
+    inventory.handle_input(&pointer, 1366, 768, None, None, None);
+    assert_eq!(inventory.selected_uid, Some(full));
+}
+
+#[cfg(test)]
+#[test]
+fn native_slot_accepts_items_with_the_configured_base_slot() {
+    use xray_core::ltx_loader::LoadedLtxSource;
+
+    let mut inventory = InventoryManager::new();
+    inventory.native_inventory = Some(ScopActorInventory { active_slot: 0, quick_slots: Default::default() });
+    inventory.item_settings = Some(Arc::new(OwnedLtxDocument::from_sources(&[LoadedLtxSource {
+        virtual_path: "items.ltx".to_owned(),
+        depth: 0,
+        text: "[bolt]\nslot = 5\n[utility]:bolt\n[loose_part]\nslot = -1\n".to_owned(),
+    }])));
+    inventory.ui_layouts[0] = Some(Arc::new(XmlDocument::parse("<w/>").unwrap()));
+    inventory.stack_all_sections = true;
+    let slot = EquipmentSlot::from_native_index(inventory.configured_base_slot("bolt").unwrap()).unwrap();
+    let utility = inventory.add_item("utility");
+    let replacement = inventory.add_item("utility");
+    let spare = inventory.add_item("utility");
+    let part = inventory.add_item("loose_part");
+    assert!(inventory.equip_item(utility, slot, None, None));
+    assert!(!inventory.equip_item(part, slot, None, None));
+    assert_eq!(inventory.item_in_slot(slot).map(|item| item.uid), Some(utility));
+    assert!(inventory.equip_item(replacement, slot, None, None));
+    assert_eq!(inventory.item(utility).unwrap().grid_pos, inventory.item(spare).unwrap().grid_pos);
+    assert!(inventory.unequip_slot(slot, None, None));
+    assert!(inventory.item_in_slot(slot).is_none());
+    assert_eq!(inventory.item(replacement).unwrap().grid_pos, inventory.item(spare).unwrap().grid_pos);
+}
+
+struct StackPickerCells<'a> {
+    rect: [f32; 4],
+    cells: Vec<([f32; 4], &'a InventoryItem)>,
+    max_scroll: usize,
 }
 
 /// Complete runtime inventory, equipment, actor vital stats, and dialogue manager.
@@ -1008,6 +1117,7 @@ pub struct InventoryManager {
     pub grid_rows: u8,
     grid_scroll_row: u8,
     bag_filter: usize,
+    stack_picker: Option<((u8, u8), usize)>,
     pub items: Vec<InventoryItem>,
     pub actor_stats: ScopActorStats,
     pub selected_uid: Option<u64>,
@@ -1020,6 +1130,8 @@ pub struct InventoryManager {
     ui_layouts: [Option<Arc<XmlDocument>>; 2],
     item_settings: Option<Arc<OwnedLtxDocument>>,
     actor_profiles: BTreeMap<String, String>,
+    stack_all_sections: bool,
+    default_equipment: Option<(EquipmentSlot, &'static str)>,
     currency_suffix: String,
     specific_profile: Option<String>,
     pub(crate) native_inventory: Option<ScopActorInventory>,
@@ -1212,6 +1324,7 @@ impl InventoryManager {
             grid_rows: DEFAULT_GRID_ROWS,
             grid_scroll_row: 0,
             bag_filter: 0,
+            stack_picker: None,
             items: Vec::new(),
             actor_stats: ScopActorStats::default(),
             selected_uid: None,
@@ -1224,6 +1337,8 @@ impl InventoryManager {
             ui_layouts: [None, None],
             item_settings: None,
             actor_profiles: BTreeMap::new(),
+            stack_all_sections: false,
+            default_equipment: None,
             currency_suffix: "RU".to_owned(),
             specific_profile: None,
             native_inventory: None,
@@ -1270,7 +1385,13 @@ impl InventoryManager {
             load_ui_xml_for_viewport_from_vfs(vfs, "configs/ui/ui_inventory.xml", &viewport)
                 .ok().map(Arc::new)
         });
-        self.item_settings = load_ltx_tree_from_vfs(vfs, "configs/system.ltx", &[]).ok().map(Arc::new);
+        self.item_settings = load_system_ltx_from_vfs(vfs).ok().map(Arc::new);
+        self.stack_all_sections = vfs.read_to_string_lossy("scripts/ui_inventory.script")
+            .is_ok_and(|script| inventory_picker_enabled(&script));
+        // CInventoryOwner::spawn_supplies gives the actor a default bolt. Its base slot
+        // is supplied by the mounted item definition and real saved occupants take precedence.
+        self.default_equipment = self.configured_base_slot("bolt")
+            .and_then(EquipmentSlot::from_native_index).map(|slot| (slot, "bolt"));
         let language = self.item_settings.as_ref()
             .and_then(|settings| settings.read_str("string_table", "language"))
             .unwrap_or("eng");
@@ -1437,6 +1558,7 @@ impl InventoryManager {
         if self.open == open {
             return;
         }
+        self.stack_picker = None;
         self.open = open;
         if !open {
             self.drag = None;
@@ -1473,6 +1595,7 @@ impl InventoryManager {
     pub fn load_from_scoc_peer_state(&mut self, peer: &ScocPeerState) {
         self.native_inventory = None;
         self.items.clear();
+        self.stack_picker = None;
         self.drag = None;
         self.selected_uid = None;
         self.grid_scroll_row = 0;
@@ -1512,6 +1635,7 @@ impl InventoryManager {
     }
 
     fn repack_bag(&mut self) {
+        self.stack_picker = None;
         for mut item in std::mem::take(&mut self.items) {
             if item.equipped_slot.is_none() {
                 item.grid_pos = self.place_in_bag(&item);
@@ -1552,6 +1676,7 @@ impl InventoryManager {
         }
 
         self.items.clear();
+        self.stack_picker = None;
         self.drag = None;
         self.selected_uid = None;
         self.grid_scroll_row = 0;
@@ -1643,6 +1768,12 @@ impl InventoryManager {
             let mut item = InventoryItem::from_section_indexed(self.allocate_uid(), entity.section(), grid_index);
             item.source_id = Some(i64::from(entity.id()));
             self.apply_item_metadata(&mut item);
+            if self.item_settings.as_ref().and_then(|settings| settings.read_str(&item.section, "class"))
+                .is_some_and(|class| matches!(class, "II_FOOD" | "II_MEDKI" | "II_ANTIR" | "II_BANDG" | "II_BOTTL" | "S_FOOD" | "S_MEDKI"))
+                && let Some(uses) = entity.eatable_item_remaining_uses()
+            {
+                item.remaining_uses = Some(i64::from(uses));
+            }
             if let ScopAlifePayload::Weapon(weapon) = &entity.payload {
                 item.has_upgrades = !weapon.item.upgrades.is_empty();
                 item.ammo_elapsed = Some(i64::from(weapon.ammo_elapsed));
@@ -1665,12 +1796,7 @@ impl InventoryManager {
             if let Some((place, condition)) = entity.inventory_item_client_state() {
                 item.condition = condition;
                 item.equipped_slot = match place {
-                    ScopItemPlace::Slot(2) => Some(EquipmentSlot::Pistol),
-                    ScopItemPlace::Slot(3) => Some(EquipmentSlot::PrimaryWeapon),
-                    ScopItemPlace::Slot(7) => Some(EquipmentSlot::Armor),
-                    ScopItemPlace::Slot(12) => Some(EquipmentSlot::Helmet),
-                    ScopItemPlace::Slot(13) => Some(EquipmentSlot::Backpack),
-                    ScopItemPlace::Slot(id @ (1 | 4..=6 | 8..=11 | 14..=18)) => Some(EquipmentSlot::NativeSlot(id)),
+                    ScopItemPlace::Slot(id) => EquipmentSlot::from_native_index(id),
                     ScopItemPlace::Belt if belt_slot < ARTIFACT_SLOT_COUNT => {
                         let slot = belt_slot;
                         belt_slot += 1;
@@ -1899,16 +2025,37 @@ impl InventoryManager {
     }
 
     fn item_uses_condition(&self, item: &InventoryItem) -> bool {
-        show_item_condition(item.category)
-            || self.item_settings.as_ref().is_some_and(|settings| settings.read_bool(&item.section, "use_condition", false))
+        let Some(settings) = &self.item_settings else { return show_item_condition(item.category) };
+        settings.read_bool(&item.section, "use_condition", false)
+            || settings.read_str(&item.section, "class").map_or_else(
+                || show_item_condition(item.category),
+                condition_gear_class,
+            )
+    }
+
+    fn counts_rounds(&self, item: &InventoryItem) -> bool {
+        if let Some(settings) = &self.item_settings
+            && let Some(class) = settings.read_str(&item.section, "class")
+        {
+            return matches!(class, "AMMO" | "AMMO_S") && !settings.read_bool(&item.section, "grenade_ammo", false);
+        }
+        item.category == ItemCategory::Ammo
     }
 
     fn compatible_stack(&self, left: &InventoryItem, right: &InventoryItem) -> bool {
         if left.section != right.section || left.grid_size != right.grid_size {
             return false;
         }
+        if self.stack_all_sections {
+            // UICellContainer::FindSimilar uses GetCell_SEC before any strict checks when
+            // the item picker is enabled. Distinct objects remain separate inventory records.
+            return true;
+        }
         if let Some(settings) = &self.item_settings {
-            let max_uses = self.configured_max_uses(&left.section);
+            let max_uses = self.configured_max_uses(&left.section).filter(|_| {
+                settings.read_str(&left.section, "class").is_none_or(|class| class == "II_FOOD")
+                    && self.item_uses_condition(left)
+            });
             if settings.read_bool(&left.section, "dont_stack", false)
                 || max_uses.is_some_and(|max_uses| {
                     left.remaining_uses.unwrap_or(max_uses) != max_uses
@@ -1931,17 +2078,21 @@ impl InventoryManager {
     }
 
     fn place_in_bag(&mut self, item: &InventoryItem) -> Option<(u8, u8)> {
+        self.place_in_bag_ignoring(item, None)
+    }
+
+    fn place_in_bag_ignoring(&mut self, item: &InventoryItem, ignore_uid: Option<u64>) -> Option<(u8, u8)> {
         let mut visited = std::collections::BTreeSet::new();
         if self.ui_layouts.iter().any(Option::is_some)
             && let Some(cell) = self.items.iter().find_map(|other| {
                 let cell = other.grid_pos?;
-                (other.equipped_slot.is_none() && other.section == item.section
+                (Some(other.uid) != ignore_uid && other.equipped_slot.is_none() && other.section == item.section
                     && visited.insert(cell) && self.compatible_stack(item, other)).then_some(cell)
             })
         {
             return Some(cell);
         }
-        self.find_or_grow_cell(item.grid_size, None)
+        self.find_or_grow_cell(item.grid_size, ignore_uid)
     }
 
     fn visible_bag_stacks(&self) -> BTreeMap<(u8, u8), (&InventoryItem, u32)> {
@@ -1954,7 +2105,7 @@ impl InventoryManager {
             }
             let Some(pos) = item.grid_pos else { continue };
             let stack = stacks.entry(pos).or_insert((item, 0));
-            let count = if item.category == ItemCategory::Ammo {
+            let count = if self.counts_rounds(item) {
                 item.ammo_elapsed.and_then(|rounds| u32::try_from(rounds).ok()).unwrap_or(1)
             } else {
                 1
@@ -1962,6 +2113,38 @@ impl InventoryManager {
             stack.1 = stack.1.saturating_add(count.saturating_mul(item.quantity.max(1)));
         }
         stacks
+    }
+
+    fn stack_members(&self, cell: (u8, u8)) -> impl Iterator<Item = &InventoryItem> {
+        self.items.iter().filter(move |item| item.equipped_slot.is_none() && item.grid_pos == Some(cell))
+    }
+
+    fn picker_cells(&self, layout: &InventoryLayout) -> Option<StackPickerCells<'_>> {
+        let (cell, scroll) = self.stack_picker?;
+        let rect = layout.picker_rect?;
+        let [x, y, w, h] = rect;
+        let mut members: Vec<_> = self.stack_members(cell).collect();
+        if members.len() < 2 {
+            return None;
+        }
+        if self.counts_rounds(members[0]) {
+            members.sort_by_key(|item| std::cmp::Reverse(item.ammo_elapsed));
+        } else {
+            members.sort_by(|a, b| b.has_upgrades.cmp(&a.has_upgrades).then_with(|| b.condition.total_cmp(&a.condition)));
+        }
+        let (width, height) = members[0].grid_size;
+        let tile_width = (f32::from(width.max(1)) * layout.cell_size).min(w);
+        let tile_height = (f32::from(height.max(1)) * layout.cell_size).min(h);
+        let columns = (w / tile_width).floor() as usize;
+        let visible_rows = (h / tile_height).floor() as usize;
+        let max_scroll = members.len().div_ceil(columns).saturating_sub(visible_rows);
+        let cells = members.into_iter().skip(scroll.min(max_scroll) * columns)
+            .take(visible_rows * columns).enumerate().map(|(index, item)| {
+                let left = x + (index % columns) as f32 * tile_width;
+                let top = y + (index / columns) as f32 * tile_height;
+                ([left, top, tile_width, tile_height], item)
+            }).collect();
+        Some(StackPickerCells { rect, cells, max_scroll })
     }
 
     /// Move an item (either from another grid cell or unequipping a slot) to backpack cell `(col, row)`.
@@ -2007,6 +2190,21 @@ impl InventoryManager {
         }
     }
 
+    fn configured_base_slot(&self, section: &str) -> Option<u8> {
+        let index = self.item_settings.as_ref()?.read_str(section, "slot")?.parse::<i16>().ok()?;
+        u8::try_from(index.checked_add(1)?).ok()
+    }
+
+    fn can_equip(&self, item: &InventoryItem, slot: EquipmentSlot) -> bool {
+        if self.native_inventory.is_some()
+            && let (Some(base), Some(target)) = (self.configured_base_slot(&item.section), slot.native_index())
+        {
+            // UIInventory.slot_cell permits weapon swaps between these native slots.
+            return base != 0 && (target == base || matches!((base, target), (2, 1 | 3) | (3, 2)));
+        }
+        Self::is_compatible(item.category, slot)
+    }
+
     /// Equip an item into `slot`, swapping any existing occupant back into the backpack grid.
     pub fn equip_item(
         &mut self,
@@ -2015,24 +2213,22 @@ impl InventoryManager {
         hud_weapon: Option<&mut HudWeaponController>,
         audio: Option<&mut AudioManager>,
     ) -> bool {
-        let Some((cat, section)) = self.item(uid).map(|i| (i.category, i.section.clone())) else {
+        let Some(item) = self.item(uid) else {
             return false;
         };
-        if !Self::is_compatible(cat, slot) {
+        if !self.can_equip(item, slot) {
             return false;
         }
+        let section = item.section.clone();
         if let EquipmentSlot::QuickSlot(index) = slot && let Some(native) = &mut self.native_inventory {
             native.quick_slots[index] = section;
             return true;
         }
 
-        // If slot is already occupied by a different item, move occupant back into free grid cell
-        if let Some(existing_uid) = self.item_in_slot(slot).map(|i| i.uid)
-            && existing_uid != uid
-        {
-            let prev_size = self.item(existing_uid).map(|i| i.grid_size).unwrap_or((1, 1));
-            let Some(free_cell) = self.find_or_grow_cell(prev_size, Some(uid)) else { return false };
-            if let Some(prev) = self.item_mut(existing_uid) {
+        // Place the old occupant in the backpack without counting the item leaving it.
+        if let Some(previous) = self.item_in_slot(slot).filter(|item| item.uid != uid).cloned() {
+            let Some(free_cell) = self.place_in_bag_ignoring(&previous, Some(uid)) else { return false };
+            if let Some(prev) = self.item_mut(previous.uid) {
                 prev.equipped_slot = None;
                 prev.grid_pos = Some(free_cell);
             }
@@ -2063,16 +2259,13 @@ impl InventoryManager {
         hud_weapon: Option<&mut HudWeaponController>,
         audio: Option<&mut AudioManager>,
     ) -> bool {
-        let Some((uid, size, section)) = self
-            .item_in_slot(slot)
-            .map(|i| (i.uid, i.grid_size, i.section.clone()))
-        else {
+        let Some(item) = self.item_in_slot(slot).cloned() else {
             return false;
         };
-        let Some(free) = self.find_or_grow_cell(size, Some(uid)) else {
+        let Some(free) = self.place_in_bag(&item) else {
             return false;
         };
-        if let Some(it) = self.item_mut(uid) {
+        if let Some(it) = self.item_mut(item.uid) {
             it.equipped_slot = None;
             it.grid_pos = Some(free);
         }
@@ -2088,7 +2281,7 @@ impl InventoryManager {
             self.hud_sync_dirty = false;
         }
         if let Some(aud) = audio {
-            aud.play_item_use(&section);
+            aud.play_item_use(&item.section);
         }
         true
     }
@@ -2137,8 +2330,14 @@ impl InventoryManager {
         let item = self.item(uid)?.clone();
         if !matches!(item.category, ItemCategory::Medical | ItemCategory::Consumable) {
             // Double-clicking / using weapon or suit equips it into its preferred slot
-            let meta = classify_section_meta(&item.section);
-            if let Some(pref_slot) = meta.preferred_slot {
+            let preferred = if let Some(base) = self.configured_base_slot(&item.section)
+                && self.native_inventory.is_some()
+            {
+                EquipmentSlot::from_native_index(base)
+            } else {
+                classify_section_meta(&item.section).preferred_slot
+            };
+            if let Some(pref_slot) = preferred {
                 let _ = self.equip_item(uid, pref_slot, hud_weapon, audio);
             }
             return None;
@@ -2472,6 +2671,38 @@ impl InventoryManager {
             return;
         }
 
+        if let Some(picker) = self.picker_cells(&layout) {
+            if point_in_rect(mx, my, picker.rect) {
+                let wheel = input.wheel_delta();
+                if wheel != 0.0 {
+                    let max_scroll = picker.max_scroll;
+                    if let Some((_, scroll)) = &mut self.stack_picker {
+                        *scroll = if wheel > 0.0 { scroll.saturating_sub(1) } else { (*scroll + 1).min(max_scroll) };
+                    }
+                    return;
+                }
+                if let Some((_, item)) = picker.cells.iter().find(|(rect, _)| point_in_rect(mx, my, *rect)) {
+                    let uid = item.uid;
+                    if input.is_mouse_just_pressed(MouseButton::Right) {
+                        self.selected_uid = Some(uid);
+                        let _ = self.use_item(uid, hud_weapon, alife, audio);
+                        return;
+                    }
+                    if input.is_mouse_just_pressed(MouseButton::Left) {
+                        let origin_cell = item.grid_pos;
+                        self.selected_uid = Some(uid);
+                        self.drag = Some(DragState {
+                            item_uid: uid, start_pointer: [mx, my], current_pointer: [mx, my],
+                            origin_cell, origin_slot: None,
+                        });
+                        return;
+                    }
+                }
+            } else if input.is_mouse_just_pressed(MouseButton::Left) && !point_in_rect(mx, my, layout.use_button_rect) {
+                self.stack_picker = None;
+            }
+        }
+
         if input.is_mouse_just_pressed(MouseButton::Left)
             && let Some(&(index, _, _)) = layout.filter_buttons.iter().find(|(_, rect, _)| point_in_rect(mx, my, *rect))
         {
@@ -2580,6 +2811,16 @@ impl InventoryManager {
             let dy = my - drag.start_pointer[1];
             let moved_dist = (dx * dx + dy * dy).sqrt();
 
+            if moved_dist < 5.0 && self.stack_all_sections
+                && let Some(cell) = drag.origin_cell
+                && self.stack_picker.is_none_or(|(selected, _)| selected != cell)
+                && let Some(item) = self.item(drag.item_uid)
+                && (self.item_uses_condition(item) || self.counts_rounds(item))
+                && self.stack_members(cell).nth(1).is_some()
+            {
+                self.stack_picker = Some((cell, 0));
+            }
+
             if moved_dist >= 5.0 {
                 if let Some(target_slot) = layout.hit_slot(mx, my) {
                     let _ = self.equip_item(
@@ -2589,6 +2830,12 @@ impl InventoryManager {
                         audio.as_deref_mut(),
                     );
                 } else if let Some((col, row)) = layout.hit_grid_cell(mx, my) {
+                    if self.stack_all_sections {
+                        if let Some(slot) = drag.origin_slot {
+                            let _ = self.unequip_slot(slot, hud_weapon, audio);
+                        }
+                        return;
+                    }
                     let ok = self.move_item_to_grid(drag.item_uid, col, row);
                     if ok && let Some(hw) = hud_weapon && self.hud_sync_dirty {
                         self.sync_hud_weapon(hw);
@@ -2769,13 +3016,14 @@ impl InventoryManager {
                     }
                 }
                 let occ = self.item_in_slot(*slot);
-                // The default bolt is a runtime supply and is absent from some native saves.
-                if occ.is_none() && *slot == EquipmentSlot::NativeSlot(6)
+                if occ.is_none()
+                    && let Some((default_slot, section)) = self.default_equipment
+                    && default_slot == *slot
                     && let (Some(size), Some(tex), Some(icons)) = (native_icon_size, equipment_tex, self.grid_index.as_deref())
-                    && let Some((_, _, w, h)) = icons.get("bolt")
+                    && let Some((_, _, w, h)) = icons.get(section)
                 {
                     let icon = native_equipment_icon(*rect, size, w, h);
-                    let uv = item_icon_uv_indexed("bolt", ItemCategory::Misc, Some(icons));
+                    let uv = item_icon_uv_indexed(section, ItemCategory::Misc, Some(icons));
                     renderer.ui_draw_textured_rect(icon, uv, tex, [1.0; 4]);
                     drawn += 1;
                 }
@@ -2864,7 +3112,8 @@ impl InventoryManager {
                     continue;
                 }
                 let rect = [ix, clipped_top, iw, clipped_bottom - clipped_top];
-                let is_sel = Some(item.uid) == self.selected_uid;
+                let is_sel = self.selected_uid.and_then(|uid| self.item(uid))
+                    .is_some_and(|selected| selected.grid_pos == Some((col, row)));
                 if is_sel {
                     renderer.ui_fill_rect(rect, [0.52, 0.45, 0.22, 0.8]);
                     drawn += 1;
@@ -2880,14 +3129,17 @@ impl InventoryManager {
                     renderer.ui_fill_rect(rect, item.category.accent_color());
                 }
                 drawn += 1;
-                if show_item_condition(item.category) && iy + ih - 4.0 >= top && iy + ih <= bottom {
+                let grouped = count > 1 && !self.counts_rounds(item);
+                if self.item_uses_condition(item) && !(self.stack_all_sections && grouped)
+                    && iy + ih - 4.0 >= top && iy + ih <= bottom
+                {
                     drawn += draw_segments(
                         renderer,
                         [ix + 2.0, iy + ih - 4.0, (iw - 4.0).max(2.0), 2.5],
                         18, item.condition, condition_bar_color(item.condition),
                     );
                 }
-                if (count > 1 || (item.category == ItemCategory::Ammo && item.ammo_elapsed.is_some()))
+                if (count > 1 || (self.counts_rounds(item) && item.ammo_elapsed.is_some()))
                     && iy >= top && iy + 12.0 <= bottom && let Some(f) = font
                 {
                     let text = format!("x{count}");
@@ -2968,6 +3220,30 @@ impl InventoryManager {
             if let Some(field) = &layout.money {
                 let money = format!("{} {}", self.actor_stats.money, self.currency_suffix);
                 drawn += field.draw(renderer, font, inventory_fonts, &money, [1.0; 4]);
+            }
+
+            if let Some(picker) = self.picker_cells(&layout) {
+                renderer.ui_fill_rect(picker.rect, [0.06, 0.06, 0.06, 0.96]);
+                drawn += 1;
+                for ([x, y, w, h], item) in picker.cells {
+                    let tint = if self.selected_uid == Some(item.uid) { [0.29, 0.32, 0.20, 0.95] }
+                        else { [0.13, 0.13, 0.12, 0.9] };
+                    renderer.ui_fill_rect([x, y, w - 1.0, h - 1.0], tint);
+                    drawn += 1;
+                    if let Some(tex) = equipment_tex {
+                        let uv = item_icon_uv_indexed(&item.section, item.category, self.grid_index.as_deref());
+                        renderer.ui_draw_textured_rect([x + 2.0, y + 2.0, w - 4.0, h - 4.0], uv, tex, [1.0; 4]);
+                        drawn += 1;
+                    }
+                    if let Some(font) = font {
+                        let number = if self.counts_rounds(item) { item.ammo_elapsed } else { item.remaining_uses };
+                        if let Some(number) = number {
+                            drawn += font.draw_text(renderer, &number.to_string(), [x + 2.0, y], 12.0, [0.88, 0.91, 0.73, 1.0]);
+                        } else if self.item_uses_condition(item) {
+                            drawn += draw_segments(renderer, [x + 2.0, y + h - 4.0, w - 4.0, 2.5], 18, item.condition, condition_bar_color(item.condition));
+                        }
+                    }
+                }
             }
 
             // Floating Drag Ghost following mouse cursor
@@ -3110,6 +3386,19 @@ fn draw_segments(
 
 fn show_item_condition(category: ItemCategory) -> bool {
     matches!(category, ItemCategory::Weapon | ItemCategory::Outfit | ItemCategory::Helmet)
+}
+
+// Class IDs registered by the C++ factory for the IsWeapon, IsOutfit and IsHeadgear checks.
+fn condition_gear_class(class: &str) -> bool {
+    matches!(class,
+        "E_STLK" | "EQU_STLK" | "E_HLMET" | "EQ_HLMET"
+        | "WP_VINT" | "WP_AK74" | "WP_LR300" | "WP_HPSA" | "WP_PM" | "WP_SHOTG" | "WP_ASHTG"
+        | "WP_BM16" | "WP_SVD" | "WP_SVU" | "WP_RG6" | "WP_RPG7" | "WP_VAL" | "WP_WALTH"
+        | "WP_USP45" | "WP_GROZA" | "WP_KNIFE"
+        | "W_VINT" | "W_AK74" | "W_LR300" | "W_HPSA" | "W_PM" | "W_SHOTGN" | "W_BM16"
+        | "W_SVD" | "W_SVU" | "W_RG6" | "W_RPG7" | "W_VAL" | "W_WALTHR" | "W_USP45"
+        | "W_GROZA" | "W_KNIFE"
+    )
 }
 
 fn fit_inventory_icon([x, y, w, h]: [f32; 4], aspect: f32) -> [f32; 4] {
