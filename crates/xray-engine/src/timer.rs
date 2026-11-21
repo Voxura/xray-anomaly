@@ -22,6 +22,13 @@ pub struct EngineTimer {
 }
 
 impl EngineTimer {
+    /// Keep the clock current while the level is paused, without queuing simulation ticks.
+    pub(crate) fn skip_frame(&mut self) {
+        unsafe {
+            let _ = QueryPerformanceCounter(&mut self.prev_time);
+        }
+    }
+
     pub fn new() -> Self {
         let mut freq = 0i64;
         unsafe {

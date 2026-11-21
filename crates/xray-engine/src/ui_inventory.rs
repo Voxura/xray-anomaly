@@ -1644,6 +1644,18 @@ impl InventoryManager {
         }
     }
 
+    pub(crate) fn set_item_picker_enabled(&mut self, enabled: bool) {
+        if self.stack_all_sections != enabled {
+            self.stack_all_sections = enabled;
+            self.grid_scroll_row = 0;
+            self.repack_bag();
+        }
+    }
+
+    pub(crate) fn item_picker_enabled(&self) -> bool {
+        self.stack_all_sections
+    }
+
     /// Hydrate actor inventory from loaded `.scop` ALife entities (`parent_id == 0` or `parent_id == actor_id`).
     pub fn hydrate_from_alife(
         &mut self,

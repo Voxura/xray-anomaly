@@ -356,6 +356,9 @@ fn run_engine(args: LaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut runtime = EngineRuntime::new(config, !args.headless)?;
     runtime.attach_vfs(Arc::clone(&vfs));
+    if let Some(app_data) = env::var_os("LOCALAPPDATA") {
+        runtime.load_extras_preferences(PathBuf::from(app_data).join("X-Ray Anomaly").join("extras.ltx"));
+    }
     eprintln!("[engine] Runtime initialized (headless: {})", args.headless);
 
     if let Some(connect_raw) = &args.connect {

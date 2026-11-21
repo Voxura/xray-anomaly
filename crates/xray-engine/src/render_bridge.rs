@@ -229,6 +229,7 @@ pub struct RenderBridge {
     hud_materials: Option<BTreeMap<String, HudMaterial>>,
     default_cube_mesh: MeshHandle,
     ui_font: Option<UiFontResource>,
+    pause_font_attempted: bool,
     inventory_fonts: BTreeMap<&'static str, UiFontResource>,
     ui_font_attempted: bool,
     ui_equipment_tex: Option<DescriptorIndex>,
@@ -278,6 +279,7 @@ impl RenderBridge {
             hud_materials: None,
             default_cube_mesh,
             ui_font: None,
+            pause_font_attempted: false,
             inventory_fonts: BTreeMap::new(),
             ui_font_attempted: false,
             ui_equipment_tex: None,
@@ -619,6 +621,28 @@ impl RenderBridge {
             dt,
             elapsed_sec,
         )
+    }
+
+    /// Monolith replaces level rendering with a separate menu pass.
+    pub(crate) fn render_pause_menu(
+        &mut self,
+        renderer: &mut Dx12Renderer,
+        menu: &crate::ui_pause::PauseMenu,
+        vfs: Option<&VirtualFileSystem>,
+        mouse: (f32, f32),
+        single_player: bool,
+    ) -> WinResult<()> {
+        let (width, height) = (renderer.stats().width, renderer.stats().height);
+        if self.ui_font.is_none() && !self.pause_font_attempted && let Some(vfs) = vfs {
+            self.pause_font_attempted = true;
+            if let Ok(fonts) = load_ltx_tree_from_vfs(vfs, "$game_configs$/fonts.ltx", &[]) {
+                self.ui_font = ["ui_font_letterica16_russian", "ui_font_arial_14", "hud_font_medium"]
+                    .into_iter().find_map(|section| load_ui_font(renderer, vfs, &fonts, section, height));
+            }
+        }
+        renderer.clear_backbuffer([0.028, 0.04, 0.045, 1.0]);
+        menu.render(renderer, self.ui_font.as_ref(), [width, height], mouse, single_player);
+        renderer.ui_flush(width, height)
     }
 
     /// Execute all 7 DX12 render graph passes plus Inventory, PDA, Dialogue, Travel Prompt & Loading Screen UI.

@@ -12,12 +12,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetForegroundWindow, GetWindowLongPtrW, GetWindowPlacement, PeekMessageW, PostQuitMessage,
-    RegisterClassExW, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
+    LoadCursorW, RegisterClassExW, SetCursor, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
     ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, MSG,
     PM_REMOVE, SW_HIDE, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WNDCLASSEXW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    HTCLIENT, IDC_ARROW, WM_SETCURSOR, WNDCLASSEXW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
     GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINDOWPLACEMENT,
 };
 
@@ -76,6 +76,7 @@ pub enum WindowEvent {
 struct WindowInternalState {
     events: Mutex<Vec<WindowEvent>>,
     is_closed: AtomicBool,
+    menu_cursor: AtomicBool,
 }
 
 pub struct EngineWindow {
@@ -140,6 +141,7 @@ impl EngineWindow {
         let state = Box::new(WindowInternalState {
             events: Mutex::new(Vec::with_capacity(32)),
             is_closed: AtomicBool::new(false),
+            menu_cursor: AtomicBool::new(false),
         });
 
         let hwnd = unsafe {
@@ -251,6 +253,10 @@ impl EngineWindow {
         }
     }
 
+    pub(crate) fn set_menu_cursor(&self, visible: bool) {
+        self.state.menu_cursor.store(visible, Ordering::Relaxed);
+    }
+
     /// Pump Windows event queue and dispatch to `EngineInput`
     pub fn poll_events(&mut self, input: &mut EngineInput) -> bool {
         if self.is_closed() {
@@ -332,6 +338,14 @@ unsafe extern "system" fn wnd_proc(
     if user_data != 0 {
         let state = unsafe { &*(user_data as *const WindowInternalState) };
         match msg {
+            WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == HTCLIENT
+                && state.menu_cursor.load(Ordering::Relaxed) =>
+            {
+                if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+                    unsafe { SetCursor(Some(cursor)); }
+                    return LRESULT(1);
+                }
+            }
             WM_CLOSE => {
                 let mut guard = state.events.lock().unwrap();
                 guard.push(WindowEvent::CloseRequested);

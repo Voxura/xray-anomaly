@@ -335,6 +335,12 @@ impl AudioManager {
         }
     }
 
+    pub fn set_gameplay_paused(&self, paused: bool) {
+        if let Ok(mut mixer) = self.mixer.lock() {
+            mixer.gameplay_paused = paused;
+        }
+    }
+
     pub fn set_category_volume(&self, category: AudioCategory, volume: f32) {
         if let Ok(mut m) = self.mixer.lock() {
             m.set_category_volume(category, volume);
@@ -868,7 +874,7 @@ impl AudioManager {
             ..Default::default()
         };
         self.ui_sounds_triggered += 1;
-        self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
+        self.play_clip_internal(clip, AudioCategory::Interface, emitter, false)
     }
 
     /// Play interface close sound.
@@ -886,7 +892,7 @@ impl AudioManager {
             ..Default::default()
         };
         self.ui_sounds_triggered += 1;
-        self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
+        self.play_clip_internal(clip, AudioCategory::Interface, emitter, false)
     }
 
     /// Play a crisp PDA / UI interaction click sound.
@@ -904,7 +910,7 @@ impl AudioManager {
             ..Default::default()
         };
         self.ui_sounds_triggered += 1;
-        self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
+        self.play_clip_internal(clip, AudioCategory::Interface, emitter, false)
     }
 
     /// Play inventory / world item pickup sound.

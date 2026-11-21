@@ -27,6 +27,7 @@ pub enum AudioCategory {
     Ambient,
     Weather,
     Dialogue,
+    Interface,
 }
 
 /// Decoded PCM audio clip ready for fast lock-free-style mixing across voices.
@@ -122,6 +123,7 @@ pub struct SpatialAudioMixer {
     pub listener: AudioListener,
     pub occlusion_mesh: Option<Arc<SoundOcclusionMesh>>,
     pub total_frames_mixed: u64,
+    pub gameplay_paused: bool,
     next_voice_id: u64,
     voices: BTreeMap<VoiceId, ActiveVoice>,
 }
@@ -149,6 +151,7 @@ impl SpatialAudioMixer {
             listener: AudioListener::default(),
             occlusion_mesh: None,
             total_frames_mixed: 0,
+            gameplay_paused: false,
             next_voice_id: 1,
             voices: BTreeMap::new(),
         }
@@ -257,7 +260,7 @@ impl SpatialAudioMixer {
         let mut finished = Vec::new();
 
         for (&id, voice) in &mut self.voices {
-            if voice.paused {
+            if voice.paused || (self.gameplay_paused && voice.category != AudioCategory::Interface) {
                 continue;
             }
             let src_frames = voice.clip.frame_count();

@@ -28,6 +28,7 @@ pub mod render_bridge;
 pub mod timer;
 pub mod ui_inventory;
 pub mod ui_pda;
+mod ui_pause;
 pub mod window;
 pub mod world_loader;
 

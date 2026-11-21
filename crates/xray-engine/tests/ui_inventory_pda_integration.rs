@@ -47,6 +47,77 @@ fn make_temp_dir(tag: &str) -> TempDirGuard {
 }
 
 #[test]
+fn escape_pauses_the_level_and_options_apply_only_when_accepted() {
+    let dir = make_temp_dir("pause");
+    let path = dir.0.join("extras.ltx");
+    let mut runtime = EngineRuntime::new(EngineConfig {
+        window: WindowConfig { visible: false, ..Default::default() },
+        ..Default::default()
+    }, true).unwrap();
+    runtime.load_extras_preferences(path.clone());
+
+    let step = |runtime: &mut EngineRuntime| {
+        runtime.timer.simulate_elapsed(0.1);
+        assert!(runtime.step_frame().unwrap());
+    };
+    let key = |runtime: &mut EngineRuntime, vk| {
+        runtime.window.push_synthetic_event(WindowEvent::KeyDown { vk });
+        step(runtime);
+        runtime.window.push_synthetic_event(WindowEvent::KeyUp { vk });
+        step(runtime);
+    };
+    let escape = EngineInput::VK_ESCAPE;
+    let select = EngineInput::VK_SPACE;
+    let next = EngineInput::VK_TAB;
+
+    runtime.inventory.set_open(true, None);
+    key(&mut runtime, escape);
+    assert!(!runtime.inventory.open);
+    assert!(runtime.input.is_cursor_locked());
+
+    let game_time = runtime.elapsed_sec;
+    let position = runtime.camera.position;
+    key(&mut runtime, escape);
+    assert!(!runtime.input.is_cursor_locked());
+    key(&mut runtime, next);
+    key(&mut runtime, select); // Options
+    key(&mut runtime, select); // Change backpack animations
+    key(&mut runtime, escape); // Confirm discard
+    key(&mut runtime, next);
+    key(&mut runtime, select); // Discard
+    assert!(!path.exists());
+
+    key(&mut runtime, next);
+    key(&mut runtime, select); // Options
+    key(&mut runtime, select); // Change backpack animations
+    key(&mut runtime, next);
+    key(&mut runtime, select); // Change item picker
+    key(&mut runtime, next);
+    key(&mut runtime, select); // Accept
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("backpack_animations = false"));
+    assert!(text.contains("inventory_item_picker = true"));
+    assert_eq!(runtime.elapsed_sec, game_time);
+    assert_eq!(runtime.camera.position, position);
+
+    key(&mut runtime, next);
+    key(&mut runtime, next);
+    key(&mut runtime, select); // Quit confirmation
+    key(&mut runtime, escape); // Cancel quit
+    key(&mut runtime, escape); // Resume
+    assert!(runtime.input.is_cursor_locked());
+    assert!(runtime.elapsed_sec > game_time);
+
+    key(&mut runtime, escape);
+    key(&mut runtime, next);
+    key(&mut runtime, next);
+    key(&mut runtime, select); // Quit confirmation
+    key(&mut runtime, next);
+    runtime.window.push_synthetic_event(WindowEvent::KeyDown { vk: select });
+    assert!(!runtime.step_frame().unwrap());
+}
+
+#[test]
 fn backpack_sequence_delays_inventory_and_blocks_other_actions_until_recovered() {
     let dir = make_temp_dir("backpack");
     let config = dir.0.join("configs/items/items");

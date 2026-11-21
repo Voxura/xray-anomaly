@@ -17,6 +17,7 @@ use crate::render_bridge::{HudOverlayState, RenderBridge, RenderBridgeConfig};
 use crate::timer::EngineTimer;
 use crate::ui_inventory::{InventoryManager, ItemGridIndex};
 use crate::ui_pda::PdaManager;
+use crate::ui_pause::{Extras, MenuOutcome, PauseMenu};
 use crate::window::{EngineWindow, WindowConfig};
 use crate::world_loader::{LevelLoadConfig, LoadedWorld, WorldLoader};
 use xray_audio::{AudioListener, AudioManager, AudioManagerConfig};
@@ -123,6 +124,8 @@ pub struct EngineRuntime {
     pub item_grid_index: Option<Arc<ItemGridIndex>>,
     pub elapsed_sec: f32,
     pub running: bool,
+    pause_menu: PauseMenu,
+    backpack_animations: bool,
 }
 
 impl EngineRuntime {
@@ -175,6 +178,8 @@ impl EngineRuntime {
             item_grid_index: None,
             elapsed_sec: 0.0,
             running: true,
+            pause_menu: PauseMenu::default(),
+            backpack_animations: true,
         })
     }
 
@@ -193,6 +198,33 @@ impl EngineRuntime {
         self.level_transition.invalidate_vfs_cache();
         self.level_transition.ensure_game_levels_loaded(&vfs);
         self.vfs = Some(vfs);
+    }
+
+    /// Load rewrite-owned preferences after establishing the installed Anomaly defaults.
+    pub fn load_extras_preferences(&mut self, path: std::path::PathBuf) {
+        let defaults = Extras {
+            backpack_animations: true,
+            item_picker: self.inventory.item_picker_enabled(),
+        };
+        let extras = self.pause_menu.configure(defaults, Some(path));
+        self.apply_extras(extras);
+    }
+
+    fn apply_extras(&mut self, extras: Extras) {
+        self.backpack_animations = extras.backpack_animations;
+        self.inventory.set_item_picker_enabled(extras.item_picker);
+    }
+
+    fn render_pause_menu(&mut self) -> windows::core::Result<()> {
+        if let (Some(renderer), Some(bridge)) = (&mut self.renderer, &mut self.render_bridge) {
+            renderer.begin_frame()?;
+            bridge.render_pause_menu(
+                renderer, &self.pause_menu, self.vfs.as_deref(),
+                self.input.mouse_position(), self.network.is_none(),
+            )?;
+            renderer.end_frame(self.config.vsync)?;
+        }
+        Ok(())
     }
 
     /// Hydrate player inventory & `item_remaining_uses` from a host/player `.scoc` file.
@@ -451,6 +483,45 @@ impl EngineRuntime {
             r.resize(width, height)?;
         }
 
+        // Escape belongs to the topmost dialog. The level only receives it when
+        // the pause menu is closed, just as CLevel::IR_OnKeyboardPress does.
+        if self.pause_menu.is_open() {
+            match self.pause_menu.handle_input(&self.input, width, height) {
+                MenuOutcome::Quit => {
+                    self.running = false;
+                    return Ok(false);
+                }
+                MenuOutcome::Resume => {
+                    self.audio.set_gameplay_paused(false);
+                    self.window.set_menu_cursor(false);
+                    self.input.set_cursor_locked(true);
+                    self.timer.skip_frame();
+                    return Ok(true);
+                }
+                MenuOutcome::Apply(extras) => self.apply_extras(extras),
+                MenuOutcome::Stay => {}
+            }
+        } else if self.input.is_action_just_pressed(Action::Menu)
+            && !self.level_transition.is_loading()
+            && !self.level_transition.is_modal_open()
+            && !self.inventory.is_modal_open()
+            && !self.pda.open
+            && !self.hud_weapon.backpack_blocks_input()
+        {
+            self.pause_menu.open();
+            self.audio.set_gameplay_paused(true);
+        }
+        let menu_open = self.pause_menu.is_open();
+        self.window.set_menu_cursor(menu_open);
+        if menu_open && self.network.is_none() {
+            self.input.set_cursor_locked(false);
+            self.timer.skip_frame();
+            if render_active {
+                self.render_pause_menu()?;
+            }
+            return Ok(true);
+        }
+
         // 3. Update timer
         let dt = self.timer.tick();
         self.elapsed_sec += dt;
@@ -535,22 +606,19 @@ impl EngineRuntime {
         if self.hud_weapon.advance_backpack(self.timer.raw_delta_time()) {
             self.inventory.set_open(true, None);
         }
-        if !inventory_was_transitioning && self.input.is_action_just_pressed(Action::Menu) {
+        if !menu_open && !inventory_was_transitioning && self.input.is_action_just_pressed(Action::Menu) {
             if self.inventory.dialogue.is_some() {
                 self.inventory.dialogue = None;
                 self.audio.play_ui_close();
             } else if self.inventory.open {
-                let animated = self.hud_weapon.close_backpack(&mut self.audio);
+                let animated = self.backpack_animations && self.hud_weapon.close_backpack(&mut self.audio);
                 self.inventory.set_open(false, (!animated).then_some(&mut self.audio));
             } else if self.pda.open {
                 self.pda.set_open(false, Some(&mut self.audio));
             } else if self.level_transition.active_prompt.is_some() {
                 self.level_transition.cancel_prompt(Some(&mut self.audio));
-            } else {
-                self.running = false;
-                return Ok(false);
             }
-        } else if !inventory_was_transitioning && self.input.is_action_just_pressed(Action::Inventory) {
+        } else if !menu_open && !inventory_was_transitioning && self.input.is_action_just_pressed(Action::Inventory) {
             if self.inventory.dialogue.is_some() {
                 self.inventory.dialogue = None;
             }
@@ -558,16 +626,16 @@ impl EngineRuntime {
                 self.pda.open = false;
             }
             if self.inventory.open {
-                let animated = self.hud_weapon.close_backpack(&mut self.audio);
+                let animated = self.backpack_animations && self.hud_weapon.close_backpack(&mut self.audio);
                 self.inventory.set_open(false, (!animated).then_some(&mut self.audio));
-            } else if !self.vfs.as_deref().is_some_and(|vfs| {
+            } else if !self.backpack_animations || !self.vfs.as_deref().is_some_and(|vfs| {
                 self.hud_weapon.start_backpack(vfs, self.inventory.actor_stats.community_index, &mut self.audio)
             }) {
                 self.inventory.set_open(true, Some(&mut self.audio));
             }
-        } else if !inventory_was_transitioning && self.input.is_action_just_pressed(Action::Pda) {
+        } else if !menu_open && !inventory_was_transitioning && self.input.is_action_just_pressed(Action::Pda) {
             if !self.pda.open && (self.inventory.open || self.inventory.dialogue.is_some()) {
-                if self.inventory.open && self.hud_weapon.close_backpack(&mut self.audio) {
+                if self.backpack_animations && self.inventory.open && self.hud_weapon.close_backpack(&mut self.audio) {
                     self.inventory.set_open(false, None);
                 } else {
                     self.inventory.set_open(false, None);
@@ -583,8 +651,8 @@ impl EngineRuntime {
         let modal_open = self.inventory.is_modal_open()
             || self.pda.open
             || self.level_transition.is_modal_open()
-            || inventory_input_locked;
-        self.input.set_cursor_locked(inventory_input_locked || !modal_open);
+            || inventory_input_locked || menu_open;
+        self.input.set_cursor_locked(!menu_open && (inventory_input_locked || !modal_open));
         if !modal_open {
             for slot in 0..crate::ui_inventory::QUICK_SLOT_COUNT {
                 if self.input.is_key_just_pressed(EngineInput::VK_F1 + slot) {
@@ -744,7 +812,7 @@ impl EngineRuntime {
         let vh = self.window.height();
 
         // Check level changer trigger volumes & travel confirmation prompt when no Inventory/PDA is open
-        if !inventory_input_locked && !self.inventory.is_modal_open() && !self.pda.open && !self.level_transition.is_loading()
+        if !menu_open && !inventory_input_locked && !self.inventory.is_modal_open() && !self.pda.open && !self.level_transition.is_loading()
         {
             let local_slot = self.network.as_ref().map_or(0, NetworkSession::local_slot);
             let networked = self
@@ -780,7 +848,7 @@ impl EngineRuntime {
         }
 
         // Proximity `'E'` (`Action::Use`) NPC/Trader dialogue & ground item pickup, plus modal UI input
-        if !inventory_input_locked && !self.inventory.is_modal_open()
+        if !menu_open && !inventory_input_locked && !self.inventory.is_modal_open()
             && !self.pda.open
             && !self.level_transition.is_modal_open()
         {
@@ -790,7 +858,7 @@ impl EngineRuntime {
                 self.alife.as_ref(),
             );
         }
-        if !inventory_input_locked && self.input.is_action_just_pressed(Action::Use)
+        if !menu_open && !inventory_input_locked && self.input.is_action_just_pressed(Action::Use)
             && !self.inventory.open
             && !self.pda.open
             && !self.level_transition.is_modal_open()
@@ -853,9 +921,10 @@ impl EngineRuntime {
         self.hud.stamina = self.inventory.actor_stats.stamina.clamp(0.0, 1.0);
         let ui_open_after = self.inventory.is_modal_open()
             || self.pda.open
-            || self.level_transition.is_modal_open();
+            || self.level_transition.is_modal_open()
+            || menu_open;
         let backpack_transition = self.hud_weapon.backpack_blocks_input();
-        self.input.set_cursor_locked(backpack_transition || !ui_open_after);
+        self.input.set_cursor_locked(!menu_open && (backpack_transition || !ui_open_after));
         self.hud.show_crosshair =
             !ui_open_after && !backpack_transition && self.hud_weapon.state != WeaponState::Aiming;
 
@@ -941,7 +1010,9 @@ impl EngineRuntime {
         }
 
         // 6. Direct3D 12 7-stage render graph presentation + first-person HUD weapon + UI Canvas pass
-        if render_active && let (Some(r), Some(rb)) = (&mut self.renderer, &mut self.render_bridge) {
+        if render_active && menu_open {
+            self.render_pause_menu()?;
+        } else if render_active && let (Some(r), Some(rb)) = (&mut self.renderer, &mut self.render_bridge) {
             let animated_camera = self.hud_weapon.backpack_camera_offset()
                 .map(|offset| self.camera.with_render_offset(&offset));
             r.begin_frame()?;
