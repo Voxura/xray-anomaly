@@ -42,12 +42,12 @@ use xray_formats::shaders_xr::{EngineShaderLibrary, R4BlenderSpec};
 use xray_formats::spawns::INVALID_OBJECT_ID;
 use xray_formats::sun::{build_3split_csm_atlas, CsmAtlasPacking, CsmAtlasPlan, SunCascadeConfig};
 use xray_formats::thm::{texture_stem_to_dds_vpath, ResolvedTextureLinks};
-use xray_formats::vfs_bridge::{load_font_from_vfs, load_ltx_tree_from_vfs, load_ogf_from_vfs, load_ui_texture_atlases_from_vfs, load_xml_from_vfs, resolve_ogf_texture_links};
+use xray_formats::vfs_bridge::{load_font_from_vfs, load_ltx_tree_from_vfs, load_ogf_from_vfs, load_shaders_xr_from_vfs, load_ui_texture_atlases_from_vfs, load_xml_from_vfs, resolve_ogf_texture_links};
 use xray_formats::weather::MixedEnvironment;
 use xray_formats::xml_ui::UiTextureAtlasMap;
 use xray_render_dx12::bindless::DescriptorIndex;
 use xray_render_dx12::clouds::{CloudSimulation, CloudsPushConstants};
-use xray_render_dx12::deferred::GpuLightParams;
+use xray_render_dx12::deferred::{GBufferSurface, GpuLightParams};
 use xray_render_dx12::details::{DetailManager, DetailPushConstants, GpuDetailInstance, GpuDetailVertex};
 use xray_render_dx12::geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
 use xray_render_dx12::geometry::HudBlend;
@@ -151,6 +151,7 @@ struct GpuWorldMesh {
     albedo_tex: DescriptorIndex,
     normal_tex: DescriptorIndex,
     material_tex: DescriptorIndex,
+    surface: GBufferSurface,
     bsphere_center: [f32; 3],
     bsphere_radius: f32,
     is_static_caster: bool,
@@ -391,6 +392,8 @@ impl RenderBridge {
         self.detail_textures.clear();
 
         // 1. Static visual meshes + fastpath shadow/depth buffers + bindless textures
+        let shader_library = vfs.and_then(|vfs| load_shaders_xr_from_vfs(vfs).ok());
+        let mut world_materials = BTreeMap::new();
         for visual in &world.visual_meshes {
             let Some(mesh_handle) = upload_resolved_mesh(renderer, &visual.mesh.vertices, &visual.mesh.indices)? else {
                 continue;
@@ -400,8 +403,18 @@ impl RenderBridge {
                 None => None,
             };
 
-            let (albedo_tex, normal_tex, material_tex) =
-                self.resolve_material_textures(renderer, vfs, &visual.texture_links);
+            let shader = visual.shader.as_ref();
+            let ((albedo_tex, normal_tex, material_tex), surface) = *world_materials
+                .entry(shader.map_or("", |shader| shader.raw.as_str()))
+                .or_insert_with(|| {
+                    let spec = shader.zip(shader_library.as_ref())
+                        .and_then(|(shader, library)| library.find_blender(&shader.shader))
+                        .and_then(R4BlenderSpec::from_blender_shader);
+                    (
+                        self.resolve_material_textures(renderer, vfs, &visual.texture_links),
+                        Self::resolve_world_surface(renderer, vfs, &world.level_dir, spec, &visual.texture_links),
+                    )
+                });
 
             let is_static_caster = !matches!(visual.visual_type, OgfVisualType::Lod);
             self.world_meshes.push(GpuWorldMesh {
@@ -410,6 +423,7 @@ impl RenderBridge {
                 albedo_tex,
                 normal_tex,
                 material_tex,
+                surface,
                 bsphere_center: visual.bsphere.center,
                 bsphere_radius: visual.bsphere.radius,
                 is_static_caster,
@@ -482,6 +496,39 @@ impl RenderBridge {
             .and_then(|b| try_load_vfs_texture(renderer, vfs, &b.bump_hash_dds))
             .unwrap_or(self.fallback_material);
         (albedo, normal, material)
+    }
+
+    fn resolve_world_surface(
+        renderer: &mut Dx12Renderer,
+        vfs: Option<&VirtualFileSystem>,
+        level_dir: &str,
+        spec: Option<R4BlenderSpec>,
+        links: &[ResolvedTextureLinks],
+    ) -> GBufferSurface {
+        match spec {
+            Some(R4BlenderSpec::BmmD { r_detail, g_detail, b_detail, a_detail, .. }) => {
+                let (Some(vfs), Some(base)) = (vfs, links.first()) else {
+                    return GBufferSurface::Opaque;
+                };
+                let mut load = |stem: &str| {
+                    let path = resolve_level_texture_vpath(vfs, level_dir, stem)?;
+                    try_load_vfs_texture(renderer, Some(vfs), &path)
+                };
+                let Some(mask) = load(&format!("{}_mask", base.diffuse_name)) else {
+                    return GBufferSurface::Opaque;
+                };
+                GBufferSurface::Terrain {
+                    mask,
+                    layers: [r_detail, g_detail, b_detail, a_detail].map(|layer| load(&layer)),
+                    detail_scale: base.detail_scale,
+                }
+            }
+            // The deferred base aref shader uses def_aref (200/255). The
+            // stored CBlender_deffer_aref threshold applies to its forward blend pass.
+            Some(R4BlenderSpec::Tree { alpha_blend: true, .. })
+            | Some(R4BlenderSpec::DefferAref { alpha_blend: false, .. }) => GBufferSurface::AlphaTest(200),
+            _ => GBufferSurface::Opaque,
+        }
     }
 
     fn ensure_dynamic_ogf_cached(
@@ -831,12 +878,13 @@ impl RenderBridge {
                     continue;
                 }
             }
-            renderer.draw_gbuffer_mesh(
+            renderer.draw_gbuffer_surface(
                 mesh.mesh_handle,
                 Some(mesh.albedo_tex),
                 Some(mesh.normal_tex),
                 Some(mesh.material_tex),
                 u32::MAX,
+                mesh.surface,
             )?;
             stats.gbuffer_static_draws += 1;
         }

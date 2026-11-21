@@ -992,6 +992,7 @@ impl GeometryState {
         height: u32,
         handle: MeshHandle,
         push_constants: &PushDrawConstants,
+        surface_constants: &[u32; 8],
     ) -> WinResult<()> {
         let mesh = self.meshes.get(handle).unwrap();
         let camera = self.camera.as_ref().unwrap();
@@ -1045,6 +1046,9 @@ impl GeometryState {
             );
             cmd.SetGraphicsRootShaderResourceView(3, tf_buf.0.GetGPUVirtualAddress());
             cmd.SetGraphicsRootShaderResourceView(4, lt_buf.0.GetGPUVirtualAddress());
+            cmd.SetGraphicsRoot32BitConstants(
+                5, surface_constants.len() as u32, surface_constants.as_ptr().cast(), 0,
+            );
             cmd.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: width as f32,
                 Height: height as f32,

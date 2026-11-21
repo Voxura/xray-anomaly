@@ -593,6 +593,35 @@ fn rttv_or_ref(rtv: &D3D12_CPU_DESCRIPTOR_HANDLE) -> D3D12_CPU_DESCRIPTOR_HANDLE
 }
 
 /// Graphics pipeline rendering meshes into the 3 G-Buffer MRTs (Albedo, Normal, Material) and Depth
+/// Material state selected by the native world shader for a G-buffer draw.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum GBufferSurface {
+    #[default]
+    Opaque,
+    AlphaTest(u8),
+    Terrain {
+        mask: crate::bindless::DescriptorIndex,
+        layers: [Option<crate::bindless::DescriptorIndex>; 4],
+        detail_scale: f32,
+    },
+}
+
+impl GBufferSurface {
+    pub(crate) fn root_constants(self) -> [u32; 8] {
+        let mut constants = [u32::MAX; 8];
+        match self {
+            Self::Opaque => {},
+            Self::AlphaTest(reference) => constants[6] = u32::from(reference),
+            Self::Terrain { mask, layers, detail_scale } => {
+                constants[0] = mask.0;
+                constants[1..5].copy_from_slice(&layers.map(|layer| layer.map_or(u32::MAX, |index| index.0)));
+                constants[5] = detail_scale.to_bits();
+            }
+        }
+        constants
+    }
+}
+
 pub struct GBufferMeshPipeline {
     pub root: ID3D12RootSignature,
     pub pso: ID3D12PipelineState,
@@ -648,7 +677,16 @@ impl GBufferMeshPipeline {
             RegisterSpace: 1,
         };
 
-        let parameters = [camera, textures, push, transforms, lights];
+        let mut surface = D3D12_ROOT_PARAMETER::default();
+        surface.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        surface.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        surface.Anonymous.Constants = D3D12_ROOT_CONSTANTS {
+            ShaderRegister: 2,
+            RegisterSpace: 0,
+            Num32BitValues: 8,
+        };
+
+        let parameters = [camera, textures, push, transforms, lights, surface];
 
         let sampler = D3D12_STATIC_SAMPLER_DESC {
             Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,

@@ -1093,6 +1093,22 @@ impl Dx12Renderer {
         material_index: Option<crate::bindless::DescriptorIndex>,
         transform_index: u32,
     ) -> WinResult<()> {
+        self.draw_gbuffer_surface(
+            handle, albedo_index, normal_index, material_index, transform_index,
+            crate::deferred::GBufferSurface::Opaque,
+        )
+    }
+
+    /// Draw an alpha-tested or layered surface into the G-Buffer.
+    pub fn draw_gbuffer_surface(
+        &mut self,
+        handle: crate::geometry_abi::MeshHandle,
+        albedo_index: Option<crate::bindless::DescriptorIndex>,
+        normal_index: Option<crate::bindless::DescriptorIndex>,
+        material_index: Option<crate::bindless::DescriptorIndex>,
+        transform_index: u32,
+        surface: crate::deferred::GBufferSurface,
+    ) -> WinResult<()> {
         self.ensure_gbuffer()?;
         let cmd = match self.current_cmd_list.as_ref() {
             Some(c) => c,
@@ -1125,6 +1141,7 @@ impl Dx12Renderer {
             self.height,
             handle,
             &push,
+            &surface.root_constants(),
         )
     }
 

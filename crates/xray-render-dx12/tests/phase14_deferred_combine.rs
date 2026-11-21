@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
+use xray_render_dx12::deferred::GBufferSurface;
 use xray_render_dx12::postprocess::PostprocessPushConstants;
 use xray_render_dx12::renderer::Dx12Renderer;
 use xray_render_dx12::{CameraConstants, DynamicLight, GpuLightParams, XRayVertex};
@@ -352,6 +353,39 @@ fn test_gbuffer_mrt_rasterization_hardware_readback() {
         "Corner outside quad should be cleared black, got {:?}",
         corner
     );
+
+    let mut texture = |name: &str, [r, g, b, a]: [u8; 4]| {
+        renderer.load_texture_from_dds(name, &create_solid_color_rgba8_dds(4, 4, r, g, b, a)).unwrap()
+    };
+    let mask = texture("terrain_mask.dds", [128, 64, 31, 31]);
+    let layers = [
+        texture("terrain_r.dds", [128, 0, 0, 255]),
+        texture("terrain_g.dds", [0, 128, 0, 255]),
+        texture("terrain_b.dds", [0, 0, 128, 255]),
+        texture("terrain_a.dds", [128, 128, 128, 255]),
+    ];
+    let transparent = texture("cutout.dds", [0, 255, 0, 0]);
+    renderer.begin_frame().unwrap();
+    renderer.begin_gbuffer_pass().unwrap();
+    renderer.draw_gbuffer_surface(
+        mesh_handle, Some(albedo_idx), None, None, u32::MAX,
+        GBufferSurface::Terrain { mask, layers: layers.map(Some), detail_scale: 80.0 },
+    ).unwrap();
+    renderer.draw_gbuffer_surface(
+        mesh_handle, Some(transparent), None, None, u32::MAX, GBufferSurface::AlphaTest(200),
+    ).unwrap();
+    renderer.end_gbuffer_pass().unwrap();
+    let cmd = renderer.current_cmd_list.as_ref().unwrap();
+    transition(cmd, &albedo_res, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    unsafe { cmd.CopyTextureRegion(&dst, 0, 0, 0, &src, None); }
+    transition(cmd, &albedo_res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    renderer.end_frame(false).unwrap();
+    renderer.wait_for_gpu().unwrap();
+
+    let center = readback_rgba8(&readback, 64, 64, 32, 32);
+    for (actual, expected) in center.into_iter().zip([138i32, 41, 10, 255]) {
+        assert!((i32::from(actual) - expected).abs() <= 3, "terrain blend through cutout: {center:?}");
+    }
 }
 
 #[test]

@@ -20,6 +20,17 @@ cbuffer cb_draw : register(b1)
     uint custom_param3;
 };
 
+cbuffer GBufferSurfaceConstants : register(b2)
+{
+    uint terrain_mask_index;
+    uint terrain_r_index;
+    uint terrain_g_index;
+    uint terrain_b_index;
+    uint terrain_a_index;
+    float terrain_detail_scale;
+    uint surface_alpha_ref;
+};
+
 Texture2D g_textures[] : register(t0);
 SamplerState g_sampler : register(s0);
 ByteAddressBuffer g_transforms : register(t0, space1);
@@ -255,6 +266,14 @@ struct GBufferOutput
     float4 material : SV_Target2; // R: Metallic, G: Roughness, B: Specular, A: 1.0
 };
 
+float3 sample_terrain_layer(uint index, float2 uv)
+{
+    // Half intensity is neutral under Monolith's 2 * base * detail modulation.
+    if (index == 0xFFFFFFFF)
+        return 0.5;
+    return g_textures[NonUniformResourceIndex(index)].Sample(g_sampler, uv).rgb;
+}
+
 GBufferOutput ps_gbuffer(PSInput input)
 {
     GBufferOutput output;
@@ -292,6 +311,25 @@ GBufferOutput ps_gbuffer(PSInput input)
     if (albedo_index != 0xFFFFFFFF)
     {
         albedo = g_textures[NonUniformResourceIndex(albedo_index)].Sample(g_sampler, input.uv);
+    }
+    if (surface_alpha_ref <= 255)
+        clip(albedo.a - (float)surface_alpha_ref / 255.0);
+
+    // CBlender_BmmD / deffer_impl_flat map the normalized mask channels
+    // to the four tiled detail textures, then modulate the level's base map.
+    if (terrain_mask_index != 0xFFFFFFFF)
+    {
+        float4 mask = g_textures[NonUniformResourceIndex(terrain_mask_index)].Sample(g_sampler, input.uv);
+        float weight = dot(mask, 1.0);
+        if (weight > 0.0)
+        {
+            float2 detail_uv = input.uv * terrain_detail_scale;
+            float3 detail = sample_terrain_layer(terrain_r_index, detail_uv) * mask.r
+                          + sample_terrain_layer(terrain_g_index, detail_uv) * mask.g
+                          + sample_terrain_layer(terrain_b_index, detail_uv) * mask.b
+                          + sample_terrain_layer(terrain_a_index, detail_uv) * mask.a;
+            albedo.rgb *= 2.0 * detail / weight;
+        }
     }
 
     // Material properties
