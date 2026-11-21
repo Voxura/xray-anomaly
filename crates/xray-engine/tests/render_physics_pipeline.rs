@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use xray_engine::alife_manager::AlifeManager;
@@ -15,7 +16,7 @@ use xray_engine::world_loader::LevelLoadConfig;
 use xray_formats::cform::{CformModel, CformTriangle};
 use xray_formats::chunk::ChunkWriter;
 use xray_formats::level::{d3d_decl_type, d3d_decl_usage, d3d_light_type, level_chunks, VertexElement9};
-use xray_formats::ogf::{ogf_chunks, OgfVisualType};
+use xray_formats::ogf::{fvf_flags, ogf_chunks, OgfVisualType};
 use xray_formats::scoc::{ScocFile, ScocInventoryItem, ScocPeerState};
 use xray_formats::scop::{
     ScopActorStats, ScopAlifeEntity, ScopAlifePayload, ScopGraphAndQuests, ScopHeader,
@@ -56,6 +57,37 @@ fn write_decl_elem(out: &mut Vec<u8>, elem: VertexElement9) {
     out.push(elem.method);
     out.push(elem.usage);
     out.push(elem.usage_index);
+}
+
+fn build_spawn_visual() -> Vec<u8> {
+    let header = |kind: OgfVisualType| {
+        let mut bytes = vec![4, kind as u8, 0, 0];
+        for value in [-1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.5, 0.0, 1.2] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    };
+    let mut vertices = Vec::new();
+    vertices.extend_from_slice(&fvf_flags::XRAY_STATIC_FVF_STANDARD.to_le_bytes());
+    vertices.extend_from_slice(&3u32.to_le_bytes());
+    for x in [-1.0f32, 0.0, 1.0] {
+        for value in [x, 1.0 - x.abs(), 0.0, 0.0, 0.0, -1.0, 0.0, 0.0] {
+            vertices.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    let mut child = ChunkWriter::new();
+    child.write_chunk(ogf_chunks::OGF_HEADER, &header(OgfVisualType::Normal));
+    child.write_chunk(ogf_chunks::OGF_VERTICES, &vertices);
+    child.write_chunk(ogf_chunks::OGF_INDICES, &[3, 0, 0, 0, 0, 0, 1, 0, 2, 0]);
+    let child = child.into_bytes();
+
+    let mut children = ChunkWriter::new();
+    children.write_chunk(0, &child);
+    children.write_chunk(1, &child);
+    let mut root = ChunkWriter::new();
+    root.write_chunk(ogf_chunks::OGF_HEADER, &header(OgfVisualType::Hierarchy));
+    root.write_chunk(ogf_chunks::OGF_CHILDREN, &children.into_bytes());
+    root.into_bytes()
 }
 
 fn build_gpu_test_level_bytes() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -438,9 +470,12 @@ fn test_full_dx12_7stage_render_graph_and_capsule_physics_loop() {
     let level_dir = temp.0.join("levels").join("l01_escape");
     let weather_dir = temp.0.join("configs").join("environment").join("weathers");
     let save_dir = temp.0.join("savedgames");
+    let mesh_dir = temp.0.join("meshes/actors/stalker_neutral");
     fs::create_dir_all(&level_dir).unwrap();
     fs::create_dir_all(&weather_dir).unwrap();
     fs::create_dir_all(&save_dir).unwrap();
+    fs::create_dir_all(&mesh_dir).unwrap();
+    fs::write(mesh_dir.join("stalker_neutral_3.ogf"), build_spawn_visual()).unwrap();
 
     let (level_bytes, geom_bytes, cform_bytes) = build_gpu_test_level_bytes();
     fs::write(level_dir.join("level"), level_bytes).unwrap();
@@ -474,6 +509,8 @@ fn test_full_dx12_7stage_render_graph_and_capsule_physics_loop() {
     )
     .expect("create DX12 runtime on RTX 4060");
 
+    let vfs = Arc::new(vfs);
+    runtime.attach_vfs(Arc::clone(&vfs));
     runtime
         .load_world_and_save_from_vfs(
             &vfs,
@@ -565,8 +602,8 @@ fn test_full_dx12_7stage_render_graph_and_capsule_physics_loop() {
     assert_eq!(stats.early_z_draws, 0, "expected one geometry pass to fill scene depth");
     assert!(stats.gbuffer_static_draws >= 1, "expected G-Buffer static draw");
     assert!(
-        stats.gbuffer_dynamic_draws >= 2,
-        "expected G-Buffer dynamic draws for NPC + co-op peer, got {}",
+        stats.gbuffer_dynamic_draws >= 3,
+        "expected two submeshes from the mounted NPC model and one co-op proxy, got {}",
         stats.gbuffer_dynamic_draws
     );
     assert_eq!(stats.csm_cascade_draws.len(), 3);

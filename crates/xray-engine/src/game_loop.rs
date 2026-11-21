@@ -405,19 +405,21 @@ impl EngineRuntime {
             None => AlifeManager::default(),
         };
 
-        // If savegame scop header level_name is blank, resolve from all.spawn game.graph via actor game_vertex_id
-        if alife.level_name.is_empty() {
-            if let Ok(spawn) = xray_formats::vfs_bridge::load_all_spawn_from_vfs(vfs, "all") {
-                if let Some(actor) = alife.host_actor() {
-                    let gvid = actor.game_vertex_id as usize;
-                    if let Some(vertex) = spawn.game_graph.vertices.get(gvid) {
-                        if let Some(info) = spawn.game_graph.header.levels.iter().find(|l| l.id == vertex.level_id) {
-                            alife.level_name = info.name.clone();
-                            eprintln!("[engine] Auto-resolved alife.level_name from game.graph (gvid {}): {}", gvid, alife.level_name);
-                        }
-                    }
-                }
+        // Native saves use global game vertices. Resolve their level even when
+        // different maps happen to use the same local coordinates.
+        if scop_vpath.is_some()
+            && let Ok(spawn) = xray_formats::vfs_bridge::load_all_spawn_from_vfs(vfs, &alife.spawn_name)
+        {
+            if alife.level_name.is_empty()
+                && let Some(actor) = alife.host_actor()
+                && let Some(vertex) = spawn.game_graph.vertices.get(usize::from(actor.game_vertex_id))
+                && let Some(info) = spawn.game_graph.header.levels.iter().find(|l| l.id == vertex.level_id)
+            {
+                alife.level_id = Some(info.id);
+                alife.level_name = info.name.clone();
+                eprintln!("[engine] Auto-resolved alife.level_name from game.graph: {}", alife.level_name);
             }
+            alife.game_graph = Some(spawn.game_graph);
         }
 
         if alife.entities.is_empty()

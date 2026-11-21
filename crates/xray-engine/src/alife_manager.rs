@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::world_loader::WorldWeatherState;
+use xray_formats::ai_graph::GameGraph;
 use xray_formats::chunk::FormatError;
 use xray_formats::savegames::GameDateTime;
 use xray_formats::scoc::{ScocFile, ScocInventoryItem, ScocPeerState};
@@ -200,6 +201,7 @@ pub struct AlifeManager {
     pub host_actor_id: Option<u16>,
     pub actor_stats: ScopActorStats,
     pub graph_and_quests: ScopGraphAndQuests,
+    pub(crate) game_graph: Option<GameGraph>,
     pub weather_snapshot: ScopWeatherState,
     pub extra_chunks: Vec<(u32, Vec<u8>)>,
     pub entities: BTreeMap<u16, LiveAlifeEntity>,
@@ -224,6 +226,7 @@ impl Default for AlifeManager {
             host_actor_id: None,
             actor_stats: ScopActorStats::default(),
             graph_and_quests: ScopGraphAndQuests::default(),
+            game_graph: None,
             weather_snapshot: ScopWeatherState::default(),
             extra_chunks: Vec::new(),
             entities: BTreeMap::new(),
@@ -251,6 +254,7 @@ impl AlifeManager {
             host_actor_id: None,
             actor_stats: scop.header.actor_stats.clone(),
             graph_and_quests: scop.graph_and_quests.clone(),
+            game_graph: None,
             weather_snapshot: scop.weather.clone(),
             extra_chunks: scop.extra_chunks.clone(),
             entities: BTreeMap::new(),

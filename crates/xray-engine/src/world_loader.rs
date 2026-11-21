@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use xray_formats::ai_graph::{LevelCrossTable, LevelGraph};
+use xray_formats::camera::matrix_transpose_44;
 use xray_formats::cform::{CformModel, RaycastHit};
 use xray_formats::chunk::FormatError;
 use xray_formats::details::LevelDetails;
@@ -20,11 +21,12 @@ use xray_formats::gamemtl::GameMaterialLibrary;
 use xray_formats::hom::{frustum_planes, ClipFrustum, OccRasterizer, HomMesh};
 use xray_formats::level::{
     LevelData, LevelGeometry, LevelShaderRef, PortalTraversalOptions, PortalTraversalResult,
-    ResolvedLevelMesh,
+    ResolvedLevelMesh, d3d_decl_type, d3d_decl_usage,
 };
-use xray_formats::ogf::{matrix_mul_44, OgfBBox, OgfBSphere, OgfModel, OgfTextureLink, OgfVisualType, XRayMatrix};
+use xray_formats::ogf::{matrix_invert_43, matrix_mul_44, matrix_transform_point, OgfBBox, OgfBSphere, OgfModel, OgfTextureLink, OgfVisualType, XRayMatrix};
 use xray_formats::scop::ScopWeatherState;
 use xray_formats::shaders_xr::{LevelEnvModifiers, LevelFogVolumes, LevelStaticParticles};
+use xray_formats::skinning::matrix_transform_dir;
 use xray_formats::sound_env::{LevelStaticSounds, SoundOcclusionMesh};
 use xray_formats::spawns::{LevelGameData, LevelSpawnData, RPointType};
 use xray_formats::thm::ResolvedTextureLinks;
@@ -743,47 +745,61 @@ fn resolve_level_visuals(
     let geom = level_geom.unwrap_or(&empty_geom);
 
     let mut out = Vec::new();
+    let mut shader_textures: BTreeMap<u16, Vec<ResolvedTextureLinks>> = BTreeMap::new();
     for (visual_index, visual) in level_data.visuals.iter().enumerate() {
         let has_geometry =
             visual.gcontainer.is_some() || visual.vcontainer.is_some() || visual.vertices.is_some();
         if !has_geometry {
             continue;
         }
-        let mesh = level_data
-            .resolve_visual_mesh(visual_index, geom)
+        // FProgressive and FTreeVisual_PM draw one slide window. The rest of
+        // the index buffer contains alternative, overlapping versions of the mesh.
+        let mut mesh = level_data
+            .resolve_visual_mesh_lod(visual_index, geom, 1.0)
             .map_err(|reason| WorldLoadError::InvalidMesh {
                 visual_index,
                 reason,
             })?;
-        let fastpath = match level_geomx {
+        let mut fastpath = match level_geomx {
             Some(gx) => level_data
-                .resolve_fastpath_mesh(visual_index, gx)
+                .resolve_fastpath_mesh_lod(visual_index, gx, 1.0)
                 .map_err(|reason| WorldLoadError::InvalidMesh {
                     visual_index,
                     reason,
                 })?,
             None => None,
         };
-
-        let mut texture_links = Vec::new();
-        if resolve_textures
-            && let Some(shader_ref) = &mesh.shader
-        {
-            for tex_name in &shader_ref.textures {
-                let link = OgfTextureLink {
-                    shader: shader_ref.shader.clone(),
-                    texture: tex_name.clone(),
-                };
-                let mut resolved = resolve_ogf_texture_links(vfs, &link)?;
-                if !vfs.exists(&resolved.diffuse_dds)
-                    && let Some(level_tex) =
-                        resolve_level_texture_vpath(vfs, level_dir, &resolved.diffuse_name)
-                {
-                    resolved.diffuse_dds = level_tex;
-                }
-                texture_links.push(resolved);
+        if let Some(tree) = &visual.tree_def {
+            let buffer_id = visual.gcontainer.map(|gc| gc.vb_id)
+                .or_else(|| visual.vcontainer.map(|vc| vc.id));
+            place_tree_mesh(&mut mesh, &tree.xform, geom, buffer_id);
+            if let (Some(fp), Some(gx), Some(gc)) = (&mut fastpath, level_geomx, visual.fastpath_gcontainer) {
+                place_tree_mesh(fp, &tree.xform, gx, Some(gc.vb_id));
             }
         }
+
+        let texture_links = if let (true, Some(shader_ref)) = (resolve_textures, &mesh.shader) {
+            let entry = shader_textures.entry(visual.header.shader_id);
+            match entry {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let mut links = Vec::with_capacity(shader_ref.textures.len());
+                    for texture in &shader_ref.textures {
+                        let mut resolved = resolve_ogf_texture_links(vfs, &OgfTextureLink {
+                            shader: shader_ref.shader.clone(),
+                            texture: texture.clone(),
+                        })?;
+                        if let Some(path) = resolve_level_texture_vpath(vfs, level_dir, &resolved.diffuse_name) {
+                            resolved.diffuse_dds = path;
+                        }
+                        links.push(resolved);
+                    }
+                    entry.insert(links).clone()
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
         out.push(LoadedVisualMesh {
             visual_index,
@@ -798,6 +814,30 @@ fn resolve_level_visuals(
     }
 
     Ok(out)
+}
+
+fn place_tree_mesh(
+    mesh: &mut ResolvedLevelMesh,
+    xform: &XRayMatrix,
+    geometry: &LevelGeometry,
+    buffer_id: Option<u32>,
+) {
+    let packed_uv = buffer_id.and_then(|id| geometry.vertex_buffers.get(id as usize))
+        .is_some_and(|buffer| buffer.declarator.elements.iter().any(|element| {
+            element.usage == d3d_decl_usage::TEXCOORD && element.usage_index == 0
+                && matches!(element.decl_type, d3d_decl_type::SHORT2 | d3d_decl_type::SHORT4)
+        }));
+    let normals = matrix_invert_43(xform).map(|inv| matrix_transpose_44(&inv));
+    for vertex in &mut mesh.vertices {
+        vertex.position = matrix_transform_point(xform, vertex.position);
+        if let Some(normals) = &normals {
+            vertex.normal = matrix_transform_dir(normals, vertex.normal);
+        }
+        if packed_uv {
+            // FTreeVisual_quant is 2048. The shared level decoder uses 1024.
+            vertex.uv0 = vertex.uv0.map(|uv| uv * 0.5);
+        }
+    }
 }
 
 /// Resolve a level-specific texture path (such as per-level terrain or lightmaps)

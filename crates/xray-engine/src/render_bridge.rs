@@ -21,16 +21,17 @@
 //! wiping forward effects.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use windows::core::Result as WinResult;
 
 use crate::alife_manager::{AlifeManager, EntityRole};
 use crate::camera::FirstPersonCamera;
 use crate::hud_weapon::{HudWeaponController, WeaponState};
-use crate::level_transition::LevelTransitionManager;
+use crate::level_transition::{LevelTransitionManager, canonical_level_name};
 use crate::ui_inventory::{InventoryManager, UiFontResource};
 use crate::ui_pda::PdaManager;
-use crate::world_loader::{LoadedDynamicModel, LoadedWorld, resolve_level_texture_vpath};
+use crate::world_loader::{LoadedWorld, resolve_level_texture_vpath};
 use xray_formats::details::{LevelDetails, DETAIL_ID_EMPTY, DETAIL_SLOT_SIZE};
 use xray_formats::hom::{frustum_planes, ClipFrustum};
 use xray_formats::ogf::{
@@ -38,9 +39,10 @@ use xray_formats::ogf::{
     OgfVisualType, StaticVertex, XRAY_IDENTITY_MATRIX,
 };
 use xray_formats::shaders_xr::{EngineShaderLibrary, R4BlenderSpec};
+use xray_formats::spawns::INVALID_OBJECT_ID;
 use xray_formats::sun::{build_3split_csm_atlas, CsmAtlasPacking, CsmAtlasPlan, SunCascadeConfig};
 use xray_formats::thm::{texture_stem_to_dds_vpath, ResolvedTextureLinks};
-use xray_formats::vfs_bridge::{load_font_from_vfs, load_ltx_tree_from_vfs, load_ui_texture_atlases_from_vfs, load_xml_from_vfs};
+use xray_formats::vfs_bridge::{load_font_from_vfs, load_ltx_tree_from_vfs, load_ogf_from_vfs, load_ui_texture_atlases_from_vfs, load_xml_from_vfs, resolve_ogf_texture_links};
 use xray_formats::weather::MixedEnvironment;
 use xray_formats::xml_ui::UiTextureAtlasMap;
 use xray_render_dx12::bindless::DescriptorIndex;
@@ -57,7 +59,7 @@ use xray_render_dx12::renderer::Dx12Renderer;
 use xray_render_dx12::shadow::CascadedShadowAtlas;
 use xray_render_dx12::sky::SkyPushConstants;
 use xray_render_dx12::wallmarks::{GpuWallmarkVertex, WallmarkPushConstants};
-use xray_vfs::VirtualFileSystem;
+use xray_vfs::{VirtualFileSystem, normalize_virtual_path};
 
 /// Maximum dynamic lights forwarded to `execute_deferred_combine_csm` per frame.
 pub const MAX_ACTIVE_FRAME_LIGHTS: usize = 64;
@@ -163,7 +165,7 @@ struct GpuOgfSubMesh {
 }
 
 struct DynamicDrawInstance {
-    submeshes: Vec<GpuOgfSubMesh>,
+    submeshes: Arc<[GpuOgfSubMesh]>,
     transform_index: u32,
     visibility: DynamicVisibility,
 }
@@ -285,10 +287,10 @@ pub struct RenderBridge {
     world_lights: Vec<GpuLight>,
     detail_meshes: Vec<Vec<GpuDetailVertex>>,
     detail_textures: Vec<Option<DescriptorIndex>>,
-    dynamic_ogf_cache: BTreeMap<String, Vec<GpuOgfSubMesh>>,
+    dynamic_ogf_cache: BTreeMap<String, Arc<[GpuOgfSubMesh]>>,
     hud_mesh_cache: BTreeMap<String, (MeshHandle, DescriptorIndex)>,
     hud_materials: Option<BTreeMap<String, HudMaterial>>,
-    default_cube_mesh: MeshHandle,
+    proxy_submeshes: Arc<[GpuOgfSubMesh]>,
     ui_font: Option<UiFontResource>,
     pause_font_height: u32,
     pause_fonts: BTreeMap<&'static str, Option<UiFontResource>>,
@@ -339,7 +341,12 @@ impl RenderBridge {
             dynamic_ogf_cache: BTreeMap::new(),
             hud_mesh_cache: BTreeMap::new(),
             hud_materials: None,
-            default_cube_mesh,
+            proxy_submeshes: Arc::from([GpuOgfSubMesh {
+                mesh_handle: default_cube_mesh,
+                albedo_tex: fallback_albedo,
+                normal_tex: fallback_normal,
+                material_tex: fallback_material,
+            }]),
             ui_font: None,
             pause_font_height: 0,
             pause_fonts: BTreeMap::new(),
@@ -355,6 +362,7 @@ impl RenderBridge {
     pub fn invalidate_world(&mut self) {
         self.world_meshes.clear();
         self.world_lights.clear();
+        self.dynamic_ogf_cache.clear();
         self.detail_meshes.clear();
         self.detail_textures.clear();
         self.world_synced = false;
@@ -480,27 +488,43 @@ impl RenderBridge {
         &mut self,
         renderer: &mut Dx12Renderer,
         vfs: Option<&VirtualFileSystem>,
-        key: &str,
-        dyn_model: Option<&LoadedDynamicModel>,
-    ) -> WinResult<Vec<GpuOgfSubMesh>> {
-        if let Some(cached) = self.dynamic_ogf_cache.get(key) {
-            return Ok(cached.clone());
+        visual_name: &str,
+        world: Option<&LoadedWorld>,
+        allow_proxy: bool,
+    ) -> WinResult<Arc<[GpuOgfSubMesh]>> {
+        let Ok(key) = normalize_virtual_path(visual_name) else {
+            return Ok(Arc::from([]));
+        };
+        let proxy = |submeshes: &Arc<[GpuOgfSubMesh]>| {
+            if submeshes.is_empty() && (vfs.is_none() || allow_proxy) {
+                Arc::clone(&self.proxy_submeshes)
+            } else {
+                Arc::clone(submeshes)
+            }
+        };
+        if let Some(cached) = self.dynamic_ogf_cache.get(&key) {
+            return Ok(proxy(cached));
         }
         let mut submeshes = Vec::new();
-        if let Some(dm) = dyn_model {
-            let fallback_mats = self.resolve_material_textures(renderer, vfs, &dm.texture_links);
-            self.collect_ogf_submeshes(renderer, vfs, &dm.model, fallback_mats, &mut submeshes)?;
+        let fallback = (self.fallback_albedo, self.fallback_normal, self.fallback_material);
+        for path in model_search_paths(&key, world.map(|world| world.level_dir.as_str())) {
+            if let Some(model) = world.and_then(|world| world.dynamic_models.get(&path)) {
+                let material = self.resolve_material_textures(renderer, vfs, &model.texture_links);
+                self.collect_ogf_submeshes(renderer, vfs, &model.model, material, &mut submeshes)?;
+            } else if let Some(vfs) = vfs && vfs.exists(&path) {
+                match load_ogf_from_vfs(vfs, &path) {
+                    Ok(model) => self.collect_ogf_submeshes(renderer, Some(vfs), &model, fallback, &mut submeshes)?,
+                    Err(error) => eprintln!("[model] {path}: {error}"),
+                }
+            }
+            if !submeshes.is_empty() {
+                break;
+            }
         }
-        if submeshes.is_empty() {
-            submeshes.push(GpuOgfSubMesh {
-                mesh_handle: self.default_cube_mesh,
-                albedo_tex: self.fallback_albedo,
-                normal_tex: self.fallback_normal,
-                material_tex: self.fallback_material,
-            });
-        }
-        self.dynamic_ogf_cache.insert(key.to_string(), submeshes.clone());
-        Ok(submeshes)
+        let submeshes: Arc<[GpuOgfSubMesh]> = submeshes.into();
+        let result = proxy(&submeshes);
+        self.dynamic_ogf_cache.insert(key, Arc::clone(&submeshes));
+        Ok(result)
     }
 
     fn collect_ogf_submeshes(
@@ -511,24 +535,21 @@ impl RenderBridge {
         default_mats: (DescriptorIndex, DescriptorIndex, DescriptorIndex),
         out: &mut Vec<GpuOgfSubMesh>,
     ) -> WinResult<()> {
+        let indices = model.progressive_indices(1.0, &[]);
         if let Some(verts) = &model.vertices
-            && !model.indices.is_empty()
+            && !indices.is_empty()
         {
             let static_verts = verts.to_static_attributes();
-            if let Some(mesh_handle) = upload_resolved_mesh(renderer, &static_verts, &model.indices)? {
-                let albedo = model
-                    .texture
-                    .as_ref()
-                    .and_then(|link| {
-                        let dds = texture_stem_to_dds_vpath(&link.texture);
-                        try_load_vfs_texture(renderer, vfs, &dds)
-                    })
-                    .unwrap_or(default_mats.0);
+            if let Some(mesh_handle) = upload_resolved_mesh(renderer, &static_verts, indices)? {
+                let (albedo_tex, normal_tex, material_tex) = vfs.zip(model.texture.as_ref())
+                    .and_then(|(vfs, link)| resolve_ogf_texture_links(vfs, link).ok())
+                    .map(|link| self.resolve_material_textures(renderer, vfs, &[link]))
+                    .unwrap_or(default_mats);
                 out.push(GpuOgfSubMesh {
                     mesh_handle,
-                    albedo_tex: albedo,
-                    normal_tex: default_mats.1,
-                    material_tex: default_mats.2,
+                    albedo_tex,
+                    normal_tex,
+                    material_tex,
                 });
             }
         }
@@ -547,6 +568,7 @@ impl RenderBridge {
         world: Option<&LoadedWorld>,
         alife: Option<&AlifeManager>,
         vfs: Option<&VirtualFileSystem>,
+        inventory: Option<&InventoryManager>,
     ) -> WinResult<Vec<DynamicDrawInstance>> {
         let mut matrices: Vec<[[f32; 4]; 4]> = vec![XRAY_IDENTITY_MATRIX];
         let mut draws = Vec::new();
@@ -556,23 +578,38 @@ impl RenderBridge {
             return Ok(draws);
         };
 
-        // Online NPCs / dynamic objects / actors (excluding first-person host actor)
+        let current_level_id = alife.game_graph.as_ref().zip(world).and_then(|(graph, world)| {
+            let name = canonical_level_name(&world.level_dir);
+            graph.header.levels.iter().find(|level| level.name.eq_ignore_ascii_case(&name)).map(|level| level.id)
+        });
+        // Only unowned entities from this level can be drawn as independent world objects.
         for ent in alife.entities.values() {
-            if !ent.online || ent.role == EntityRole::LocalHostActor {
+            if !ent.online || ent.parent_id != INVALID_OBJECT_ID || ent.role == EntityRole::LocalHostActor {
+                continue;
+            }
+            if let (Some(graph), Some(level_id), Some(_)) = (&alife.game_graph, current_level_id, &ent.source_scop)
+                && !graph.vertices.get(usize::from(ent.game_vertex_id)).is_some_and(|vertex| vertex.level_id == level_id)
+            {
                 continue;
             }
             let Some(visibility) = classify_dynamic_visibility(ent.position, cam_pos, frustum, sun_plan) else {
                 continue;
             };
-            let Some(visual_key) = ent.visual_name.as_deref().filter(|name| !name.is_empty()) else {
+            let configured_visual = inventory.and_then(|inventory| inventory.world_visual_for_section(&ent.section));
+            let Some(visual_key) = ent.visual_name.as_deref().filter(|name| !name.is_empty()).or(configured_visual) else {
                 continue;
             };
+            let mut submeshes = self.ensure_dynamic_ogf_cached(renderer, vfs, visual_key, world, false)?;
+            if submeshes.is_empty() && let Some(configured) = configured_visual.filter(|name| *name != visual_key) {
+                submeshes = self.ensure_dynamic_ogf_cached(renderer, vfs, configured, world, false)?;
+            }
+            if submeshes.is_empty() {
+                continue;
+            }
             let xf = matrix_set_xyz_translate(ent.angle, ent.position);
             let tf_idx = matrices.len() as u32;
             matrices.push(xf);
 
-            let dyn_model = world.and_then(|w| find_dynamic_model(w, visual_key));
-            let submeshes = self.ensure_dynamic_ogf_cached(renderer, vfs, visual_key, dyn_model)?;
             draws.push(DynamicDrawInstance {
                 submeshes,
                 transform_index: tf_idx,
@@ -591,8 +628,7 @@ impl RenderBridge {
 
             let vpath = peer.visual_path();
             let visual_key = vpath.unwrap_or("__default_coop_peer_proxy");
-            let dyn_model = world.and_then(|w| vpath.and_then(|v| find_dynamic_model(w, v)));
-            let submeshes = self.ensure_dynamic_ogf_cached(renderer, vfs, visual_key, dyn_model)?;
+            let submeshes = self.ensure_dynamic_ogf_cached(renderer, vfs, visual_key, world, true)?;
             draws.push(DynamicDrawInstance {
                 submeshes,
                 transform_index: tf_idx,
@@ -773,6 +809,7 @@ impl RenderBridge {
             world,
             alife,
             vfs,
+            inventory,
         )?;
 
         // ---------------------------------------------------------------------
@@ -804,7 +841,7 @@ impl RenderBridge {
             stats.gbuffer_static_draws += 1;
         }
         for inst in dynamic_draws.iter().filter(|instance| instance.visibility.camera) {
-            for sub in &inst.submeshes {
+            for sub in inst.submeshes.iter() {
                 renderer.draw_gbuffer_mesh(
                     sub.mesh_handle,
                     Some(sub.albedo_tex),
@@ -867,7 +904,7 @@ impl RenderBridge {
                         shadow_draws.push((caster, u32::MAX));
                     }
                     for inst in dynamic_draws.iter().filter(|instance| instance.visibility.shadows[cascade_idx]) {
-                        for sub in &inst.submeshes {
+                        for sub in inst.submeshes.iter() {
                             shadow_draws.push((sub.mesh_handle, inst.transform_index));
                         }
                     }
@@ -1373,18 +1410,19 @@ impl RenderBridge {
     }
 }
 
-fn find_dynamic_model<'a>(world: &'a LoadedWorld, visual_name: &str) -> Option<&'a LoadedDynamicModel> {
-    if let Some(m) = world.dynamic_models.get(visual_name) {
-        return Some(m);
-    }
-    let norm = visual_name.replace('/', "\\").to_ascii_lowercase();
-    world.dynamic_models.get(&norm).or_else(|| {
-        let with_meshes = format!("meshes\\{norm}");
-        world
-            .dynamic_models
-            .get(&with_meshes)
-            .or_else(|| world.dynamic_models.get(&format!("{with_meshes}.ogf")))
-    })
+fn model_search_paths(key: &str, level_dir: Option<&str>) -> impl Iterator<Item = String> {
+    let file = if key.rsplit('\\').next().is_some_and(|name| name.contains('.')) {
+        key.to_owned()
+    } else {
+        format!("{key}.ogf")
+    };
+    // CModelPool tries the explicit path, the level and then $game_meshes$.
+    [
+        Some(key.to_owned()),
+        (key != file).then(|| file.clone()),
+        level_dir.and_then(|dir| normalize_virtual_path(&format!("{dir}\\{file}")).ok()),
+        (!file.starts_with("meshes\\")).then(|| format!("meshes\\{file}")),
+    ].into_iter().flatten()
 }
 
 fn upload_resolved_mesh(

@@ -1662,6 +1662,10 @@ impl InventoryManager {
             .unwrap_or("eng")
     }
 
+    pub(crate) fn world_visual_for_section(&self, section: &str) -> Option<&str> {
+        self.item_settings.as_ref()?.read_str(section, "visual").filter(|name| !name.is_empty())
+    }
+
     /// Hydrate actor inventory from loaded `.scop` ALife entities (`parent_id == 0` or `parent_id == actor_id`).
     pub fn hydrate_from_alife(
         &mut self,
