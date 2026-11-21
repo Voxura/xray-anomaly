@@ -1,12 +1,18 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_RETURN, VK_UP};
+use xray_formats::{fonts::FontAlignment, xml_ui::UiViewport};
 use xray_render_dx12::Dx12Renderer;
+use xray_vfs::VirtualFileSystem;
 
 use crate::input::{Action, EngineInput, MouseButton};
 use crate::ui_inventory::UiFontResource;
+
+mod layout;
+use layout::{MainAction, MenuLayouts, Rect, contains, draw_text_in};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Extras {
@@ -110,6 +116,8 @@ pub(crate) struct PauseMenu {
     pending: Extras,
     path: Option<PathBuf>,
     save_failed: bool,
+    layouts: MenuLayouts,
+    selector: Option<SelectorMotion>,
 }
 
 impl Default for PauseMenu {
@@ -126,6 +134,8 @@ impl Default for PauseMenu {
             pending: defaults,
             path: None,
             save_failed: false,
+            layouts: MenuLayouts::default(),
+            selector: None,
         }
     }
 }
@@ -154,10 +164,58 @@ impl PauseMenu {
         self.show(Page::Main);
     }
 
+    pub fn reset_layouts(&mut self) {
+        self.layouts = MenuLayouts::default();
+        self.selector = None;
+    }
+
+    pub fn sync_layouts(
+        &mut self,
+        vfs: Option<&VirtualFileSystem>,
+        size: [u32; 2],
+        single_player: bool,
+        language: &str,
+    ) {
+        if let Some(vfs) = vfs
+            && self
+                .layouts
+                .sync(vfs, viewport(size), single_player, language)
+            && self.page == Page::Main
+        {
+            self.show(Page::Main);
+        }
+    }
+
+    pub fn font_sections(&self) -> [&'static str; 3] {
+        [
+            self.layouts
+                .main
+                .as_ref()
+                .map_or("ui_font_graffiti19_russian", |main| main.font_section),
+            self.layouts
+                .options
+                .as_ref()
+                .map_or("ui_font_letterica16_russian", |options| options.label_font),
+            self.layouts
+                .options
+                .as_ref()
+                .map_or("ui_font_letterica18_russian", |options| options.button_font),
+        ]
+    }
+
     fn show(&mut self, page: Page) {
         self.page = page;
         self.focused = 0;
         self.save_failed = false;
+        self.selector = if page == Page::Main {
+            self.layouts.main.as_ref().map(|layout| {
+                let target = layout.selector(0)[1];
+                let from = layout.selector_start();
+                SelectorMotion::new(from, target, layout.selector_duration(from, target))
+            })
+        } else {
+            None
+        };
     }
 
     fn back(&mut self) -> MenuOutcome {
@@ -183,17 +241,26 @@ impl PauseMenu {
     }
 
     fn activate(&mut self, row: usize) -> MenuOutcome {
+        if self.page == Page::Main {
+            let action = self.layouts.main.as_ref().map_or(
+                [MainAction::Resume, MainAction::Options, MainAction::Quit][row],
+                |layout| layout.buttons[row].0,
+            );
+            return match action {
+                MainAction::Resume => self.back(),
+                MainAction::Options => {
+                    self.pending = self.current;
+                    self.show(Page::Extras);
+                    MenuOutcome::Stay
+                }
+                MainAction::Quit => {
+                    self.show(Page::Quit);
+                    MenuOutcome::Stay
+                }
+            };
+        }
         match (self.page, row) {
-            (Page::Main, 0) | (Page::Extras, 5) | (Page::Quit | Page::Discard, 0) => self.back(),
-            (Page::Main, 1) => {
-                self.pending = self.current;
-                self.show(Page::Extras);
-                MenuOutcome::Stay
-            }
-            (Page::Main, 2) => {
-                self.show(Page::Quit);
-                MenuOutcome::Stay
-            }
+            (Page::Extras, 5) | (Page::Quit | Page::Discard, 0) => self.back(),
             (Page::Extras, 0) => {
                 self.pending.backpack_animations = !self.pending.backpack_animations;
                 MenuOutcome::Stay
@@ -237,6 +304,37 @@ impl PauseMenu {
         }
     }
 
+    fn button_rect(&self, row: usize, size: [u32; 2]) -> Rect {
+        let rect = match self.page {
+            Page::Main => self.layouts.main.as_ref().map(|layout| layout.row(row)),
+            Page::Extras => self.layouts.options.as_ref().map(|layout| layout.rows[row]),
+            _ => None,
+        };
+        rect.map_or_else(
+            || FallbackLayout::new(size[0], size[1]).row(row),
+            |rect| viewport(size).virtual_to_screen_rect(rect),
+        )
+    }
+
+    fn focus(&mut self, row: usize) {
+        if row != self.focused
+            && self.page == Page::Main
+            && let Some(layout) = &self.layouts.main
+        {
+            let from = self
+                .selector
+                .as_ref()
+                .map_or(layout.selector(self.focused)[1], SelectorMotion::y);
+            let to = layout.selector(row)[1];
+            self.selector = Some(SelectorMotion::new(
+                from,
+                to,
+                layout.selector_duration(from, to),
+            ));
+        }
+        self.focused = row;
+    }
+
     pub fn handle_input(&mut self, input: &EngineInput, width: u32, height: u32) -> MenuOutcome {
         if input.is_action_just_pressed(Action::Menu) {
             return self.back();
@@ -245,24 +343,33 @@ impl PauseMenu {
         if count == 0 {
             return MenuOutcome::Stay;
         }
-        if input.is_key_just_pressed(usize::from(VK_UP.0)) {
-            self.focused = (self.focused + count - 1) % count;
+        if let Some(row) = (0..count).find(|row| {
+            contains(
+                self.button_rect(*row, [width, height]),
+                input.mouse_position(),
+            )
+        }) {
+            if input.is_mouse_just_pressed(MouseButton::Left) {
+                self.focus(row);
+                return self.activate(row);
+            }
+            if input.mouse_delta() != (0.0, 0.0) {
+                self.focus(row);
+            }
         }
-        if input.is_key_just_pressed(usize::from(VK_DOWN.0))
-            || input.is_key_just_pressed(EngineInput::VK_TAB)
-        {
-            self.focused = (self.focused + 1) % count;
+        if input.is_key_just_pressed(usize::from(VK_UP.0)) {
+            self.focus(self.focused.saturating_sub(1));
+        }
+        if input.is_key_just_pressed(usize::from(VK_DOWN.0)) {
+            self.focus((self.focused + 1).min(count - 1));
+        }
+        if input.is_key_just_pressed(EngineInput::VK_TAB) {
+            self.focus((self.focused + 1) % count);
         }
         if input.is_key_just_pressed(usize::from(VK_RETURN.0))
             || input.is_key_just_pressed(EngineInput::VK_SPACE)
         {
             return self.activate(self.focused);
-        }
-        if input.is_mouse_just_pressed(MouseButton::Left)
-            && let Some(row) = MenuLayout::new(width, height).hit(input.mouse_position(), count)
-        {
-            self.focused = row;
-            return self.activate(row);
         }
         MenuOutcome::Stay
     }
@@ -270,19 +377,176 @@ impl PauseMenu {
     pub fn render(
         &self,
         renderer: &mut Dx12Renderer,
-        font: Option<&UiFontResource>,
+        fonts: [Option<&UiFontResource>; 3],
         size: [u32; 2],
-        mouse: (f32, f32),
         single_player: bool,
     ) {
-        let layout = MenuLayout::new(size[0], size[1]);
+        let vp = viewport(size);
+        if self.page == Page::Main
+            && let Some(layout) = &self.layouts.main
+        {
+            self.render_main(renderer, fonts[0], vp, layout, single_player);
+        } else if self.page == Page::Extras
+            && let Some(layout) = &self.layouts.options
+        {
+            self.render_options(renderer, fonts[1], fonts[2], vp, layout);
+        } else {
+            self.render_fallback(renderer, fonts[1], size, single_player);
+        }
+    }
+
+    fn render_main(
+        &self,
+        renderer: &mut Dx12Renderer,
+        font: Option<&UiFontResource>,
+        vp: UiViewport,
+        layout: &layout::MainLayout,
+        single_player: bool,
+    ) {
+        let [x, y, w, h] = layout.row(0);
+        let heading = [x, y - h * 1.5, w, h];
+        let mut selector = layout.selector(self.focused);
+        if let Some(motion) = &self.selector {
+            selector[1] = motion.y();
+        }
+        let [sx, sy, sw, sh] = vp.virtual_to_screen_rect(selector);
+        renderer.ui_fill_rect([sx, sy, sw, sh], [0.17, 0.20, 0.20, 1.0]);
+        renderer.ui_fill_rect([sx, sy, 3.0, sh], [0.79, 0.62, 0.31, 1.0]);
+        if let Some(font) = font {
+            draw_text_in(
+                renderer,
+                font,
+                self.page.heading(single_player),
+                vp.virtual_to_screen_rect(heading),
+                FontAlignment::Center,
+                [0.69, 0.73, 0.70, 1.0],
+            );
+            for (row, (_, label)) in layout.buttons.iter().enumerate() {
+                draw_text_in(
+                    renderer,
+                    font,
+                    label,
+                    vp.virtual_to_screen_rect(layout.row(row)),
+                    FontAlignment::Center,
+                    layout.text_color,
+                );
+            }
+        }
+    }
+
+    fn render_options(
+        &self,
+        renderer: &mut Dx12Renderer,
+        font: Option<&UiFontResource>,
+        button_font: Option<&UiFontResource>,
+        vp: UiViewport,
+        layout: &layout::OptionsLayout,
+    ) {
+        let screen = |rect| vp.virtual_to_screen_rect(rect);
+        let panel = [0.09, 0.115, 0.12, 1.0];
+        let field = [0.12, 0.15, 0.15, 1.0];
+        let focus = [0.23, 0.26, 0.23, 1.0];
+        let accent = [0.83, 0.67, 0.34, 1.0];
+        let text = [0.90, 0.91, 0.89, 1.0];
+        renderer.ui_fill_rect(screen(layout.panel), panel);
+        renderer.ui_fill_rect(screen(layout.area), [0.065, 0.078, 0.08, 1.0]);
+        renderer.ui_fill_rect(screen(layout.category), focus);
+        if let Some(font) = font {
+            draw_text_in(
+                renderer,
+                font,
+                "Options",
+                screen(layout.heading),
+                FontAlignment::Left,
+                text,
+            );
+            draw_text_in(
+                renderer,
+                font,
+                "Extras",
+                screen(layout.category),
+                FontAlignment::Center,
+                accent,
+            );
+        }
+        for (row, mut rect) in layout.rows.into_iter().enumerate() {
+            renderer.ui_fill_rect(
+                screen(rect),
+                if row == self.focused { focus } else { field },
+            );
+            if row < 2 {
+                let enabled = [self.pending.backpack_animations, self.pending.item_picker][row];
+                let label = self.page.rows()[row];
+                let [x, y, w, h] = screen(layout.status[row]);
+                let side = w.min(h) * 0.56;
+                let color = if enabled {
+                    accent
+                } else {
+                    [0.32, 0.36, 0.35, 1.0]
+                };
+                let [cx, cy] = [x + (w - side) * 0.5, y + (h - side) * 0.5];
+                renderer.ui_fill_rect([cx, cy, side, side], color);
+                if !enabled {
+                    renderer.ui_fill_rect(
+                        [
+                            cx + 2.0,
+                            cy + 2.0,
+                            (side - 4.0).max(0.0),
+                            (side - 4.0).max(0.0),
+                        ],
+                        panel,
+                    );
+                }
+                if let Some(font) = font {
+                    rect[0] += layout.label_x;
+                    draw_text_in(
+                        renderer,
+                        font,
+                        label,
+                        screen(rect),
+                        FontAlignment::Left,
+                        text,
+                    );
+                }
+            } else if let Some(font) = button_font {
+                draw_text_in(
+                    renderer,
+                    font,
+                    &layout.labels[row - 2],
+                    screen(rect),
+                    FontAlignment::Center,
+                    text,
+                );
+            }
+        }
+        if self.save_failed
+            && let Some(font) = font
+        {
+            draw_text_in(
+                renderer,
+                font,
+                "Could not save options",
+                screen(layout.notification),
+                FontAlignment::Left,
+                accent,
+            );
+        }
+    }
+
+    fn render_fallback(
+        &self,
+        renderer: &mut Dx12Renderer,
+        font: Option<&UiFontResource>,
+        size: [u32; 2],
+        single_player: bool,
+    ) {
+        let layout = FallbackLayout::new(size[0], size[1]);
         let s = layout.scale;
         let [x, y] = layout.origin;
         let rows = self.page.rows();
         let panel_height = 105.0 + rows.len() as f32 * 49.0;
         let label_color = [0.9, 0.91, 0.89, 1.0];
         let accent = [0.83, 0.67, 0.34, 1.0];
-        let hover = layout.hit(mouse, rows.len());
         renderer.ui_fill_rect(
             [x, y, 420.0 * s, panel_height * s],
             [0.09, 0.115, 0.12, 1.0],
@@ -299,7 +563,7 @@ impl PauseMenu {
         }
         for (row, label) in rows.iter().enumerate() {
             let [left, top, w, h] = layout.row(row);
-            let active = hover == Some(row) || (hover.is_none() && self.focused == row);
+            let active = self.focused == row;
             let fill = if active {
                 [0.23, 0.26, 0.23, 1.0]
             } else {
@@ -345,12 +609,41 @@ impl PauseMenu {
     }
 }
 
-struct MenuLayout {
+fn viewport([width, height]: [u32; 2]) -> UiViewport {
+    UiViewport::new(width as f32, height as f32)
+}
+
+struct SelectorMotion {
+    start: Instant,
+    from: f32,
+    to: f32,
+    duration: f32,
+}
+
+impl SelectorMotion {
+    fn new(from: f32, to: f32, duration: f32) -> Self {
+        Self {
+            start: Instant::now(),
+            from,
+            to,
+            duration,
+        }
+    }
+
+    fn y(&self) -> f32 {
+        // The menu selector runs on real time while the simulation is frozen.
+        let t = (self.start.elapsed().as_secs_f32() / self.duration).min(1.0);
+        let eased = (1.0 + 10.0 * t).ln() / 11.0_f32.ln();
+        self.from + (self.to - self.from) * eased
+    }
+}
+
+struct FallbackLayout {
     origin: [f32; 2],
     scale: f32,
 }
 
-impl MenuLayout {
+impl FallbackLayout {
     fn new(width: u32, height: u32) -> Self {
         let scale = (height as f32 / 720.0).min(width as f32 / 560.0);
         Self {
@@ -368,12 +661,5 @@ impl MenuLayout {
             372.0 * s,
             42.0 * s,
         ]
-    }
-
-    fn hit(&self, (mx, my): (f32, f32), count: usize) -> Option<usize> {
-        (0..count).find(|row| {
-            let [x, y, w, h] = self.row(*row);
-            (x..x + w).contains(&mx) && (y..y + h).contains(&my)
-        })
     }
 }

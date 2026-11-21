@@ -65,7 +65,7 @@ impl UiFontResource {
         self.draw_aligned(renderer, text, pos_xy, line_height_px, FontAlignment::Left, color)
     }
 
-    fn draw_aligned(
+    pub(crate) fn draw_aligned(
         &self,
         renderer: &mut Dx12Renderer,
         text: &str,
@@ -1654,6 +1654,12 @@ impl InventoryManager {
 
     pub(crate) fn item_picker_enabled(&self) -> bool {
         self.stack_all_sections
+    }
+
+    pub(crate) fn ui_language(&self) -> &str {
+        self.item_settings.as_ref()
+            .and_then(|settings| settings.read_str("string_table", "language"))
+            .unwrap_or("eng")
     }
 
     /// Hydrate actor inventory from loaded `.scop` ALife entities (`parent_id == 0` or `parent_id == actor_id`).

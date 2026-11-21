@@ -229,7 +229,8 @@ pub struct RenderBridge {
     hud_materials: Option<BTreeMap<String, HudMaterial>>,
     default_cube_mesh: MeshHandle,
     ui_font: Option<UiFontResource>,
-    pause_font_attempted: bool,
+    pause_font_height: u32,
+    pause_fonts: BTreeMap<&'static str, Option<UiFontResource>>,
     inventory_fonts: BTreeMap<&'static str, UiFontResource>,
     ui_font_attempted: bool,
     ui_equipment_tex: Option<DescriptorIndex>,
@@ -279,7 +280,8 @@ impl RenderBridge {
             hud_materials: None,
             default_cube_mesh,
             ui_font: None,
-            pause_font_attempted: false,
+            pause_font_height: 0,
+            pause_fonts: BTreeMap::new(),
             inventory_fonts: BTreeMap::new(),
             ui_font_attempted: false,
             ui_equipment_tex: None,
@@ -629,20 +631,31 @@ impl RenderBridge {
         renderer: &mut Dx12Renderer,
         menu: &crate::ui_pause::PauseMenu,
         vfs: Option<&VirtualFileSystem>,
-        mouse: (f32, f32),
         single_player: bool,
     ) -> WinResult<()> {
         let (width, height) = (renderer.stats().width, renderer.stats().height);
-        if self.ui_font.is_none() && !self.pause_font_attempted && let Some(vfs) = vfs {
-            self.pause_font_attempted = true;
-            if let Ok(fonts) = load_ltx_tree_from_vfs(vfs, "$game_configs$/fonts.ltx", &[]) {
-                self.ui_font = ["ui_font_letterica16_russian", "ui_font_arial_14", "hud_font_medium"]
-                    .into_iter().find_map(|section| load_ui_font(renderer, vfs, &fonts, section, height));
+        if self.pause_font_height != height {
+            self.pause_font_height = height;
+            self.pause_fonts.clear();
+        }
+        let sections = menu.font_sections();
+        if let Some(vfs) = vfs && sections.iter().any(|section| !self.pause_fonts.contains_key(section)) {
+            let fonts = load_ltx_tree_from_vfs(vfs, "$game_configs$/fonts.ltx", &[]).ok();
+            for section in sections {
+                self.pause_fonts.entry(section).or_insert_with(|| {
+                    load_ui_font(renderer, vfs, fonts.as_ref()?, section, height)
+                });
             }
         }
-        renderer.clear_backbuffer([0.028, 0.04, 0.045, 1.0]);
-        menu.render(renderer, self.ui_font.as_ref(), [width, height], mouse, single_player);
+        let fallback = self.ui_font.as_ref().or_else(|| self.pause_fonts.values().find_map(Option::as_ref));
+        let fonts = sections.map(|section| self.pause_fonts.get(section).and_then(Option::as_ref).or(fallback));
+        renderer.clear_backbuffer([0.025, 0.032, 0.033, 1.0]);
+        menu.render(renderer, fonts, [width, height], single_player);
         renderer.ui_flush(width, height)
+    }
+
+    pub(crate) fn reset_pause_fonts(&mut self) {
+        self.pause_fonts.clear();
     }
 
     /// Execute all 7 DX12 render graph passes plus Inventory, PDA, Dialogue, Travel Prompt & Loading Screen UI.

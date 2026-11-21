@@ -185,6 +185,10 @@ impl EngineRuntime {
 
     /// Attach a shared [`VirtualFileSystem`] for on-demand dynamic model/texture/audio streaming.
     pub fn attach_vfs(&mut self, vfs: Arc<VirtualFileSystem>) {
+        self.pause_menu.reset_layouts();
+        if let Some(bridge) = &mut self.render_bridge {
+            bridge.reset_pause_fonts();
+        }
         self.inventory.load_ui_layouts(&vfs);
         let mut grid_index = ItemGridIndex::load_from_vfs(&vfs);
         self.inventory.resolve_inventory_icons(&mut grid_index);
@@ -219,8 +223,7 @@ impl EngineRuntime {
         if let (Some(renderer), Some(bridge)) = (&mut self.renderer, &mut self.render_bridge) {
             renderer.begin_frame()?;
             bridge.render_pause_menu(
-                renderer, &self.pause_menu, self.vfs.as_deref(),
-                self.input.mouse_position(), self.network.is_none(),
+                renderer, &self.pause_menu, self.vfs.as_deref(), self.network.is_none(),
             )?;
             renderer.end_frame(self.config.vsync)?;
         }
@@ -485,6 +488,18 @@ impl EngineRuntime {
 
         // Escape belongs to the topmost dialog. The level only receives it when
         // the pause menu is closed, just as CLevel::IR_OnKeyboardPress does.
+        let open_pause_menu = !self.pause_menu.is_open()
+            && self.input.is_action_just_pressed(Action::Menu)
+            && !self.level_transition.is_loading()
+            && !self.level_transition.is_modal_open()
+            && !self.inventory.is_modal_open()
+            && !self.pda.open
+            && !self.hud_weapon.backpack_blocks_input();
+        if open_pause_menu || self.pause_menu.is_open() {
+            self.pause_menu.sync_layouts(
+                self.vfs.as_deref(), [width, height], self.network.is_none(), self.inventory.ui_language(),
+            );
+        }
         if self.pause_menu.is_open() {
             match self.pause_menu.handle_input(&self.input, width, height) {
                 MenuOutcome::Quit => {
@@ -501,13 +516,7 @@ impl EngineRuntime {
                 MenuOutcome::Apply(extras) => self.apply_extras(extras),
                 MenuOutcome::Stay => {}
             }
-        } else if self.input.is_action_just_pressed(Action::Menu)
-            && !self.level_transition.is_loading()
-            && !self.level_transition.is_modal_open()
-            && !self.inventory.is_modal_open()
-            && !self.pda.open
-            && !self.hud_weapon.backpack_blocks_input()
-        {
+        } else if open_pause_menu {
             self.pause_menu.open();
             self.audio.set_gameplay_paused(true);
         }
