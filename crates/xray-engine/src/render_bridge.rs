@@ -38,7 +38,7 @@ use xray_formats::ogf::{
     OgfVisualType, StaticVertex, XRAY_IDENTITY_MATRIX,
 };
 use xray_formats::shaders_xr::{EngineShaderLibrary, R4BlenderSpec};
-use xray_formats::sun::{build_3split_csm_atlas, CsmAtlasPacking, SunCascadeConfig};
+use xray_formats::sun::{build_3split_csm_atlas, CsmAtlasPacking, CsmAtlasPlan, SunCascadeConfig};
 use xray_formats::thm::{texture_stem_to_dds_vpath, ResolvedTextureLinks};
 use xray_formats::vfs_bridge::{load_font_from_vfs, load_ltx_tree_from_vfs, load_ui_texture_atlases_from_vfs, load_xml_from_vfs};
 use xray_formats::weather::MixedEnvironment;
@@ -162,10 +162,71 @@ struct GpuOgfSubMesh {
     material_tex: DescriptorIndex,
 }
 
-#[derive(Debug, Clone)]
 struct DynamicDrawInstance {
     submeshes: Vec<GpuOgfSubMesh>,
     transform_index: u32,
+    visibility: DynamicVisibility,
+}
+
+struct DynamicVisibility {
+    camera: bool,
+    shadows: [bool; 3],
+}
+
+fn classify_dynamic_visibility(
+    position: [f32; 3],
+    cam_pos: [f32; 3],
+    frustum: &ClipFrustum,
+    sun_plan: Option<&CsmAtlasPlan>,
+) -> Option<DynamicVisibility> {
+    const MAX_ENT_VIS_DIST_SQ: f32 = 280.0 * 280.0;
+    const ENTITY_RADIUS: f32 = 2.5;
+    if distance_sq(cam_pos, position) > MAX_ENT_VIS_DIST_SQ {
+        return None;
+    }
+    let camera = frustum.test_sphere(position, ENTITY_RADIUS);
+    // Offscreen models can cast visible shadows. Query the sun's caster volume
+    // for each cascade, like r_dsgraph_render_subspace in render_sun_cascade.
+    let shadows = std::array::from_fn(|cascade| {
+        sun_plan.is_some_and(|plan| plan.slots[cascade].cull_frustum.test_sphere(position, ENTITY_RADIUS))
+    });
+    (camera || shadows.into_iter().any(|visible| visible))
+        .then_some(DynamicVisibility { camera, shadows })
+}
+
+#[cfg(test)]
+#[test]
+fn offscreen_dynamic_caster_uses_the_sun_volume_for_each_cascade() {
+    use xray_formats::hom::Plane;
+
+    let camera = FirstPersonCamera::new(1280, 720);
+    let mut plan = build_3split_csm_atlas(
+        &SunCascadeConfig::default(),
+        camera.position,
+        camera.forward(),
+        &camera.view_matrix(),
+        &camera.projection_matrix(),
+        [0.0, 400.0, -300.0],
+        [0.0, -0.8, 0.6],
+        1024,
+        CsmAtlasPacking::Row3x1,
+        0.1,
+        false,
+    ).unwrap();
+    let exclude = ClipFrustum { planes: vec![Plane { n: [1.0, 0.0, 0.0], d: 0.0 }] };
+    let include = ClipFrustum { planes: vec![Plane { n: [-1.0, 0.0, 0.0], d: 0.0 }] };
+    plan.slots[0].cull_frustum = exclude.clone();
+    plan.slots[1].cull_frustum = include.clone();
+    plan.slots[2].cull_frustum = exclude.clone();
+
+    let position = [8.0, 1.0, 15.0];
+    let offscreen = classify_dynamic_visibility(position, camera.position, &exclude, Some(&plan)).unwrap();
+    let onscreen = classify_dynamic_visibility(position, camera.position, &include, Some(&plan)).unwrap();
+    assert!(!offscreen.camera);
+    assert!(onscreen.camera);
+    assert_eq!(offscreen.shadows, [false, true, false]);
+    assert_eq!(onscreen.shadows, offscreen.shadows);
+    assert!(classify_dynamic_visibility(position, camera.position, &exclude, None).is_none());
 }
 
 #[derive(Clone, Copy, Default)]
@@ -482,6 +543,7 @@ impl RenderBridge {
         renderer: &mut Dx12Renderer,
         cam_pos: [f32; 3],
         frustum: &ClipFrustum,
+        sun_plan: Option<&CsmAtlasPlan>,
         world: Option<&LoadedWorld>,
         alife: Option<&AlifeManager>,
         vfs: Option<&VirtualFileSystem>,
@@ -494,19 +556,14 @@ impl RenderBridge {
             return Ok(draws);
         };
 
-        const MAX_ENT_VIS_DIST_SQ: f32 = 280.0 * 280.0;
-
         // Online NPCs / dynamic objects / actors (excluding first-person host actor)
         for ent in alife.entities.values() {
             if !ent.online || ent.role == EntityRole::LocalHostActor {
                 continue;
             }
-            if distance_sq(cam_pos, ent.position) > MAX_ENT_VIS_DIST_SQ {
+            let Some(visibility) = classify_dynamic_visibility(ent.position, cam_pos, frustum, sun_plan) else {
                 continue;
-            }
-            if !frustum.test_sphere(ent.position, 2.5) {
-                continue;
-            }
+            };
             let Some(visual_key) = ent.visual_name.as_deref().filter(|name| !name.is_empty()) else {
                 continue;
             };
@@ -519,17 +576,15 @@ impl RenderBridge {
             draws.push(DynamicDrawInstance {
                 submeshes,
                 transform_index: tf_idx,
+                visibility,
             });
         }
 
         // Connected co-op peers (`RemotePeerAvatar`)
         for peer in alife.remote_peers.values() {
-            if distance_sq(cam_pos, peer.position) > MAX_ENT_VIS_DIST_SQ {
+            let Some(visibility) = classify_dynamic_visibility(peer.position, cam_pos, frustum, sun_plan) else {
                 continue;
-            }
-            if !frustum.test_sphere(peer.position, 2.5) {
-                continue;
-            }
+            };
             let xf = matrix_set_xyz_translate([peer.pitch, peer.yaw, 0.0], peer.position);
             let tf_idx = matrices.len() as u32;
             matrices.push(xf);
@@ -541,6 +596,7 @@ impl RenderBridge {
             draws.push(DynamicDrawInstance {
                 submeshes,
                 transform_index: tf_idx,
+                visibility,
             });
         }
 
@@ -691,10 +747,29 @@ impl RenderBridge {
         let frustum = ClipFrustum::from_view_proj_dx(&vp_xray, frustum_planes::ALL);
         const MAX_VIS_DIST: f32 = 280.0;
 
+        let env = world.and_then(|w| w.weather.current_env.as_ref());
+        let (sun_dir_to_surface, sun_rgb, ambient_rgb) = extract_lighting_env(env);
+        let sun_pos = std::array::from_fn(|axis| {
+            camera.position[axis] - sun_dir_to_surface[axis] * 500.0
+        });
+        let sun_plan = build_3split_csm_atlas(
+            &self.config.sun_cascades,
+            camera.position,
+            camera.forward(),
+            &view_mat,
+            &proj_mat,
+            sun_pos,
+            sun_dir_to_surface,
+            self.csm_atlas.tile_size,
+            CsmAtlasPacking::Row3x1,
+            self.config.csm_blend_band,
+            self.config.volumetric_shafts,
+        );
         let dynamic_draws = self.prepare_dynamic_draws(
             renderer,
             camera.position,
             &frustum,
+            sun_plan.as_ref(),
             world,
             alife,
             vfs,
@@ -728,7 +803,7 @@ impl RenderBridge {
             )?;
             stats.gbuffer_static_draws += 1;
         }
-        for inst in &dynamic_draws {
+        for inst in dynamic_draws.iter().filter(|instance| instance.visibility.camera) {
             for sub in &inst.submeshes {
                 renderer.draw_gbuffer_mesh(
                     sub.mesh_handle,
@@ -748,30 +823,11 @@ impl RenderBridge {
         // ---------------------------------------------------------------------
         // Stage (c): 3-Split Cascaded Shadow Map (CSM) Pass
         // ---------------------------------------------------------------------
-        let env = world.and_then(|w| w.weather.current_env.as_ref());
-        let (sun_dir_to_surface, sun_rgb, ambient_rgb) = extract_lighting_env(env);
-        let sun_pos = [
-            camera.position[0] - sun_dir_to_surface[0] * 500.0,
-            camera.position[1] - sun_dir_to_surface[1] * 500.0,
-            camera.position[2] - sun_dir_to_surface[2] * 500.0,
-        ];
-
-        if let Some(plan) = build_3split_csm_atlas(
-            &self.config.sun_cascades,
-            camera.position,
-            camera.forward(),
-            &view_mat,
-            &proj_mat,
-            sun_pos,
-            sun_dir_to_surface,
-            self.csm_atlas.tile_size,
-            CsmAtlasPacking::Row3x1,
-            self.config.csm_blend_band,
-            self.config.volumetric_shafts,
-        ) {
-            self.csm_atlas.update_plan(plan.clone())?;
+        if let Some(plan) = sun_plan {
+            self.csm_atlas.update_plan(plan)?;
             if let Some(cmd) = renderer.current_cmd_list.clone() {
                 self.csm_atlas.begin_atlas_pass(&cmd);
+                let plan = self.csm_atlas.plan.as_ref().unwrap();
                 let mut shadow_draws = Vec::new();
                 for (cascade_idx, slot) in plan.slots.iter().enumerate() {
                     shadow_draws.clear();
@@ -810,7 +866,7 @@ impl RenderBridge {
                         let caster = mesh.fastpath_handle.unwrap_or(mesh.mesh_handle);
                         shadow_draws.push((caster, u32::MAX));
                     }
-                    for inst in &dynamic_draws {
+                    for inst in dynamic_draws.iter().filter(|instance| instance.visibility.shadows[cascade_idx]) {
                         for sub in &inst.submeshes {
                             shadow_draws.push((sub.mesh_handle, inst.transform_index));
                         }
@@ -822,6 +878,8 @@ impl RenderBridge {
                 // Restore main player camera CBV before deferred combine & forward stages
                 renderer.update_camera(&cam_constants)?;
             }
+        } else {
+            self.csm_atlas.plan = None;
         }
 
         // ---------------------------------------------------------------------
