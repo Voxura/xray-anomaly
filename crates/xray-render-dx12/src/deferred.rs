@@ -839,7 +839,6 @@ impl GBufferMeshPipeline {
 pub struct DeferredCombinePipeline {
     pub root: ID3D12RootSignature,
     pub pso: ID3D12PipelineState,
-    light_params_buffer: Option<ID3D12Resource>,
     dummy_csm_buffer: Option<ID3D12Resource>,
 }
 
@@ -864,13 +863,14 @@ impl DeferredCombinePipeline {
             RegisterSpace: 0,
         };
 
-        // Param 2: LightParams CBV (b2)
+        // Param 2: LightParams inline constants (b2)
         let mut light_params = D3D12_ROOT_PARAMETER::default();
-        light_params.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        light_params.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         light_params.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        light_params.Anonymous.Descriptor = D3D12_ROOT_DESCRIPTOR {
+        light_params.Anonymous.Constants = D3D12_ROOT_CONSTANTS {
             ShaderRegister: 2,
             RegisterSpace: 0,
+            Num32BitValues: (std::mem::size_of::<GpuLightParams>() / 4) as u32,
         };
 
         // Param 3: Dynamic Lights SRV (t0, space 1)
@@ -1065,7 +1065,6 @@ impl DeferredCombinePipeline {
         Ok(Self {
             root,
             pso,
-            light_params_buffer: None,
             dummy_csm_buffer: None,
         })
     }
@@ -1085,40 +1084,6 @@ impl DeferredCombinePipeline {
         width: u32,
         height: u32,
     ) -> WinResult<()> {
-        if self.light_params_buffer.is_none() {
-            let heap_props = D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_UPLOAD,
-                CreationNodeMask: 1,
-                VisibleNodeMask: 1,
-                ..Default::default()
-            };
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: 256,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                ..Default::default()
-            };
-            let mut res = None;
-            unsafe {
-                device.CreateCommittedResource(
-                    &heap_props,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut res,
-                )?;
-            }
-            self.light_params_buffer = Some(res.ok_or_else(failure)?);
-        }
-
         if self.dummy_csm_buffer.is_none() {
             let heap_props = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_UPLOAD,
@@ -1153,19 +1118,6 @@ impl DeferredCombinePipeline {
             self.dummy_csm_buffer = Some(res.ok_or_else(failure)?);
         }
 
-        let lpb = self.light_params_buffer.as_ref().unwrap();
-        unsafe {
-            let mut mapped = std::ptr::null_mut();
-            lpb.Map(0, None, Some(&mut mapped))?;
-            std::ptr::copy_nonoverlapping(
-                light_params as *const GpuLightParams as *const u8,
-                mapped.cast(),
-                std::mem::size_of::<GpuLightParams>(),
-            );
-            lpb.Unmap(0, None);
-        }
-
-        let light_params_va = unsafe { lpb.GetGPUVirtualAddress() };
         let csm_va = if let Some(va) = csm_uniforms_va {
             va
         } else {
@@ -1185,7 +1137,10 @@ impl DeferredCombinePipeline {
             );
 
             cmd.SetGraphicsRootConstantBufferView(1, camera_va);
-            cmd.SetGraphicsRootConstantBufferView(2, light_params_va);
+            cmd.SetGraphicsRoot32BitConstants(
+                2, (std::mem::size_of::<GpuLightParams>() / 4) as u32,
+                std::ptr::from_ref(light_params).cast(), 0,
+            );
             cmd.SetGraphicsRootShaderResourceView(3, lights_va);
             cmd.SetGraphicsRootDescriptorTable(
                 4,

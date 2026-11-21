@@ -1023,11 +1023,7 @@ impl Dx12Renderer {
         if self.postprocess_manager.is_none() {
             self.postprocess_manager = Some(crate::postprocess::PostprocessManager::new());
         }
-        let (tonemap_va, img_correct_va) = self
-            .postprocess_manager
-            .as_mut()
-            .unwrap()
-            .upload_constants(&self.device_ctx.device)?;
+        let settings = self.postprocess_manager.as_ref().unwrap();
         let postprocess = self.postprocess_renderer.as_ref().unwrap();
         let cmd = match self.current_cmd_list.as_ref() {
             Some(c) => c,
@@ -1041,8 +1037,8 @@ impl Dx12Renderer {
         postprocess.render(
             cmd,
             &self.bindless_heap,
-            tonemap_va,
-            img_correct_va,
+            &settings.tonemap.to_gpu_params(),
+            &settings.image_correction.to_gpu_params(),
             push,
             rtv,
             self.width,
@@ -1231,6 +1227,9 @@ impl Dx12Renderer {
         num_lights: u32,
         volumetric_active: bool,
     ) -> WinResult<crate::bindless::DescriptorIndex> {
+        let Some(plan) = &csm_atlas.plan else {
+            return self.execute_deferred_combine(light_params, None, num_lights);
+        };
         self.ensure_gbuffer()?;
         let cmd = match self.current_cmd_list.as_ref() {
             Some(c) => c,
@@ -1241,6 +1240,9 @@ impl Dx12Renderer {
             .camera_gpu_va()
             .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
         let lt_va = self.geometry.lights_gpu_va(&self.device_ctx.device)?;
+        let uniforms_va = self.geometry.upload_csm_uniforms(
+            &self.device_ctx.device, &plan.to_gpu_uniforms(),
+        )?;
 
         let gbuffer = self.gbuffer.as_mut().unwrap();
         let targets = gbuffer.targets.as_ref().unwrap();
@@ -1275,7 +1277,7 @@ impl Dx12Renderer {
             &self.bindless_heap,
             &push,
             light_params,
-            Some(csm_atlas.gpu_uniforms_va),
+            Some(uniforms_va),
             hdr_rtv,
             width,
             height,

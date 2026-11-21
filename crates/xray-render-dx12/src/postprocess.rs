@@ -67,22 +67,24 @@ impl PostprocessRenderer {
             Num32BitValues: (std::mem::size_of::<PostprocessPushConstants>() / 4) as u32,
         };
 
-        // Param 1: Tonemap parameters CBV (b1, space 0)
+        // Param 1: Tonemap parameters inline constants (b1, space 0)
         let mut tonemap = D3D12_ROOT_PARAMETER::default();
-        tonemap.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        tonemap.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         tonemap.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        tonemap.Anonymous.Descriptor = D3D12_ROOT_DESCRIPTOR {
+        tonemap.Anonymous.Constants = D3D12_ROOT_CONSTANTS {
             ShaderRegister: 1,
             RegisterSpace: 0,
+            Num32BitValues: (std::mem::size_of::<TonemapGpuParams>() / 4) as u32,
         };
 
-        // Param 2: Image correction parameters CBV (b2, space 0)
+        // Param 2: Image correction parameters inline constants (b2, space 0)
         let mut img_correct = D3D12_ROOT_PARAMETER::default();
-        img_correct.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        img_correct.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         img_correct.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        img_correct.Anonymous.Descriptor = D3D12_ROOT_DESCRIPTOR {
+        img_correct.Anonymous.Constants = D3D12_ROOT_CONSTANTS {
             ShaderRegister: 2,
             RegisterSpace: 0,
+            Num32BitValues: (std::mem::size_of::<ImageCorrectionGpuParams>() / 4) as u32,
         };
 
         // Param 3: Bindless texture table (t0, space 0)
@@ -248,8 +250,8 @@ impl PostprocessRenderer {
         &self,
         cmd: &ID3D12GraphicsCommandList,
         bindless_heap: &ID3D12DescriptorHeap,
-        tonemap_va: u64,
-        img_correct_va: u64,
+        tonemap: &TonemapGpuParams,
+        img_correct: &ImageCorrectionGpuParams,
         push: &PostprocessPushConstants,
         rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
         width: u32,
@@ -268,11 +270,15 @@ impl PostprocessRenderer {
                 0,
             );
 
-            // Param 1: Tonemap CBV
-            cmd.SetGraphicsRootConstantBufferView(1, tonemap_va);
+            cmd.SetGraphicsRoot32BitConstants(
+                1, (std::mem::size_of::<TonemapGpuParams>() / 4) as u32,
+                std::ptr::from_ref(tonemap).cast(), 0,
+            );
 
-            // Param 2: Image correction CBV
-            cmd.SetGraphicsRootConstantBufferView(2, img_correct_va);
+            cmd.SetGraphicsRoot32BitConstants(
+                2, (std::mem::size_of::<ImageCorrectionGpuParams>() / 4) as u32,
+                std::ptr::from_ref(img_correct).cast(), 0,
+            );
 
             // Param 3: Bindless texture table
             cmd.SetGraphicsRootDescriptorTable(
@@ -311,8 +317,6 @@ pub struct PostprocessManager {
     pub image_correction: ImageCorrectionConfig,
     pub bloom: BloomConfig,
     pub bloom_adapt: BloomAdaptState,
-    tonemap_buffer: Option<ID3D12Resource>,
-    img_correct_buffer: Option<ID3D12Resource>,
 }
 
 impl Default for PostprocessManager {
@@ -328,107 +332,7 @@ impl PostprocessManager {
             image_correction: ImageCorrectionConfig::default(),
             bloom: BloomConfig::default(),
             bloom_adapt: BloomAdaptState::default(),
-            tonemap_buffer: None,
-            img_correct_buffer: None,
         }
     }
 
-    /// Upload tonemap and image correction parameters to GPU constant buffers and return (tonemap_va, img_correct_va)
-    pub fn upload_constants(&mut self, device: &ID3D12Device) -> WinResult<(u64, u64)> {
-        let heap_props = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
-            CreationNodeMask: 1,
-            VisibleNodeMask: 1,
-            ..Default::default()
-        };
-
-        // 256-byte aligned CBV for Tonemap
-        if self.tonemap_buffer.is_none() {
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: 256,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                ..Default::default()
-            };
-            let mut res: Option<ID3D12Resource> = None;
-            unsafe {
-                device.CreateCommittedResource(
-                    &heap_props,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut res,
-                )?;
-            }
-            self.tonemap_buffer = Some(res.ok_or_else(failure)?);
-        }
-
-        // 256-byte aligned CBV for Image Correction
-        if self.img_correct_buffer.is_none() {
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: 256,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                ..Default::default()
-            };
-            let mut res: Option<ID3D12Resource> = None;
-            unsafe {
-                device.CreateCommittedResource(
-                    &heap_props,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut res,
-                )?;
-            }
-            self.img_correct_buffer = Some(res.ok_or_else(failure)?);
-        }
-
-        let gpu_tonemap = self.tonemap.to_gpu_params();
-        let gpu_img = self.image_correction.to_gpu_params();
-
-        let tb = self.tonemap_buffer.as_ref().unwrap();
-        unsafe {
-            let mut mapped = std::ptr::null_mut();
-            tb.Map(0, None, Some(&mut mapped))?;
-            std::ptr::copy_nonoverlapping(
-                &gpu_tonemap as *const TonemapGpuParams as *const u8,
-                mapped.cast(),
-                std::mem::size_of::<TonemapGpuParams>(),
-            );
-            tb.Unmap(0, None);
-        }
-
-        let ib = self.img_correct_buffer.as_ref().unwrap();
-        unsafe {
-            let mut mapped = std::ptr::null_mut();
-            ib.Map(0, None, Some(&mut mapped))?;
-            std::ptr::copy_nonoverlapping(
-                &gpu_img as *const ImageCorrectionGpuParams as *const u8,
-                mapped.cast(),
-                std::mem::size_of::<ImageCorrectionGpuParams>(),
-            );
-            ib.Unmap(0, None);
-        }
-
-        let t_va = unsafe { tb.GetGPUVirtualAddress() };
-        let i_va = unsafe { ib.GetGPUVirtualAddress() };
-        Ok((t_va, i_va))
-    }
 }

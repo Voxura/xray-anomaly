@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Foundation::RECT;
 
 use crate::bindless::{BindlessIndexAllocator, DescriptorIndex};
-use xray_formats::sun::{CsmAtlasPacking, CsmAtlasPlan, GpuCsmSplitUniforms};
+use xray_formats::sun::{CsmAtlasPacking, CsmAtlasPlan};
 
 fn failure() -> Error {
     Error::from_hresult(HRESULT(0x80004005u32 as i32))
@@ -241,8 +241,6 @@ pub struct CascadedShadowAtlas {
     pub dsv_heap: ID3D12DescriptorHeap,
     pub srv_index: DescriptorIndex,
     pub current_state: D3D12_RESOURCE_STATES,
-    pub gpu_uniforms_buffer: ID3D12Resource,
-    pub gpu_uniforms_va: u64,
     pub plan: Option<CsmAtlasPlan>,
 }
 
@@ -357,39 +355,6 @@ impl CascadedShadowAtlas {
             device.CreateShaderResourceView(Some(&resource), Some(&srv_desc), dest_handle);
         }
 
-        // 512B upload buffer for GpuCsmSplitUniforms
-        let upload_props = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
-            CreationNodeMask: 1,
-            VisibleNodeMask: 1,
-            ..Default::default()
-        };
-        let cb_desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: 512,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            Format: DXGI_FORMAT_UNKNOWN,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_NONE,
-            Alignment: 0,
-        };
-        let mut gpu_uniforms_buffer: Option<ID3D12Resource> = None;
-        unsafe {
-            device.CreateCommittedResource(
-                &upload_props,
-                D3D12_HEAP_FLAG_NONE,
-                &cb_desc,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                None,
-                &mut gpu_uniforms_buffer,
-            )?;
-        }
-        let gpu_uniforms_buffer = gpu_uniforms_buffer.ok_or_else(failure)?;
-        let gpu_uniforms_va = unsafe { gpu_uniforms_buffer.GetGPUVirtualAddress() };
-
         Ok(Self {
             atlas_width,
             atlas_height,
@@ -399,8 +364,6 @@ impl CascadedShadowAtlas {
             dsv_heap,
             srv_index,
             current_state: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            gpu_uniforms_buffer,
-            gpu_uniforms_va,
             plan: None,
         })
     }
@@ -410,17 +373,7 @@ impl CascadedShadowAtlas {
     }
 
     pub fn update_plan(&mut self, plan: CsmAtlasPlan) -> WinResult<()> {
-        let uniforms = plan.to_gpu_uniforms();
-        unsafe {
-            let mut mapped_ptr = std::ptr::null_mut();
-            self.gpu_uniforms_buffer.Map(0, None, Some(&mut mapped_ptr))?;
-            std::ptr::copy_nonoverlapping(
-                &uniforms as *const GpuCsmSplitUniforms as *const u8,
-                mapped_ptr as *mut u8,
-                std::mem::size_of::<GpuCsmSplitUniforms>(),
-            );
-            self.gpu_uniforms_buffer.Unmap(0, None);
-        }
+        // Deferred lighting uploads a snapshot with the commands that sample the atlas.
         self.plan = Some(plan);
         Ok(())
     }

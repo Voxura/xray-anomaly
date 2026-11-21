@@ -492,6 +492,23 @@ impl GeometryState {
         self.recording_resources.push(res);
     }
 
+    pub(crate) fn upload_csm_uniforms(
+        &mut self,
+        device: &ID3D12Device,
+        uniforms: &xray_formats::sun::GpuCsmSplitUniforms,
+    ) -> WinResult<u64> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(uniforms).cast::<u8>(),
+                std::mem::size_of_val(uniforms),
+            )
+        };
+        let buffer = UploadBuffer::new(device, bytes)?;
+        let address = unsafe { buffer.0.GetGPUVirtualAddress() };
+        self.track_resource(buffer.0);
+        Ok(address)
+    }
+
     pub fn update_camera(
         &mut self,
         device: &ID3D12Device,
@@ -555,7 +572,9 @@ impl GeometryState {
         }
         let default_lt = self.default_lights.as_ref().unwrap();
         let lt_buf = self.lights.as_ref().unwrap_or(default_lt);
-        unsafe { Ok(lt_buf.0.GetGPUVirtualAddress()) }
+        let address = unsafe { lt_buf.0.GetGPUVirtualAddress() };
+        self.recording_resources.push(lt_buf.0.clone());
+        Ok(address)
     }
 
     /// Caller validates frame, mesh and camera before recording any commands.
@@ -1069,6 +1088,44 @@ impl GeometryState {
 #[cfg(test)]
 mod camera_lifetime_tests {
     use super::*;
+
+    #[test]
+    fn cascade_uniforms_remain_immutable_until_each_submission_finishes() {
+        use xray_formats::sun::GpuCsmSplitUniforms;
+
+        let renderer = crate::renderer::Dx12Renderer::new(2).expect("DX12 device required");
+        let device = &renderer.device_ctx.device;
+        let mut state = GeometryState::default();
+        let mut uniforms = GpuCsmSplitUniforms {
+            cascade_view_proj: [[[0.0; 4]; 4]; 3],
+            atlas_uv_scale_offset: [[0.0; 4]; 3],
+            cascade_uv_clamp: [[0.0; 4]; 3],
+            cascade_bias_texel: [[0.0; 4]; 3],
+            split_distances_and_blend: [0.0; 4],
+            atlas_dims_inv: [0.0; 4],
+            padding: [0.0; 36],
+        };
+        let a = state.upload_csm_uniforms(device, &uniforms).unwrap();
+        state.prepare_submission();
+        state.tag_submission(1);
+        uniforms.cascade_view_proj[0][0][0] = 1.0;
+        let b = state.upload_csm_uniforms(device, &uniforms).unwrap();
+        state.prepare_submission();
+        state.tag_submission(2);
+        assert_ne!(a, b);
+        state.retire(0);
+        let old = &state.submitted_resources[0].1[0];
+        unsafe {
+            assert_eq!(old.GetGPUVirtualAddress(), a);
+            let mut bytes = std::ptr::null_mut();
+            old.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 4 }), Some(&mut bytes)).unwrap();
+            assert_eq!(*bytes.cast::<f32>(), 0.0);
+            old.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+        }
+        state.retire(1);
+        assert_eq!(state.submitted_resources.len(), 1);
+        assert_eq!(unsafe { state.submitted_resources[0].1[0].GetGPUVirtualAddress() }, b);
+    }
 
     #[test]
     fn forward_camera_survives_replacement_until_submission_retirement() {
