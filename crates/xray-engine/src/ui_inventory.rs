@@ -2319,7 +2319,8 @@ impl InventoryManager {
         for (eq_slot, hud_idx, default_sec) in slot_mappings {
             let slot_arr_idx = hud_idx - 1;
             if let Some(item) = self.item_in_slot(eq_slot).cloned() {
-                let spec = build_weapon_spec_for_section(hud_idx as u8, &item.section, item.ammo_elapsed);
+                let mut spec = build_weapon_spec_for_section(hud_idx as u8, &item.section, item.ammo_elapsed);
+                spec.bullet_material = self.configured_bullet_material(&item);
                 hw.slots[slot_arr_idx] = spec;
             } else {
                 // Slot unequipped: mark section empty / cleared clip so HUD knows slot is vacant
@@ -2335,6 +2336,18 @@ impl InventoryManager {
             }
         }
         self.hud_sync_dirty = false;
+    }
+
+    fn configured_bullet_material(&self, weapon: &InventoryItem) -> Option<String> {
+        let settings = self.item_settings.as_ref()?;
+        let ammo = match weapon.ammo_section.as_deref() {
+            Some(section) if settings.sections.contains_key(section) => section,
+            _ => {
+                let ammo_type = usize::try_from(weapon.ammo_type.unwrap_or_default()).ok()?;
+                settings.read_str(&weapon.section, "ammo_class")?.split(',').nth(ammo_type)?.trim()
+            }
+        };
+        settings.read_str(ammo, "bullet_material").filter(|name| !name.is_empty()).map(str::to_owned)
     }
 
     /// Use / consume an item (medkit, bandage, energy drink, antirad) or equip if gear/weapon.

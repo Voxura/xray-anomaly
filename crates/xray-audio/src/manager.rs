@@ -10,9 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::f32::consts::TAU;
 use std::sync::{Arc, Mutex};
 
+use xray_core::ltx_loader::glob_matches_ascii;
 use xray_formats::gamemtl::{gamemtl_flags, GameMaterialLibrary};
 use xray_formats::sound_env::{LevelStaticSounds, OggXRayParams, SoundOcclusionMesh};
-use xray_vfs::VirtualFileSystem;
+use xray_vfs::{VirtualFileSystem, normalize_virtual_path};
 
 use crate::backend::AudioOutputBackend;
 use crate::mixer::{
@@ -87,11 +88,14 @@ impl SurfaceMaterialCategory {
     pub fn default_impact_paths(self) -> &'static [&'static str] {
         match self {
             Self::Dirt => &[
+                "material\\bullet\\collide\\dirt01gr",
+                "material\\bullet\\collide\\sand01gr",
                 "material\\bullet\\collide\\dirt01hl",
                 "material\\bullet\\collide\\dirt02hl",
                 "material\\bullet\\collide\\earth01",
             ],
             Self::Grass => &[
+                "material\\bullet\\collide\\sand03gr",
                 "material\\bullet\\collide\\dirt01hl",
                 "material\\bullet\\collide\\grass01",
             ],
@@ -242,6 +246,7 @@ pub struct AudioManager {
     backend: AudioOutputBackend,
     vfs: Option<Arc<VirtualFileSystem>>,
     clip_cache: BTreeMap<String, Arc<SoundClip>>,
+    impact_sound_patterns: BTreeMap<String, Vec<String>>,
 
     // Footstep kinematics state
     footstep_distance_m: f32,
@@ -285,6 +290,7 @@ impl AudioManager {
             backend,
             vfs: None,
             clip_cache: BTreeMap::new(),
+            impact_sound_patterns: BTreeMap::new(),
             footstep_distance_m: 0.0,
             was_grounded: true,
             air_time_sec: 0.0,
@@ -314,6 +320,7 @@ impl AudioManager {
     }
 
     pub fn attach_vfs(&mut self, vfs: Arc<VirtualFileSystem>) {
+        self.impact_sound_patterns.clear();
         self.vfs = Some(vfs);
     }
 
@@ -859,6 +866,47 @@ impl AudioManager {
         self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
     }
 
+    /// Play the collision sound configured for the projectile and the raw CFORM material ID.
+    /// An empty or absent pair is silent, as in CBulletManager::FireShotmark.
+    pub fn play_bullet_impact_on_surface(
+        &mut self,
+        materials: Option<&GameMaterialLibrary>,
+        bullet_material: &str,
+        target_id: u16,
+        surface: SurfaceMaterialCategory,
+        hit_pos: [f32; 3],
+    ) -> Option<VoiceId> {
+        let Some((library, projectile_id)) = materials.and_then(|library| {
+            Some((library, library.material_by_name(bullet_material)?.id))
+        }) else {
+            return Some(self.play_bullet_impact_3d(surface, hit_pos, [0.0; 3]));
+        };
+
+        let pair = library.find_pair(projectile_id, u32::from(target_id))?;
+        let mut paths = Vec::new();
+        for name in pair.collide_sounds() {
+            if name.contains('*') {
+                let matches = self.impact_sound_patterns.entry(name.to_owned()).or_insert_with(|| {
+                    self.vfs.as_deref().map_or_else(Vec::new, |vfs| expand_impact_sound_pattern(vfs, name))
+                });
+                paths.extend(matches.iter().cloned());
+            } else {
+                paths.push(name.to_owned());
+            }
+        }
+        if paths.is_empty() {
+            return None;
+        }
+
+        // Vary the starting entry and try the rest of the configured group if a clip fails to load.
+        let start = (self.bullet_impacts_triggered % paths.len() as u64) as usize;
+        paths.rotate_left(start);
+        let clip = paths.iter().find_map(|path| self.load_clip_from_vfs(path))?;
+        let emitter = AudioEmitter3D::from_xray_params(hit_pos, &clip.xray_params);
+        self.bullet_impacts_triggered += 1;
+        Some(self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false))
+    }
+
     /// Play interface open sound (inventory, PDA, or dialogue screen).
     pub fn play_ui_open(&mut self) -> VoiceId {
         let clip = self.resolve_or_synthesize(
@@ -960,6 +1008,20 @@ impl AudioManager {
         self.item_sounds_triggered += 1;
         self.play_clip_internal(clip, AudioCategory::Sfx, emitter, false)
     }
+}
+
+fn expand_impact_sound_pattern(vfs: &VirtualFileSystem, reference: &str) -> Vec<String> {
+    let Ok(path) = normalize_virtual_path(reference) else {
+        return Vec::new();
+    };
+    let mut pattern = if path.starts_with("sounds\\") { path } else { format!("sounds\\{path}") };
+    if !pattern.ends_with(".ogg") {
+        pattern.push_str(".ogg");
+    }
+    let prefix = pattern.split('*').next().unwrap_or_default();
+    let directory = prefix.rsplit_once('\\').map_or("sounds", |(dir, _)| dir);
+    vfs.list_files(directory).unwrap_or_default().into_iter()
+        .filter(|path| glob_matches_ascii(&pattern, path)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,6 +1399,43 @@ mod tests {
             assert_eq!(manager.trigger_weapon_sound(alias, [0.0; 3], [0.0; 3]), VoiceId(0));
         }
         assert_eq!(manager.stats().weapon_sounds_triggered, 0);
+    }
+
+    #[test]
+    fn bullet_impact_uses_the_cform_material_id_and_preserves_silent_pairs() {
+        use xray_formats::gamemtl::{GameMaterial, GameMaterialPair, GAMEMTL_CURRENT_VERSION};
+
+        let library = GameMaterialLibrary {
+            version: GAMEMTL_CURRENT_VERSION,
+            material_index: 43,
+            material_pair_index: 2,
+            materials: vec![
+                GameMaterial { id: 38, name: "objects\\bullet".into(), ..Default::default() },
+                GameMaterial { id: 42, name: "materials\\grass".into(), ..Default::default() },
+                GameMaterial { id: 1, name: "materials\\silent".into(), ..Default::default() },
+            ],
+            material_pairs: vec![
+                GameMaterialPair {
+                    mtl0: 42, mtl1: 38, id: 0,
+                    collide_sounds_raw: "missing_clip, configured_impact".into(),
+                    ..Default::default()
+                },
+                GameMaterialPair { mtl0: 1, mtl1: 38, id: 1, ..Default::default() },
+            ],
+        };
+        let mut audio = AudioManager::new_headless();
+        let expected = Arc::new(synthesize_footstep(SurfaceMaterialCategory::Grass));
+        audio.register_clip("configured_impact", Arc::clone(&expected));
+        let play = |audio: &mut AudioManager, target_id| {
+            audio.play_bullet_impact_on_surface(
+                Some(&library), "objects\\bullet", target_id, SurfaceMaterialCategory::Grass, [1.0; 3],
+            )
+        };
+        let voice = play(&mut audio, 42).unwrap();
+        assert!(Arc::ptr_eq(&audio.mixer.lock().unwrap().get_voice(voice).unwrap().clip, &expected));
+        assert!(play(&mut audio, 1).is_none());
+        assert!(play(&mut audio, 99).is_none());
+        assert_eq!(audio.stats().bullet_impacts_triggered, 1);
     }
 
     #[test]

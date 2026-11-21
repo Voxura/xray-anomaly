@@ -183,6 +183,7 @@ pub struct WeaponSpec {
     pub weapon_hud_ogf: String,
     pub hands_hud_ogf: String,
     pub shoot_sound: String,
+    pub bullet_material: Option<String>,
     pub reload_sound: String,
     pub holster_sound: String,
     pub rpm: f32,
@@ -219,6 +220,7 @@ impl WeaponSpec {
                 weapon_hud_ogf: "dynamics\\weapons\\wpn_knife\\wpn_knife_hud.ogf".to_string(),
                 hands_hud_ogf: "actors\\stalker_hero\\hand_stalker_hud.ogf".to_string(),
                 shoot_sound: "weapons\\knife\\knife_1".to_string(),
+                bullet_material: None,
                 reload_sound: "weapons\\generic_draw".to_string(),
                 holster_sound: "weapons\\generic_holster".to_string(),
                 rpm: 90.0,
@@ -246,6 +248,7 @@ impl WeaponSpec {
                 weapon_hud_ogf: "dynamics\\weapons\\wpn_pm\\wpn_pm_hud.ogf".to_string(),
                 hands_hud_ogf: "actors\\stalker_hero\\hand_stalker_hud.ogf".to_string(),
                 shoot_sound: "weapons\\pm\\pm_shoot".to_string(),
+                bullet_material: None,
                 reload_sound: "weapons\\pm\\pm_reload".to_string(),
                 holster_sound: "weapons\\generic_holster".to_string(),
                 rpm: 320.0,
@@ -273,6 +276,7 @@ impl WeaponSpec {
                 weapon_hud_ogf: "dynamics\\weapons\\wpn_ak74\\wpn_ak74_hud.ogf".to_string(),
                 hands_hud_ogf: "actors\\stalker_hero\\hand_stalker_hud.ogf".to_string(),
                 shoot_sound: "weapons\\ak74\\ak74_shoot".to_string(),
+                bullet_material: None,
                 reload_sound: "weapons\\ak74_reload".to_string(),
                 holster_sound: "weapons\\generic_holster".to_string(),
                 rpm: 600.0,
@@ -300,6 +304,7 @@ impl WeaponSpec {
                 weapon_hud_ogf: "dynamics\\weapons\\wpn_mp5\\wpn_mp5_hud.ogf".to_string(),
                 hands_hud_ogf: "actors\\stalker_hero\\hand_stalker_hud.ogf".to_string(),
                 shoot_sound: "weapons\\mp5\\mp5_shoot".to_string(),
+                bullet_material: None,
                 reload_sound: "weapons\\mp5_reload".to_string(),
                 holster_sound: "weapons\\generic_holster".to_string(),
                 rpm: 750.0,
@@ -327,6 +332,7 @@ impl WeaponSpec {
                 weapon_hud_ogf: "dynamics\\weapons\\wpn_svd\\wpn_svd_hud.ogf".to_string(),
                 hands_hud_ogf: "actors\\stalker_hero\\hand_stalker_hud.ogf".to_string(),
                 shoot_sound: "weapons\\svd\\svd_shoot".to_string(),
+                bullet_material: None,
                 reload_sound: "weapons\\svd_reload".to_string(),
                 holster_sound: "weapons\\generic_holster".to_string(),
                 rpm: 120.0,
@@ -354,6 +360,7 @@ impl WeaponSpec {
                 weapon_hud_ogf: "dynamics\\devices\\dev_bolt\\dev_bolt_hud.ogf".to_string(),
                 hands_hud_ogf: "actors\\stalker_hero\\hand_stalker_hud.ogf".to_string(),
                 shoot_sound: "weapons\\generic_draw".to_string(),
+                bullet_material: None,
                 reload_sound: "weapons\\generic_draw".to_string(),
                 holster_sound: "weapons\\generic_holster".to_string(),
                 rpm: 75.0,
@@ -1495,6 +1502,8 @@ impl HudWeaponController {
 
         // Ballistic raycast vs CformBvh (with penetration) + live ALife entity hitboxes
         let gamemtl = world.and_then(|w| w.gamemtl.as_ref());
+        let default_material = if spec_snapshot.slot == 1 { "objects\\knife" } else { "objects\\bullet" };
+        let bullet_material = spec_snapshot.bullet_material.as_deref().unwrap_or(default_material);
         let cform = world.and_then(|w| w.cform.as_ref());
         let mut impacts = Vec::new();
         let mut wallmarks_spawned = 0usize;
@@ -1562,7 +1571,7 @@ impl HudWeaponController {
 
                 // Trigger bullet impact 3D sound at surface point
                 if let Some(aud) = audio.as_deref_mut() {
-                    aud.play_bullet_impact_3d(surface, hit.point, [0.0; 3]);
+                    aud.play_bullet_impact_on_surface(gamemtl, bullet_material, hit.material, surface, hit.point);
                 }
 
                 // Spawn surface wallmark (bullet hole) via WallmarksManager unless suppressed
