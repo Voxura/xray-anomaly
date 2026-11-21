@@ -81,6 +81,7 @@ impl EngineInput {
     pub const VK_TAB: usize = 0x09;
     pub const VK_ESCAPE: usize = 0x1B;
     pub const VK_F1: usize = 0x70;
+    pub const VK_F11: usize = 0x7a;
     pub const VK_SPACE: usize = 0x20;
     pub const VK_SHIFT: usize = 0x10;
     pub const VK_CONTROL: usize = 0x11;

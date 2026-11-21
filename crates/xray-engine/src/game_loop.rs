@@ -427,6 +427,12 @@ impl EngineRuntime {
             return Ok(false);
         }
 
+        if self.config.window.visible && self.input.is_key_just_pressed(EngineInput::VK_F11)
+            && let Err(err) = self.window.toggle_fullscreen()
+        {
+            eprintln!("[window] Could not toggle fullscreen: {err}");
+        }
+
         // Monolith continues simulation while inactive and skips submitting frames.
         let render_active = !self.config.window.visible || self.window.is_foreground();
         if !render_active {
@@ -434,11 +440,10 @@ impl EngineRuntime {
         }
 
         // 2. Handle window resize
-        if self.camera.aspect != (self.window.height() as f32 / self.window.width() as f32) {
-            self.camera.resize(self.window.width(), self.window.height());
-            if let Some(r) = &mut self.renderer {
-                r.resize(self.window.width(), self.window.height())?;
-            }
+        let (width, height) = (self.window.width(), self.window.height());
+        self.camera.resize(width, height);
+        if let Some(r) = &mut self.renderer && (r.stats().width, r.stats().height) != (width, height) {
+            r.resize(width, height)?;
         }
 
         // 3. Update timer

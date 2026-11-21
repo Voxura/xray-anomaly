@@ -7,18 +7,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetForegroundWindow, GetWindowLongPtrW, PeekMessageW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW,
+    GetClientRect, GetForegroundWindow, GetWindowLongPtrW, GetWindowPlacement, PeekMessageW, PostQuitMessage,
+    RegisterClassExW, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
     ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, MSG,
     PM_REMOVE, SW_HIDE, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
     WNDCLASSEXW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINDOWPLACEMENT,
 };
 
 use crate::input::{EngineInput, MouseButton};
+
+#[cfg(test)]
+#[test]
+fn borderless_fullscreen_covers_the_monitor_and_restores_the_client() {
+    let mut window = EngineWindow::new(&WindowConfig {
+        width: 640,
+        height: 480,
+        visible: false,
+        ..Default::default()
+    }).unwrap();
+    window.toggle_fullscreen().unwrap();
+    let mut monitor = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe { GetMonitorInfoW(MonitorFromWindow(window.hwnd(), MONITOR_DEFAULTTONEAREST), &mut monitor).ok().unwrap(); }
+    assert_eq!(window.width(), (monitor.rcMonitor.right - monitor.rcMonitor.left) as u32);
+    assert_eq!(window.height(), (monitor.rcMonitor.bottom - monitor.rcMonitor.top) as u32);
+    window.toggle_fullscreen().unwrap();
+    assert_eq!((window.width(), window.height()), (640, 480));
+}
 
 #[derive(Debug, Clone)]
 pub struct WindowConfig {
@@ -61,6 +82,7 @@ pub struct EngineWindow {
     hwnd: HWND,
     width: u32,
     height: u32,
+    windowed: Option<(isize, WINDOWPLACEMENT)>,
     state: Box<WindowInternalState>,
 }
 
@@ -157,6 +179,7 @@ impl EngineWindow {
             hwnd,
             width: config.width,
             height: config.height,
+            windowed: None,
             state,
         })
     }
@@ -183,6 +206,42 @@ impl EngineWindow {
 
     pub(crate) fn is_foreground(&self) -> bool {
         unsafe { GetForegroundWindow() == self.hwnd }
+    }
+
+    /// Toggle borderless fullscreen on this window's current monitor.
+    pub(crate) fn toggle_fullscreen(&mut self) -> windows::core::Result<()> {
+        let hwnd = self.hwnd;
+        let flags = SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER;
+        unsafe {
+            if let Some((style, placement)) = self.windowed {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                SetWindowPlacement(hwnd, &placement)?;
+                SetWindowPos(hwnd, None, 0, 0, 0, 0, flags | SWP_NOMOVE | SWP_NOSIZE)?;
+                self.windowed = None;
+            } else {
+                let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                let mut placement = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+                GetWindowPlacement(hwnd, &mut placement)?;
+                let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+                GetMonitorInfoW(monitor, &mut info).ok()?;
+                let bounds = info.rcMonitor;
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW.0 as isize));
+                if let Err(err) = SetWindowPos(
+                    hwnd, None, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top, flags,
+                ) {
+                    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                    let _ = SetWindowPlacement(hwnd, &placement);
+                    return Err(err);
+                }
+                self.windowed = Some((style, placement));
+            }
+            let mut client = RECT::default();
+            GetClientRect(hwnd, &mut client)?;
+            self.width = client.right.max(1) as u32;
+            self.height = client.bottom.max(1) as u32;
+        }
+        Ok(())
     }
 
     /// Enqueue a synthetic window event into the pending queue (useful for automated runtime tests).
@@ -217,8 +276,10 @@ impl EngineWindow {
         for event in events_guard.drain(..) {
             match event {
                 WindowEvent::Resized { width, height } => {
-                    self.width = width;
-                    self.height = height;
+                    if width > 0 && height > 0 {
+                        self.width = width;
+                        self.height = height;
+                    }
                 }
                 WindowEvent::CloseRequested => {
                     self.state.is_closed.store(true, Ordering::SeqCst);
