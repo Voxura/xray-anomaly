@@ -37,6 +37,8 @@ use xray_vfs::VirtualFileSystem;
 pub const DEFAULT_GRID_COLS: u8 = 10;
 /// Default backpack grid height in cells.
 pub const DEFAULT_GRID_ROWS: u8 = 12;
+const NATIVE_ICON_SIZE: f32 = 41.0;
+const NATIVE_GRID_PITCH: f32 = NATIVE_ICON_SIZE + 2.0;
 /// Number of artifact belt slots.
 pub const ARTIFACT_SLOT_COUNT: usize = 5;
 /// Number of quick-access consumable slots.
@@ -60,12 +62,24 @@ impl UiFontResource {
         line_height_px: f32,
         color: [f32; 4],
     ) -> u32 {
+        self.draw_aligned(renderer, text, pos_xy, line_height_px, FontAlignment::Left, color)
+    }
+
+    fn draw_aligned(
+        &self,
+        renderer: &mut Dx12Renderer,
+        text: &str,
+        pos_xy: [f32; 2],
+        line_height_px: f32,
+        align: FontAlignment,
+        color: [f32; 4],
+    ) -> u32 {
         if text.is_empty() {
             return 0;
         }
         let params = FontDrawParams {
             current_height: line_height_px,
-            align: FontAlignment::Left,
+            align,
             ..Default::default()
         };
         let font_quads = self.atlas.build_string_quads(self.texture_size, pos_xy, text, &params);
@@ -87,6 +101,33 @@ impl UiFontResource {
         let count = glyphs.len() as u32;
         renderer.ui_draw_glyph_quads(&glyphs, self.texture_index, color);
         count
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InventoryText {
+    rect: [f32; 4],
+    font: String,
+    alignment: FontAlignment,
+}
+
+impl InventoryText {
+    fn draw(
+        &self,
+        renderer: &mut Dx12Renderer,
+        default: Option<&UiFontResource>,
+        fonts: &BTreeMap<&str, UiFontResource>,
+        text: &str,
+        color: [f32; 4],
+    ) -> u32 {
+        let Some(font) = fonts.get(self.font.as_str()).or(default) else { return 0 };
+        let [x, y, width, _] = self.rect;
+        let x = match self.alignment {
+            FontAlignment::Left => x,
+            FontAlignment::Center => x + width * 0.5,
+            FontAlignment::Right => x + width,
+        };
+        font.draw_aligned(renderer, text, [x, y], font.atlas.line_height, self.alignment, color)
     }
 }
 
@@ -361,6 +402,7 @@ pub struct InventoryItem {
     pub grid_pos: Option<(u8, u8)>,
     pub equipped_slot: Option<EquipmentSlot>,
     pub condition: f32,
+    has_upgrades: bool,
     pub remaining_uses: Option<i64>,
     pub quantity: u32,
     pub ammo_elapsed: Option<i64>,
@@ -393,6 +435,7 @@ impl InventoryItem {
             grid_pos: None,
             equipped_slot: None,
             condition: 1.0,
+            has_upgrades: false,
             remaining_uses: meta.default_uses,
             quantity: 1,
             ammo_elapsed: None,
@@ -437,6 +480,7 @@ impl InventoryItem {
             grid_pos: None,
             equipped_slot,
             condition: (scoc.condition as f32).clamp(0.0, 1.0),
+            has_upgrades: false,
             remaining_uses: resolved_uses,
             quantity: scoc.quantity.unwrap_or(1).max(1) as u32,
             ammo_elapsed: scoc.ammo_elapsed,
@@ -545,6 +589,7 @@ pub struct InventoryLayout {
     pub panel_rect: [f32; 4],
     pub grid_origin: [f32; 2],
     pub cell_size: f32,
+    bag_viewport: Option<[f32; 4]>,
     pub grid_cols: u8,
     pub grid_rows: u8,
     grid_scroll_row: u8,
@@ -555,10 +600,12 @@ pub struct InventoryLayout {
     pub dialogue_option_rects: Vec<[f32; 4]>,
     backgrounds: Vec<([f32; 4], String)>,
     rotated_slots: Vec<EquipmentSlot>,
-    weight_rect: Option<[f32; 4]>,
-    money_rect: Option<[f32; 4]>,
-    name_rect: Option<[f32; 4]>,
-    faction_rect: Option<[f32; 4]>,
+    weight_caption: Option<InventoryText>,
+    weight: Option<InventoryText>,
+    weight_max: Option<InventoryText>,
+    money: Option<InventoryText>,
+    name: Option<InventoryText>,
+    faction: Option<InventoryText>,
     portrait_rect: Option<[f32; 4]>,
     health_rect: Option<[f32; 4]>,
     condition_rects: BTreeMap<EquipmentSlot, [f32; 4]>,
@@ -676,6 +723,7 @@ impl InventoryLayout {
             panel_rect,
             grid_origin,
             cell_size,
+            bag_viewport: None,
             grid_cols: cols,
             grid_rows: rows,
             grid_scroll_row: 0,
@@ -686,10 +734,12 @@ impl InventoryLayout {
             dialogue_option_rects,
             backgrounds: Vec::new(),
             rotated_slots: Vec::new(),
-            weight_rect: None,
-            money_rect: None,
-            name_rect: None,
-            faction_rect: None,
+            weight_caption: None,
+            weight: None,
+            weight_max: None,
+            money: None,
+            name: None,
+            faction: None,
             portrait_rect: None,
             health_rect: None,
             condition_rects: BTreeMap::new(),
@@ -712,30 +762,39 @@ impl InventoryLayout {
         let equipment_rect = relative(equipment, [0.0; 2]);
         let player_origin = [player_rect[0], player_rect[1]];
         let equipment_origin = [equipment_rect[0], equipment_rect[1]];
-        let bag = relative(player.navigate("cont_bag", 0)?, player_origin);
-        if bag[2] <= 0.0 || bag[3] <= 0.0 {
-            return None;
-        }
-        let [x, y, w, h] = viewport.virtual_to_screen_rect(bag);
-        // Anomaly's UICellContainer uses a 41-unit icon and a 2-unit gap, with aspect correction.
-        let pitch = (43.0 * viewport.scale()[1])
-            .min(w / f32::from(self.grid_cols.max(1)))
-            .min(h / f32::from(self.grid_rows.max(1)));
+        let [x, y, w, h] = Self::native_bag_rect(xml, viewport)?;
+        let pitch = (NATIVE_GRID_PITCH * viewport.scale()[1]).min(w / f32::from(self.grid_cols.max(1)));
         self.grid_origin = [x, y];
         self.cell_size = pitch;
+        self.grid_rows = (h / pitch).floor().max(1.0) as u8;
+        self.bag_viewport = Some([x, y, w, h]);
         self.backgrounds = [(equipment, equipment_origin), (player, player_origin)].into_iter()
             .filter_map(|(node, origin)| {
                 let background = node.navigate("background", 0)?;
                 let texture = background.navigate("texture", 0)?.read_text()?.trim().to_owned();
                 Some((viewport.virtual_to_screen_rect(relative(background, origin)), texture))
             }).collect();
-        let player_control = |path| player.navigate(path, 0)
+        let text_control = |path| {
+            let node = player.navigate(path, 0)?;
+            let text = node.navigate("text", 0)?;
+            Some(InventoryText {
+                rect: viewport.virtual_to_screen_rect(relative(node, player_origin)),
+                font: text.attr_or("font", "letterica16").to_owned(),
+                alignment: match text.attr_or("align", "l") {
+                    "r" => FontAlignment::Right,
+                    "c" => FontAlignment::Center,
+                    _ => FontAlignment::Left,
+                },
+            })
+        };
+        self.weight_caption = text_control("weight_caption");
+        self.weight = text_control("weight");
+        self.weight_max = text_control("weight_max");
+        self.money = text_control("money");
+        self.name = text_control("name");
+        self.faction = text_control("community");
+        self.portrait_rect = player.navigate("icon", 0)
             .map(|node| viewport.virtual_to_screen_rect(relative(node, player_origin)));
-        self.weight_rect = player_control("weight_caption");
-        self.money_rect = player_control("money");
-        self.name_rect = player_control("name");
-        self.faction_rect = player_control("community");
-        self.portrait_rect = player_control("icon");
         self.health_rect = equipment.navigate("actor_state_info", 0).and_then(|state| {
             let [x, y, _, _] = relative(state, equipment_origin);
             let sensor = state.navigate("health_sensor", 0)?;
@@ -784,6 +843,19 @@ impl InventoryLayout {
         Some(())
     }
 
+    fn native_bag_rect(xml: &XmlDocument, viewport: UiViewport) -> Option<[f32; 4]> {
+        let player = xml.navigate("player", 0)?;
+        let bag = player.navigate("cont_bag", 0)?;
+        let width = bag.attr_f32("width", 0.0);
+        let height = bag.attr_f32("height", 0.0);
+        (width > 0.0 && height > 0.0).then(|| viewport.virtual_to_screen_rect([
+            player.attr_f32("x", 0.0) + bag.attr_f32("x", 0.0),
+            player.attr_f32("y", 0.0) + bag.attr_f32("y", 0.0),
+            width,
+            height,
+        ]))
+    }
+
     pub fn grid_cell_center(&self, col: u8, row: u8, w: u8, h: u8) -> [f32; 2] {
         [
             self.grid_origin[0] + (f32::from(col) + f32::from(w) * 0.5) * self.cell_size,
@@ -800,12 +872,12 @@ impl InventoryLayout {
     }
 
     fn grid_rect(&self) -> [f32; 4] {
-        [
+        self.bag_viewport.unwrap_or([
             self.grid_origin[0],
             self.grid_origin[1],
             f32::from(self.grid_cols) * self.cell_size,
             f32::from(self.grid_rows) * self.cell_size,
-        ]
+        ])
     }
 
     fn scrollbar_rect(&self) -> [f32; 4] {
@@ -823,7 +895,7 @@ impl InventoryLayout {
     pub fn hit_grid_cell(&self, px: f32, py: f32) -> Option<(u8, u8)> {
         let rx = px - self.grid_origin[0];
         let ry = py - self.grid_origin[1];
-        if rx < 0.0 || ry < 0.0 {
+        if !point_in_rect(px, py, self.grid_rect()) {
             return None;
         }
         let col = (rx / self.cell_size).floor() as i32;
@@ -831,7 +903,7 @@ impl InventoryLayout {
         if col >= 0
             && row >= 0
             && col < i32::from(self.grid_cols)
-            && row < i32::from(self.grid_rows)
+            && row < i32::from(self.grid_rows) + i32::from(self.bag_viewport.is_some())
         {
             Some((col as u8, self.grid_scroll_row.saturating_add(row as u8)))
         } else {
@@ -897,7 +969,7 @@ fn configured_weight_and_display_stacks_preserve_individual_items() {
     inventory.item_settings = Some(Arc::new(OwnedLtxDocument::from_sources(&[LoadedLtxSource {
         virtual_path: "items.ltx".to_owned(),
         depth: 0,
-        text: "[base_food]\ninv_weight = 0.1\n[bandage]:base_food\n[stalker_outfit]\nadditional_inventory_weight = 12\n".to_owned(),
+        text: "[base_food]\ninv_weight = 0.1\n[bandage]:base_food\n[stalker_outfit]\nadditional_inventory_weight = 12\n[repair_kit]\nmax_uses = 3\n[prt_i_ammo]\n[unique_supply]\ndont_stack = true\n".to_owned(),
     }])));
     let first = inventory.add_item("bandage");
     let second = inventory.add_item("bandage");
@@ -912,6 +984,20 @@ fn configured_weight_and_display_stacks_preserve_individual_items() {
     assert!(inventory.move_item_to_grid(first, cell.0 + 1, cell.1));
     assert_eq!(inventory.visible_bag_stacks()[&cell].1, 1);
     assert_eq!(inventory.item_at_grid_cell(cell.0, cell.1).unwrap().uid, second);
+
+    let component = inventory.add_item("prt_i_ammo");
+    inventory.item_mut(component).unwrap().condition = 0.4;
+    let another = inventory.add_item("prt_i_ammo");
+    assert_eq!(inventory.item(component).unwrap().grid_pos, inventory.item(another).unwrap().grid_pos);
+
+    let used = inventory.add_item("repair_kit");
+    inventory.item_mut(used).unwrap().remaining_uses = Some(2);
+    let full = inventory.add_item("repair_kit");
+    assert_ne!(inventory.item(used).unwrap().grid_pos, inventory.item(full).unwrap().grid_pos);
+
+    let unique = inventory.add_item("unique_supply");
+    let other = inventory.add_item("unique_supply");
+    assert_ne!(inventory.item(unique).unwrap().grid_pos, inventory.item(other).unwrap().grid_pos);
 }
 
 /// Complete runtime inventory, equipment, actor vital stats, and dialogue manager.
@@ -934,6 +1020,7 @@ pub struct InventoryManager {
     ui_layouts: [Option<Arc<XmlDocument>>; 2],
     item_settings: Option<Arc<OwnedLtxDocument>>,
     actor_profiles: BTreeMap<String, String>,
+    currency_suffix: String,
     specific_profile: Option<String>,
     pub(crate) native_inventory: Option<ScopActorInventory>,
     community_ids: Vec<String>,
@@ -1137,6 +1224,7 @@ impl InventoryManager {
             ui_layouts: [None, None],
             item_settings: None,
             actor_profiles: BTreeMap::new(),
+            currency_suffix: "RU".to_owned(),
             specific_profile: None,
             native_inventory: None,
             community_ids: Vec::new(),
@@ -1183,6 +1271,15 @@ impl InventoryManager {
                 .ok().map(Arc::new)
         });
         self.item_settings = load_ltx_tree_from_vfs(vfs, "configs/system.ltx", &[]).ok().map(Arc::new);
+        let language = self.item_settings.as_ref()
+            .and_then(|settings| settings.read_str("string_table", "language"))
+            .unwrap_or("eng");
+        self.currency_suffix = [language, "eng"].into_iter().find_map(|language| {
+            let doc = load_xml_from_vfs(vfs, &format!("configs/text/{language}/ui_xrrazom.xml")).ok()?;
+            let text = doc.navigate_with_attribute("string", "id", "st_xrr_currency")?
+                .navigate("text", 0)?.read_text()?.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        }).unwrap_or_else(|| "RU".to_owned());
         if let Some(settings) = &self.item_settings {
             self.max_carry_weight_kg = settings.read_f32("inventory", "max_weight", self.max_carry_weight_kg);
             for item in &mut self.items {
@@ -1214,6 +1311,9 @@ impl InventoryManager {
     fn apply_item_metadata(&self, item: &mut InventoryItem) {
         if let Some(settings) = &self.item_settings {
             item.weight_kg = settings.read_f32(&item.section, "inv_weight", item.weight_kg);
+        }
+        if item.source_scoc.is_none() && let Some(max_uses) = self.configured_max_uses(&item.section) {
+            item.remaining_uses = Some(max_uses);
         }
         if let Some((_, _, width, height)) = self.grid_index.as_ref().and_then(|index| index.get(&item.section)) {
             item.grid_size = (width.max(1), height.max(1));
@@ -1264,7 +1364,6 @@ impl InventoryManager {
     pub fn layout(&self, width: u32, height: u32) -> InventoryLayout {
         let visible_rows = self.grid_rows.min(DEFAULT_GRID_ROWS);
         let mut layout = InventoryLayout::compute(width, height, self.grid_cols, visible_rows);
-        layout.grid_scroll_row = self.grid_scroll_row.min(self.max_grid_scroll(visible_rows));
         if self.native_inventory.is_some() {
             layout.slot_rects.retain(|(slot, _)| *slot != EquipmentSlot::SecondaryWeapon);
             layout.slot_rects.extend([1, 4, 5, 6, 8, 9, 10, 11, 14, 15, 16, 17, 18]
@@ -1274,8 +1373,28 @@ impl InventoryManager {
         if let Some(xml) = self.ui_layouts[usize::from(viewport.is_widescreen())].as_ref() {
             layout.apply_xml(xml, viewport);
         }
+        layout.grid_scroll_row = self.grid_scroll_row.min(self.max_grid_scroll(layout.grid_rows));
         layout.slot_rects.retain(|(_, rect)| rect[2] > 0.0 && rect[3] > 0.0);
         layout
+    }
+
+    pub(crate) fn fit_bag_to_viewport(&mut self, width: u32, height: u32) {
+        let viewport = UiViewport::new(width as f32, height as f32);
+        if let Some(xml) = self.ui_layouts[usize::from(viewport.is_widescreen())].as_ref()
+            && let Some([_, _, bag_width, bag_height]) = InventoryLayout::native_bag_rect(xml, viewport)
+        {
+            let widest = self.items.iter().map(|item| item.grid_size.0).max().unwrap_or(1);
+            let pitch = NATIVE_GRID_PITCH * viewport.scale()[1];
+            let columns = ((bag_width / pitch).floor() as u8).max(widest);
+            let visible_rows = (bag_height / pitch.min(bag_width / f32::from(columns))).floor() as u8;
+            self.grid_rows = self.grid_rows.max(visible_rows);
+            if columns != self.grid_cols {
+                self.grid_cols = columns;
+                self.grid_scroll_row = 0;
+                self.drag = None;
+                self.repack_bag();
+            }
+        }
     }
 
     fn max_grid_scroll(&self, visible_rows: u8) -> u8 {
@@ -1347,12 +1466,7 @@ impl InventoryManager {
             }
         }
         // Repack so differently used items from the same section retain separate cells.
-        for mut item in std::mem::take(&mut self.items) {
-            if item.equipped_slot.is_none() {
-                item.grid_pos = self.place_in_bag(&item);
-            }
-            self.items.push(item);
-        }
+        self.repack_bag();
     }
 
     /// Hydrate from extracted [`ScocPeerState`] (`inventory` + `item_remaining_uses`).
@@ -1393,12 +1507,16 @@ impl InventoryManager {
         }
         self.grid_index = Some(index);
         if changed {
-            for mut item in std::mem::take(&mut self.items) {
-                if item.equipped_slot.is_none() {
-                    item.grid_pos = self.place_in_bag(&item);
-                }
-                self.items.push(item);
+            self.repack_bag();
+        }
+    }
+
+    fn repack_bag(&mut self) {
+        for mut item in std::mem::take(&mut self.items) {
+            if item.equipped_slot.is_none() {
+                item.grid_pos = self.place_in_bag(&item);
             }
+            self.items.push(item);
         }
     }
 
@@ -1518,7 +1636,6 @@ impl InventoryManager {
         self.drag = None;
         self.selected_uid = None;
         self.grid_scroll_row = 0;
-        self.grid_rows = DEFAULT_GRID_ROWS;
 
         let mut items = Vec::new();
         let mut belt_slot = 0;
@@ -1527,8 +1644,12 @@ impl InventoryManager {
             item.source_id = Some(i64::from(entity.id()));
             self.apply_item_metadata(&mut item);
             if let ScopAlifePayload::Weapon(weapon) = &entity.payload {
+                item.has_upgrades = !weapon.item.upgrades.is_empty();
                 item.ammo_elapsed = Some(i64::from(weapon.ammo_elapsed));
                 item.ammo_type = Some(i64::from(weapon.ammo_type));
+            }
+            if let ScopAlifePayload::InventoryItem(saved) = &entity.payload {
+                item.has_upgrades = !saved.upgrades.is_empty();
             }
             if item.category == ItemCategory::Ammo
                 && let Ok(ammo) = AlifeItemAmmoState::parse(entity.spawn.version, &entity.spawn.state_payload)
@@ -1563,10 +1684,14 @@ impl InventoryManager {
             items.push(item);
         }
 
-        // InventoryUtilities::GreaterRoomInRuck fits wide and tall items first.
-        items.sort_by(|left, right| {
-            (right.grid_size, right.section.as_str(), right.source_id)
-                .cmp(&(left.grid_size, left.section.as_str(), left.source_id))
+        // Anomaly's sizekind sort uses width, height, configured kind order, and condition.
+        items.sort_by_cached_key(|item| {
+            let kind_order = self.item_settings.as_ref().and_then(|settings| {
+                let kind = settings.read_str(&item.section, "kind")?;
+                settings.read_str("item_kind_order", kind)?.parse::<u32>().ok()
+            }).unwrap_or(u32::MAX);
+            (std::cmp::Reverse(item.grid_size), kind_order, item.section.clone(),
+                std::cmp::Reverse(item.condition.to_bits()))
         });
         for mut item in items {
             if item.equipped_slot.is_some_and(|slot| self.item_in_slot(slot).is_some()) {
@@ -1768,10 +1893,36 @@ impl InventoryManager {
         Some((0, row))
     }
 
-    fn compatible_stack(left: &InventoryItem, right: &InventoryItem) -> bool {
+    fn configured_max_uses(&self, section: &str) -> Option<i64> {
+        let uses = self.item_settings.as_ref()?.read_str(section, "max_uses")?.parse::<i64>().ok()?;
+        (uses > 1).then_some(uses)
+    }
+
+    fn item_uses_condition(&self, item: &InventoryItem) -> bool {
+        show_item_condition(item.category)
+            || self.item_settings.as_ref().is_some_and(|settings| settings.read_bool(&item.section, "use_condition", false))
+    }
+
+    fn compatible_stack(&self, left: &InventoryItem, right: &InventoryItem) -> bool {
+        if left.section != right.section || left.grid_size != right.grid_size {
+            return false;
+        }
+        if let Some(settings) = &self.item_settings {
+            let max_uses = self.configured_max_uses(&left.section);
+            if settings.read_bool(&left.section, "dont_stack", false)
+                || max_uses.is_some_and(|max_uses| {
+                    left.remaining_uses.unwrap_or(max_uses) != max_uses
+                        || right.remaining_uses.unwrap_or(max_uses) != max_uses
+                })
+            {
+                return false;
+            }
+            // Anomaly's UICellContainer groups ordinary supplies by section.
+            return !self.item_uses_condition(left) || (!left.has_upgrades && !right.has_upgrades
+                && (max_uses.is_some()
+                    || (left.condition - right.condition).abs() < 0.1));
+        }
         matches!(left.category, ItemCategory::Ammo | ItemCategory::Medical | ItemCategory::Consumable)
-            && left.section == right.section
-            && left.grid_size == right.grid_size
             && (left.condition - right.condition).abs() < 0.01
             && left.remaining_uses == right.remaining_uses
             && (left.category == ItemCategory::Ammo || left.ammo_elapsed == right.ammo_elapsed)
@@ -1780,13 +1931,12 @@ impl InventoryManager {
     }
 
     fn place_in_bag(&mut self, item: &InventoryItem) -> Option<(u8, u8)> {
+        let mut visited = std::collections::BTreeSet::new();
         if self.ui_layouts.iter().any(Option::is_some)
             && let Some(cell) = self.items.iter().find_map(|other| {
-                if other.equipped_slot.is_none() && Self::compatible_stack(item, other) {
-                    other.grid_pos
-                } else {
-                    None
-                }
+                let cell = other.grid_pos?;
+                (other.equipped_slot.is_none() && other.section == item.section
+                    && visited.insert(cell) && self.compatible_stack(item, other)).then_some(cell)
             })
         {
             return Some(cell);
@@ -2074,7 +2224,7 @@ impl InventoryManager {
         } else if let Some(item) = self.item(uid)
             && let Some(cell) = item.grid_pos
             && self.items.iter().any(|other| {
-                other.uid != uid && other.grid_pos == Some(cell) && !Self::compatible_stack(item, other)
+                other.uid != uid && other.grid_pos == Some(cell) && !self.compatible_stack(item, other)
             })
         {
             let size = item.grid_size;
@@ -2462,6 +2612,7 @@ impl InventoryManager {
         show_crosshair: bool,
         stamina: f32,
         font: Option<&UiFontResource>,
+        inventory_fonts: &BTreeMap<&str, UiFontResource>,
         equipment_tex: Option<DescriptorIndex>,
         grid_tex: Option<DescriptorIndex>,
         atlas: Option<&UiTextureAtlasMap>,
@@ -2554,22 +2705,20 @@ impl InventoryManager {
             if let (Some(icon), Some(rect)) = (portrait, layout.portrait_rect) {
                 drawn += u32::from(draw_atlas_region(renderer, vfs, atlas, icon, rect));
             }
-            if let Some(f) = font {
-                if let Some([x, y, _, h]) = layout.name_rect {
-                    drawn += f.draw_text(renderer, &self.actor_stats.actor_name, [x, y], h, [0.94, 0.88, 0.74, 1.0]);
-                }
-                if let (Some(id), Some([x, y, _, h])) = (community, layout.faction_rect) {
-                    let faction = id.strip_prefix("actor_").unwrap_or(id);
-                    let label = match faction {
-                        "stalker" => "Loner".to_owned(),
-                        "csky" => "Clear Sky".to_owned(),
-                        "dolg" => "Duty".to_owned(),
-                        "ecolog" => "Ecologist".to_owned(),
-                        "killer" => "Mercenary".to_owned(),
-                        id => prettify_section(id),
-                    };
-                    drawn += f.draw_text(renderer, &label, [x, y], h, [0.72, 0.72, 0.68, 1.0]);
-                }
+            if let Some(name) = &layout.name {
+                drawn += name.draw(renderer, font, inventory_fonts, &self.actor_stats.actor_name, [0.94, 0.88, 0.74, 1.0]);
+            }
+            if let (Some(id), Some(field)) = (community, &layout.faction) {
+                let faction = id.strip_prefix("actor_").unwrap_or(id);
+                let label = match faction {
+                    "stalker" => "Loner".to_owned(),
+                    "csky" => "Clear Sky".to_owned(),
+                    "dolg" => "Duty".to_owned(),
+                    "ecolog" => "Ecologist".to_owned(),
+                    "killer" => "Mercenary".to_owned(),
+                    id => prettify_section(id),
+                };
+                drawn += field.draw(renderer, font, inventory_fonts, &label, [0.72, 0.72, 0.68, 1.0]);
             }
             if let Some(rect) = layout.health_rect {
                 drawn += draw_segments(renderer, rect, 50, self.actor_stats.health, [0.52, 0.52, 0.49, 0.92]);
@@ -2601,6 +2750,7 @@ impl InventoryManager {
             }
 
             // Equipment Slots
+            let native_icon_size = layout.bag_viewport.map(|_| NATIVE_ICON_SIZE * fh / 768.0);
             for (slot, rect) in &layout.slot_rects {
                 if let EquipmentSlot::QuickSlot(index) = slot && let Some(native) = &self.native_inventory {
                     let section = &native.quick_slots[*index];
@@ -2609,13 +2759,26 @@ impl InventoryManager {
                         && w > 0 && h > 0
                     {
                         let uv = item_icon_uv_indexed(section, ItemCategory::Consumable, self.grid_index.as_deref());
-                        let icon = fit_inventory_icon([rect[0] + 4.0, rect[1] + 4.0, rect[2] - 8.0, rect[3] - 13.0], f32::from(w) / f32::from(h));
+                        let icon = native_icon_size.map_or_else(
+                            || fit_inventory_icon(*rect, f32::from(w) / f32::from(h)),
+                            |size| native_equipment_icon(*rect, size, w, h),
+                        );
                         let opacity = if self.items.iter().any(|item| item.section == *section) { 1.0 } else { 0.35 };
                         renderer.ui_draw_textured_rect(icon, uv, tex, [1.0, 1.0, 1.0, opacity]);
                         drawn += 1;
                     }
                 }
                 let occ = self.item_in_slot(*slot);
+                // The default bolt is a runtime supply and is absent from some native saves.
+                if occ.is_none() && *slot == EquipmentSlot::NativeSlot(6)
+                    && let (Some(size), Some(tex), Some(icons)) = (native_icon_size, equipment_tex, self.grid_index.as_deref())
+                    && let Some((_, _, w, h)) = icons.get("bolt")
+                {
+                    let icon = native_equipment_icon(*rect, size, w, h);
+                    let uv = item_icon_uv_indexed("bolt", ItemCategory::Misc, Some(icons));
+                    renderer.ui_draw_textured_rect(icon, uv, tex, [1.0; 4]);
+                    drawn += 1;
+                }
                 let is_sel = occ.is_some_and(|i| Some(i.uid) == self.selected_uid);
                 if is_sel || layout.backgrounds.is_empty() {
                     let bg = if is_sel {
@@ -2635,9 +2798,13 @@ impl InventoryManager {
                         let uv = item_icon_uv_indexed(&item.section, item.category, self.grid_index.as_deref());
                         let rotated = layout.rotated_slots.contains(slot);
                         let (w, h) = item.grid_size;
+                        let (icon_w, icon_h) = if rotated { (h, w) } else { (w, h) };
                         let aspect = if rotated { f32::from(h) / f32::from(w.max(1)) }
                             else { f32::from(w) / f32::from(h.max(1)) };
-                        let icon = fit_inventory_icon(inner, aspect);
+                        let icon = native_icon_size.map_or_else(
+                            || fit_inventory_icon(inner, aspect),
+                            |size| native_equipment_icon(*rect, size, icon_w, icon_h),
+                        );
                         if rotated {
                             renderer.ui_draw_rotated_rect(icon, uv, tex, [1.0; 4]);
                         } else {
@@ -2647,10 +2814,12 @@ impl InventoryManager {
                         renderer.ui_fill_rect(inner, item.category.accent_color());
                     }
                     drawn += 1;
-                    if show_item_condition(item.category) {
+                    if self.item_uses_condition(item) {
                         let bar = layout.condition_rects.get(slot).copied()
                             .unwrap_or([rect[0] + 4.0, rect[1] + rect[3] - 5.0, (rect[2] - 8.0).max(4.0), 3.0]);
-                        drawn += draw_segments(renderer, bar, 18, item.condition, condition_bar_color(item.condition));
+                        let power_bar = matches!(slot, EquipmentSlot::NativeSlot(8..=10));
+                        let color = if power_bar { [0.34, 0.77, 0.82, 1.0] } else { condition_bar_color(item.condition) };
+                        drawn += draw_segments(renderer, bar, 18, item.condition, color);
                     }
                 }
                 if let EquipmentSlot::QuickSlot(index) = slot && let Some(f) = font {
@@ -2775,14 +2944,14 @@ impl InventoryManager {
             } else {
                 [0.87, 0.85, 0.80, 0.95]
             };
-            if let Some([x, y, _, h]) = layout.weight_rect {
-                if let Some(f) = font {
-                    let line = format!("Weight  {weight:.1} kg  (max {capacity:.0} kg)");
-                    drawn += f.draw_text(renderer, &line, [x - 16.0, y], (h * 0.76).max(9.0), weight_color);
-                    if let Some([x, y, _, h]) = layout.money_rect {
-                        let money = format!("{} RU", self.actor_stats.money);
-                        drawn += f.draw_text(renderer, &money, [x, y], h.min(18.0), [0.92, 0.86, 0.70, 1.0]);
-                    }
+            if let Some(field) = &layout.weight {
+                drawn += field.draw(renderer, font, inventory_fonts, &format!("{weight:.1} kg"), weight_color);
+                let muted = [0.72, 0.72, 0.68, 1.0];
+                if let Some(caption) = &layout.weight_caption {
+                    drawn += caption.draw(renderer, font, inventory_fonts, "Weight:", muted);
+                }
+                if let Some(max) = &layout.weight_max {
+                    drawn += max.draw(renderer, font, inventory_fonts, &format!("(max {capacity:.0} kg)"), muted);
                 }
             } else {
                 renderer.ui_draw_meter_bar(
@@ -2795,6 +2964,10 @@ impl InventoryManager {
                     weight_frac, [0.06, 0.06, 0.06, 0.9], weight_color,
                 );
                 drawn += 2;
+            }
+            if let Some(field) = &layout.money {
+                let money = format!("{} {}", self.actor_stats.money, self.currency_suffix);
+                drawn += field.draw(renderer, font, inventory_fonts, &money, [1.0; 4]);
             }
 
             // Floating Drag Ghost following mouse cursor
@@ -2942,6 +3115,13 @@ fn show_item_condition(category: ItemCategory) -> bool {
 fn fit_inventory_icon([x, y, w, h]: [f32; 4], aspect: f32) -> [f32; 4] {
     let width = w.min(h * aspect);
     let height = h.min(w / aspect);
+    [x + (w - width) * 0.5, y + (h - height) * 0.5, width, height]
+}
+
+fn native_equipment_icon([x, y, w, h]: [f32; 4], tile_size: f32, cols: u8, rows: u8) -> [f32; 4] {
+    let [width, height] = [f32::from(cols.max(1)) * tile_size, f32::from(rows.max(1)) * tile_size];
+    let scale = (w.max(tile_size) / width).min(h.max(tile_size) / height).min(1.0);
+    let [width, height] = [width * scale, height * scale];
     [x + (w - width) * 0.5, y + (h - height) * 0.5, width, height]
 }
 

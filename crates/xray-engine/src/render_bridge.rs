@@ -229,6 +229,7 @@ pub struct RenderBridge {
     hud_materials: Option<BTreeMap<String, HudMaterial>>,
     default_cube_mesh: MeshHandle,
     ui_font: Option<UiFontResource>,
+    inventory_fonts: BTreeMap<&'static str, UiFontResource>,
     ui_font_attempted: bool,
     ui_equipment_tex: Option<DescriptorIndex>,
     ui_grid_tex: Option<DescriptorIndex>,
@@ -277,6 +278,7 @@ impl RenderBridge {
             hud_materials: None,
             default_cube_mesh,
             ui_font: None,
+            inventory_fonts: BTreeMap::new(),
             ui_font_attempted: false,
             ui_equipment_tex: None,
             ui_grid_tex: None,
@@ -1083,7 +1085,16 @@ impl RenderBridge {
                 && let Some(vfs_ref) = vfs
             {
                 self.ui_font_attempted = true;
-                self.ui_font = try_load_ui_font(renderer, vfs_ref, height);
+                if let Ok(fonts) = load_ltx_tree_from_vfs(vfs_ref, "$game_configs$/fonts.ltx", &[]) {
+                    self.ui_font = ["ui_font_letterica16_russian", "ui_font_arial_14", "ui_font_letterica18_russian", "hud_font_medium"]
+                        .into_iter().find_map(|section| load_ui_font(renderer, vfs_ref, &fonts, section, height));
+                    self.inventory_fonts = [
+                        ("letterica18", "ui_font_letterica18_russian"),
+                        ("graffiti22", "ui_font_graffiti22_russian"),
+                    ].into_iter().filter_map(|(name, section)| {
+                        Some((name, load_ui_font(renderer, vfs_ref, &fonts, section, height)?))
+                    }).collect();
+                }
                 self.ui_equipment_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_icon_equipment.dds");
                 self.ui_grid_tex = try_load_vfs_texture(renderer, Some(vfs_ref), "textures\\ui\\ui_grid.dds");
                 self.inventory_atlas = load_ui_texture_atlases_from_vfs(vfs_ref).ok().or_else(|| {
@@ -1110,6 +1121,7 @@ impl RenderBridge {
                     draw_crosshair,
                     hud.stamina,
                     font_ref,
+                    &self.inventory_fonts,
                     self.ui_equipment_tex,
                     self.ui_grid_tex,
                     self.inventory_atlas.as_ref(),
@@ -1378,33 +1390,17 @@ pub fn load_vfs_texture(
         .map_err(|e| format!("GPU upload {key} from {source:?}: {e:?}"))
 }
 
-fn try_load_ui_font(
+fn load_ui_font(
     renderer: &mut Dx12Renderer,
     vfs: &VirtualFileSystem,
+    fonts: &xray_core::ltx_loader::OwnedLtxDocument,
+    section: &str,
     screen_height: u32,
 ) -> Option<UiFontResource> {
-    let fonts_doc = load_ltx_tree_from_vfs(vfs, "$game_configs$/fonts.ltx", &[]).ok()?;
-    for section in [
-        "ui_font_letterica16_russian",
-        "ui_font_arial_14",
-        "ui_font_letterica18_russian",
-        "hud_font_medium",
-    ] {
-        if let Ok((cfg, atlas)) = load_font_from_vfs(vfs, &fonts_doc, section, screen_height)
-            && let Some(tex_idx) = try_load_vfs_texture(renderer, Some(vfs), &cfg.texture_dds_vpath)
-        {
-            let size = renderer
-                .get_texture_by_index(tex_idx)
-                .map(|t| [t.width.max(1), t.height.max(1)])
-                .unwrap_or([512, 256]);
-            return Some(UiFontResource {
-                atlas,
-                texture_index: tex_idx,
-                texture_size: size,
-            });
-        }
-    }
-    None
+    let (cfg, atlas) = load_font_from_vfs(vfs, fonts, section, screen_height).ok()?;
+    let texture_index = try_load_vfs_texture(renderer, Some(vfs), &cfg.texture_dds_vpath)?;
+    let texture = renderer.get_texture_by_index(texture_index)?;
+    Some(UiFontResource { atlas, texture_index, texture_size: [texture.width, texture.height] })
 }
 
 fn load_solid_dds(

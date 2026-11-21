@@ -185,6 +185,7 @@ impl EngineRuntime {
         self.inventory.resolve_inventory_icons(&mut grid_index);
         let grid_index = Arc::new(grid_index);
         self.inventory.set_grid_index(Arc::clone(&grid_index));
+        self.inventory.fit_bag_to_viewport(self.window.width(), self.window.height());
         self.item_grid_index = Some(grid_index);
         self.audio.attach_vfs(Arc::clone(&vfs));
         self.pda.invalidate_map_cache();
@@ -421,6 +422,7 @@ impl EngineRuntime {
         }
 
         // 1. Process OS window messages
+        let previous_size = (self.window.width(), self.window.height());
         let active = self.window.poll_events(&mut self.input);
         if !active {
             self.running = false;
@@ -441,6 +443,9 @@ impl EngineRuntime {
 
         // 2. Handle window resize
         let (width, height) = (self.window.width(), self.window.height());
+        if (width, height) != previous_size {
+            self.inventory.fit_bag_to_viewport(width, height);
+        }
         self.camera.resize(width, height);
         if let Some(r) = &mut self.renderer && (r.stats().width, r.stats().height) != (width, height) {
             r.resize(width, height)?;
