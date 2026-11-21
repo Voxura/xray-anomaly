@@ -1427,6 +1427,18 @@ impl DetailCacheGrid {
     fn shift_grid(&mut self, details: &LevelDetails, target_cx: i32, target_cz: i32) -> bool {
         let moved = self.cache_cx != target_cx || self.cache_cz != target_cz;
         let line = self.dm_cache_line;
+        if self.cache_cx.abs_diff(target_cx) as usize >= line
+            || self.cache_cz.abs_diff(target_cz) as usize >= line
+        {
+            self.cache_cx = target_cx;
+            self.cache_cz = target_cz;
+            self.pending_indices.clear();
+            for idx in 0..self.slots.len() {
+                self.slots[idx].pending = false;
+                self.assign_task(details, idx % line, idx / line, idx);
+            }
+            return true;
+        }
 
         while self.cache_cx != target_cx {
             if target_cx > self.cache_cx {
@@ -1449,22 +1461,14 @@ impl DetailCacheGrid {
         while self.cache_cz != target_cz {
             if target_cz > self.cache_cz {
                 self.cache_cz += 1;
+                self.slots.rotate_right(line);
                 for gx in 0..line {
-                    let saved = self.slots[(line - 1) * line + gx].clone();
-                    for gz in (1..line).rev() {
-                        self.slots[gz * line + gx] = self.slots[(gz - 1) * line + gx].clone();
-                    }
-                    self.slots[gx] = saved;
                     self.assign_task(details, gx, 0, gx);
                 }
             } else {
                 self.cache_cz -= 1;
+                self.slots.rotate_left(line);
                 for gx in 0..line {
-                    let saved = self.slots[gx].clone();
-                    for gz in 1..line {
-                        self.slots[(gz - 1) * line + gx] = self.slots[gz * line + gx].clone();
-                    }
-                    self.slots[(line - 1) * line + gx] = saved;
                     self.assign_task(details, gx, line - 1, (line - 1) * line + gx);
                 }
             }
@@ -1552,6 +1556,8 @@ impl DetailCacheGrid {
         model: &CformModel,
         mtl_lib: Option<&GameMaterialLibrary>,
     ) {
+        let mut last_box = None;
+        let mut hits = Vec::new();
         self.update_cache_with_sampler(
             details,
             target_cx,
@@ -1560,32 +1566,24 @@ impl DetailCacheGrid {
             decompress_limit,
             cfg,
             |px, pz, slot_box| {
-                let center = [
-                    (slot_box.min[0] + slot_box.max[0]) * 0.5,
-                    (slot_box.min[1] + slot_box.max[1]) * 0.5,
-                    (slot_box.min[2] + slot_box.max[2]) * 0.5,
-                ];
-                let half = [
-                    (slot_box.max[0] - slot_box.min[0]) * 0.5,
-                    (slot_box.max[1] - slot_box.min[1]) * 0.5,
-                    (slot_box.max[2] - slot_box.min[2]) * 0.5,
-                ];
-                let hits = bvh.box_query(center, half, true, false);
-                if hits.is_empty() {
-                    return None;
+                if last_box != Some(*slot_box) {
+                    last_box = Some(*slot_box);
+                    let center = std::array::from_fn(|axis| (slot_box.min[axis] + slot_box.max[axis]) * 0.5);
+                    let half = std::array::from_fn(|axis| (slot_box.max[axis] - slot_box.min[axis]) * 0.5);
+                    hits = bvh.box_query(center, half, true, false);
+                    if let Some(lib) = mtl_lib {
+                        hits.retain(|hit| {
+                            let id = u32::from(model.triangles[hit.tri_index].material);
+                            !lib.material_by_id(id).is_some_and(|mtl| mtl.has_flag(gamemtl_flags::FL_PASSABLE))
+                        });
+                    }
                 }
                 let origin = [px, slot_box.max[1], pz];
                 let dir = [0.0_f32, -1.0, 0.0];
                 let mut best_y = slot_box.min[1] - 5.0;
                 let mut best_normal = None;
 
-                for h in hits {
-                    if let Some(lib) = mtl_lib
-                        && let Some(mtl) = model.triangle_material(h.tri_index, lib)
-                        && mtl.has_flag(gamemtl_flags::FL_PASSABLE)
-                    {
-                        continue;
-                    }
+                for h in &hits {
                     let [p0, p1, p2] = h.verts;
                     if let Some((range, _, _)) = ray_triangle_test(origin, dir, p0, p1, p2, true)
                         && range >= 0.0
@@ -1654,7 +1652,7 @@ impl DetailCacheGrid {
             dst[3] = 255.0 * f32::from(pal.a3) / 15.0;
         }
 
-        let density = cfg.density.max(0.05);
+        let density = cfg.density.max(0.04);
         let jitter = density / 1.7;
         let d_size = ((DETAIL_SLOT_SIZE / density).ceil() as u32).max(1);
         let seed = (0x1207_1980u32 ^ detail_hash2(sx, sz)) as i32;
@@ -1663,9 +1661,7 @@ impl DetailCacheGrid {
         let mut r_yaw = DetailRandom::new(seed);
         let mut r_scale = DetailRandom::new(seed);
 
-        let min_x = (sx as f32) * DETAIL_SLOT_SIZE;
-        let min_z = (sz as f32) * DETAIL_SLOT_SIZE;
-        let min_y = ds.y_base_meters();
+        let [min_x, min_y, min_z] = slot_box.min;
         let c_hemi = ds.hemi_light();
         let c_sun = ds.dir_light();
         let c_rgb = ds.rgb_light();
@@ -2825,7 +2821,7 @@ swing_fast_speed = 3.5
             slots: vec![s],
         };
 
-        // Gamemtl library: idx 0 solid, idx 1 FL_PASSABLE
+        // CFORM refers to material IDs, which can differ from the library indices.
         let make_mtl = |id: u32, name: &str, flags: u32| {
             let mut mw = ChunkWriter::new();
             let mut main = id.to_le_bytes().to_vec();
@@ -2838,8 +2834,8 @@ swing_fast_speed = 3.5
             mw.into_bytes()
         };
         let mut mtls = ChunkWriter::new();
-        mtls.write_chunk(0, &make_mtl(0, "ground", gamemtl_flags::FL_SHOOTABLE));
-        mtls.write_chunk(1, &make_mtl(1, "bush", gamemtl_flags::FL_PASSABLE));
+        mtls.write_chunk(0, &make_mtl(7, "ground", gamemtl_flags::FL_SHOOTABLE));
+        mtls.write_chunk(1, &make_mtl(321, "bush", gamemtl_flags::FL_PASSABLE));
         let mut root = ChunkWriter::new();
         root.write_chunk(gamemtl_root_chunks::GAMEMTLS_CHUNK_VERSION, &1u16.to_le_bytes());
         root.write_chunk(gamemtl_root_chunks::GAMEMTLS_CHUNK_AUTOINC, &[0u8; 8]);
@@ -2863,28 +2859,28 @@ swing_fast_speed = 3.5
             vec![
                 crate::cform::CformTriangle {
                     verts: [0, 1, 2],
-                    material: 0,
+                    material: 7,
                     suppress_shadows: false,
                     suppress_wm: false,
                     sector: 0,
                 },
                 crate::cform::CformTriangle {
                     verts: [0, 2, 3],
-                    material: 0,
+                    material: 7,
                     suppress_shadows: false,
                     suppress_wm: false,
                     sector: 0,
                 },
                 crate::cform::CformTriangle {
                     verts: [4, 5, 6],
-                    material: 1,
+                    material: 321,
                     suppress_shadows: false,
                     suppress_wm: false,
                     sector: 0,
                 },
                 crate::cform::CformTriangle {
                     verts: [4, 6, 7],
-                    material: 1,
+                    material: 321,
                     suppress_shadows: false,
                     suppress_wm: false,
                     sector: 0,

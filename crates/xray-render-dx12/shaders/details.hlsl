@@ -33,6 +33,7 @@ struct DetailVSOutput
     float2 uv : TEXCOORD0;
     float4 lighting : COLOR0;
     float alpha : TEXCOORD1;
+    float3 normal : TEXCOORD2;
 };
 
 struct DetailInstanceData
@@ -72,10 +73,11 @@ DetailVSOutput vs_detail(uint vertex_id : SV_VertexID, uint instance_id : SV_Ins
     // 24 bytes per mesh vertex: float3 pos (12B), float2 uv (8B), float height_fraction (4B)
     uint v_offset = vertex_id * 24;
     float4 v0 = asfloat(g_detail_vertices.Load4(v_offset));
-    float2 uv = asfloat(g_detail_vertices.Load2(v_offset + 16));
+    float2 v1 = asfloat(g_detail_vertices.Load2(v_offset + 16));
+    float2 uv = float2(v0.w, v1.x);
 
     float3 local_pos = v0.xyz * inst.scale;
-    float height_frac = v0.w;
+    float height_frac = v1.y;
 
     // Rotate around Y axis
     float s = sin(inst.rotation_y);
@@ -104,10 +106,13 @@ DetailVSOutput vs_detail(uint vertex_id : SV_VertexID, uint instance_id : SV_Ins
     output.uv = uv;
     output.lighting = lit_color;
     output.alpha = inst.alpha;
+    // Native detail_s/detail_w use the clump's radial normal, biased upward,
+    // and blend it with the original vertex position.
+    output.normal = lerp(normalize(world_pos - inst.position + float3(0.0, 0.75, 0.0)), v0.xyz, 0.25);
     return output;
 }
 
-float4 ps_detail(DetailVSOutput input) : SV_Target
+float4 sample_detail(DetailVSOutput input)
 {
     float4 tex_color = float4(1.0, 1.0, 1.0, 1.0);
     if (texture_index != 0xFFFFFFFF)
@@ -116,9 +121,29 @@ float4 ps_detail(DetailVSOutput input) : SV_Target
     }
 
     // Alpha test cut-out with distance dissolve factor
-    float effective_alpha = tex_color.a * input.alpha;
-    clip(effective_alpha - alpha_threshold);
+    tex_color.a *= input.alpha;
+    clip(tex_color.a - alpha_threshold);
+    return tex_color;
+}
 
-    float3 final_rgb = tex_color.rgb * input.lighting.rgb;
-    return float4(final_rgb, effective_alpha);
+float4 ps_detail(DetailVSOutput input) : SV_Target
+{
+    float4 tex_color = sample_detail(input);
+    return float4(tex_color.rgb * input.lighting.rgb, tex_color.a);
+}
+
+struct DetailGBufferOutput
+{
+    float4 albedo : SV_Target0;
+    float4 normal : SV_Target1;
+    float4 material : SV_Target2;
+};
+
+DetailGBufferOutput ps_detail_gbuffer(DetailVSOutput input)
+{
+    DetailGBufferOutput output;
+    output.albedo = sample_detail(input);
+    output.normal = float4(normalize(input.normal) * 0.5 + 0.5, 1.0);
+    output.material = float4(0.0, 1.0, 2.0 / 255.0, 1.0); // def_gloss
+    return output;
 }

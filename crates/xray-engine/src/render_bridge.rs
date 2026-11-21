@@ -7,7 +7,7 @@
 //!   c) 3-Split Cascaded Shadow Map Pass (`build_3split_csm_atlas` + `CascadedShadowAtlas` + `draw_csm_shadow_mesh`)
 //!   d) Deferred Lighting Combine (`execute_deferred_combine_csm` with CSM PCF, SSFX volumetrics & dynamic lights)
 //!   f) Filmic Postprocessing Resolve (`draw_postprocess`: bloom, exposure, Uncharted2/ACES tonemapping -> backbuffer)
-//!   e) Forward Alpha & Environment Effects (scene-depth occluded `draw_sky`, `draw_clouds`, `draw_details`,
+//!   e) Forward Alpha & Environment Effects (scene-depth occluded `draw_sky`, `draw_clouds`,
 //!      `draw_wallmarks`, `draw_rain`, `draw_particles`)
 //!   g) UI Canvas HUD Overlay (`ui_draw_crosshair`, health/stamina `ui_draw_meter_bar`, `ui_flush`)
 //!
@@ -32,11 +32,14 @@ use crate::level_transition::{LevelTransitionManager, canonical_level_name};
 use crate::ui_inventory::{InventoryManager, UiFontResource};
 use crate::ui_pda::PdaManager;
 use crate::world_loader::{LoadedWorld, resolve_level_texture_vpath};
-use xray_formats::details::{LevelDetails, DETAIL_ID_EMPTY, DETAIL_SLOT_SIZE};
+use xray_formats::details::{
+    DETAIL_DEFAULT_PS_SSA_DISCARD, DETAIL_DEFAULT_RADIUS, DetailCacheGrid, DetailDecompressConfig,
+    DetailVisibilityConfig, LevelDetails, compute_r_ssa_discard,
+};
 use xray_formats::hom::{frustum_planes, ClipFrustum};
 use xray_formats::ogf::{
     matrix_mul_44, matrix_set_xyz_translate, matrix_transform_point, vector_generate_orthonormal_basis, OgfModel,
-    OgfVisualType, StaticVertex, XRAY_IDENTITY_MATRIX,
+    OgfVisualType, StaticVertex, XRayMatrix, XRAY_IDENTITY_MATRIX,
 };
 use xray_formats::shaders_xr::{EngineShaderLibrary, R4BlenderSpec};
 use xray_formats::spawns::INVALID_OBJECT_ID;
@@ -48,7 +51,7 @@ use xray_formats::xml_ui::UiTextureAtlasMap;
 use xray_render_dx12::bindless::DescriptorIndex;
 use xray_render_dx12::clouds::{CloudSimulation, CloudsPushConstants};
 use xray_render_dx12::deferred::{GBufferSurface, GpuLightParams};
-use xray_render_dx12::details::{DetailManager, DetailPushConstants, GpuDetailInstance, GpuDetailVertex};
+use xray_render_dx12::details::{DetailManager, DetailPushConstants, GpuDetailBatch, GpuDetailInstance, GpuDetailMesh};
 use xray_render_dx12::geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
 use xray_render_dx12::geometry::HudBlend;
 use xray_render_dx12::lighting::GpuLight;
@@ -63,8 +66,6 @@ use xray_vfs::{VirtualFileSystem, normalize_virtual_path};
 
 /// Maximum dynamic lights forwarded to `execute_deferred_combine_csm` per frame.
 pub const MAX_ACTIVE_FRAME_LIGHTS: usize = 64;
-/// Maximum grass detail instances gathered around camera per batch.
-pub const MAX_DETAIL_INSTANCES_PER_BATCH: usize = 512;
 
 /// Configuration knobs for [`RenderBridge`].
 #[derive(Debug, Clone, PartialEq)]
@@ -155,6 +156,17 @@ struct GpuWorldMesh {
     bsphere_center: [f32; 3],
     bsphere_radius: f32,
     is_static_caster: bool,
+}
+
+struct DetailPrototype {
+    mesh: GpuDetailMesh,
+    texture: DescriptorIndex,
+}
+
+struct LevelDetailState {
+    cache: DetailCacheGrid,
+    config: DetailDecompressConfig,
+    prototypes: Vec<Option<DetailPrototype>>,
 }
 
 #[derive(Debug, Clone)]
@@ -286,8 +298,7 @@ pub struct RenderBridge {
 
     world_meshes: Vec<GpuWorldMesh>,
     world_lights: Vec<GpuLight>,
-    detail_meshes: Vec<Vec<GpuDetailVertex>>,
-    detail_textures: Vec<Option<DescriptorIndex>>,
+    level_details: Option<LevelDetailState>,
     dynamic_ogf_cache: BTreeMap<String, Arc<[GpuOgfSubMesh]>>,
     hud_mesh_cache: BTreeMap<String, (MeshHandle, DescriptorIndex)>,
     hud_materials: Option<BTreeMap<String, HudMaterial>>,
@@ -337,8 +348,7 @@ impl RenderBridge {
             fallback_white,
             world_meshes: Vec::new(),
             world_lights: Vec::new(),
-            detail_meshes: Vec::new(),
-            detail_textures: Vec::new(),
+            level_details: None,
             dynamic_ogf_cache: BTreeMap::new(),
             hud_mesh_cache: BTreeMap::new(),
             hud_materials: None,
@@ -364,8 +374,7 @@ impl RenderBridge {
         self.world_meshes.clear();
         self.world_lights.clear();
         self.dynamic_ogf_cache.clear();
-        self.detail_meshes.clear();
-        self.detail_textures.clear();
+        self.level_details = None;
         self.world_synced = false;
     }
 
@@ -388,8 +397,7 @@ impl RenderBridge {
     ) -> WinResult<()> {
         self.world_meshes.clear();
         self.world_lights.clear();
-        self.detail_meshes.clear();
-        self.detail_textures.clear();
+        self.level_details = None;
 
         // 1. Static visual meshes + fastpath shadow/depth buffers + bindless textures
         let shader_library = vfs.and_then(|vfs| load_shaders_xr_from_vfs(vfs).ok());
@@ -452,20 +460,35 @@ impl RenderBridge {
         }
 
         // 3. Detail grass object meshes (`level.details`)
-        if let Some(details) = &world.details {
+        let (radius, detail_config) = load_detail_config(vfs);
+        if let Some(details) = &world.details
+            && world.cform.is_some()
+            && radius > 0
+            && !details.objects.is_empty()
+        {
+            let mut prototypes = Vec::with_capacity(details.objects.len());
             for obj in &details.objects {
                 let gpu_verts = DetailManager::build_gpu_mesh(obj);
-                let tex = if !obj.texture.is_empty() {
+                let texture = if !obj.texture.is_empty() {
                     let vpath = vfs
                         .and_then(|vfs| resolve_level_texture_vpath(vfs, &world.level_dir, &obj.texture))
                         .unwrap_or_else(|| texture_stem_to_dds_vpath(&obj.texture));
                     try_load_vfs_texture(renderer, vfs, &vpath)
                 } else {
+                    Some(self.fallback_white)
+                };
+                let prototype = if let Some(texture) = texture {
+                    renderer.create_detail_mesh(&gpu_verts)?.map(|mesh| DetailPrototype { mesh, texture })
+                } else {
                     None
                 };
-                self.detail_meshes.push(gpu_verts);
-                self.detail_textures.push(tex);
+                prototypes.push(prototype);
             }
+            self.level_details = Some(LevelDetailState {
+                cache: DetailCacheGrid::new(details, radius),
+                config: detail_config,
+                prototypes,
+            });
         }
 
         self.world_synced = true;
@@ -900,6 +923,14 @@ impl RenderBridge {
                 stats.gbuffer_dynamic_draws += 1;
             }
         }
+        if self.config.render_details && let Some(world) = world {
+            stats.detail_instances_drawn = self.draw_level_details(
+                renderer, world, camera, &frustum, &vp_xray,
+                env.map_or(0.35, |weather| weather.wind_direction),
+                env.map_or(120.0, |weather| weather.wind_velocity),
+                elapsed_sec,
+            )?;
+        }
         renderer.end_gbuffer_pass()?;
         // R4 reuses the opaque scene depth for forward rendering.
         renderer.copy_scene_depth_to_backbuffer()?;
@@ -1129,20 +1160,6 @@ impl RenderBridge {
         renderer.draw_clouds(&clouds_push)?;
         stats.clouds_drawn = true;
 
-        // e.3 Instanced Grass Details (`level.details`)
-        if self.config.render_details
-            && let Some(details) = world.and_then(|w| w.details.as_ref())
-        {
-            stats.detail_instances_drawn = self.draw_level_details(
-                renderer,
-                details,
-                camera.position,
-                wind_dir,
-                wind_vel,
-                elapsed_sec,
-            )?;
-        }
-
         // e.4 Static Wallmark Decals
         let mut combined_wallmarks = self.wallmark_vertices.clone();
         if let Some(hw) = hud_weapon.as_deref_mut() {
@@ -1362,100 +1379,94 @@ impl RenderBridge {
     fn draw_level_details(
         &mut self,
         renderer: &mut Dx12Renderer,
-        details: &LevelDetails,
-        cam_pos: [f32; 3],
+        world: &LoadedWorld,
+        camera: &FirstPersonCamera,
+        frustum: &ClipFrustum,
+        view_proj: &XRayMatrix,
         wind_dir: f32,
         wind_vel: f32,
         elapsed_sec: f32,
     ) -> WinResult<u32> {
-        if self.detail_meshes.is_empty() || details.slots.is_empty() {
+        let (Some(state), Some(details), Some(cform)) = (&mut self.level_details, &world.details, &world.cform) else {
             return Ok(0);
-        }
-        let (csx, csz) = LevelDetails::world_to_slot_coords(cam_pos[0], cam_pos[2]);
-        let radius_slots: i32 = 8;
-
-        // Bucket instances per detail object prototype ID
-        let mut buckets: BTreeMap<usize, Vec<GpuDetailInstance>> = BTreeMap::new();
-        let mut total_gathered = 0usize;
-
-        'outer: for dz in -radius_slots..=radius_slots {
-            for dx in -radius_slots..=radius_slots {
-                let sx = csx + dx;
-                let sz = csz + dz;
-                let Some(slot) = details.query_slot(sx, sz) else {
+        };
+        let position = camera.position;
+        let (sx, sz) = LevelDetails::world_to_cache_center(position[0], position[2]);
+        // Monolith fills the initial grid, then decompresses up to seven new cells per update.
+        state.cache.update_cache_with_cform(
+            details, sx, sz, position, 7, &state.config, &cform.build_bvh(), cform, world.gamemtl.as_ref(),
+        );
+        let visible = state.cache.collect_visible(
+            position, frustum, None, view_proj, renderer.frame_index as u32,
+            &DetailVisibilityConfig {
+                ssa_discard: compute_r_ssa_discard(renderer.width, renderer.height, camera.fov_deg, 0.75, DETAIL_DEFAULT_PS_SSA_DISCARD),
+                ..Default::default()
+            },
+        );
+        let mut instances = Vec::new();
+        let mut batches = Vec::new();
+        for (groups, wind_strength) in [(&visible.still, 0.0), (&visible.wave1, 0.15), (&visible.wave2, 0.15)] {
+            for (group, prototype) in groups.iter().zip(&state.prototypes) {
+                let Some(prototype) = prototype.as_ref().filter(|_| !group.is_empty()) else {
                     continue;
                 };
-                if slot.is_empty() {
-                    continue;
-                }
-                let y = slot.y_base_meters() + 0.5 * slot.y_height_meters();
-                let hemi = slot.hemi_light();
-                let sun = slot.dir_light();
-                let rgb = slot.rgb_light();
-
-                for (sub_i, &obj_id) in slot.ids.iter().enumerate() {
-                    if obj_id == DETAIL_ID_EMPTY {
-                        continue;
-                    }
-                    let idx = obj_id as usize;
-                    if idx >= self.detail_meshes.len() || self.detail_meshes[idx].is_empty() {
-                        continue;
-                    }
-                    let ox = if (sub_i & 1) == 0 { 0.5 } else { 1.5 };
-                    let oz = if (sub_i & 2) == 0 { 0.5 } else { 1.5 };
-                    let x = (sx as f32) * DETAIL_SLOT_SIZE + ox;
-                    let z = (sz as f32) * DETAIL_SLOT_SIZE + oz;
-                    buckets.entry(idx).or_default().push(GpuDetailInstance {
-                        position: [x, y, z],
-                        scale: 1.0,
-                        rotation_y: ((sub_i as f32) * 1.57) + ((sx ^ sz) & 3) as f32 * 0.785,
-                        alpha: 1.0,
-                        hemi_light: hemi,
-                        sun_light: sun,
-                        color_tint: [rgb[0].max(0.4), rgb[1].max(0.4), rgb[2].max(0.4), 1.0],
-                    });
-                    total_gathered += 1;
-                    if total_gathered >= MAX_DETAIL_INSTANCES_PER_BATCH {
-                        break 'outer;
-                    }
-                }
+                let start = instances.len();
+                instances.extend(group.iter().map(|item| GpuDetailInstance {
+                    position: item.position,
+                    scale: item.scale_calculated,
+                    rotation_y: item.xform[2][0].atan2(item.xform[0][0]),
+                    alpha: item.alpha_target,
+                    hemi_light: item.c_hemi,
+                    sun_light: item.c_sun,
+                    color_tint: [1.0; 4],
+                }));
+                batches.push(GpuDetailBatch {
+                    mesh: &prototype.mesh,
+                    instances: start..instances.len(),
+                    push: DetailPushConstants {
+                        wind_direction: [wind_dir.cos(), wind_dir.sin()],
+                        wind_speed: (wind_vel * 0.01).clamp(0.5, 4.0),
+                        wind_strength,
+                        time_seconds: elapsed_sec,
+                        texture_index: prototype.texture.0,
+                        alpha_threshold: 200.0 / 255.0,
+                        custom_param: 0.0,
+                    },
+                });
             }
         }
-
-        let mut drawn = 0u32;
-        for (obj_idx, instances) in buckets {
-            if instances.is_empty() {
-                continue;
-            }
-            let mesh_verts = &self.detail_meshes[obj_idx];
-            if mesh_verts.is_empty() {
-                continue;
-            }
-            let tex_idx = self
-                .detail_textures
-                .get(obj_idx)
-                .and_then(|t| *t)
-                .unwrap_or(self.fallback_white);
-            let mgr = renderer.detail_manager_mut();
-            mgr.clear_instances();
-            for inst in &instances {
-                mgr.add_instance(*inst);
-            }
-            let push = DetailPushConstants {
-                wind_direction: [wind_dir.cos(), wind_dir.sin()],
-                wind_speed: (wind_vel * 0.01).clamp(0.5, 4.0),
-                wind_strength: 0.15,
-                time_seconds: elapsed_sec,
-                texture_index: tex_idx.0,
-                alpha_threshold: 0.3,
-                custom_param: 0.0,
-            };
-            renderer.draw_details(mesh_verts, &push)?;
-            drawn += instances.len() as u32;
-        }
-
-        Ok(drawn)
+        renderer.draw_gbuffer_details(&instances, &batches)?;
+        Ok(instances.len() as u32)
     }
+}
+
+fn load_detail_config(vfs: Option<&VirtualFileSystem>) -> (u32, DetailDecompressConfig) {
+    let mut radius = DETAIL_DEFAULT_RADIUS;
+    let mut config = DetailDecompressConfig::default();
+    if let Some(commands) = vfs.and_then(|vfs| vfs.read_to_string_lossy("user.ltx").ok()) {
+        for line in commands.lines() {
+            let mut words = line.split_whitespace();
+            let (Some(command), Some(value)) = (words.next(), words.next()) else {
+                continue;
+            };
+            match command {
+                "r__detail_radius" => {
+                    if let Ok(value) = value.parse::<u32>() { radius = value.min(250); }
+                }
+                "r__detail_density" => {
+                    if let Ok(value) = value.parse::<f32>() { config.density = value.clamp(0.04, 1.0); }
+                }
+                "r__detail_height" => {
+                    if let Ok(value) = value.parse::<f32>() { config.detail_height = value.clamp(0.5, 2.0); }
+                }
+                "ssfx_terrain_grass_slope" => {
+                    if let Ok(value) = value.parse::<f32>() { config.terrain_grass_slope = value.clamp(0.0, 1.0); }
+                }
+                _ => {}
+            }
+        }
+    }
+    (radius, config)
 }
 
 fn model_search_paths(key: &str, level_dir: Option<&str>) -> impl Iterator<Item = String> {

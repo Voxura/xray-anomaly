@@ -9,7 +9,7 @@ use windows::core::{Interface, Result as WinResult, HRESULT};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12Fence, ID3D12GraphicsCommandList, D3D12_COMMAND_LIST_TYPE_DIRECT,
+    ID3D12Fence, ID3D12GraphicsCommandList, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_CPU_DESCRIPTOR_HANDLE,
     D3D12_FENCE_FLAG_NONE, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
     D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -21,7 +21,8 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFIN
 use crate::allocators::MultiThreadedCommandManager;
 use crate::bindless::{BindlessIndexAllocator, DescriptorIndex};
 use crate::device::Dx12DeviceContext;
-use crate::geometry::GeometryState;
+use crate::details::{GpuDetailBatch, GpuDetailInstance, GpuDetailMesh, GpuDetailVertex};
+use crate::geometry::{GeometryState, UploadBuffer};
 use crate::heaps::TransientHeapManager;
 use crate::pipeline::PipelineManager;
 use crate::swapchain::SwapChainManager;
@@ -950,56 +951,106 @@ impl Dx12Renderer {
     /// Record a draw call rendering instanced detail foliage
     pub fn draw_details(
         &mut self,
-        mesh_vertices: &[crate::details::GpuDetailVertex],
+        mesh_vertices: &[GpuDetailVertex],
         push: &crate::details::DetailPushConstants,
     ) -> WinResult<()> {
-        if mesh_vertices.is_empty() {
+        if self.detail_manager.as_ref().is_none_or(|manager| manager.instance_count() == 0) {
+            return Ok(());
+        }
+        let Some(mesh) = self.create_detail_mesh(mesh_vertices)? else {
+            return Ok(());
+        };
+        let manager = self.detail_manager.take().unwrap();
+        let batch = GpuDetailBatch { mesh: &mesh, instances: 0..manager.instance_count(), push: *push };
+        let result = self.draw_detail_batches(&manager.instances, &[batch]);
+        self.detail_manager = Some(manager);
+        result
+    }
+
+    pub fn create_detail_mesh(&self, vertices: &[GpuDetailVertex]) -> WinResult<Option<GpuDetailMesh>> {
+        GpuDetailMesh::upload(&self.device_ctx.device, vertices)
+    }
+
+    /// Submit all visible detail prototypes using one immutable frame instance buffer.
+    pub fn draw_detail_batches(
+        &mut self,
+        instances: &[GpuDetailInstance],
+        batches: &[GpuDetailBatch<'_>],
+    ) -> WinResult<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let sc = self.swapchain.as_ref().ok_or(windows::Win32::Foundation::E_FAIL)?;
+        self.draw_detail_batches_into(instances, batches, &[sc.current_rtv_handle()], sc.dsv_handle())
+    }
+
+    /// Record opaque cutout detail geometry during an active G-buffer pass.
+    pub fn draw_gbuffer_details(
+        &mut self,
+        instances: &[GpuDetailInstance],
+        batches: &[GpuDetailBatch<'_>],
+    ) -> WinResult<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let targets = self.gbuffer.as_ref().and_then(|gbuffer| gbuffer.targets.as_ref())
+            .ok_or(windows::Win32::Foundation::E_FAIL)?;
+        self.draw_detail_batches_into(instances, batches, &targets.gbuffer_rtvs(), targets.dsv_handle())
+    }
+
+    fn draw_detail_batches_into(
+        &mut self,
+        instances: &[GpuDetailInstance],
+        batches: &[GpuDetailBatch<'_>],
+        rtvs: &[D3D12_CPU_DESCRIPTOR_HANDLE],
+        dsv: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> WinResult<()> {
+        if batches.iter().any(|batch| batch.instances.end > instances.len()) {
+            return Err(windows::Win32::Foundation::E_INVALIDARG.into());
+        }
+        if instances.is_empty() || batches.is_empty() {
             return Ok(());
         }
         if self.detail_renderer.is_none() {
             self.detail_renderer = Some(crate::details::DetailRenderer::new(&self.device_ctx.device)?);
         }
-        if self.detail_manager.is_none() {
-            self.detail_manager = Some(crate::details::DetailManager::new());
-        }
-        let mgr = self.detail_manager.as_mut().unwrap();
-        let instance_count = mgr.instance_count() as u32;
-        if instance_count == 0 {
-            return Ok(());
-        }
-        let vertices_va = mgr.upload_mesh(&self.device_ctx.device, mesh_vertices)?;
-        let instances_va = mgr.upload_instances(&self.device_ctx.device)?;
 
         let detail = self.detail_renderer.as_ref().unwrap();
         let cmd = match self.current_cmd_list.as_ref() {
             Some(c) => c,
             None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
         };
-        let sc = match self.swapchain.as_ref() {
-            Some(s) => s,
-            None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
-        };
         let camera_va = self
             .geometry
             .camera_gpu_va()
             .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
-        let rtv = sc.current_rtv_handle();
-        let dsv = sc.dsv_handle();
-
-        detail.render(
-            cmd,
-            camera_va,
-            &self.bindless_heap,
-            vertices_va,
-            instances_va,
-            mesh_vertices.len() as u32,
-            instance_count,
-            push,
-            rtv,
-            Some(dsv),
-            self.width,
-            self.height,
-        );
+        // GpuDetailInstance is repr(C) with no padding. Its stride keeps each
+        // batch start aligned for a D3D12 raw buffer SRV.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(instances.as_ptr().cast(), std::mem::size_of_val(instances))
+        };
+        let buffer = UploadBuffer::new(&self.device_ctx.device, bytes)?;
+        let instances_va = unsafe { buffer.0.GetGPUVirtualAddress() };
+        for batch in batches.iter().filter(|batch| !batch.instances.is_empty()) {
+            let vertices = &batch.mesh.vertices.0;
+            let offset = batch.instances.start * std::mem::size_of::<GpuDetailInstance>();
+            detail.render_into(
+                cmd,
+                camera_va,
+                &self.bindless_heap,
+                unsafe { vertices.GetGPUVirtualAddress() },
+                instances_va + offset as u64,
+                batch.mesh.vertex_count,
+                batch.instances.len() as u32,
+                &batch.push,
+                rtvs,
+                Some(dsv),
+                self.width,
+                self.height,
+            );
+            self.geometry.track_resource(vertices.clone());
+        }
+        self.geometry.track_resource(buffer.0);
         Ok(())
     }
 

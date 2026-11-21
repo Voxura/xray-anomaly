@@ -3,12 +3,15 @@
 //! Renders dense instanced vegetation (grass clumps, flowers, shrubs, pebbles)
 //! with procedural SSFX wind waving animation, distance dissolve, and alpha-tested cutouts.
 
+use std::ops::Range;
+
 use windows::core::{Error, Result as WinResult, HRESULT};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use crate::geometry::UploadBuffer;
 use crate::shaders::{ShaderCompileRequest, ShaderCompiler, ShaderTarget};
 use xray_formats::details::DetailMesh;
 
@@ -90,6 +93,7 @@ impl Default for DetailPushConstants {
 pub struct DetailRenderer {
     pub root: ID3D12RootSignature,
     pub pso: ID3D12PipelineState,
+    gbuffer_pso: ID3D12PipelineState,
 }
 
 impl DetailRenderer {
@@ -230,6 +234,16 @@ impl DetailRenderer {
                 eprintln!("[DetailRenderer] ps compile failed: {:?}", e);
                 failure()
             })?;
+        let ps_gbuffer = compiler
+            .compile(&ShaderCompileRequest::new(
+                source,
+                "ps_detail_gbuffer",
+                ShaderTarget::Pixel6_0,
+            ))
+            .map_err(|e| {
+                eprintln!("[DetailRenderer] ps_detail_gbuffer compile failed: {:?}", e);
+                failure()
+            })?;
 
         let mut blend = D3D12_BLEND_DESC::default();
         let rt_blend = &mut blend.RenderTarget[0];
@@ -250,7 +264,7 @@ impl DetailRenderer {
             ..Default::default()
         };
 
-        let pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        let mut pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
             VS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: vs.as_ptr().cast(),
@@ -285,8 +299,15 @@ impl DetailRenderer {
         };
 
         let pso: ID3D12PipelineState = unsafe { device.CreateGraphicsPipelineState(&pso_desc)? };
+        pso_desc.PS = D3D12_SHADER_BYTECODE {
+            pShaderBytecode: ps_gbuffer.as_ptr().cast(),
+            BytecodeLength: ps_gbuffer.len(),
+        };
+        pso_desc.NumRenderTargets = 3;
+        pso_desc.RTVFormats[..3].fill(DXGI_FORMAT_R8G8B8A8_UNORM);
+        let gbuffer_pso = unsafe { device.CreateGraphicsPipelineState(&pso_desc)? };
 
-        Ok(Self { root, pso })
+        Ok(Self { root, pso, gbuffer_pso })
     }
 
     /// Render instanced foliage objects
@@ -306,12 +327,35 @@ impl DetailRenderer {
         width: u32,
         height: u32,
     ) {
+        self.render_into(
+            cmd, camera_va, bindless_heap, vertices_va, instances_va, vertex_count, instance_count,
+            push, &[rtv], dsv, width, height,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_into(
+        &self,
+        cmd: &ID3D12GraphicsCommandList,
+        camera_va: u64,
+        bindless_heap: &ID3D12DescriptorHeap,
+        vertices_va: u64,
+        instances_va: u64,
+        vertex_count: u32,
+        instance_count: u32,
+        push: &DetailPushConstants,
+        rtvs: &[D3D12_CPU_DESCRIPTOR_HANDLE],
+        dsv: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+        width: u32,
+        height: u32,
+    ) {
         if vertex_count == 0 || instance_count == 0 {
             return;
         }
 
         unsafe {
-            cmd.SetPipelineState(&self.pso);
+            let pipeline = if rtvs.len() == 3 { &self.gbuffer_pso } else { &self.pso };
+            cmd.SetPipelineState(pipeline);
             cmd.SetGraphicsRootSignature(&self.root);
             cmd.SetDescriptorHeaps(&[Some(bindless_heap.clone())]);
 
@@ -354,11 +398,9 @@ impl DetailRenderer {
                 bottom: height as i32,
             }]);
 
-            if let Some(dsv) = dsv {
-                cmd.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
-            } else {
-                cmd.OMSetRenderTargets(1, Some(&rtv), false, None);
-            }
+            cmd.OMSetRenderTargets(
+                rtvs.len() as u32, Some(rtvs.as_ptr()), false, dsv.as_ref().map(std::ptr::from_ref),
+            );
 
             cmd.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             cmd.DrawInstanced(vertex_count, instance_count, 0, 0);
@@ -366,13 +408,38 @@ impl DetailRenderer {
     }
 }
 
-/// High-level manager coordinating detail mesh geometry and GPU instances
+/// Immutable vertex storage for a single level.details prototype.
+pub struct GpuDetailMesh {
+    pub(crate) vertices: UploadBuffer,
+    pub(crate) vertex_count: u32,
+}
+
+impl GpuDetailMesh {
+    pub(crate) fn upload(device: &ID3D12Device, vertices: &[GpuDetailVertex]) -> WinResult<Option<Self>> {
+        if vertices.is_empty() {
+            return Ok(None);
+        }
+        // GpuDetailVertex is repr(C) with no padding.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(vertices.as_ptr().cast(), std::mem::size_of_val(vertices))
+        };
+        Ok(Some(Self {
+            vertices: UploadBuffer::new(device, bytes)?,
+            vertex_count: vertices.len() as u32,
+        }))
+    }
+}
+
+/// Draw a prototype using its range in the frame's packed instance buffer.
+pub struct GpuDetailBatch<'a> {
+    pub mesh: &'a GpuDetailMesh,
+    pub instances: Range<usize>,
+    pub push: DetailPushConstants,
+}
+
+/// Instance collector for callers that submit a single detail batch at a time.
 pub struct DetailManager {
-    mesh_buffer: Option<ID3D12Resource>,
-    mesh_capacity_bytes: usize,
-    instance_buffer: Option<ID3D12Resource>,
-    instance_capacity_bytes: usize,
-    instances: Vec<GpuDetailInstance>,
+    pub(crate) instances: Vec<GpuDetailInstance>,
 }
 
 impl Default for DetailManager {
@@ -384,10 +451,6 @@ impl Default for DetailManager {
 impl DetailManager {
     pub fn new() -> Self {
         Self {
-            mesh_buffer: None,
-            mesh_capacity_bytes: 0,
-            instance_buffer: None,
-            instance_capacity_bytes: 0,
             instances: Vec::new(),
         }
     }
@@ -419,66 +482,6 @@ impl DetailManager {
         out
     }
 
-    /// Upload mesh vertices to GPU
-    pub fn upload_mesh(
-        &mut self,
-        device: &ID3D12Device,
-        vertices: &[GpuDetailVertex],
-    ) -> WinResult<u64> {
-        if vertices.is_empty() {
-            return Ok(0);
-        }
-        let needed_bytes = std::mem::size_of_val(vertices).max(256);
-
-        if self.mesh_buffer.is_none() || self.mesh_capacity_bytes < needed_bytes {
-            let heap_props = D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_UPLOAD,
-                CreationNodeMask: 1,
-                VisibleNodeMask: 1,
-                ..Default::default()
-            };
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: needed_bytes as u64,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                ..Default::default()
-            };
-            let mut res: Option<ID3D12Resource> = None;
-            unsafe {
-                device.CreateCommittedResource(
-                    &heap_props,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut res,
-                )?;
-            }
-            self.mesh_buffer = Some(res.ok_or_else(failure)?);
-            self.mesh_capacity_bytes = needed_bytes;
-        }
-
-        let res = self.mesh_buffer.as_ref().unwrap();
-        unsafe {
-            let mut mapped = std::ptr::null_mut();
-            res.Map(0, None, Some(&mut mapped))?;
-            std::ptr::copy_nonoverlapping(
-                vertices.as_ptr() as *const u8,
-                mapped.cast(),
-                std::mem::size_of_val(vertices),
-            );
-            res.Unmap(0, None);
-            Ok(res.GetGPUVirtualAddress())
-        }
-    }
-
     /// Add an instance to the active batch
     pub fn add_instance(&mut self, instance: GpuDetailInstance) {
         self.instances.push(instance);
@@ -494,59 +497,4 @@ impl DetailManager {
         self.instances.len()
     }
 
-    /// Upload active instance records to GPU
-    pub fn upload_instances(&mut self, device: &ID3D12Device) -> WinResult<u64> {
-        if self.instances.is_empty() {
-            return Ok(0);
-        }
-        let needed_bytes = std::mem::size_of_val(self.instances.as_slice()).max(256);
-
-        if self.instance_buffer.is_none() || self.instance_capacity_bytes < needed_bytes {
-            let heap_props = D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_UPLOAD,
-                CreationNodeMask: 1,
-                VisibleNodeMask: 1,
-                ..Default::default()
-            };
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: needed_bytes as u64,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                ..Default::default()
-            };
-            let mut res: Option<ID3D12Resource> = None;
-            unsafe {
-                device.CreateCommittedResource(
-                    &heap_props,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut res,
-                )?;
-            }
-            self.instance_buffer = Some(res.ok_or_else(failure)?);
-            self.instance_capacity_bytes = needed_bytes;
-        }
-
-        let res = self.instance_buffer.as_ref().unwrap();
-        unsafe {
-            let mut mapped = std::ptr::null_mut();
-            res.Map(0, None, Some(&mut mapped))?;
-            std::ptr::copy_nonoverlapping(
-                self.instances.as_ptr() as *const u8,
-                mapped.cast(),
-                std::mem::size_of_val(self.instances.as_slice()),
-            );
-            res.Unmap(0, None);
-            Ok(res.GetGPUVirtualAddress())
-        }
-    }
 }

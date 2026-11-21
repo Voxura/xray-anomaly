@@ -14,7 +14,7 @@ fn failure() -> Error {
     Error::from_hresult(HRESULT(0x80004005u32 as i32))
 }
 
-struct UploadBuffer(ID3D12Resource);
+pub(crate) struct UploadBuffer(pub(crate) ID3D12Resource);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +45,7 @@ impl Default for PushDrawConstants {
 }
 
 impl UploadBuffer {
-    fn new(device: &ID3D12Device, bytes: &[u8]) -> WinResult<Self> {
+    pub(crate) fn new(device: &ID3D12Device, bytes: &[u8]) -> WinResult<Self> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_UPLOAD,
             CreationNodeMask: 1,

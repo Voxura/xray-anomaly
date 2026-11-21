@@ -459,6 +459,8 @@ fn test_wallmark_ttl_alpha_blending_readback() {
 
 #[test]
 fn test_instanced_detail_foliage_hardware_readback() {
+    use xray_render_dx12::details::GpuDetailBatch;
+
     let window = Window(unsafe {
         CreateWindowExW(
             Default::default(),
@@ -488,70 +490,87 @@ fn test_instanced_detail_foliage_hardware_readback() {
     renderer.update_camera(&identity_camera()).expect("update_camera failed");
 
     let readback = create_readback_buffer(&renderer.device_ctx.device, 64, 64);
+    let mut atlas = create_solid_color_rgba8_dds(4, 4, 255, 255, 255, 0);
+    for row in atlas[128..].chunks_exact_mut(16) {
+        row[0..4].copy_from_slice(&[255, 255, 0, 255]);
+        row[4..8].copy_from_slice(&[0, 255, 255, 255]);
+    }
+    let atlas = renderer.load_texture_from_dds("detail_uv.dds", &atlas).unwrap();
 
     renderer.begin_frame().expect("begin_frame failed");
-    renderer.clear_backbuffer([0.0, 0.0, 0.0, 1.0]);
+    renderer.begin_gbuffer_pass().unwrap();
 
     // Mesh: 1 upright triangle representing a grass clump blade
     let mesh_vertices = [
         GpuDetailVertex {
             position: [-0.3, -0.3, 0.5],
-            uv: [0.0, 1.0],
+            uv: [0.125, 0.625],
             height_fraction: 0.0, // base
         },
         GpuDetailVertex {
             position: [0.0, 0.3, 0.5],
-            uv: [0.5, 0.0],
+            uv: [0.125, 0.625],
             height_fraction: 1.0, // tip
         },
         GpuDetailVertex {
             position: [0.3, -0.3, 0.5],
-            uv: [1.0, 1.0],
+            uv: [0.125, 0.625],
             height_fraction: 0.0, // base
         },
     ];
 
-    // Single instance with solid Yellow tint [1.0, 1.0, 0.0, 1.0] and full lighting
-    let detail_mgr = renderer.detail_manager_mut();
-    detail_mgr.clear_instances();
-    detail_mgr.add_instance(GpuDetailInstance {
-        position: [0.0, 0.0, 0.0],
-        scale: 1.0,
-        rotation_y: 0.0,
-        alpha: 1.0,
-        hemi_light: 1.0,
-        sun_light: 1.0,
-        color_tint: [1.0, 1.0, 0.0, 1.0],
-    });
+    let left = renderer.create_detail_mesh(&mesh_vertices).unwrap().unwrap();
+    let right = renderer.create_detail_mesh(&mesh_vertices.map(|mut vertex| {
+        vertex.position[0] *= 0.75;
+        vertex.uv[0] = 0.375;
+        vertex
+    })).unwrap().unwrap();
+    let instances = [
+        GpuDetailInstance {
+            position: [-0.5, 0.0, 0.0],
+            hemi_light: 0.0,
+            sun_light: 0.0,
+            ..Default::default()
+        },
+        GpuDetailInstance {
+            position: [0.5, 0.0, 0.0],
+            ..Default::default()
+        },
+    ];
 
     let push = DetailPushConstants {
         wind_direction: [1.0, 0.0],
         wind_speed: 0.0,
         wind_strength: 0.0, // static baseline
         time_seconds: 0.0,
-        texture_index: u32::MAX, // untextured
-        alpha_threshold: 0.1,
+        texture_index: atlas.0,
+        alpha_threshold: 0.8,
         custom_param: 0.0,
     };
 
     renderer
-        .draw_details(&mesh_vertices, &push)
+        .draw_gbuffer_details(&instances, &[
+            GpuDetailBatch { mesh: &left, instances: 0..1, push },
+            GpuDetailBatch { mesh: &right, instances: 1..2, push },
+        ])
         .expect("Failed to draw details");
+    drop((left, right));
+    renderer.end_gbuffer_pass().unwrap();
 
+    let albedo = renderer.gbuffer_manager_mut().unwrap().targets.as_ref().unwrap().albedo.clone();
     let cmd = renderer.current_cmd_list.as_ref().unwrap();
-    let backbuffer = renderer.swapchain.as_ref().unwrap().current_backbuffer_resource();
 
     unsafe {
         transition(
             cmd,
-            backbuffer,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            &albedo,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         );
 
         let row_pitch = ((64 * 4 + 255) / 256) * 256;
         let src_location = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: ManuallyDrop::new(Some(backbuffer.clone())),
+            pResource: ManuallyDrop::new(Some(albedo.clone())),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 SubresourceIndex: 0,
@@ -577,21 +596,19 @@ fn test_instanced_detail_foliage_hardware_readback() {
 
         transition(
             cmd,
-            backbuffer,
+            &albedo,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         );
     }
 
     renderer.end_frame(false).expect("Failed to end frame");
     renderer.wait_for_gpu().expect("Failed waiting for GPU");
 
-    // Center pixel (32, 32) covered by yellow foliage blade
-    let center_pixel = readback_rgba8(&readback, 64, 64, 32, 32);
-    println!("Center detail foliage pixel: {:?}", center_pixel);
-    assert_eq!(center_pixel[0], 255, "R must be 255 (Yellow)");
-    assert_eq!(center_pixel[1], 255, "G must be 255 (Yellow)");
-    assert_eq!(center_pixel[2], 0, "B must be 0 (Yellow)");
+    let left = readback_rgba8(&readback, 64, 64, 16, 32);
+    let right = readback_rgba8(&readback, 64, 64, 48, 32);
+    assert_eq!(left, [255, 255, 0, 255], "left prototype samples its opaque atlas region");
+    assert_eq!(right, [0, 255, 255, 255], "right prototype uses its own instance range");
 
     // Corner pixel (2, 2) outside foliage
     let corner_pixel = readback_rgba8(&readback, 64, 64, 2, 2);
