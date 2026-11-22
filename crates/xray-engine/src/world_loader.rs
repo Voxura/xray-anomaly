@@ -417,6 +417,19 @@ impl LoadedWorld {
     /// Discard heavy CPU-side vertex and index buffers after uploading to GPU,
     /// dropping hundreds of megabytes of duplicated RAM.
     pub fn drop_cpu_geometry_after_gpu_upload(&mut self) {
+        self.drop_source_geometry();
+        for visual in &mut self.visual_meshes {
+            visual.mesh.vertices = Vec::new();
+            visual.mesh.indices = Vec::new();
+            if let Some(fp) = &mut visual.fastpath {
+                fp.vertices = Vec::new();
+                fp.indices = Vec::new();
+            }
+        }
+    }
+
+    /// Release source buffers once owned visual meshes have been resolved.
+    pub(crate) fn drop_source_geometry(&mut self) {
         self.level_geom = None;
         self.level_geomx = None;
         // The parsed OGF hierarchy also owns inline geometry, independently of
@@ -431,14 +444,6 @@ impl LoadedWorld {
         }
         for visual in &mut self.level_data.visuals {
             drop_visual_geometry(visual);
-        }
-        for visual in &mut self.visual_meshes {
-            visual.mesh.vertices = Vec::new();
-            visual.mesh.indices = Vec::new();
-            if let Some(fp) = &mut visual.fastpath {
-                fp.vertices = Vec::new();
-                fp.indices = Vec::new();
-            }
         }
     }
 

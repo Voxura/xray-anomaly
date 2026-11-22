@@ -1027,11 +1027,7 @@ pub struct AlifeSpawnArchive {
 }
 
 impl AlifeSpawnArchive {
-    /// Parse a binary `all.spawn` archive (`CALifeSpawnRegistry::load`).
-    pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
-        let root = ChunkReader::new(data);
-
-        // Chunk 0: CALifeSpawnHeader
+    fn parse_header(root: &ChunkReader<'_>) -> Result<SpawnHeader, FormatError> {
         let hdr_bytes = root.require_chunk(0)?;
         let mut hcur = ByteCursor::new(&hdr_bytes);
         let version = hcur.read_u32()?;
@@ -1046,13 +1042,30 @@ impl AlifeSpawnArchive {
         graph_guid.copy_from_slice(hcur.read_bytes(16)?);
         let spawn_count = hcur.read_u32()?;
         let level_count = hcur.read_u32()?;
-        let header = SpawnHeader {
+        Ok(SpawnHeader {
             version,
             guid,
             graph_guid,
             spawn_count,
             level_count,
-        };
+        })
+    }
+
+    /// Read the embedded world graph without allocating spawn packets or patrol paths.
+    pub fn parse_game_graph(data: &[u8]) -> Result<GameGraph, FormatError> {
+        let root = ChunkReader::new(data);
+        Self::parse_header(&root)?;
+        Self::read_game_graph(&root)
+    }
+
+    fn read_game_graph(root: &ChunkReader<'_>) -> Result<GameGraph, FormatError> {
+        GameGraph::parse(&root.require_chunk(4)?)
+    }
+
+    /// Parse a binary `all.spawn` archive (`CALifeSpawnRegistry::load`).
+    pub fn parse(data: &[u8]) -> Result<Self, FormatError> {
+        let root = ChunkReader::new(data);
+        let header = Self::parse_header(&root)?;
 
         // Chunk 1: CGraphAbstractSerialize<CServerEntityWrapper*, float, u16>
         let graph_chunk = root.require_chunk(1)?;
@@ -1151,8 +1164,7 @@ impl AlifeSpawnArchive {
         }
 
         // Chunk 4: embedded CGameGraph
-        let gg_bytes = root.require_chunk(4)?;
-        let game_graph = GameGraph::parse(&gg_bytes)?;
+        let game_graph = Self::read_game_graph(&root)?;
 
         Ok(Self {
             header,

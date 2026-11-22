@@ -310,6 +310,7 @@ pub struct RenderBridge {
     pause_fonts: BTreeMap<&'static str, Option<UiFontResource>>,
     native_tonemap: Option<TonemapParams>,
     native_middle_gray: [f32; 4],
+    geometry_lod: f32,
     inventory_fonts: BTreeMap<&'static str, UiFontResource>,
     ui_font_attempted: bool,
     ui_equipment_tex: Option<DescriptorIndex>,
@@ -368,6 +369,7 @@ impl RenderBridge {
             pause_fonts: BTreeMap::new(),
             native_tonemap: None,
             native_middle_gray: [1.0, 0.0, 1.0, 0.0],
+            geometry_lod: 0.75,
             inventory_fonts: BTreeMap::new(),
             ui_font_attempted: false,
             ui_equipment_tex: None,
@@ -886,7 +888,8 @@ impl RenderBridge {
         self.pause_fonts.clear();
     }
 
-    pub(crate) fn load_tonemap_profile(&mut self, profile: &str) {
+    pub(crate) fn load_render_profile(&mut self, profile: &str) {
+        self.geometry_lod = 0.75;
         let mut tonemap = TonemapParams::default();
         let mut luminance = LuminanceConfig::default();
         let mut has_native_settings = false;
@@ -903,6 +906,10 @@ impl RenderBridge {
                 continue;
             }
             let Ok(value) = value.parse::<f32>() else { continue };
+            if cvar == "r__geometry_lod" && (0.1..=1.5).contains(&value) {
+                self.geometry_lod = value;
+                continue;
+            }
             if cvar.starts_with("r2_tonemap_") {
                 match cvar {
                     "r2_tonemap_middlegray" if (0.0..=2.0).contains(&value) => luminance.middle_gray = value,
@@ -973,6 +980,7 @@ impl RenderBridge {
         let proj_mat = camera.projection_matrix();
         let vp_xray = matrix_mul_44(&proj_mat, &view_mat);
         let frustum = ClipFrustum::from_view_proj_dx(&vp_xray, frustum_planes::ALL);
+        let ssa_discard = self.ssa_discard(renderer, camera);
         const MAX_VIS_DIST: f32 = 280.0;
 
         let env = world.and_then(|w| w.weather.current_env.as_ref());
@@ -1014,8 +1022,9 @@ impl RenderBridge {
         renderer.begin_gbuffer_pass()?;
         for mesh in &self.world_meshes {
             if mesh.bsphere_radius > 1e-4 {
-                if distance_sq(camera.position, mesh.bsphere_center)
-                    > (MAX_VIS_DIST + mesh.bsphere_radius).powi(2)
+                let dist_sq = distance_sq(camera.position, mesh.bsphere_center);
+                if dist_sq > (MAX_VIS_DIST + mesh.bsphere_radius).powi(2)
+                    || below_ssa_discard(mesh.bsphere_radius, dist_sq, ssa_discard)
                 {
                     continue;
                 }
@@ -1047,7 +1056,7 @@ impl RenderBridge {
         }
         if self.config.render_details && let Some(world) = world {
             stats.detail_instances_drawn = self.draw_level_details(
-                renderer, world, camera, &frustum, &vp_xray,
+                renderer, world, camera, &frustum, &vp_xray, ssa_discard,
                 env.map_or(0.35, |weather| weather.wind_direction),
                 env.map_or(120.0, |weather| weather.wind_velocity),
                 elapsed_sec,
@@ -1084,7 +1093,9 @@ impl RenderBridge {
                         }
                         if mesh.bsphere_radius > 1e-4 {
                             let dist_sq = distance_sq(camera.position, mesh.bsphere_center);
-                            if dist_sq > (slot.split_distance + mesh.bsphere_radius + 32.0).powi(2) {
+                            if dist_sq > (slot.split_distance + mesh.bsphere_radius + 32.0).powi(2)
+                                || below_ssa_discard(mesh.bsphere_radius, dist_sq, ssa_discard)
+                            {
                                 continue;
                             }
                             if !slot.cull_frustum.planes.is_empty()
@@ -1505,6 +1516,16 @@ impl RenderBridge {
         Ok(stats)
     }
 
+    fn ssa_discard(&self, renderer: &Dx12Renderer, camera: &FirstPersonCamera) -> f32 {
+        compute_r_ssa_discard(
+            renderer.width,
+            renderer.height,
+            camera.fov_deg,
+            self.geometry_lod,
+            DETAIL_DEFAULT_PS_SSA_DISCARD,
+        )
+    }
+
     fn draw_level_details(
         &mut self,
         renderer: &mut Dx12Renderer,
@@ -1512,6 +1533,7 @@ impl RenderBridge {
         camera: &FirstPersonCamera,
         frustum: &ClipFrustum,
         view_proj: &XRayMatrix,
+        ssa_discard: f32,
         wind_dir: f32,
         wind_vel: f32,
         elapsed_sec: f32,
@@ -1528,7 +1550,7 @@ impl RenderBridge {
         let visible = state.cache.collect_visible(
             position, frustum, None, view_proj, renderer.frame_index as u32,
             &DetailVisibilityConfig {
-                ssa_discard: compute_r_ssa_discard(renderer.width, renderer.height, camera.fov_deg, 0.75, DETAIL_DEFAULT_PS_SSA_DISCARD),
+                ssa_discard,
                 ..Default::default()
             },
         );
@@ -1784,6 +1806,11 @@ fn create_unit_actor_box_mesh(renderer: &mut Dx12Renderer) -> WinResult<MeshHand
         5, 4, 1, 5, 1, 0, // Bottom
     ];
     renderer.create_mesh(&verts, &indices)
+}
+
+fn below_ssa_discard(radius: f32, distance_sq: f32, threshold: f32) -> bool {
+    // R4's CalcSSA uses the sphere radius divided by squared camera distance.
+    radius <= threshold * (distance_sq + 1e-5)
 }
 
 fn extract_lighting_env(env: Option<&MixedEnvironment>) -> ([f32; 3], [f32; 3], [f32; 3]) {

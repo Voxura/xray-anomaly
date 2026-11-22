@@ -606,13 +606,27 @@ pub fn load_all_spawn_from_vfs(
     vfs: &VirtualFileSystem,
     spawn_name_or_path: &str,
 ) -> Result<AlifeSpawnArchive, AssetLoadError> {
+    let bytes = vfs.read_bytes(&resolve_spawn_path(spawn_name_or_path)?)?;
+    Ok(AlifeSpawnArchive::parse(&bytes)?)
+}
+
+/// Read the world graph embedded in a compiled spawn archive.
+pub fn load_spawn_game_graph_from_vfs(
+    vfs: &VirtualFileSystem,
+    spawn_name_or_path: &str,
+) -> Result<GameGraph, AssetLoadError> {
+    let bytes = vfs.read_bytes(&resolve_spawn_path(spawn_name_or_path)?)?;
+    Ok(AlifeSpawnArchive::parse_game_graph(&bytes)?)
+}
+
+fn resolve_spawn_path(spawn_name_or_path: &str) -> Result<String, AssetLoadError> {
     let trimmed = spawn_name_or_path.trim();
     let with_ext = if trimmed.is_empty() {
         "all.spawn".to_string()
     } else {
         ensure_extension_ci(trimmed, b".spawn")
     };
-    let candidate = if with_ext.starts_with('$') {
+    Ok(if with_ext.starts_with('$') {
         with_ext
     } else {
         let norm = normalize_virtual_path(&with_ext)?;
@@ -621,9 +635,7 @@ pub fn load_all_spawn_from_vfs(
         } else {
             format!("spawns\\{norm}")
         }
-    };
-    let bytes = vfs.read_bytes(&candidate)?;
-    Ok(AlifeSpawnArchive::parse(&bytes)?)
+    })
 }
 
 /// Adapter implementing `crate::xml_ui::XmlFileProvider` over a mounted `VirtualFileSystem`.
@@ -2398,6 +2410,7 @@ mod tests {
         assert_eq!(aspawn.spawns[0].spawn.name_replace, "esc_wolf");
         assert_eq!(aspawn.artefact_spawn_positions.len(), 1);
         assert_eq!(aspawn.game_graph.header.levels[0].name, "l01_escape");
+        assert_eq!(load_spawn_game_graph_from_vfs(&vfs, "all").unwrap(), aspawn.game_graph);
     }
 
     #[test]

@@ -189,7 +189,7 @@ impl EngineRuntime {
     pub fn attach_vfs(&mut self, vfs: Arc<VirtualFileSystem>) {
         if let Ok(profile) = vfs.read_to_string_lossy("user.ltx") {
             if let Some(bridge) = &mut self.render_bridge {
-                bridge.load_tonemap_profile(&profile);
+                bridge.load_render_profile(&profile);
             }
             for line in profile.lines() {
                 let mut args = line.split_whitespace();
@@ -429,27 +429,28 @@ impl EngineRuntime {
         level_config: &LevelLoadConfig,
         scop_vpath: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let world = WorldLoader::load_from_vfs(vfs, level_config)?;
-        let mut alife = match scop_vpath {
-            Some(path) => AlifeManager::load_from_vfs(vfs, path)?,
+        let alife = match scop_vpath {
+            Some(path) => {
+                let mut alife = AlifeManager::load_from_vfs(vfs, path)?;
+                alife.restore_game_graph(vfs);
+                alife
+            }
             None => AlifeManager::default(),
         };
+        self.load_world_with_alife(vfs, level_config, scop_vpath, alife)
+    }
 
-        // Native saves use global game vertices. Resolve their level even when
-        // different maps happen to use the same local coordinates.
-        if scop_vpath.is_some()
-            && let Ok(spawn) = xray_formats::vfs_bridge::load_all_spawn_from_vfs(vfs, &alife.spawn_name)
-        {
-            if alife.level_name.is_empty()
-                && let Some(actor) = alife.host_actor()
-                && let Some(vertex) = spawn.game_graph.vertices.get(usize::from(actor.game_vertex_id))
-                && let Some(info) = spawn.game_graph.header.levels.iter().find(|l| l.id == vertex.level_id)
-            {
-                alife.level_id = Some(info.id);
-                alife.level_name = info.name.clone();
-                eprintln!("[engine] Auto-resolved alife.level_name from game.graph: {}", alife.level_name);
-            }
-            alife.game_graph = Some(spawn.game_graph);
+    /// Load a level using the save state already parsed during launch.
+    pub fn load_world_with_alife(
+        &mut self,
+        vfs: &VirtualFileSystem,
+        level_config: &LevelLoadConfig,
+        scop_vpath: Option<&str>,
+        mut alife: AlifeManager,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut world = WorldLoader::load_from_vfs(vfs, level_config)?;
+        if self.renderer.is_some() && level_config.resolve_visual_meshes {
+            world.drop_source_geometry();
         }
 
         if alife.entities.is_empty()

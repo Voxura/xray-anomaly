@@ -286,6 +286,27 @@ impl AlifeManager {
         Ok(Self::from_scop(&scop))
     }
 
+    /// Restore the world graph referenced by a native save.
+    pub fn restore_game_graph(&mut self, vfs: &VirtualFileSystem) {
+        let Ok(graph) = xray_formats::vfs_bridge::load_spawn_game_graph_from_vfs(vfs, &self.spawn_name)
+        else {
+            return;
+        };
+        if self.level_name.is_empty()
+            && let Some(actor) = self.host_actor()
+            && let Some(vertex) = graph.vertices.get(usize::from(actor.game_vertex_id))
+            && let Some(info) = graph.header.levels.iter().find(|level| level.id == vertex.level_id)
+        {
+            eprintln!(
+                "[engine] Auto-resolved level from all.spawn game.graph (gvid {}): {}",
+                actor.game_vertex_id, info.name
+            );
+            self.level_id = Some(info.id);
+            self.level_name = info.name.clone();
+        }
+        self.game_graph = Some(graph);
+    }
+
     /// Insert or replace an entity while maintaining `host_actor_id`, `story_id_index`, and `next_dynamic_id`.
     pub fn insert_entity(&mut self, entity: LiveAlifeEntity) {
         if matches!(entity.role, EntityRole::LocalHostActor) || entity.id == 0 {
