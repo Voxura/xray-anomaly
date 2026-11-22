@@ -33,6 +33,9 @@ pub struct PostprocessPushConstants {
     pub color_grading_enabled: u32,
 }
 
+/// Monolith's extended Reinhard SDR pass with an optional Uncharted 2 curve.
+pub const MONOLITH_SDR_TONEMAP: u32 = 4;
+
 const _: () = assert!(std::mem::size_of::<PostprocessPushConstants>() == 32);
 
 impl Default for PostprocessPushConstants {

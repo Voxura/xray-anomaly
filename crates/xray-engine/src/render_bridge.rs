@@ -41,6 +41,7 @@ use xray_formats::ogf::{
     matrix_mul_44, matrix_set_xyz_translate, matrix_transform_point, vector_generate_orthonormal_basis, OgfModel,
     OgfVisualType, StaticVertex, XRayMatrix, XRAY_IDENTITY_MATRIX,
 };
+use xray_formats::postprocess::TonemapParams;
 use xray_formats::shaders_xr::{EngineShaderLibrary, R4BlenderSpec};
 use xray_formats::spawns::INVALID_OBJECT_ID;
 use xray_formats::sun::{build_3split_csm_atlas, CsmAtlasPacking, CsmAtlasPlan, SunCascadeConfig};
@@ -56,7 +57,7 @@ use xray_render_dx12::geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
 use xray_render_dx12::geometry::HudBlend;
 use xray_render_dx12::lighting::GpuLight;
 use xray_render_dx12::particle::GpuParticleInstance;
-use xray_render_dx12::postprocess::PostprocessPushConstants;
+use xray_render_dx12::postprocess::{MONOLITH_SDR_TONEMAP, PostprocessPushConstants};
 use xray_render_dx12::rain::RainPushConstants;
 use xray_render_dx12::renderer::Dx12Renderer;
 use xray_render_dx12::shadow::CascadedShadowAtlas;
@@ -306,6 +307,7 @@ pub struct RenderBridge {
     ui_font: Option<UiFontResource>,
     pause_font_height: u32,
     pause_fonts: BTreeMap<&'static str, Option<UiFontResource>>,
+    native_tonemap: Option<TonemapParams>,
     inventory_fonts: BTreeMap<&'static str, UiFontResource>,
     ui_font_attempted: bool,
     ui_equipment_tex: Option<DescriptorIndex>,
@@ -361,6 +363,7 @@ impl RenderBridge {
             ui_font: None,
             pause_font_height: 0,
             pause_fonts: BTreeMap::new(),
+            native_tonemap: None,
             inventory_fonts: BTreeMap::new(),
             ui_font_attempted: false,
             ui_equipment_tex: None,
@@ -820,6 +823,35 @@ impl RenderBridge {
         self.pause_fonts.clear();
     }
 
+    pub(crate) fn load_tonemap_profile(&mut self, profile: &str) {
+        let mut tonemap = TonemapParams::default();
+        let mut has_native_settings = false;
+        for line in profile.lines() {
+            let mut words = line.split_whitespace();
+            let (Some(cvar), Some(value)) = (words.next(), words.next()) else { continue };
+            let Some(parameter) = cvar.strip_prefix("r2_tnmp_") else { continue };
+            let Ok(value) = value.parse::<f32>() else { continue };
+            if !(0.0..=20.0).contains(&value) {
+                continue;
+            }
+            match parameter {
+                "a" => tonemap.a = value,
+                "b" => tonemap.b = value,
+                "c" => tonemap.c = value,
+                "d" => tonemap.d = value,
+                "e" => tonemap.e = value,
+                "f" => tonemap.f = value,
+                "w" => tonemap.w = value,
+                "exposure" => tonemap.exposure = value,
+                "gamma" => tonemap.gamma = value,
+                "onoff" if value <= 1.0 => tonemap.enabled = value == 1.0,
+                _ => continue,
+            }
+            has_native_settings = true;
+        }
+        self.native_tonemap = has_native_settings.then_some(tonemap);
+    }
+
     /// Execute all 7 DX12 render graph passes plus Inventory, PDA, Dialogue, Travel Prompt & Loading Screen UI.
     #[allow(clippy::too_many_arguments)]
     pub fn render_frame_with_transition(
@@ -1039,7 +1071,10 @@ impl RenderBridge {
         // ---------------------------------------------------------------------
         let width = renderer.width.max(1);
         let height = renderer.height.max(1);
-        if let Some(e) = env {
+        let native_tonemap = self.native_tonemap.filter(|_| self.config.tonemap_mode == 0);
+        if let Some(tonemap) = native_tonemap {
+            renderer.postprocess_manager_mut().tonemap = tonemap;
+        } else if let Some(e) = env {
             let pp = renderer.postprocess_manager_mut();
             pp.tonemap.exposure = e.bloom_exposure.max(0.5);
         }
@@ -1049,7 +1084,7 @@ impl RenderBridge {
             bloom_factor: self.config.bloom_factor,
             scene_texture_index: hdr_srv.0,
             bloom_texture_index: u32::MAX,
-            tonemap_mode: self.config.tonemap_mode,
+            tonemap_mode: native_tonemap.map_or(self.config.tonemap_mode, |_| MONOLITH_SDR_TONEMAP),
             color_grading_enabled: 0,
         };
         renderer.draw_postprocess(&post_push)?;

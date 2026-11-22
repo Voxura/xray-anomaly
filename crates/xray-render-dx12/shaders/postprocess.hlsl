@@ -8,7 +8,7 @@ cbuffer PostprocessConstants : register(b0)
     float bloom_factor;
     uint scene_texture_index;
     uint bloom_texture_index;
-    uint tonemap_mode; // 0 = Uncharted 2 / Filmic, 1 = ACES, 2 = Reinhard, 3 = Linear / Pass-through
+    uint tonemap_mode; // 0 = Uncharted 2, 1 = ACES, 2 = Reinhard, 3 = Pass-through, 4 = Monolith SDR
     uint color_grading_enabled;
 };
 
@@ -123,6 +123,18 @@ float4 ps_postprocess(PostprocessVSOutput input) : SV_Target
     {
         // Reinhard
         ldr_color = reinhard_tonemap(hdr_color);
+    }
+    else if (tonemap_mode == 4)
+    {
+        // common_functions.h writes the extended Reinhard result to the low buffer.
+        const float white = 1.7;
+        ldr_color = hdr_color * (1.0 + hdr_color / (white * white)) / (1.0 + hdr_color);
+        // combine_2_naa.ps optionally applies its separate filmic curve and gamma.
+        if (tnmp_gamma_onoff.y == 1.0)
+        {
+            ldr_color = uncharted2_tonemap(ldr_color, tnmp_abcd, tnmp_efw_exposure);
+            ldr_color = pow(ldr_color, 1.0 / max(tnmp_gamma_onoff.x, 0.001));
+        }
     }
     else
     {

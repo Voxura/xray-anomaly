@@ -422,6 +422,29 @@ fn test_postprocess_uncharted2_tonemap_hardware_readback() {
         expected_u8,
         diff
     );
+
+    renderer.postprocess_manager_mut().tonemap.enabled = false;
+    renderer.begin_frame().unwrap();
+    renderer.draw_postprocess(&PostprocessPushConstants {
+        tonemap_mode: xray_render_dx12::postprocess::MONOLITH_SDR_TONEMAP,
+        ..push
+    }).unwrap();
+    let cmd = renderer.current_cmd_list.as_ref().unwrap();
+    let backbuffer = renderer.swapchain.as_ref().unwrap().current_backbuffer_resource();
+    let src = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: ManuallyDrop::new(Some(backbuffer.clone())),
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+    };
+    transition(cmd, backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    unsafe { cmd.CopyTextureRegion(&dst, 0, 0, 0, &src, None) };
+    transition(cmd, backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    renderer.end_frame(false).unwrap();
+    renderer.wait_for_gpu().unwrap();
+
+    let px = readback_rgba8(&readback, 64, 64, 32, 32);
+    let expected_sdr = (in_hdr * (1.0 + in_hdr / (1.7 * 1.7)) / (1.0 + in_hdr) * 255.0).round() as i32;
+    assert!((i32::from(px[0]) - expected_sdr).abs() <= 2, "Monolith SDR with filmic disabled: {px:?}");
 }
 
 #[test]

@@ -188,6 +188,9 @@ impl EngineRuntime {
     /// Attach a shared [`VirtualFileSystem`] for on-demand dynamic model/texture/audio streaming.
     pub fn attach_vfs(&mut self, vfs: Arc<VirtualFileSystem>) {
         if let Ok(profile) = vfs.read_to_string_lossy("user.ltx") {
+            if let Some(bridge) = &mut self.render_bridge {
+                bridge.load_tonemap_profile(&profile);
+            }
             for line in profile.lines() {
                 let mut args = line.split_whitespace();
                 let (Some(command @ ("fov" | "hud_fov" | "rs_vis_distance")), Some(value)) =
