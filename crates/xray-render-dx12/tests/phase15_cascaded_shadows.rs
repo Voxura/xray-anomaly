@@ -392,7 +392,7 @@ fn test_csm_deferred_combine_hardware_readback() {
     .expect("CascadedShadowAtlas::new failed");
 
     let config = SunCascadeConfig::default();
-    let plan = build_3split_csm_atlas(
+    let mut plan = build_3split_csm_atlas(
         &config,
         [0.0, 0.0, 0.0],
         [0.0, 0.0, 1.0],
@@ -407,15 +407,20 @@ fn test_csm_deferred_combine_hardware_readback() {
     )
     .expect("build_3split_csm_atlas failed");
 
+    // Render a single surface as both caster and receiver. The signed receiver
+    // bias should keep it lit when both passes produce the same depth.
+    plan.slots[0].view_proj = XRAY_IDENTITY_MATRIX;
+    plan.slots[0].col_major_view_proj = XRAY_IDENTITY_MATRIX;
+    plan.slots[0].depth_bias = -0.01;
     atlas.update_plan(plan).expect("update_plan failed");
 
     renderer.begin_frame().expect("begin_frame failed");
 
     // Clear and rasterize into CSM atlas
-    let cmd = renderer.current_cmd_list.as_ref().unwrap();
-    atlas.begin_atlas_pass(cmd);
-    atlas.set_cascade_viewport(cmd, 0);
-    atlas.end_atlas_pass(cmd);
+    renderer.update_camera(&identity_camera()).unwrap();
+    atlas.begin_atlas_pass(renderer.current_cmd_list.as_ref().unwrap());
+    renderer.draw_csm_shadow_mesh(&atlas, 0, quad, u32::MAX).unwrap();
+    atlas.end_atlas_pass(renderer.current_cmd_list.as_ref().unwrap());
 
     // Render G-Buffer
     let cam = identity_camera();
@@ -435,7 +440,7 @@ fn test_csm_deferred_combine_hardware_readback() {
 
     // Execute Deferred Combine with 3-split CSM
     let mut light_params = GpuLightParams::default();
-    light_params.sun_direction = [0.0, 1.0, 0.0, 0.0];
+    light_params.sun_direction = [0.0, 0.0, -1.0, 0.0];
     light_params.sun_color = [1.0, 1.0, 1.0, 1.0];
     light_params.ambient_color = [0.2, 0.2, 0.2, 1.0];
 
@@ -512,9 +517,7 @@ fn test_csm_deferred_combine_hardware_readback() {
 
     // Read back pixel at quad center
     let center_px = readback_rgba8(&readback, 64, 64, 32, 32);
-    // Verified on AMD GPU: Ambient + Direct illumination produces visible non-zero pixel
-    assert!(center_px[0] > 0 || center_px[1] > 0 || center_px[2] > 0,
-        "CSM deferred combine center pixel should receive illumination, got {:?}", center_px);
+    assert!(center_px[0] > 200, "the surface should receive direct sunlight, got {center_px:?}");
 }
 
 #[test]

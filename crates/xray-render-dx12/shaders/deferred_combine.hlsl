@@ -34,6 +34,8 @@ cbuffer LightParams : register(b2)
     float4 SunColor;
     float4 AmbientColor;
     column_major float4x4 SunViewProj;
+    float4 FogColor;
+    float4 FogRange; // [near, far, 0, 0]
 };
 
 cbuffer CsmSplitUniforms : register(b3)
@@ -107,7 +109,8 @@ float sample_csm_cascade(Texture2D shadow_tex, uint cascade_idx, float3 world_po
     atlas_uv = clamp(atlas_uv, csm_cascade_uv_clamp[cascade_idx].xy, csm_cascade_uv_clamp[cascade_idx].zw);
 
     float depth_bias = csm_cascade_bias_texel[cascade_idx].x;
-    float shadow_depth = saturate(shadow_ndc.z - depth_bias);
+    // The cascade stores a signed depth translation, like R4's m_TexelAdjust.
+    float shadow_depth = saturate(shadow_ndc.z + depth_bias);
 
     // 4-tap PCF filtering using atlas dimensions
     float2 texel_size = csm_atlas_dims_inv.zw;
@@ -305,5 +308,12 @@ float4 ps_deferred_combine(VSOutput input) : SV_Target0
     }
 
     float3 final_hdr = sun_diffuse + sun_specular + albedo_sample.rgb * dynamic_light_accum + ambient + volumetric_shafts;
+    // Monolith's combine applies weather fog to the lit scene before tonemapping.
+    if (FogRange.y > FogRange.x)
+    {
+        float distance_to_eye = length(world_pos - cam_pos.xyz);
+        float fog = saturate((distance_to_eye - FogRange.x) / (FogRange.y - FogRange.x));
+        final_hdr = lerp(final_hdr, FogColor.rgb, fog);
+    }
     return float4(final_hdr, 1.0);
 }

@@ -186,6 +186,8 @@ pub struct GpuLightParams {
     pub sun_color: [f32; 4],
     pub ambient_color: [f32; 4],
     pub sun_view_proj: [[f32; 4]; 4],
+    pub fog_color: [f32; 4],
+    pub fog_range: [f32; 4],
 }
 
 impl Default for GpuLightParams {
@@ -199,6 +201,8 @@ impl Default for GpuLightParams {
             sun_color: [1.0, 1.0, 1.0, 1.0],
             ambient_color: [0.1, 0.1, 0.1, 1.0],
             sun_view_proj,
+            fog_color: [0.0; 4],
+            fog_range: [0.0; 4],
         }
     }
 }

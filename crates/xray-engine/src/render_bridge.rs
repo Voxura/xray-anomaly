@@ -1016,12 +1016,14 @@ impl RenderBridge {
         let light_params = GpuLightParams {
             sun_direction: [
                 -sun_dir_to_surface[0],
-                (-sun_dir_to_surface[1]).abs().max(0.35),
+                -sun_dir_to_surface[1],
                 -sun_dir_to_surface[2],
                 0.0,
             ],
             sun_color: [sun_rgb[0], sun_rgb[1], sun_rgb[2], 1.0],
             ambient_color: [ambient_rgb[0], ambient_rgb[1], ambient_rgb[2], 1.0],
+            fog_color: env.map_or([0.0; 4], |weather| weather.fog_color_rgba()),
+            fog_range: env.map_or([0.0; 4], |weather| [weather.fog_near, weather.fog_far, 0.0, 0.0]),
             ..Default::default()
         };
 
@@ -1668,10 +1670,11 @@ fn extract_lighting_env(env: Option<&MixedEnvironment>) -> ([f32; 3], [f32; 3], 
         } else {
             [0.45, -0.78, 0.43]
         };
-        let mut amb = e.effective_ambient_rgb(0.5);
-        amb[0] = amb[0].max(0.28);
-        amb[1] = amb[1].max(0.30);
-        amb[2] = amb[2].max(0.34);
+        // R4 phase_combine doubles the environment ambient and uses a 0.001 floor.
+        // Keep the current hemispherical estimate until the environment probes are sampled here.
+        let amb = std::array::from_fn(|axis| {
+            (2.0 * e.ambient_color[axis]).max(0.001) + 0.5 * e.hemi_color[axis]
+        });
         (dir, e.sun_color, amb)
     } else {
         ([0.45, -0.78, 0.43], [1.0, 0.94, 0.85], [0.28, 0.30, 0.34])
