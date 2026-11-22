@@ -41,7 +41,7 @@ use xray_formats::ogf::{
     matrix_mul_44, matrix_set_xyz_translate, matrix_transform_point, vector_generate_orthonormal_basis, OgfModel,
     OgfVisualType, StaticVertex, XRayMatrix, XRAY_IDENTITY_MATRIX,
 };
-use xray_formats::postprocess::TonemapParams;
+use xray_formats::postprocess::{LuminanceConfig, TonemapParams};
 use xray_formats::shaders_xr::{EngineShaderLibrary, R4BlenderSpec};
 use xray_formats::spawns::INVALID_OBJECT_ID;
 use xray_formats::sun::{build_3split_csm_atlas, CsmAtlasPacking, CsmAtlasPlan, SunCascadeConfig};
@@ -308,6 +308,7 @@ pub struct RenderBridge {
     pause_font_height: u32,
     pause_fonts: BTreeMap<&'static str, Option<UiFontResource>>,
     native_tonemap: Option<TonemapParams>,
+    native_middle_gray: [f32; 4],
     inventory_fonts: BTreeMap<&'static str, UiFontResource>,
     ui_font_attempted: bool,
     ui_equipment_tex: Option<DescriptorIndex>,
@@ -364,6 +365,7 @@ impl RenderBridge {
             pause_font_height: 0,
             pause_fonts: BTreeMap::new(),
             native_tonemap: None,
+            native_middle_gray: [1.0, 0.0, 1.0, 0.0],
             inventory_fonts: BTreeMap::new(),
             ui_font_attempted: false,
             ui_equipment_tex: None,
@@ -825,12 +827,32 @@ impl RenderBridge {
 
     pub(crate) fn load_tonemap_profile(&mut self, profile: &str) {
         let mut tonemap = TonemapParams::default();
+        let mut luminance = LuminanceConfig::default();
         let mut has_native_settings = false;
         for line in profile.lines() {
             let mut words = line.split_whitespace();
             let (Some(cvar), Some(value)) = (words.next(), words.next()) else { continue };
-            let Some(parameter) = cvar.strip_prefix("r2_tnmp_") else { continue };
+            if cvar == "r2_tonemap" {
+                match value {
+                    "on" | "1" => luminance.tonemap_enabled = true,
+                    "off" | "0" => luminance.tonemap_enabled = false,
+                    _ => {}
+                }
+                has_native_settings = true;
+                continue;
+            }
             let Ok(value) = value.parse::<f32>() else { continue };
+            if cvar.starts_with("r2_tonemap_") {
+                match cvar {
+                    "r2_tonemap_middlegray" if (0.0..=2.0).contains(&value) => luminance.middle_gray = value,
+                    "r2_tonemap_lowlum" if (0.0001..=1.0).contains(&value) => luminance.low_lum = value,
+                    "r2_tonemap_amount" if (0.0..=1.0).contains(&value) => luminance.amount = value,
+                    _ => continue,
+                }
+                has_native_settings = true;
+                continue;
+            }
+            let Some(parameter) = cvar.strip_prefix("r2_tnmp_") else { continue };
             if !(0.0..=20.0).contains(&value) {
                 continue;
             }
@@ -850,6 +872,13 @@ impl RenderBridge {
             has_native_settings = true;
         }
         self.native_tonemap = has_native_settings.then_some(tonemap);
+        let amount = if luminance.tonemap_enabled { luminance.amount } else { 0.0 };
+        self.native_middle_gray = [
+            1.0 + (luminance.middle_gray - 1.0) * amount,
+            amount,
+            1.0 + (luminance.low_lum - 1.0) * amount,
+            0.0,
+        ];
     }
 
     /// Execute all 7 DX12 render graph passes plus Inventory, PDA, Dialogue, Travel Prompt & Loading Screen UI.
@@ -1073,7 +1102,9 @@ impl RenderBridge {
         let height = renderer.height.max(1);
         let native_tonemap = self.native_tonemap.filter(|_| self.config.tonemap_mode == 0);
         if let Some(tonemap) = native_tonemap {
-            renderer.postprocess_manager_mut().tonemap = tonemap;
+            let settings = renderer.postprocess_manager_mut();
+            settings.tonemap = tonemap;
+            settings.middle_gray = self.native_middle_gray;
         } else if let Some(e) = env {
             let pp = renderer.postprocess_manager_mut();
             pp.tonemap.exposure = e.bloom_exposure.max(0.5);

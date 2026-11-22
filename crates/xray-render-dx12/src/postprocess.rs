@@ -93,7 +93,7 @@ impl PostprocessRenderer {
         // Param 3: Bindless texture table (t0, space 0)
         let mut textures = D3D12_ROOT_PARAMETER::default();
         textures.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        textures.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        textures.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         let srv_range = D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
             NumDescriptors: u32::MAX,
@@ -106,7 +106,15 @@ impl PostprocessRenderer {
             pDescriptorRanges: &srv_range,
         };
 
-        let parameters = [push, tonemap, img_correct, textures];
+        let mut luminance = D3D12_ROOT_PARAMETER::default();
+        luminance.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        luminance.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+        luminance.Anonymous.Constants = D3D12_ROOT_CONSTANTS {
+            ShaderRegister: 3,
+            RegisterSpace: 0,
+            Num32BitValues: 4,
+        };
+        let parameters = [push, tonemap, img_correct, textures, luminance];
 
         let sampler = D3D12_STATIC_SAMPLER_DESC {
             Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -118,7 +126,7 @@ impl PostprocessRenderer {
             MaxLOD: f32::MAX,
             ShaderRegister: 0,
             RegisterSpace: 0,
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             ..Default::default()
         };
 
@@ -255,6 +263,7 @@ impl PostprocessRenderer {
         bindless_heap: &ID3D12DescriptorHeap,
         tonemap: &TonemapGpuParams,
         img_correct: &ImageCorrectionGpuParams,
+        middle_gray: &[f32; 4],
         push: &PostprocessPushConstants,
         rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
         width: u32,
@@ -288,6 +297,7 @@ impl PostprocessRenderer {
                 3,
                 bindless_heap.GetGPUDescriptorHandleForHeapStart(),
             );
+            cmd.SetGraphicsRoot32BitConstants(4, 4, middle_gray.as_ptr().cast(), 0);
 
             cmd.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: 0.0,
@@ -317,6 +327,8 @@ impl PostprocessRenderer {
 /// High-level coordinator managing post-processing tonemap, bloom, and color correction constants
 pub struct PostprocessManager {
     pub tonemap: TonemapParams,
+    /// Target gray, luminance weight and minimum luminance for Monolith SDR.
+    pub middle_gray: [f32; 4],
     pub image_correction: ImageCorrectionConfig,
     pub bloom: BloomConfig,
     pub bloom_adapt: BloomAdaptState,
@@ -332,6 +344,7 @@ impl PostprocessManager {
     pub fn new() -> Self {
         Self {
             tonemap: TonemapParams::default(),
+            middle_gray: [1.0, 0.0, 1.0, 0.0],
             image_correction: ImageCorrectionConfig::default(),
             bloom: BloomConfig::default(),
             bloom_adapt: BloomAdaptState::default(),

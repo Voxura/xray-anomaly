@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_FENCE_FLAG_NONE, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
     D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
     D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET,
     D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_VIEWPORT,
 };
@@ -1085,16 +1086,37 @@ impl Dx12Renderer {
             None => return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32))),
         };
         let rtv = sc.current_rtv_handle();
+        let scene_for_exposure = if push.tonemap_mode == crate::postprocess::MONOLITH_SDR_TONEMAP
+            && settings.middle_gray[1] > 0.0
+        {
+            self.get_texture_by_index(DescriptorIndex(push.scene_texture_index))
+                .map(|texture| &texture.resource)
+                .or_else(|| {
+                    let targets = self.gbuffer.as_ref()?.targets.as_ref()?;
+                    (targets.hdr_srv.0 == push.scene_texture_index).then_some(&targets.hdr_accumulation)
+                })
+        } else {
+            None
+        };
+        let pixel_read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        let shader_read = pixel_read | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        if let Some(scene) = scene_for_exposure {
+            unsafe { cmd.ResourceBarrier(&[crate::deferred::transition_barrier(scene, pixel_read, shader_read)]) };
+        }
         postprocess.render(
             cmd,
             &self.bindless_heap,
             &settings.tonemap.to_gpu_params(),
             &settings.image_correction.to_gpu_params(),
+            if scene_for_exposure.is_some() { &settings.middle_gray } else { &[1.0, 0.0, 1.0, 0.0] },
             push,
             rtv,
             self.width,
             self.height,
         );
+        if let Some(scene) = scene_for_exposure {
+            unsafe { cmd.ResourceBarrier(&[crate::deferred::transition_barrier(scene, shader_read, pixel_read)]) };
+        }
         Ok(())
     }
 

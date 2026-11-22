@@ -20,7 +20,7 @@ fn failure() -> Error {
     Error::from_hresult(HRESULT(0x80004005u32 as i32))
 }
 
-fn transition_barrier(
+pub(crate) fn transition_barrier(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,

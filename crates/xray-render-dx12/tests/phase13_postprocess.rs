@@ -423,7 +423,9 @@ fn test_postprocess_uncharted2_tonemap_hardware_readback() {
         diff
     );
 
-    renderer.postprocess_manager_mut().tonemap.enabled = false;
+    let settings = renderer.postprocess_manager_mut();
+    settings.tonemap.enabled = false;
+    settings.middle_gray = [1.5, 1.0, 0.5, 0.0];
     renderer.begin_frame().unwrap();
     renderer.draw_postprocess(&PostprocessPushConstants {
         tonemap_mode: xray_render_dx12::postprocess::MONOLITH_SDR_TONEMAP,
@@ -443,7 +445,8 @@ fn test_postprocess_uncharted2_tonemap_hardware_readback() {
     renderer.wait_for_gpu().unwrap();
 
     let px = readback_rgba8(&readback, 64, 64, 32, 32);
-    let expected_sdr = (in_hdr * (1.0 + in_hdr / (1.7 * 1.7)) / (1.0 + in_hdr) * 255.0).round() as i32;
+    let exposed = in_hdr * 1.5 / (in_hdr + 0.5);
+    let expected_sdr = (exposed * (1.0 + exposed / (1.7 * 1.7)) / (1.0 + exposed) * 255.0).round() as i32;
     assert!((i32::from(px[0]) - expected_sdr).abs() <= 2, "Monolith SDR with filmic disabled: {px:?}");
 }
 

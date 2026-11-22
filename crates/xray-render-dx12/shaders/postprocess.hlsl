@@ -26,6 +26,11 @@ cbuffer ImageCorrectionConstants : register(b2)
     float4 vignette_control; // (center_x, center_y, radius, intensity)
 };
 
+cbuffer SceneExposureConstants : register(b3)
+{
+    float4 middle_gray; // [target gray, luminance weight, minimum luminance, 0]
+};
+
 Texture2D g_textures[] : register(t0);
 SamplerState g_sampler : register(s0);
 
@@ -33,6 +38,7 @@ struct PostprocessVSOutput
 {
     float4 position : SV_Position;
     float2 uv : TEXCOORD0;
+    nointerpolation float exposure : TEXCOORD1;
 };
 
 // Procedural fullscreen triangle (0..2) covering the entire NDC quad [-1, 1]
@@ -45,6 +51,23 @@ PostprocessVSOutput vs_postprocess(uint vertex_id : SV_VertexID)
     float2 pos = float2((vertex_id == 2) ? 3.0 : -1.0, (vertex_id == 1) ? 3.0 : -1.0);
     output.position = float4(pos, 0.0, 1.0);
     output.uv = float2(pos.x * 0.5 + 0.5, 1.0 - (pos.y * 0.5 + 0.5));
+    output.exposure = 1.0;
+    if (tonemap_mode == 4 && middle_gray.y > 0.0 && scene_texture_index != 0xFFFFFFFF)
+    {
+        // Estimate the average HDR luminance on the same 8x8 grid as the final
+        // Monolith reduction. The fullscreen triangle shares a single exposure.
+        Texture2D scene = g_textures[NonUniformResourceIndex(scene_texture_index)];
+        float brightness = 0.0;
+        for (uint y = 0; y < 8; ++y)
+        {
+            for (uint x = 0; x < 8; ++x)
+            {
+                float3 color = scene.SampleLevel(g_sampler, (float2(x, y) + 0.5) / 8.0, 0).rgb;
+                brightness += dot(color, float3(0.2125, 0.7154, 0.0721));
+            }
+        }
+        output.exposure = middle_gray.x / max((brightness / 64.0) * middle_gray.y + middle_gray.z, 0.0001);
+    }
     return output;
 }
 
@@ -128,7 +151,8 @@ float4 ps_postprocess(PostprocessVSOutput input) : SV_Target
     {
         // common_functions.h writes the extended Reinhard result to the low buffer.
         const float white = 1.7;
-        ldr_color = hdr_color * (1.0 + hdr_color / (white * white)) / (1.0 + hdr_color);
+        float3 exposed = hdr_color * input.exposure;
+        ldr_color = exposed * (1.0 + exposed / (white * white)) / (1.0 + exposed);
         // combine_2_naa.ps optionally applies its separate filmic curve and gamma.
         if (tnmp_gamma_onoff.y == 1.0)
         {
