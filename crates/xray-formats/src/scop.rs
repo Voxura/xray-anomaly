@@ -1687,6 +1687,8 @@ impl ScopSaveFile {
         };
 
         let mut weather = ScopWeatherState {
+            current_weather: String::new(),
+            next_weather: String::new(),
             cycle_time_sec: ScopWeatherState::cycle_seconds_from_date_time(save.time.date_time()),
             ..Default::default()
         };

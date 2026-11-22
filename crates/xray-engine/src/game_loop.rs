@@ -126,6 +126,7 @@ pub struct EngineRuntime {
     pub running: bool,
     pause_menu: PauseMenu,
     backpack_animations: bool,
+    visibility_scale: f32,
 }
 
 impl EngineRuntime {
@@ -180,11 +181,36 @@ impl EngineRuntime {
             running: true,
             pause_menu: PauseMenu::default(),
             backpack_animations: true,
+            visibility_scale: 1.0,
         })
     }
 
     /// Attach a shared [`VirtualFileSystem`] for on-demand dynamic model/texture/audio streaming.
     pub fn attach_vfs(&mut self, vfs: Arc<VirtualFileSystem>) {
+        if let Ok(profile) = vfs.read_to_string_lossy("user.ltx") {
+            for line in profile.lines() {
+                let mut args = line.split_whitespace();
+                let (Some(command @ ("fov" | "hud_fov" | "rs_vis_distance")), Some(value)) =
+                    (args.next(), args.next())
+                else {
+                    continue;
+                };
+                let Ok(value) = value.parse::<f32>() else { continue };
+                match command {
+                    "fov" if (5.0..180.0).contains(&value) => {
+                        self.camera.fov_deg = value;
+                        self.hud_weapon.base_world_fov_deg = value;
+                    }
+                    "hud_fov" if (0.1..=1.0).contains(&value) => {
+                        self.hud_weapon.base_hud_fov_factor = value;
+                    }
+                    "rs_vis_distance" if (0.4..=1.5).contains(&value) => {
+                        self.visibility_scale = value;
+                    }
+                    _ => {}
+                }
+            }
+        }
         self.pause_menu.reset_layouts();
         if let Some(bridge) = &mut self.render_bridge {
             bridge.reset_pause_fonts();
@@ -340,6 +366,7 @@ impl EngineRuntime {
         self.hud.stamina = self.inventory.actor_stats.stamina.clamp(0.0, 1.0);
         if let Some(world) = &mut self.world {
             world.weather.apply_scop_weather(&alife.weather_snapshot);
+            world.weather.time_factor = alife.time_factor;
         }
         let lvl = canonical_level_name(&alife.level_name);
         self.alife = Some(alife);
@@ -427,24 +454,39 @@ impl EngineRuntime {
         {
             alife.seed_from_level_spawn(&world.level_dir, spawn);
         }
+        let companion = scop_vpath.and_then(|path| {
+            let path = format!("{}.scoc", path.trim_end_matches(".scop"));
+            xray_formats::vfs_bridge::load_scoc_from_vfs(vfs, &path).ok()
+        });
+        if alife.weather_snapshot.current_weather.is_empty()
+            && let Some(weather) = companion.as_ref().and_then(|save| save.root.get_str("weather_manager"))
+                .and_then(|value| value.as_table())
+        {
+            let cycle = |key| {
+                weather.get_str(key)?.as_xray_string().filter(|name| {
+                    !name.is_empty() && world.weather.weather_lib.as_ref().is_none_or(|lib| lib.cycles.contains_key(name))
+                })
+            };
+            // Anomaly's WeatherManager keeps the active preset in script-side m_data.
+            if let Some(current) = ["curr_weather", "weather_file", "preset"].into_iter().find_map(cycle) {
+                alife.weather_snapshot.next_weather = cycle("next_weather").unwrap_or_else(|| current.clone());
+                alife.weather_snapshot.current_weather = current;
+                eprintln!("[engine] Restored weather cycle from companion save: {}", alife.weather_snapshot.current_weather);
+            }
+        }
         self.attach_world(world);
         self.attach_alife(alife);
 
-        if let Some(scop_path) = scop_vpath {
-            let scoc_vpath = scop_path.trim_end_matches(".scop").to_string() + ".scoc";
-            if vfs.exists(&scoc_vpath) {
-                if let Ok(scoc) = xray_formats::vfs_bridge::load_scoc_from_vfs(vfs, &scoc_vpath) {
-                    let peer = scoc.extract_peer_state();
-                    if !peer.inventory.is_empty() {
-                        eprintln!(
-                            "[engine] Loaded {} inventory items from companion .scoc state",
-                            peer.inventory.len()
-                        );
-                        self.attach_host_scoc(&scoc);
-                    } else {
-                        self.inventory.restore_saved_item_uses(&peer);
-                    }
-                }
+        if let Some(scoc) = companion {
+            let peer = scoc.extract_peer_state();
+            if !peer.inventory.is_empty() {
+                eprintln!(
+                    "[engine] Loaded {} inventory items from companion .scoc state",
+                    peer.inventory.len()
+                );
+                self.attach_host_scoc(&scoc);
+            } else {
+                self.inventory.restore_saved_item_uses(&peer);
             }
         }
 
@@ -957,12 +999,14 @@ impl EngineRuntime {
         ));
 
         if let Some(world) = &mut self.world {
-            world.step_weather(
+            if let Some(env) = world.step_weather(
                 dt,
                 self.camera.position,
                 self.camera.forward(),
-                self.camera.far_z,
-            );
+                self.visibility_scale,
+            ) && env.far_plane.is_finite() && env.far_plane > self.camera.near_z {
+                self.camera.far_z = env.far_plane;
+            }
 
             let (wind_vel, rain_dens) = world
                 .weather

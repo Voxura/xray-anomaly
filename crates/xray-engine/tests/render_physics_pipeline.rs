@@ -17,7 +17,7 @@ use xray_formats::cform::{CformModel, CformTriangle};
 use xray_formats::chunk::ChunkWriter;
 use xray_formats::level::{d3d_decl_type, d3d_decl_usage, d3d_light_type, level_chunks, VertexElement9};
 use xray_formats::ogf::{fvf_flags, ogf_chunks, OgfVisualType};
-use xray_formats::scoc::{ScocFile, ScocInventoryItem, ScocPeerState};
+use xray_formats::scoc::{ScocFile, ScocInventoryItem, ScocPeerState, ScocTable, ScocValue};
 use xray_formats::scop::{
     ScopActorStats, ScopAlifeEntity, ScopAlifePayload, ScopGraphAndQuests, ScopHeader,
     ScopSaveFile, ScopWeatherState,
@@ -487,8 +487,16 @@ fn test_full_dx12_7stage_render_graph_and_capsule_physics_loop() {
     )
     .unwrap();
 
-    let (scop, scoc) = build_test_save_and_scoc();
+    let (mut scop, scoc) = build_test_save_and_scoc();
+    scop.weather.current_weather.clear();
+    scop.weather.next_weather.clear();
     fs::write(save_dir.join("honey_host.scop"), scop.to_bytes().unwrap()).unwrap();
+    let mut weather = ScocTable::default();
+    weather.set_str("curr_weather", ScocValue::string("w_storm"));
+    let mut companion = ScocFile::default();
+    companion.root.set_str("weather_manager", ScocValue::Table(weather));
+    fs::write(save_dir.join("honey_host.scoc"), companion.to_bytes().unwrap()).unwrap();
+    fs::write(temp.0.join("user.ltx"), "fov 91.\nhud_fov 0.45\nrs_vis_distance 0.7\n").unwrap();
     let scoc_bytes = scoc.to_bytes().unwrap();
 
     let mut vfs = VirtualFileSystem::new();
@@ -525,6 +533,9 @@ fn test_full_dx12_7stage_render_graph_and_capsule_physics_loop() {
             Some("savedgames/honey_host.scop"),
         )
         .expect("stream world and .scop onto DX12 runtime");
+    assert_eq!(runtime.world.as_ref().unwrap().weather.active_cycle, "w_storm");
+    assert_eq!(runtime.camera.fov_deg, 91.0);
+    assert_eq!(runtime.hud_weapon.base_world_fov_deg, 91.0);
 
     let peer_id = runtime
         .alife
