@@ -18,6 +18,14 @@ pub struct XRayVertex {
     pub tangent: [f32; 3],
 }
 
+/// Viewmodel vertex with the full skinned OGF tangent frame.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HudVertex {
+    pub vertex: XRayVertex,
+    pub bitangent: [f32; 3],
+}
+
 /// Matrices are column-major, multiplying column vectors in HLSL.
 #[repr(C, align(256))]
 #[derive(Debug, Clone, Copy, Default)]
@@ -30,6 +38,8 @@ pub struct CameraConstants {
 }
 
 const _: () = assert!(std::mem::size_of::<XRayVertex>() == 44);
+const _: () = assert!(std::mem::offset_of!(HudVertex, bitangent) == 44);
+const _: () = assert!(std::mem::size_of::<HudVertex>() == 56);
 const _: () = assert!(std::mem::size_of::<CameraConstants>() == 256);
 const _: () = assert!(std::mem::align_of::<CameraConstants>() == 256);
 

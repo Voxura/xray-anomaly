@@ -188,7 +188,16 @@ pub struct GpuLightParams {
     pub sun_view_proj: [[f32; 4]; 4],
     pub fog_color: [f32; 4],
     pub fog_range: [f32; 4],
+    pub hud_projection: [f32; 4],
+    pub hud_environment_color: [f32; 4],
+    pub hud_ambient_hemi: [f32; 4],
+    pub hud_environment_indices: [u32; 4],
+    pub hud_hemi_positive: [f32; 4],
+    pub hud_hemi_negative: [f32; 4],
+    pub _padding: [u32; 4],
 }
+
+const _: () = assert!(std::mem::size_of::<GpuLightParams>() == 256);
 
 impl Default for GpuLightParams {
     fn default() -> Self {
@@ -203,6 +212,13 @@ impl Default for GpuLightParams {
             sun_view_proj,
             fog_color: [0.0; 4],
             fog_range: [0.0; 4],
+            hud_projection: [0.0; 4],
+            hud_environment_color: [0.0; 4],
+            hud_ambient_hemi: [0.0; 4],
+            hud_environment_indices: [u32::MAX; 4],
+            hud_hemi_positive: [0.0; 4],
+            hud_hemi_negative: [0.0; 4],
+            _padding: [0; 4],
         }
     }
 }
@@ -608,6 +624,11 @@ pub enum GBufferSurface {
         layers: [Option<crate::bindless::DescriptorIndex>; 4],
         detail_scale: f32,
     },
+    Hud {
+        alpha_ref: Option<u8>,
+        packed_bump: bool,
+        material_id: f32,
+    },
 }
 
 impl GBufferSurface {
@@ -621,6 +642,11 @@ impl GBufferSurface {
                 constants[1..5].copy_from_slice(&layers.map(|layer| layer.map_or(u32::MAX, |index| index.0)));
                 constants[5] = detail_scale.to_bits();
             }
+            Self::Hud { alpha_ref, packed_bump, material_id } => {
+                constants[5] = material_id.to_bits();
+                constants[6] = alpha_ref.map_or(u32::MAX, u32::from);
+                constants[7] = u32::from(packed_bump);
+            }
         }
         constants
     }
@@ -629,6 +655,7 @@ impl GBufferSurface {
 pub struct GBufferMeshPipeline {
     pub root: ID3D12RootSignature,
     pub pso: ID3D12PipelineState,
+    pub(crate) hud_pso: ID3D12PipelineState,
 }
 
 impl GBufferMeshPipeline {
@@ -833,7 +860,25 @@ impl GBufferMeshPipeline {
             ..Default::default()
         };
 
-        let pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        let hud_vs = compiler.compile(&ShaderCompileRequest::new(source, "vs_hud_gbuffer", ShaderTarget::Vertex6_0))
+            .map_err(|e| {
+                eprintln!("[GBufferMeshPipeline] vs_hud_gbuffer compile failed: {e:?}");
+                failure()
+            })?;
+        let hud_ps = compiler.compile(&ShaderCompileRequest::new(source, "ps_hud_gbuffer", ShaderTarget::Pixel6_0))
+            .map_err(|e| {
+                eprintln!("[GBufferMeshPipeline] ps_hud_gbuffer compile failed: {e:?}");
+                failure()
+            })?;
+        let mut hud_inputs = input_elements.to_vec();
+        hud_inputs.push(D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: windows::core::s!("BINORMAL"),
+            Format: DXGI_FORMAT_R32G32B32_FLOAT,
+            AlignedByteOffset: std::mem::offset_of!(crate::geometry_abi::HudVertex, bitangent) as u32,
+            ..Default::default()
+        });
+
+        let mut pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
             VS: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: vs.as_ptr().cast(),
@@ -871,9 +916,25 @@ impl GBufferMeshPipeline {
             ..Default::default()
         };
 
-        let pso: ID3D12PipelineState = unsafe { device.CreateGraphicsPipelineState(&pso_desc)? };
-
-        Ok(Self { root, pso })
+        let pso = unsafe { device.CreateGraphicsPipelineState(&pso_desc) };
+        pso_desc.VS = D3D12_SHADER_BYTECODE {
+            pShaderBytecode: hud_vs.as_ptr().cast(),
+            BytecodeLength: hud_vs.len(),
+        };
+        pso_desc.PS = D3D12_SHADER_BYTECODE {
+            pShaderBytecode: hud_ps.as_ptr().cast(),
+            BytecodeLength: hud_ps.len(),
+        };
+        pso_desc.InputLayout = D3D12_INPUT_LAYOUT_DESC {
+            pInputElementDescs: hud_inputs.as_ptr(),
+            NumElements: hud_inputs.len() as u32,
+        };
+        let pipelines = pso.and_then(|pso| unsafe {
+            device.CreateGraphicsPipelineState(&pso_desc).map(|hud_pso| (pso, hud_pso))
+        });
+        unsafe { std::mem::ManuallyDrop::drop(&mut pso_desc.pRootSignature) };
+        let (pso, hud_pso) = pipelines?;
+        Ok(Self { root, pso, hud_pso })
     }
 }
 
@@ -905,14 +966,13 @@ impl DeferredCombinePipeline {
             RegisterSpace: 0,
         };
 
-        // Param 2: LightParams inline constants (b2)
+        // Param 2: immutable lighting uniforms (b2)
         let mut light_params = D3D12_ROOT_PARAMETER::default();
-        light_params.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        light_params.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         light_params.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        light_params.Anonymous.Constants = D3D12_ROOT_CONSTANTS {
+        light_params.Anonymous.Descriptor = D3D12_ROOT_DESCRIPTOR {
             ShaderRegister: 2,
             RegisterSpace: 0,
-            Num32BitValues: (std::mem::size_of::<GpuLightParams>() / 4) as u32,
         };
 
         // Param 3: Dynamic Lights SRV (t0, space 1)
@@ -949,9 +1009,15 @@ impl DeferredCombinePipeline {
             RegisterSpace: 0,
         };
 
-        let parameters = [push, cam, light_params, lights, textures, csm_cbv];
+        let cube_range = D3D12_DESCRIPTOR_RANGE { RegisterSpace: 2, ..srv_range };
+        let mut cubes = textures;
+        cubes.Anonymous.DescriptorTable = D3D12_ROOT_DESCRIPTOR_TABLE {
+            NumDescriptorRanges: 1,
+            pDescriptorRanges: &cube_range,
+        };
+        let parameters = [push, cam, light_params, lights, textures, csm_cbv, cubes];
 
-        let samplers = [
+        let mut samplers = [
             D3D12_STATIC_SAMPLER_DESC {
                 Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
                 AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -978,7 +1044,13 @@ impl DeferredCombinePipeline {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
                 ..Default::default()
             },
+            D3D12_STATIC_SAMPLER_DESC::default(),
         ];
+        samplers[2] = D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            ShaderRegister: 2,
+            ..samplers[0]
+        };
 
         let root_desc = D3D12_ROOT_SIGNATURE_DESC {
             NumParameters: parameters.len() as u32,
@@ -1120,7 +1192,7 @@ impl DeferredCombinePipeline {
         lights_va: u64,
         bindless_heap: &ID3D12DescriptorHeap,
         push: &PushCombineConstants,
-        light_params: &GpuLightParams,
+        light_params_va: u64,
         csm_uniforms_va: Option<u64>,
         hdr_rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
         width: u32,
@@ -1179,16 +1251,14 @@ impl DeferredCombinePipeline {
             );
 
             cmd.SetGraphicsRootConstantBufferView(1, camera_va);
-            cmd.SetGraphicsRoot32BitConstants(
-                2, (std::mem::size_of::<GpuLightParams>() / 4) as u32,
-                std::ptr::from_ref(light_params).cast(), 0,
-            );
+            cmd.SetGraphicsRootConstantBufferView(2, light_params_va);
             cmd.SetGraphicsRootShaderResourceView(3, lights_va);
             cmd.SetGraphicsRootDescriptorTable(
                 4,
                 bindless_heap.GetGPUDescriptorHandleForHeapStart(),
             );
             cmd.SetGraphicsRootConstantBufferView(5, csm_va);
+            cmd.SetGraphicsRootDescriptorTable(6, bindless_heap.GetGPUDescriptorHandleForHeapStart());
 
             cmd.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: 0.0,

@@ -14,6 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
 use xray_render_dx12::deferred::GBufferSurface;
+use xray_render_dx12::geometry_abi::HudVertex;
 use xray_render_dx12::postprocess::PostprocessPushConstants;
 use xray_render_dx12::renderer::Dx12Renderer;
 use xray_render_dx12::{CameraConstants, DynamicLight, GpuLightParams, XRayVertex};
@@ -226,6 +227,77 @@ fn create_fullscreen_quad(renderer: &mut Dx12Renderer) -> xray_render_dx12::Mesh
     renderer
         .create_mesh(&vertices, &indices)
         .expect("create_mesh failed")
+}
+
+#[test]
+fn hud_gbuffer_uses_packed_bump_error_and_exported_bitangent() {
+    let window = Window(unsafe {
+        CreateWindowExW(
+            Default::default(), w!("STATIC"), w!("HUD material readback"), WS_OVERLAPPEDWINDOW,
+            0, 0, 64, 64, None, None, None, None,
+        ).unwrap()
+    });
+    let mut renderer = Dx12Renderer::new(1).expect("DX12 device required");
+    renderer.attach_window(window.0, 64, 64).unwrap();
+    let vertices = [[-0.6, 0.6, 0.8], [0.6, 0.6, 0.8], [0.0, -0.6, 0.8]].map(|position| {
+        HudVertex {
+            vertex: XRayVertex { position, normal: [0.0, 0.0, -1.0], tangent: [1.0, 0.0, 0.0], uv: [0.5; 2] },
+            bitangent: [0.0, -1.0, 0.0],
+        }
+    });
+    let mesh = renderer.create_hud_mesh(&vertices, &[0, 1, 2]).unwrap();
+    let (bump, error) = renderer.with_asset_uploads(|renderer| {
+        let bump = create_solid_color_rgba8_dds(4, 4, 128, 128, 255, 128);
+        let error = create_solid_color_rgba8_dds(4, 4, 191, 128, 128, 0);
+        Ok((
+            renderer.load_texture_from_dds("hud_bump", &bump)?,
+            renderer.load_texture_from_dds("hud_bump#", &error)?,
+        ))
+    }).unwrap();
+    renderer.begin_frame().unwrap();
+    renderer.update_camera(&identity_camera()).unwrap();
+    renderer.begin_gbuffer_pass().unwrap();
+    renderer.draw_gbuffer_surface(
+        mesh, None, Some(bump), Some(error), u32::MAX,
+        GBufferSurface::Hud { alpha_ref: None, packed_bump: true, material_id: 1.0 },
+    ).unwrap();
+    renderer.end_gbuffer_pass().unwrap();
+    let targets = renderer.gbuffer_manager_mut().unwrap().targets.as_ref().unwrap();
+    let resources = [targets.normal.clone(), targets.material.clone()];
+    let readbacks = resources.map(|resource| {
+        let buffer = create_readback_buffer(&renderer.device_ctx.device, 64, 64);
+        let cmd = renderer.current_cmd_list.as_ref().unwrap();
+        transition(cmd, &resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        let mut src = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(resource.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        let mut dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: ManuallyDrop::new(Some(buffer.clone())),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 64, Height: 64, Depth: 1, RowPitch: 256,
+                    },
+                },
+            },
+        };
+        unsafe {
+            cmd.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            ManuallyDrop::drop(&mut src.pResource);
+            ManuallyDrop::drop(&mut dst.pResource);
+        }
+        transition(cmd, &resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        buffer
+    });
+    renderer.end_frame(false).unwrap();
+    renderer.wait_for_gpu().unwrap();
+    let [normal, material] = readbacks.map(|buffer| readback_rgba8(&buffer, 64, 64, 32, 32));
+    assert!((180..=188).contains(&normal[0]) && (10..=16).contains(&normal[1]), "{normal:?}");
+    assert_eq!(material, [96, 191, 64, 0]);
 }
 
 #[test]

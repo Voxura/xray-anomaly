@@ -482,6 +482,7 @@ impl GeometryState {
         indices: &[u8],
         count: u32,
         format: u32,
+        stride: u32,
     ) -> WinResult<MeshHandle> {
         let vertices_buffer = UploadBuffer::new(device, vertices)?;
         let indices_buffer = UploadBuffer::new(device, indices)?;
@@ -489,7 +490,7 @@ impl GeometryState {
             vertex_view: D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: unsafe { vertices_buffer.0.GetGPUVirtualAddress() },
                 SizeInBytes: vertices.len() as u32,
-                StrideInBytes: VERTEX_STRIDE,
+                StrideInBytes: stride,
             },
             index_view: D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: unsafe { indices_buffer.0.GetGPUVirtualAddress() },
@@ -599,6 +600,23 @@ impl GeometryState {
         &mut self,
         device: &ID3D12Device,
         uniforms: &xray_formats::sun::GpuCsmSplitUniforms,
+    ) -> WinResult<u64> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(uniforms).cast::<u8>(),
+                std::mem::size_of_val(uniforms),
+            )
+        };
+        let buffer = UploadBuffer::new(device, bytes)?;
+        let address = unsafe { buffer.0.GetGPUVirtualAddress() };
+        self.track_resource(buffer.0);
+        Ok(address)
+    }
+
+    pub(crate) fn upload_lighting_uniforms(
+        &mut self,
+        device: &ID3D12Device,
+        uniforms: &crate::deferred::GpuLightParams,
     ) -> WinResult<u64> {
         let bytes = unsafe {
             std::slice::from_raw_parts(
@@ -1096,6 +1114,7 @@ impl GeometryState {
         handle: MeshHandle,
         push_constants: &PushDrawConstants,
         surface_constants: &[u32; 8],
+        max_depth: f32,
     ) -> WinResult<()> {
         let mesh = self.meshes.get(handle).unwrap();
         let camera = self.camera.as_ref().unwrap();
@@ -1155,7 +1174,7 @@ impl GeometryState {
             cmd.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: width as f32,
                 Height: height as f32,
-                MaxDepth: 1.0,
+                MaxDepth: max_depth,
                 ..Default::default()
             }]);
             cmd.RSSetScissorRects(&[windows::Win32::Foundation::RECT {

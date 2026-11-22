@@ -230,6 +230,7 @@ pub struct SkinnedMeshPart {
     pub visual_center: [f32; 3],
     pub texture: Option<OgfTextureLink>,
     pub vertices: Vec<SkinnedVertex>,
+    pub bitangents: Vec<[f32; 3]>,
     pub indices: Vec<u16>,
 }
 
@@ -267,6 +268,14 @@ pub fn skin_vertices(
     vertices: &OgfVertices,
     palette: &BonePalette,
 ) -> Result<Vec<SkinnedVertex>, FormatError> {
+    skin_vertices_with_basis(vertices, palette, None)
+}
+
+fn skin_vertices_with_basis(
+    vertices: &OgfVertices,
+    palette: &BonePalette,
+    mut bitangents: Option<&mut Vec<[f32; 3]>>,
+) -> Result<Vec<SkinnedVertex>, FormatError> {
     let mats = &palette.render_transforms;
 
     let get_mat = |bone_id: usize| -> Result<&XRayMatrix, FormatError> {
@@ -278,19 +287,25 @@ pub fn skin_vertices(
         OgfVertices::Static {
             vertices: static_verts,
             ..
-        } => Ok(static_verts
-            .iter()
-            .map(|v| SkinnedVertex {
+        } => {
+            if let Some(out) = &mut bitangents {
+                // Static FVF streams have no exported tangent frame.
+                out.resize(static_verts.len(), [0.0; 3]);
+            }
+            Ok(static_verts.iter().map(|v| SkinnedVertex {
                 position: v.position,
                 normal: v.normal,
                 uv: v.uv0,
                 tangent: [1.0, 0.0, 0.0],
-            })
-            .collect()),
+            }).collect())
+        }
         OgfVertices::Skinned1W(verts) => {
             let mut out = Vec::with_capacity(verts.len());
             for v in verts {
                 let m = get_mat(v.matrix as usize)?;
+                if let Some(out) = &mut bitangents {
+                    out.push(matrix_transform_dir(m, v.binormal));
+                }
                 out.push(SkinnedVertex {
                     position: matrix_transform_point(m, v.position),
                     normal: normalize_vec3(matrix_transform_dir(m, v.normal)),
@@ -307,6 +322,11 @@ pub fn skin_vertices(
                 let m1 = get_mat(v.matrix1 as usize)?;
                 let w1 = v.weight;
                 let w0 = 1.0 - w1;
+                if let Some(out) = &mut bitangents {
+                    let b0 = matrix_transform_dir(m0, v.binormal);
+                    let b1 = matrix_transform_dir(m1, v.binormal);
+                    out.push(std::array::from_fn(|axis| b0[axis] * w0 + b1[axis] * w1));
+                }
 
                 let p0 = matrix_transform_point(m0, v.position);
                 let p1 = matrix_transform_point(m1, v.position);
@@ -348,12 +368,19 @@ pub fn skin_vertices(
                 let mut pos = [0.0f32; 3];
                 let mut norm = [0.0f32; 3];
                 let mut tang = [0.0f32; 3];
+                let mut bitang = [0.0f32; 3];
 
                 for (&bone, &w) in v.matrices.iter().zip(&weights) {
                     let m = get_mat(bone as usize)?;
                     add_weighted_vec3(&mut pos, matrix_transform_point(m, v.position), w);
                     add_weighted_vec3(&mut norm, matrix_transform_dir(m, v.normal), w);
                     add_weighted_vec3(&mut tang, matrix_transform_dir(m, v.tangent), w);
+                    if bitangents.is_some() {
+                        add_weighted_vec3(&mut bitang, matrix_transform_dir(m, v.binormal), w);
+                    }
+                }
+                if let Some(out) = &mut bitangents {
+                    out.push(bitang);
                 }
 
                 out.push(SkinnedVertex {
@@ -373,12 +400,19 @@ pub fn skin_vertices(
                 let mut pos = [0.0f32; 3];
                 let mut norm = [0.0f32; 3];
                 let mut tang = [0.0f32; 3];
+                let mut bitang = [0.0f32; 3];
 
                 for (&bone, &w) in v.matrices.iter().zip(&weights) {
                     let m = get_mat(bone as usize)?;
                     add_weighted_vec3(&mut pos, matrix_transform_point(m, v.position), w);
                     add_weighted_vec3(&mut norm, matrix_transform_dir(m, v.normal), w);
                     add_weighted_vec3(&mut tang, matrix_transform_dir(m, v.tangent), w);
+                    if bitangents.is_some() {
+                        add_weighted_vec3(&mut bitang, matrix_transform_dir(m, v.binormal), w);
+                    }
+                }
+                if let Some(out) = &mut bitangents {
+                    out.push(bitang);
                 }
 
                 out.push(SkinnedVertex {
@@ -428,11 +462,14 @@ pub fn skin_ogf_hierarchy_visible(
         if let Some(ref verts) = model.vertices
             && visible.is_none_or(|mask| has_visible_bones(verts, mask))
         {
+            let mut bitangents = Vec::with_capacity(verts.len());
+            let vertices = skin_vertices_with_basis(verts, palette, Some(&mut bitangents))?;
             out.push(SkinnedMeshPart {
                 child_index,
                 visual_center: model.header.bsphere.center,
                 texture: model.texture.clone(),
-                vertices: skin_vertices(verts, palette)?,
+                vertices,
+                bitangents,
                 indices: model.progressive_indices(1.0, &[]).to_vec(),
             });
         }

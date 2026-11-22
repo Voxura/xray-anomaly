@@ -28,7 +28,7 @@ use xray_formats::lanims::pack_argb;
 use xray_formats::ogf::{
     matrix_invert_43, matrix_mul_43, matrix_mul_44, matrix_rotate_x, matrix_rotate_y, matrix_rotate_z,
     matrix_set_hpb, vector_generate_orthonormal_basis,
-    BonePoseMatrices, OgfModel, OgfTextureLink, StaticVertex, XRayMatrix,
+    BonePoseMatrices, OgfModel, OgfTextureLink, XRayMatrix,
 };
 use xray_formats::omf::OmfMotions;
 use xray_formats::particles::{
@@ -37,7 +37,7 @@ use xray_formats::particles::{
 use xray_formats::skinning::{skin_ogf_hierarchy_visible, BoneMask, BonePalette};
 use xray_formats::thm::ResolvedTextureLinks;
 use xray_formats::vfs_bridge::{load_ogf_from_vfs, load_omf_from_vfs, resolve_ogf_texture_links};
-use xray_render_dx12::geometry_abi::{CameraConstants, XRayVertex};
+use xray_render_dx12::geometry_abi::{CameraConstants, HudVertex, XRayVertex};
 use xray_render_dx12::lighting::GpuLight;
 use xray_render_dx12::particle::GpuParticleInstance;
 use xray_render_dx12::wallmarks::{GpuWallmarkVertex, WallmarksManager};
@@ -402,7 +402,7 @@ pub struct HudDrawPart {
     pub texture_vpath: Option<String>,
     pub shader: Option<String>,
     pub visual_center: [f32; 3],
-    pub vertices: Vec<XRayVertex>,
+    pub vertices: Vec<HudVertex>,
     pub indices: Vec<u16>,
     pub world_transform: XRayMatrix,
     pub transient: bool,
@@ -1234,29 +1234,11 @@ impl HudWeaponController {
                 if sp.vertices.is_empty() || sp.indices.is_empty() {
                     continue;
                 }
-                let verts: Vec<XRayVertex> = sp
+                let verts = sp
                     .vertices
                     .into_iter()
-                    .map(|sv| {
-                        let px = if sv.position[0].is_nan() || sv.position[0].is_infinite() { 0.0 } else { sv.position[0] };
-                        let py = if sv.position[1].is_nan() || sv.position[1].is_infinite() { 0.0 } else { sv.position[1] };
-                        let pz = if sv.position[2].is_nan() || sv.position[2].is_infinite() { 0.0 } else { sv.position[2] };
-                        let normal = normalize3([
-                            if sv.normal[0].is_nan() { 0.0 } else { sv.normal[0] },
-                            if sv.normal[1].is_nan() { 1.0 } else { sv.normal[1] },
-                            if sv.normal[2].is_nan() { 0.0 } else { sv.normal[2] },
-                        ]);
-                        let (tangent, _) = vector_generate_orthonormal_basis(normal);
-                        XRayVertex {
-                            position: [px, py, pz],
-                            normal,
-                            uv: [
-                                if sv.uv[0].is_nan() { 0.0 } else { sv.uv[0] },
-                                if sv.uv[1].is_nan() { 0.0 } else { sv.uv[1] },
-                            ],
-                            tangent,
-                        }
-                    })
+                    .zip(sp.bitangents)
+                    .map(|(sv, bitangent)| hud_vertex(sv.position, sv.normal, sv.uv, sv.tangent, bitangent))
                     .collect();
                 let tex = sp
                     .texture
@@ -1811,9 +1793,9 @@ fn collect_static_ogf_parts(
         && !indices.is_empty()
     {
         let static_verts = verts.to_static_attributes();
-        let gpu_verts: Vec<XRayVertex> = static_verts
+        let gpu_verts = static_verts
             .iter()
-            .map(static_vertex_to_xray_vertex)
+            .map(|v| hud_vertex(v.position, v.normal, v.uv0, [0.0; 3], [0.0; 3]))
             .collect();
         let tex = model
             .texture
@@ -1836,22 +1818,32 @@ fn collect_static_ogf_parts(
     }
 }
 
-fn static_vertex_to_xray_vertex(v: &StaticVertex) -> XRayVertex {
-    let pos = [
-        if v.position[0].is_nan() { 0.0 } else { v.position[0] },
-        if v.position[1].is_nan() { 0.0 } else { v.position[1] },
-        if v.position[2].is_nan() { 0.0 } else { v.position[2] },
-    ];
-    let normal = normalize3(v.normal);
-    let (tangent, _) = vector_generate_orthonormal_basis(normal);
-    XRayVertex {
-        position: pos,
-        normal,
-        uv: [
-            if v.uv0[0].is_nan() { 0.0 } else { v.uv0[0] },
-            if v.uv0[1].is_nan() { 0.0 } else { v.uv0[1] },
-        ],
-        tangent,
+fn hud_vertex(
+    position: [f32; 3],
+    normal: [f32; 3],
+    uv: [f32; 2],
+    tangent: [f32; 3],
+    bitangent: [f32; 3],
+) -> HudVertex {
+    let finite = |value: f32| if value.is_finite() { value } else { 0.0 };
+    let valid_axis = |axis: [f32; 3]| {
+        let length_sq = axis.into_iter().map(|v| v * v).sum::<f32>();
+        length_sq.is_finite() && length_sq > 1e-8
+    };
+    let normal = if valid_axis(normal) { normalize3(normal) } else { [0.0, 1.0, 0.0] };
+    let (tangent, bitangent) = if valid_axis(tangent) && valid_axis(bitangent) {
+        (normalize3(tangent), normalize3(bitangent))
+    } else {
+        vector_generate_orthonormal_basis(normal)
+    };
+    HudVertex {
+        vertex: XRayVertex {
+            position: position.map(finite),
+            normal,
+            uv: uv.map(finite),
+            tangent,
+        },
+        bitangent,
     }
 }
 
@@ -1906,7 +1898,7 @@ fn build_fallback_viewmodel_parts(
     });
 }
 
-fn make_box_mesh(min: [f32; 3], max: [f32; 3]) -> (Vec<XRayVertex>, Vec<u16>) {
+fn make_box_mesh(min: [f32; 3], max: [f32; 3]) -> (Vec<HudVertex>, Vec<u16>) {
     let [x0, y0, z0] = min;
     let [x1, y1, z1] = max;
     let verts = vec![
@@ -1925,6 +1917,9 @@ fn make_box_mesh(min: [f32; 3], max: [f32; 3]) -> (Vec<XRayVertex>, Vec<u16>) {
         0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 5, 0, 3, 5, 3, 6, 1, 4, 7, 1, 7, 2, 3, 2, 7, 3, 7, 6,
         5, 4, 1, 5, 1, 0,
     ];
+    let verts = verts.into_iter()
+        .map(|v| hud_vertex(v.position, v.normal, v.uv, v.tangent, [0.0; 3]))
+        .collect();
     (verts, indices)
 }
 

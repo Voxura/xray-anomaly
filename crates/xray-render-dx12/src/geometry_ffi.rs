@@ -51,6 +51,7 @@ pub unsafe extern "C" fn xr_dx12_create_mesh(
             indices,
             idx_count,
             idx_format,
+            vert_stride,
         ) {
             Ok(handle) => {
                 unsafe {

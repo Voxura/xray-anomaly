@@ -27,16 +27,18 @@ use windows::core::Result as WinResult;
 
 use crate::alife_manager::{AlifeManager, EntityRole};
 use crate::camera::FirstPersonCamera;
-use crate::hud_weapon::{HudWeaponController, WeaponState};
+use crate::hud_weapon::{HudDrawPart, HudWeaponController, WeaponState};
 use crate::level_transition::{LevelTransitionManager, canonical_level_name};
 use crate::ui_inventory::{InventoryManager, UiFontResource};
 use crate::ui_pda::PdaManager;
 use crate::world_loader::{LoadedVisualMesh, LoadedWorld, resolve_level_texture_vpath};
+use xray_formats::cform::RaycastOptions;
 use xray_formats::details::{
     DETAIL_DEFAULT_PS_SSA_DISCARD, DETAIL_DEFAULT_RADIUS, DetailCacheGrid, DetailDecompressConfig,
     DetailVisibilityConfig, LevelDetails, compute_r_ssa_discard,
 };
 use xray_formats::hom::{frustum_planes, ClipFrustum};
+use xray_formats::lighting::{HEMI_SAMPLE_DIRS, LightTrackConfig, ObjectLightTracker};
 use xray_formats::ogf::{
     matrix_mul_44, matrix_set_xyz_translate, matrix_transform_point, vector_generate_orthonormal_basis, OgfModel,
     OgfVisualType, StaticVertex, XRayMatrix, XRAY_IDENTITY_MATRIX,
@@ -46,7 +48,7 @@ use xray_formats::shaders_xr::{EngineShaderLibrary, R4BlenderSpec};
 use xray_formats::spawns::INVALID_OBJECT_ID;
 use xray_formats::sun::{build_3split_csm_atlas, CsmAtlasPacking, CsmAtlasPlan, SunCascadeConfig};
 use xray_formats::thm::{texture_stem_to_dds_vpath, ResolvedTextureLinks};
-use xray_formats::vfs_bridge::{load_font_from_vfs, load_ltx_tree_from_vfs, load_ogf_from_vfs, load_shaders_xr_from_vfs, load_ui_texture_atlases_from_vfs, load_xml_from_vfs, resolve_ogf_texture_links};
+use xray_formats::vfs_bridge::{load_font_from_vfs, load_ltx_tree_from_vfs, load_ogf_from_vfs, load_shaders_xr_from_vfs, load_thm_from_vfs, load_ui_texture_atlases_from_vfs, load_xml_from_vfs, resolve_ogf_texture_links};
 use xray_formats::weather::MixedEnvironment;
 use xray_formats::xml_ui::UiTextureAtlasMap;
 use xray_render_dx12::bindless::DescriptorIndex;
@@ -261,7 +263,8 @@ impl HudMaterial {
         let forward = strict_sorting || (alpha_blend && alpha_ref < 16);
         Some(Self {
             blend: if forward { HudBlend::Alpha } else { HudBlend::Opaque },
-            alpha_ref: (forward || alpha_blend).then_some(alpha_ref.clamp(0, 255) as u8),
+            alpha_ref: (forward || alpha_blend)
+                .then_some(if forward { alpha_ref.clamp(0, 255) as u8 } else { 200 }),
             strict_sorting,
         })
     }
@@ -270,6 +273,29 @@ impl HudMaterial {
         // r_dsgraph_render_hud traverses mapHUD front-to-back and mapHUDSorted back-to-front.
         (self.strict_sorting, if self.strict_sorting { -distance_sq } else { distance_sq })
     }
+}
+
+#[derive(Clone, Copy)]
+struct HudTextures {
+    albedo: DescriptorIndex,
+    normal: Option<DescriptorIndex>,
+    normal_error: Option<DescriptorIndex>,
+    packed_bump: bool,
+    material_id: f32,
+}
+
+struct HudDrawItem {
+    part: HudDrawPart,
+    textures: HudTextures,
+    material: HudMaterial,
+    transform_index: u32,
+    order: (bool, f32),
+}
+
+struct HudDrawBatch {
+    camera: CameraConstants,
+    transforms: Vec<XRayMatrix>,
+    draws: Vec<HudDrawItem>,
 }
 
 #[cfg(test)]
@@ -302,7 +328,12 @@ pub struct RenderBridge {
     level_details: Option<LevelDetailState>,
     dynamic_ogf_cache: BTreeMap<String, Arc<[GpuOgfSubMesh]>>,
     retired_world_meshes: Vec<MeshHandle>,
-    hud_mesh_cache: BTreeMap<String, (MeshHandle, DescriptorIndex)>,
+    hud_mesh_cache: BTreeMap<String, MeshHandle>,
+    hud_textures: BTreeMap<String, HudTextures>,
+    hud_light_tracker: ObjectLightTracker,
+    hud_light_config: LightTrackConfig,
+    ambient_scale: f32,
+    hemisphere_scale: f32,
     hud_materials: Option<BTreeMap<String, HudMaterial>>,
     proxy_submeshes: Arc<[GpuOgfSubMesh]>,
     ui_font: Option<UiFontResource>,
@@ -357,6 +388,11 @@ impl RenderBridge {
             dynamic_ogf_cache: BTreeMap::new(),
             retired_world_meshes: Vec::new(),
             hud_mesh_cache: BTreeMap::new(),
+            hud_textures: BTreeMap::new(),
+            hud_light_tracker: ObjectLightTracker::default(),
+            hud_light_config: LightTrackConfig::default(),
+            ambient_scale: 1.0,
+            hemisphere_scale: 1.0,
             hud_materials: None,
             proxy_submeshes: Arc::from([GpuOgfSubMesh {
                 mesh_handle: default_cube_mesh,
@@ -386,6 +422,7 @@ impl RenderBridge {
         }
         self.world_lights.clear();
         self.level_details = None;
+        self.hud_light_tracker = ObjectLightTracker::default();
         self.world_synced = false;
     }
 
@@ -890,6 +927,9 @@ impl RenderBridge {
 
     pub(crate) fn load_render_profile(&mut self, profile: &str) {
         self.geometry_lod = 0.75;
+        self.ambient_scale = 1.0;
+        self.hemisphere_scale = 1.0;
+        self.hud_light_config = LightTrackConfig::default();
         let mut tonemap = TonemapParams::default();
         let mut luminance = LuminanceConfig::default();
         let mut has_native_settings = false;
@@ -906,9 +946,24 @@ impl RenderBridge {
                 continue;
             }
             let Ok(value) = value.parse::<f32>() else { continue };
-            if cvar == "r__geometry_lod" && (0.1..=1.5).contains(&value) {
-                self.geometry_lod = value;
-                continue;
+            match cvar {
+                "r__geometry_lod" if (0.1..=1.5).contains(&value) => {
+                    self.geometry_lod = value;
+                    continue;
+                }
+                "r2_sun_lumscale_amb" if (0.0..=3.0).contains(&value) => {
+                    self.ambient_scale = value;
+                    continue;
+                }
+                "r2_sun_lumscale_hemi" if (0.0..=3.0).contains(&value) => {
+                    self.hemisphere_scale = value;
+                    continue;
+                }
+                "r2_dhemi_sky_scale" if (0.0..=100.0).contains(&value) => {
+                    self.hud_light_config.dhemi_sky_scale = value;
+                    continue;
+                }
+                _ => {}
             }
             if cvar.starts_with("r2_tonemap_") {
                 match cvar {
@@ -947,6 +1002,189 @@ impl RenderBridge {
             1.0 + (luminance.low_lum - 1.0) * amount,
             0.0,
         ];
+    }
+
+    fn prepare_hud_draws(
+        &mut self,
+        renderer: &mut Dx12Renderer,
+        weapon: &mut HudWeaponController,
+        camera: &FirstPersonCamera,
+        vfs: Option<&VirtualFileSystem>,
+    ) -> Option<HudDrawBatch> {
+        let parts = weapon.collect_hud_draw_parts(camera, vfs);
+        if parts.is_empty() {
+            return None;
+        }
+        if self.hud_materials.is_none() && let Some(vfs) = vfs {
+            self.hud_materials = Some(load_hud_materials(vfs));
+        }
+        let mut batch = HudDrawBatch {
+            camera: weapon.build_hud_camera_constants(camera),
+            transforms: Vec::with_capacity(parts.len()),
+            draws: Vec::with_capacity(parts.len()),
+        };
+        for part in parts {
+            let transform_index = batch.transforms.len() as u32;
+            batch.transforms.push(part.world_transform);
+            let material = part.shader.as_deref()
+                .and_then(|name| self.hud_materials.as_ref()?.get(name))
+                .copied()
+                .unwrap_or_default();
+            let center = matrix_transform_point(&part.world_transform, part.visual_center);
+            let order = material.sort_order(distance_sq(camera.position, center));
+            let textures = self.resolve_hud_textures(
+                renderer, vfs, part.texture_vpath.as_deref(), material.blend,
+            );
+            batch.draws.push(HudDrawItem { part, textures, material, transform_index, order });
+        }
+        batch.draws.sort_by(|a, b| a.order.0.cmp(&b.order.0).then_with(|| a.order.1.total_cmp(&b.order.1)));
+        Some(batch)
+    }
+
+    fn resolve_hud_textures(
+        &mut self,
+        renderer: &mut Dx12Renderer,
+        vfs: Option<&VirtualFileSystem>,
+        texture: Option<&str>,
+        blend: HudBlend,
+    ) -> HudTextures {
+        let mut textures = HudTextures {
+            albedo: self.fallback_albedo,
+            normal: None,
+            normal_error: None,
+            packed_bump: false,
+            material_id: 1.0,
+        };
+        let (Some(texture), Some(vfs)) = (texture, vfs) else { return textures };
+        let key = texture_stem_to_dds_vpath(texture);
+        if blend == HudBlend::Opaque && let Some(cached) = self.hud_textures.get(&key) {
+            return *cached;
+        }
+        textures.albedo = try_load_vfs_texture(renderer, Some(vfs), &key)
+            .unwrap_or(self.fallback_albedo);
+        if blend == HudBlend::Opaque {
+            if let Ok(Some(params)) = load_thm_from_vfs(vfs, texture) {
+                let links = params.resolve_texture_links(texture);
+                textures.material_id = links.material_id;
+                if let Some(bump) = links.bump {
+                    textures.normal = try_load_vfs_texture(renderer, Some(vfs), &bump.bump_dds);
+                    if textures.normal.is_some() {
+                        textures.packed_bump = true;
+                        textures.normal_error = try_load_vfs_texture(renderer, Some(vfs), &bump.bump_hash_dds);
+                    }
+                }
+                if textures.normal.is_none() && let Some(path) = links.ext_normal_map_dds {
+                    textures.normal = try_load_vfs_texture(renderer, Some(vfs), &path);
+                }
+            }
+            self.hud_textures.insert(key, textures);
+        }
+        textures
+    }
+
+    /// A light count selects the forward pass for blended materials.
+    fn draw_hud_pass(
+        &mut self,
+        renderer: &mut Dx12Renderer,
+        batch: &HudDrawBatch,
+        forward_lights: Option<u32>,
+    ) -> WinResult<u32> {
+        let mut draws = batch.draws.iter()
+            .filter(|draw| (draw.material.blend != HudBlend::Opaque) == forward_lights.is_some())
+            .peekable();
+        if draws.peek().is_none() {
+            return Ok(0);
+        }
+        renderer.update_camera(&batch.camera)?;
+        renderer.update_transforms(&batch.transforms)?;
+        let mut count = 0;
+        for draw in draws {
+            let part = &draw.part;
+            let mesh = if let Some(cached) = self.hud_mesh_cache.get(&part.key).filter(|_| !part.transient) {
+                *cached
+            } else {
+                let mesh = renderer.create_hud_mesh(&part.vertices, &part.indices)?;
+                if !part.transient {
+                    self.hud_mesh_cache.insert(part.key.clone(), mesh);
+                }
+                mesh
+            };
+            let textures = draw.textures;
+            let material = draw.material;
+            let result = match forward_lights {
+                Some(lights) => renderer.draw_hud_mesh_with_material(
+                    mesh, Some(textures.albedo), draw.transform_index, lights,
+                    material.blend, material.alpha_ref,
+                ),
+                None => renderer.draw_gbuffer_surface(
+                    mesh, Some(textures.albedo), textures.normal, textures.normal_error,
+                    draw.transform_index, GBufferSurface::Hud {
+                        alpha_ref: material.alpha_ref,
+                        packed_bump: textures.packed_bump,
+                        material_id: textures.material_id,
+                    },
+                ),
+            };
+            if part.transient {
+                // Draw recording retains the resources until the submission fence completes.
+                renderer.destroy_mesh(mesh);
+            }
+            result?;
+            count += 1;
+        }
+        renderer.restore_normal_viewport();
+        Ok(count)
+    }
+
+    fn set_hud_environment(
+        &mut self,
+        renderer: &mut Dx12Renderer,
+        world: &LoadedWorld,
+        weather: &MixedEnvironment,
+        camera: &FirstPersonCamera,
+        vfs: Option<&VirtualFileSystem>,
+        dt: f32,
+        light_params: &mut GpuLightParams,
+    ) {
+        let (a, b) = weather.sky_env_dds_vpaths();
+        let [first, second] = [a, b].map(|path| {
+            let index = try_load_vfs_texture(renderer, vfs, path.as_deref()?)?;
+            renderer.get_texture_by_index(index)?.is_cubemap.then_some(index.0)
+        });
+        let Some(index) = first.or(second) else { return };
+        light_params.hud_environment_indices = [first.unwrap_or(index), second.unwrap_or(index), u32::MAX, u32::MAX];
+
+        let tracker = &mut self.hud_light_tracker;
+        let config = self.hud_light_config;
+        if let Some(collision) = &world.cform {
+            let bvh = collision.build_bvh();
+            let first_sample = tracker.result_count == 0;
+            // CROS traces five static hemisphere rays per update. The camera
+            // supplies the first-person sample origin until the actor visual is available.
+            for sample in tracker.next_hemi_ray_indices(config.dhemi_count) {
+                let direction = xray_formats::skinning::normalize_vec3(HEMI_SAMPLE_DIRS[sample]);
+                tracker.ray_clear[sample] = bvh.raycast(
+                    camera.position,
+                    direction,
+                    50.0,
+                    RaycastOptions { only_first: true, ..Default::default() },
+                ).is_empty();
+            }
+            tracker.accumulate_sky_hemi(config.dhemi_sky_scale);
+            tracker.step_smooth(if first_sample { 1.0 } else { dt }, config.lt_smooth);
+        }
+        let hemi = tracker.to_hemi_gpu_params(0.0, [0.0; 4], [0.0; 4]);
+        light_params.hud_hemi_positive = hemi.pos_faces;
+        light_params.hud_hemi_negative = hemi.neg_faces;
+        for axis in 0..3 {
+            // R4 phase_combine binds ambient separately from the environment tint.
+            light_params.hud_environment_color[axis] = (2.0 * weather.hemi_color[axis] + 1e-5)
+                * 2.0 * self.hemisphere_scale;
+            light_params.hud_ambient_hemi[axis] =
+                (2.0 * weather.ambient_color[axis]).max(0.001) * self.ambient_scale;
+        }
+        light_params.hud_environment_color[3] = weather.weight;
+        light_params.hud_ambient_hemi[3] = hemi.material[0];
     }
 
     /// Execute all 7 DX12 render graph passes plus Inventory, PDA, Dialogue, Travel Prompt & Loading Screen UI.
@@ -1001,6 +1239,24 @@ impl RenderBridge {
             self.config.csm_blend_band,
             self.config.volumetric_shafts,
         );
+        let is_aiming_ads = hud_weapon.as_ref().is_some_and(|hw| hw.state == WeaponState::Aiming);
+        let hud_draws = hud_weapon.as_deref_mut()
+            .and_then(|weapon| self.prepare_hud_draws(renderer, weapon, camera, vfs));
+
+        // ---------------------------------------------------------------------
+        // Stage (a): Clear the swapchain targets
+        // ---------------------------------------------------------------------
+        renderer.clear_backbuffer([0.04, 0.05, 0.08, 1.0]);
+        // ---------------------------------------------------------------------
+        // Stage (b): G-Buffer MRT Pass (Albedo, Normal, Material + Depth)
+        // ---------------------------------------------------------------------
+        renderer.begin_gbuffer_pass()?;
+        if let Some(batch) = &hud_draws {
+            stats.hud_weapon_draws = self.draw_hud_pass(renderer, batch, None)?;
+            if stats.hud_weapon_draws > 0 {
+                renderer.update_camera(&cam_constants)?;
+            }
+        }
         let dynamic_draws = self.prepare_dynamic_draws(
             renderer,
             camera.position,
@@ -1011,15 +1267,6 @@ impl RenderBridge {
             vfs,
             inventory,
         )?;
-
-        // ---------------------------------------------------------------------
-        // Stage (a): Clear the swapchain targets
-        // ---------------------------------------------------------------------
-        renderer.clear_backbuffer([0.04, 0.05, 0.08, 1.0]);
-        // ---------------------------------------------------------------------
-        // Stage (b): G-Buffer MRT Pass (Albedo, Normal, Material + Depth)
-        // ---------------------------------------------------------------------
-        renderer.begin_gbuffer_pass()?;
         for mesh in &self.world_meshes {
             if mesh.bsphere_radius > 1e-4 {
                 let dist_sq = distance_sq(camera.position, mesh.bsphere_center);
@@ -1146,7 +1393,7 @@ impl RenderBridge {
         stats.combine_light_count = active_lights.len() as u32;
         stats.combine_csm_active = self.csm_atlas.plan.is_some();
 
-        let light_params = GpuLightParams {
+        let mut light_params = GpuLightParams {
             sun_direction: [
                 -sun_dir_to_surface[0],
                 -sun_dir_to_surface[1],
@@ -1157,8 +1404,15 @@ impl RenderBridge {
             ambient_color: [ambient_rgb[0], ambient_rgb[1], ambient_rgb[2], 1.0],
             fog_color: env.map_or([0.0; 4], |weather| weather.fog_color_rgba()),
             fog_range: env.map_or([0.0; 4], |weather| [weather.fog_near, weather.fog_far, 0.0, 0.0]),
+            hud_projection: hud_draws.as_ref().map_or([0.0; 4], |batch| {
+                let p = batch.camera.proj;
+                [p[0][0], p[1][1], p[2][2], p[3][2]]
+            }),
             ..Default::default()
         };
+        if stats.hud_weapon_draws > 0 && let (Some(world), Some(weather)) = (world, env) {
+            self.set_hud_environment(renderer, world, weather, camera, vfs, dt, &mut light_params);
+        }
 
         let hdr_srv = renderer.execute_deferred_combine_csm(
             &light_params,
@@ -1356,62 +1610,9 @@ impl RenderBridge {
             }
         }
 
-        // e.7 First-Person HUD Weapon & Hand OGF Pass (`hud_projection_matrix` + depth-only clear)
-        let is_aiming_ads = hud_weapon
-            .as_ref()
-            .is_some_and(|hw| hw.state == WeaponState::Aiming);
-        if let Some(hw) = hud_weapon.as_deref_mut() {
-            let hud_parts = hw.collect_hud_draw_parts(camera, vfs);
-            if !hud_parts.is_empty() {
-                if self.hud_materials.is_none() && let Some(vfs) = vfs {
-                    self.hud_materials = Some(load_hud_materials(vfs));
-                }
-                let hud_cam = hw.build_hud_camera_constants(camera);
-                renderer.update_camera(&hud_cam)?;
-
-                let mut hud_matrices = Vec::with_capacity(hud_parts.len());
-                let mut draw_items = Vec::with_capacity(hud_parts.len());
-                for part in hud_parts {
-                    let tf_idx = hud_matrices.len() as u32;
-                    hud_matrices.push(part.world_transform);
-                    let tex_idx = part.texture_vpath.as_deref()
-                        .and_then(|vpath| try_load_vfs_texture(renderer, vfs, vpath))
-                        .unwrap_or(self.fallback_albedo);
-                    let material = part.shader.as_deref().and_then(|name| self.hud_materials.as_ref()?.get(name)).copied().unwrap_or_default();
-                    let center = matrix_transform_point(&part.world_transform, part.visual_center);
-                    let order = material.sort_order(distance_sq(camera.position, center));
-                    draw_items.push((part, tex_idx, tf_idx, material, order));
-                }
-
-                renderer.update_transforms(&hud_matrices)?;
-                draw_items.sort_by(|a, b| a.4.0.cmp(&b.4.0).then_with(|| a.4.1.total_cmp(&b.4.1)));
-                for (part, tex_idx, tf_idx, material, _) in draw_items {
-                    let mesh_handle = if part.transient {
-                        renderer.create_mesh(&part.vertices, &part.indices)?
-                    } else if let Some(&(cached, _)) = self.hud_mesh_cache.get(&part.key) {
-                        cached
-                    } else {
-                        let handle = renderer.create_mesh(&part.vertices, &part.indices)?;
-                        self.hud_mesh_cache.insert(part.key, (handle, tex_idx));
-                        handle
-                    };
-                    let result = renderer.draw_hud_mesh_with_material(
-                        mesh_handle,
-                        Some(tex_idx),
-                        tf_idx,
-                        active_lights.len() as u32,
-                        material.blend,
-                        material.alpha_ref,
-                    );
-                    if part.transient {
-                        // Draw recording retains the resources until the submission fence completes.
-                        renderer.destroy_mesh(mesh_handle);
-                    }
-                    result?;
-                    stats.hud_weapon_draws += 1;
-                }
-                renderer.restore_normal_viewport();
-            }
+        // e.7 Forward HUD passes for scope glass and additive reticles.
+        if let Some(batch) = &hud_draws {
+            stats.hud_weapon_draws += self.draw_hud_pass(renderer, batch, Some(stats.combine_light_count))?;
         }
 
         // ---------------------------------------------------------------------

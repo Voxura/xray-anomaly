@@ -36,6 +36,12 @@ cbuffer LightParams : register(b2)
     column_major float4x4 SunViewProj;
     float4 FogColor;
     float4 FogRange; // [near, far, 0, 0]
+    float4 HudProjection; // Perspective projection terms [x scale, y scale, z scale, z offset]
+    float4 HudEnvironmentColor; // [RGB tint, weather blend]
+    float4 HudAmbientHemi; // [RGB ambient, scalar hemisphere fallback]
+    uint4 HudEnvironmentIndices;
+    float4 HudHemiPositive;
+    float4 HudHemiNegative;
 };
 
 cbuffer CsmSplitUniforms : register(b3)
@@ -50,8 +56,10 @@ cbuffer CsmSplitUniforms : register(b3)
 };
 
 Texture2D g_textures[] : register(t0, space0);
+TextureCube g_environment_cubes[] : register(t0, space2);
 SamplerState g_point_sampler : register(s0);
 SamplerComparisonState g_shadow_sampler : register(s1);
+SamplerState g_environment_sampler : register(s2);
 
 ByteAddressBuffer g_lights : register(t0, space1);
 
@@ -181,21 +189,23 @@ float4 ps_deferred_combine(VSOutput input) : SV_Target0
     // Decode world normal and material properties
     float3 normal = normalize(normal_sample.xyz * 2.0 - 1.0);
     float roughness = normal_sample.w;
-    float metallic = material_sample.r;
     float specular_intensity = material_sample.b;
 
-    // World position reconstruction from depth
+    // HUD geometry uses its own projection and Monolith's rmNear viewport [0, 0.02].
+    bool is_hud = material_sample.a < 0.5 && HudProjection.x > 0.0;
+    float metallic = is_hud ? 0.0 : material_sample.r;
+    float4 projection = is_hud ? HudProjection : float4(proj[0][0], proj[1][1], proj[2][2], proj[2][3]);
+    float depth_ndc = is_hud ? depth / 0.02 : depth;
     float2 ndc_xy = float2(input.uv.x * 2.0 - 1.0, (1.0 - input.uv.y) * 2.0 - 1.0);
-    float4 clip_pos = float4(ndc_xy, depth, 1.0);
-    
-    float view_x = clip_pos.x / max(proj[0][0], 1e-6);
-    float view_y = clip_pos.y / max(proj[1][1], 1e-6);
+
+    float view_x = ndc_xy.x / max(projection.x, 1e-6);
+    float view_y = ndc_xy.y / max(projection.y, 1e-6);
 
     float3x3 inv_view_rot = transpose((float3x3)view);
     float3 world_pos;
-    if (abs(proj[2][3]) > 1e-6) // Perspective projection
+    if (abs(projection.w) > 1e-6) // Perspective projection
     {
-        float view_z = (-proj[2][3]) / max(proj[2][2] - depth, 1e-6);
+        float view_z = (-projection.w) / max(projection.z - depth_ndc, 1e-6);
         float3 pos_vs = float3(view_x * view_z, view_y * view_z, view_z);
         world_pos = mul(inv_view_rot, pos_vs) + cam_pos.xyz;
     }
@@ -238,7 +248,8 @@ float4 ps_deferred_combine(VSOutput input) : SV_Target0
     float3 H = normalize(L + V);
     float n_dot_h = saturate(dot(normal, H));
     float spec_power = (1.0 - roughness) * 64.0 + 1.0;
-    float spec_factor = pow(n_dot_h, spec_power) * n_dot_l;
+    float gloss_factor = is_hud ? specular_intensity : 1.0;
+    float spec_factor = pow(n_dot_h, spec_power) * n_dot_l * gloss_factor;
 
     float3 sun_diffuse = albedo_sample.rgb * SunColor.rgb * (n_dot_l * shadow_factor);
     float3 sun_specular = SunColor.rgb * (spec_factor * shadow_factor * (0.04 * (1.0 - metallic) + albedo_sample.rgb * metallic));
@@ -268,14 +279,36 @@ float4 ps_deferred_combine(VSOutput input) : SV_Target0
                 }
 
                 float3 light_h = normalize(light_dir + V);
-                float light_spec = pow(saturate(dot(normal, light_h)), spec_power);
+                float light_spec = pow(saturate(dot(normal, light_h)), spec_power) * gloss_factor;
                 dynamic_light_accum += (light.color.rgb * light.color.a) * (light_ndotl * att + light_spec * att * 0.5);
             }
         }
     }
 
     // Ambient Lighting
-    float3 ambient = AmbientColor.rgb * albedo_sample.rgb;
+    float3 irradiance = AmbientColor.rgb;
+    if (is_hud && HudEnvironmentIndices.x != 0xFFFFFFFF)
+    {
+        // Monolith hmodel: tint and blend the two weather irradiance maps,
+        // square the diffuse color, then apply the material LUT's diffuse response.
+        float3 sky_a = g_environment_cubes[NonUniformResourceIndex(HudEnvironmentIndices.x)]
+            .SampleLevel(g_environment_sampler, normal, 0).rgb;
+        float3 sky_b = g_environment_cubes[NonUniformResourceIndex(HudEnvironmentIndices.y)]
+            .SampleLevel(g_environment_sampler, normal, 0).rgb;
+        float3 environment = lerp(sky_a, sky_b, HudEnvironmentColor.w) * HudEnvironmentColor.rgb;
+        float3 hemisphere = float3(
+            normal.x >= 0.0 ? HudHemiPositive.x : HudHemiNegative.x,
+            normal.y >= 0.0 ? HudHemiPositive.y : HudHemiNegative.y,
+            normal.z >= 0.0 ? HudHemiPositive.z : HudHemiNegative.z
+        );
+        float h = saturate(max(HudAmbientHemi.w, dot(hemisphere, abs(normal))));
+        float4 diffuse_response = float4(pow(h, 0.75), pow(h, 0.9), h, h);
+        float slice = clamp(material_sample.r * 4.0 - 0.5, 0.0, 3.0);
+        uint lo = (uint)slice;
+        float weight = lerp(diffuse_response[lo], diffuse_response[min(lo + 1, 3)], frac(slice));
+        irradiance = HudAmbientHemi.rgb + environment * environment * weight;
+    }
+    float3 ambient = irradiance * albedo_sample.rgb;
 
     // SSFX Volumetric Light Shafts
     float3 volumetric_shafts = float3(0.0, 0.0, 0.0);

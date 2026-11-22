@@ -513,6 +513,22 @@ impl Dx12Renderer {
         vertices: &[crate::geometry_abi::XRayVertex],
         indices: &[u16],
     ) -> WinResult<crate::geometry_abi::MeshHandle> {
+        self.create_typed_mesh(vertices, indices)
+    }
+
+    pub fn create_hud_mesh(
+        &mut self,
+        vertices: &[crate::geometry_abi::HudVertex],
+        indices: &[u16],
+    ) -> WinResult<crate::geometry_abi::MeshHandle> {
+        self.create_typed_mesh(vertices, indices)
+    }
+
+    fn create_typed_mesh<V>(
+        &mut self,
+        vertices: &[V],
+        indices: &[u16],
+    ) -> WinResult<crate::geometry_abi::MeshHandle> {
         let v_bytes = unsafe {
             std::slice::from_raw_parts(
                 vertices.as_ptr().cast::<u8>(),
@@ -531,6 +547,7 @@ impl Dx12Renderer {
             i_bytes,
             indices.len() as u32,
             crate::geometry_abi::INDEX_FORMAT_U16,
+            std::mem::size_of::<V>() as u32,
         )
     }
 
@@ -1268,6 +1285,10 @@ impl Dx12Renderer {
 
         let rtvs = targets.gbuffer_rtvs();
         let dsv = targets.dsv_handle();
+        let (pso, max_depth) = match surface {
+            crate::deferred::GBufferSurface::Hud { .. } => (&pipeline.hud_pso, 0.02),
+            _ => (&pipeline.pso, 1.0),
+        };
 
         let push = crate::geometry::PushDrawConstants {
             albedo_index: albedo_index.map(|i| i.0).unwrap_or(u32::MAX),
@@ -1280,7 +1301,7 @@ impl Dx12Renderer {
         self.geometry.draw_gbuffer(
             &self.device_ctx.device,
             cmd,
-            &pipeline.pso,
+            pso,
             &pipeline.root,
             &self.bindless_heap,
             &rtvs,
@@ -1290,6 +1311,7 @@ impl Dx12Renderer {
             handle,
             &push,
             &surface.root_constants(),
+            max_depth,
         )
     }
 
@@ -1339,6 +1361,7 @@ impl Dx12Renderer {
             .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
         let lt_va = self.geometry.lights_gpu_va(&self.device_ctx.device)?;
 
+        let lighting_va = self.geometry.upload_lighting_uniforms(&self.device_ctx.device, light_params)?;
         let gbuffer = self.gbuffer.as_mut().unwrap();
         let targets = gbuffer.targets.as_ref().unwrap();
 
@@ -1371,7 +1394,7 @@ impl Dx12Renderer {
             lt_va,
             &self.bindless_heap,
             &push,
-            light_params,
+            lighting_va,
             None,
             hdr_rtv,
             width,
@@ -1408,6 +1431,7 @@ impl Dx12Renderer {
         let uniforms_va = self.geometry.upload_csm_uniforms(
             &self.device_ctx.device, &plan.to_gpu_uniforms(),
         )?;
+        let lighting_va = self.geometry.upload_lighting_uniforms(&self.device_ctx.device, light_params)?;
 
         let gbuffer = self.gbuffer.as_mut().unwrap();
         let targets = gbuffer.targets.as_ref().unwrap();
@@ -1441,7 +1465,7 @@ impl Dx12Renderer {
             lt_va,
             &self.bindless_heap,
             &push,
-            light_params,
+            lighting_va,
             Some(uniforms_va),
             hdr_rtv,
             width,

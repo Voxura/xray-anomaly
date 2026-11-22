@@ -29,6 +29,7 @@ cbuffer GBufferSurfaceConstants : register(b2)
     uint terrain_a_index;
     float terrain_detail_scale;
     uint surface_alpha_ref;
+    uint hud_normal_encoding;
 };
 
 Texture2D g_textures[] : register(t0);
@@ -139,6 +140,15 @@ PSInput vs_main(VSInput input)
     output.tangent = world_tangent;
     output.bitangent = cross(world_normal, world_tangent);
     output.world_pos = world_pos;
+    return output;
+}
+
+PSInput vs_hud_gbuffer(VSInput input, float3 bitangent : BINORMAL)
+{
+    PSInput output = vs_main(input);
+    output.bitangent = transform_index != 0xFFFFFFFF
+        ? mul(bitangent, (float3x3)load_transform(transform_index))
+        : bitangent;
     return output;
 }
 
@@ -347,5 +357,44 @@ GBufferOutput ps_gbuffer(PSInput input)
     output.albedo = albedo;
     output.normal = float4(world_normal * 0.5 + 0.5, roughness);
     output.material = float4(metallic, roughness, specular, 1.0);
+    return output;
+}
+
+GBufferOutput ps_hud_gbuffer(PSInput input)
+{
+    GBufferOutput output;
+    float4 albedo = float4(1.0, 1.0, 1.0, 1.0);
+    if (albedo_index != 0xFFFFFFFF)
+        albedo = g_textures[NonUniformResourceIndex(albedo_index)].Sample(g_sampler, input.uv);
+    if (surface_alpha_ref <= 255)
+        clip(albedo.a - (float)surface_alpha_ref / 255.0);
+
+    float3 N = normalize(input.normal);
+    float gloss = 2.0 / 255.0;
+    if (normal_index != 0xFFFFFFFF)
+    {
+        float4 bump = g_textures[NonUniformResourceIndex(normal_index)].Sample(g_sampler, input.uv);
+        float3 tangent_normal = bump.xyz * 2.0 - 1.0;
+        if (hud_normal_encoding == 1)
+        {
+            // Monolith sload.h: the main map stores gloss in R and the normal in ABG.
+            float3 error = 0.5;
+            if (material_index != 0xFFFFFFFF)
+                error = g_textures[NonUniformResourceIndex(material_index)].Sample(g_sampler, input.uv).rgb;
+            tangent_normal = bump.wzy + error - 1.0;
+            gloss = bump.x * bump.x;
+        }
+        float3 T = normalize(input.tangent);
+        float3 B = normalize(input.bitangent);
+        float3 surface_normal = mul(tangent_normal, float3x3(T, B, N));
+        if (dot(surface_normal, surface_normal) > 1e-6)
+            N = normalize(surface_normal);
+    }
+
+    float roughness = 1.0 - gloss;
+    output.albedo = albedo;
+    output.normal = float4(N * 0.5 + 0.5, roughness);
+    // HUD pixels store a normalized Monolith material ID in R and the projection flag in A.
+    output.material = float4((terrain_detail_scale + 0.5) / 4.0, roughness, gloss, 0.0);
     return output;
 }
