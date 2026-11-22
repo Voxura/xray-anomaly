@@ -9,6 +9,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 use xray_render_dx12::ffi::*;
+use xray_render_dx12::geometry::StaticMeshRange;
 use xray_render_dx12::geometry_abi::{INDEX_FORMAT_U16, INDEX_FORMAT_U32};
 use xray_render_dx12::renderer::Dx12Renderer;
 use xray_render_dx12::{CameraConstants, XRayVertex};
@@ -126,39 +127,70 @@ fn phase4_indexed_draw_readback_and_lifetimes() {
         resource.unwrap()
     };
     for (format, indices) in [
-        (INDEX_FORMAT_U16, indices16.as_ptr().cast()),
-        (INDEX_FORMAT_U32, indices32.as_ptr().cast()),
+        (Some(INDEX_FORMAT_U16), indices16.as_ptr().cast()),
+        (Some(INDEX_FORMAT_U32), indices32.as_ptr().cast()),
+        (None, ptr::null()),
     ] {
         unsafe {
             let r = ptr::addr_of_mut!(renderer);
             let mut handle = 0;
-            assert_eq!(
-                xr_dx12_create_mesh(
-                    r,
-                    vertices.as_ptr().cast(),
-                    3,
-                    48,
-                    indices,
-                    3,
-                    format,
-                    &mut handle
-                ),
-                XR_DX12_ERR_INVALID_ARGUMENT
-            );
-            assert_eq!(handle, 0);
-            assert_eq!(
-                xr_dx12_create_mesh(
-                    r,
-                    vertices.as_ptr().cast(),
-                    3,
-                    44,
-                    indices,
-                    3,
-                    format,
-                    &mut handle
-                ),
-                XR_DX12_OK
-            );
+            if let Some(format) = format {
+                assert_eq!(
+                    xr_dx12_create_mesh(
+                        r,
+                        vertices.as_ptr().cast(),
+                        3,
+                        48,
+                        indices,
+                        3,
+                        format,
+                        &mut handle
+                    ),
+                    XR_DX12_ERR_INVALID_ARGUMENT
+                );
+                assert_eq!(handle, 0);
+                assert_eq!(
+                    xr_dx12_create_mesh(
+                        r,
+                        vertices.as_ptr().cast(),
+                        3,
+                        44,
+                        indices,
+                        3,
+                        format,
+                        &mut handle
+                    ),
+                    XR_DX12_OK
+                );
+            } else {
+                // Read from the second views in a packed page. The preceding
+                // vertices and indices are both degenerate on purpose.
+                let page_vertices = [XRayVertex::default(); 3]
+                    .into_iter()
+                    .chain(vertices)
+                    .collect::<Vec<_>>();
+                let page_indices = [0, 0, 0, 0, 1, 2];
+                let handles = renderer
+                    .with_asset_uploads(|renderer| {
+                        renderer.create_static_mesh_page(
+                            &page_vertices,
+                            &page_indices,
+                            &[
+                                StaticMeshRange {
+                                    vertices: 0..3,
+                                    indices: 0..3,
+                                },
+                                StaticMeshRange {
+                                    vertices: 3..6,
+                                    indices: 3..6,
+                                },
+                            ],
+                        )
+                    })
+                    .unwrap();
+                renderer.destroy_mesh(handles[0]);
+                handle = handles[1];
+            }
             assert_ne!(handle, 0);
             assert_eq!(xr_dx12_draw_indexed(r, handle), XR_DX12_ERR_INVALID_STATE);
             assert_eq!(xr_dx12_update_camera(r, &camera()), XR_DX12_OK);
@@ -239,14 +271,14 @@ fn phase4_indexed_draw_readback_and_lifetimes() {
             assert_eq!(
                 center,
                 [255, 0, 0, 255],
-                "format {format}: triangle/camera lifetime"
+                "format {format:?}: triangle/camera lifetime"
             );
             assert_eq!(
                 corner,
                 [0, 0, 0, 255],
-                "format {format}: clear outside triangle"
+                "format {format:?}: clear outside triangle"
             );
-            println!("Phase 4 format {format}: red center and black corner verified");
+            println!("Phase 4 format {format:?}: red center and black corner verified");
         }
     }
 }

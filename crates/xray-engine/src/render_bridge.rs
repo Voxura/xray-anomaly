@@ -31,7 +31,7 @@ use crate::hud_weapon::{HudWeaponController, WeaponState};
 use crate::level_transition::{LevelTransitionManager, canonical_level_name};
 use crate::ui_inventory::{InventoryManager, UiFontResource};
 use crate::ui_pda::PdaManager;
-use crate::world_loader::{LoadedWorld, resolve_level_texture_vpath};
+use crate::world_loader::{LoadedVisualMesh, LoadedWorld, resolve_level_texture_vpath};
 use xray_formats::details::{
     DETAIL_DEFAULT_PS_SSA_DISCARD, DETAIL_DEFAULT_RADIUS, DetailCacheGrid, DetailDecompressConfig,
     DetailVisibilityConfig, LevelDetails, compute_r_ssa_discard,
@@ -54,7 +54,7 @@ use xray_render_dx12::clouds::{CloudSimulation, CloudsPushConstants};
 use xray_render_dx12::deferred::{GBufferSurface, GpuLightParams};
 use xray_render_dx12::details::{DetailManager, DetailPushConstants, GpuDetailBatch, GpuDetailInstance, GpuDetailMesh};
 use xray_render_dx12::geometry_abi::{CameraConstants, MeshHandle, XRayVertex};
-use xray_render_dx12::geometry::HudBlend;
+use xray_render_dx12::geometry::{HudBlend, StaticMeshRange};
 use xray_render_dx12::lighting::GpuLight;
 use xray_render_dx12::particle::GpuParticleInstance;
 use xray_render_dx12::postprocess::{MONOLITH_SDR_TONEMAP, PostprocessPushConstants};
@@ -301,6 +301,7 @@ pub struct RenderBridge {
     world_lights: Vec<GpuLight>,
     level_details: Option<LevelDetailState>,
     dynamic_ogf_cache: BTreeMap<String, Arc<[GpuOgfSubMesh]>>,
+    retired_world_meshes: Vec<MeshHandle>,
     hud_mesh_cache: BTreeMap<String, (MeshHandle, DescriptorIndex)>,
     hud_materials: Option<BTreeMap<String, HudMaterial>>,
     proxy_submeshes: Arc<[GpuOgfSubMesh]>,
@@ -353,6 +354,7 @@ impl RenderBridge {
             world_lights: Vec::new(),
             level_details: None,
             dynamic_ogf_cache: BTreeMap::new(),
+            retired_world_meshes: Vec::new(),
             hud_mesh_cache: BTreeMap::new(),
             hud_materials: None,
             proxy_submeshes: Arc::from([GpuOgfSubMesh {
@@ -376,11 +378,20 @@ impl RenderBridge {
 
     /// Mark world GPU caches dirty so the next frame re-uploads static geometry/lights.
     pub fn invalidate_world(&mut self) {
-        self.world_meshes.clear();
+        self.retire_static_meshes();
+        for submeshes in std::mem::take(&mut self.dynamic_ogf_cache).into_values() {
+            self.retired_world_meshes.extend(submeshes.iter().map(|mesh| mesh.mesh_handle));
+        }
         self.world_lights.clear();
-        self.dynamic_ogf_cache.clear();
         self.level_details = None;
         self.world_synced = false;
+    }
+
+    fn retire_static_meshes(&mut self) {
+        for mesh in self.world_meshes.drain(..) {
+            self.retired_world_meshes.push(mesh.mesh_handle);
+            self.retired_world_meshes.extend(mesh.fastpath_handle);
+        }
     }
 
     /// Queue static wallmark decal vertices to draw in Stage (e) until cleared.
@@ -400,48 +411,99 @@ impl RenderBridge {
         world: &LoadedWorld,
         vfs: Option<&VirtualFileSystem>,
     ) -> WinResult<()> {
-        self.world_meshes.clear();
+        self.retire_static_meshes();
+        for handle in self.retired_world_meshes.drain(..) {
+            renderer.destroy_mesh(handle);
+        }
         self.world_lights.clear();
         self.level_details = None;
+        self.world_synced = false;
+        renderer.with_asset_uploads(|renderer| self.upload_world(renderer, world, vfs))?;
+        self.world_synced = true;
+        Ok(())
+    }
+
+    fn upload_world<'world>(
+        &mut self,
+        renderer: &mut Dx12Renderer,
+        world: &'world LoadedWorld,
+        vfs: Option<&VirtualFileSystem>,
+    ) -> WinResult<()> {
+        const GEOMETRY_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
         // 1. Static visual meshes + fastpath shadow/depth buffers + bindless textures
         let shader_library = vfs.and_then(|vfs| load_shaders_xr_from_vfs(vfs).ok());
         let mut world_materials = BTreeMap::new();
-        for visual in &world.visual_meshes {
-            let Some(mesh_handle) = upload_resolved_mesh(renderer, &visual.mesh.vertices, &visual.mesh.indices)? else {
-                continue;
-            };
-            let fastpath_handle = match &visual.fastpath {
-                Some(fp) => upload_resolved_mesh(renderer, &fp.vertices, &fp.indices)?,
-                None => None,
-            };
+        let mut upload_page = |renderer: &mut Dx12Renderer,
+                               vertices: &[XRayVertex],
+                               indices: &[u16],
+                               ranges: &[StaticMeshRange],
+                               visuals: &[(&'world LoadedVisualMesh, bool)]| -> WinResult<()> {
+            if visuals.is_empty() {
+                return Ok(());
+            }
+            let mut handles = renderer.create_static_mesh_page(vertices, indices, ranges)?.into_iter();
+            for &(visual, has_fastpath) in visuals {
+                let mesh_handle = handles.next().expect("one range per visual");
+                let fastpath_handle = has_fastpath.then(|| handles.next().expect("one range per fastpath"));
 
-            let shader = visual.shader.as_ref();
-            let ((albedo_tex, normal_tex, material_tex), surface) = *world_materials
-                .entry(shader.map_or("", |shader| shader.raw.as_str()))
-                .or_insert_with(|| {
-                    let spec = shader.zip(shader_library.as_ref())
-                        .and_then(|(shader, library)| library.find_blender(&shader.shader))
-                        .and_then(R4BlenderSpec::from_blender_shader);
-                    (
-                        self.resolve_material_textures(renderer, vfs, &visual.texture_links),
-                        Self::resolve_world_surface(renderer, vfs, &world.level_dir, spec, &visual.texture_links),
-                    )
+                let shader = visual.shader.as_ref();
+                let ((albedo_tex, normal_tex, material_tex), surface) = *world_materials
+                    .entry(shader.map_or("", |shader| shader.raw.as_str()))
+                    .or_insert_with(|| {
+                        let spec = shader.zip(shader_library.as_ref())
+                            .and_then(|(shader, library)| library.find_blender(&shader.shader))
+                            .and_then(R4BlenderSpec::from_blender_shader);
+                        (
+                            self.resolve_material_textures(renderer, vfs, &visual.texture_links),
+                            Self::resolve_world_surface(renderer, vfs, &world.level_dir, spec, &visual.texture_links),
+                        )
+                    });
+
+                self.world_meshes.push(GpuWorldMesh {
+                    mesh_handle,
+                    fastpath_handle,
+                    albedo_tex,
+                    normal_tex,
+                    material_tex,
+                    surface,
+                    bsphere_center: visual.bsphere.center,
+                    bsphere_radius: visual.bsphere.radius,
+                    is_static_caster: !matches!(visual.visual_type, OgfVisualType::Lod),
                 });
-
-            let is_static_caster = !matches!(visual.visual_type, OgfVisualType::Lod);
-            self.world_meshes.push(GpuWorldMesh {
-                mesh_handle,
-                fastpath_handle,
-                albedo_tex,
-                normal_tex,
-                material_tex,
-                surface,
-                bsphere_center: visual.bsphere.center,
-                bsphere_radius: visual.bsphere.radius,
-                is_static_caster,
-            });
+            }
+            Ok(())
+        };
+        let (mut vertices, mut indices, mut ranges, mut pending) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for visual in &world.visual_meshes {
+            if visual.mesh.vertices.is_empty() || visual.mesh.indices.is_empty() {
+                continue;
+            }
+            let fastpath = visual.fastpath.as_ref()
+                .filter(|mesh| !mesh.vertices.is_empty() && !mesh.indices.is_empty());
+            for mesh in std::iter::once(&visual.mesh).chain(fastpath) {
+                let vertex_start = vertices.len();
+                let index_start = indices.len();
+                vertices.extend(mesh.vertices.iter().map(world_vertex));
+                indices.extend_from_slice(&mesh.indices);
+                ranges.push(StaticMeshRange {
+                    vertices: vertex_start..vertices.len(),
+                    indices: index_start..indices.len(),
+                });
+            }
+            pending.push((visual, fastpath.is_some()));
+            if std::mem::size_of_val(vertices.as_slice()) + std::mem::size_of_val(indices.as_slice())
+                >= GEOMETRY_PAGE_BYTES
+            {
+                upload_page(renderer, &vertices, &indices, &ranges, &pending)?;
+                vertices.clear();
+                indices.clear();
+                ranges.clear();
+                pending.clear();
+            }
         }
+        upload_page(renderer, &vertices, &indices, &ranges, &pending)?;
 
         // 2. Dynamic lights from `level`
         for lvl_light in &world.level_data.lights {
@@ -496,7 +558,6 @@ impl RenderBridge {
             });
         }
 
-        self.world_synced = true;
         Ok(())
     }
 
@@ -1560,27 +1621,26 @@ fn upload_resolved_mesh(
     if static_verts.is_empty() || indices.is_empty() {
         return Ok(None);
     }
-    let gpu_verts: Vec<XRayVertex> = static_verts
-        .iter()
-        .map(|v| {
-            let n_len_sq = v.normal[0] * v.normal[0] + v.normal[1] * v.normal[1] + v.normal[2] * v.normal[2];
-            let normal = if n_len_sq > 1e-10 {
-                let inv = 1.0 / n_len_sq.sqrt();
-                [v.normal[0] * inv, v.normal[1] * inv, v.normal[2] * inv]
-            } else {
-                [0.0, 1.0, 0.0]
-            };
-            let (tangent, _) = vector_generate_orthonormal_basis(normal);
-            XRayVertex {
-                position: v.position,
-                normal,
-                uv: v.uv0,
-                tangent,
-            }
-        })
-        .collect();
+    let gpu_verts: Vec<XRayVertex> = static_verts.iter().map(world_vertex).collect();
     let handle = renderer.create_mesh(&gpu_verts, indices)?;
     Ok(Some(handle))
+}
+
+fn world_vertex(v: &StaticVertex) -> XRayVertex {
+    let n_len_sq = v.normal[0] * v.normal[0] + v.normal[1] * v.normal[1] + v.normal[2] * v.normal[2];
+    let normal = if n_len_sq > 1e-10 {
+        let inv = 1.0 / n_len_sq.sqrt();
+        [v.normal[0] * inv, v.normal[1] * inv, v.normal[2] * inv]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let (tangent, _) = vector_generate_orthonormal_basis(normal);
+    XRayVertex {
+        position: v.position,
+        normal,
+        uv: v.uv0,
+        tangent,
+    }
 }
 
 fn load_hud_materials(vfs: &VirtualFileSystem) -> BTreeMap<String, HudMaterial> {
@@ -1644,9 +1704,9 @@ pub fn load_vfs_texture(
     let vfs = vfs.ok_or_else(|| "VFS not attached".to_owned())?;
     let source = vfs.resolve(&key).map_err(|e| format!("VFS lookup {key}: {e:?}"))?;
     let bytes = vfs.read_bytes(&key).map_err(|e| format!("VFS read {source:?}: {e:?}"))?;
-    xray_render_dx12::texture::parse_dds(&bytes)
+    let dds = xray_render_dx12::texture::parse_dds(&bytes)
         .map_err(|e| format!("DDS decode {key} from {source:?}: {e:?}"))?;
-    renderer.load_texture_from_dds(&key, &bytes)
+    renderer.load_parsed_dds_texture(&key, &dds)
         .map_err(|e| format!("GPU upload {key} from {source:?}: {e:?}"))
 }
 

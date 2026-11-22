@@ -96,11 +96,42 @@ impl UploadBuffer {
 }
 
 struct Mesh {
-    vertices: UploadBuffer,
-    indices: UploadBuffer,
+    vertices: ID3D12Resource,
+    indices: ID3D12Resource,
     vertex_view: D3D12_VERTEX_BUFFER_VIEW,
     index_view: D3D12_INDEX_BUFFER_VIEW,
     index_count: u32,
+}
+
+/// Element ranges in a packed static geometry page. Indices are local to each vertex range.
+pub struct StaticMeshRange {
+    pub vertices: std::ops::Range<usize>,
+    pub indices: std::ops::Range<usize>,
+}
+
+fn create_static_buffer(
+    device: &ID3D12Device,
+    bytes: &[u8],
+) -> WinResult<(ID3D12Resource, UploadBuffer)> {
+    let staging = UploadBuffer::new(device, bytes)?;
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+        ..Default::default()
+    };
+    let mut resource: Option<ID3D12Resource> = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &staging.0.GetDesc(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut resource,
+        )?;
+    }
+    Ok((resource.ok_or_else(failure)?, staging))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -465,11 +496,83 @@ impl GeometryState {
                 SizeInBytes: indices.len() as u32,
                 Format: DXGI_FORMAT(format as i32),
             },
-            vertices: vertices_buffer,
-            indices: indices_buffer,
+            vertices: vertices_buffer.0,
+            indices: indices_buffer.0,
             index_count: count,
         };
         self.meshes.insert(mesh).ok_or_else(failure)
+    }
+
+    pub fn create_static_mesh_page(
+        &mut self,
+        device: &ID3D12Device,
+        cmd: &ID3D12GraphicsCommandList,
+        vertices: &[crate::geometry_abi::XRayVertex],
+        indices: &[u16],
+        ranges: &[StaticMeshRange],
+    ) -> WinResult<Vec<MeshHandle>> {
+        let vertex_size = std::mem::size_of_val(vertices);
+        let index_size = std::mem::size_of_val(indices);
+        if vertex_size > u32::MAX as usize || index_size > u32::MAX as usize
+            || ranges.iter().any(|range| {
+                range.vertices.is_empty() || range.vertices.end > vertices.len()
+                    || range.indices.is_empty() || range.indices.end > indices.len()
+            })
+        {
+            return Err(failure());
+        }
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vertex_bytes = unsafe {
+            std::slice::from_raw_parts(vertices.as_ptr().cast::<u8>(), vertex_size)
+        };
+        let index_bytes = unsafe {
+            std::slice::from_raw_parts(indices.as_ptr().cast::<u8>(), index_size)
+        };
+        let (vertex_buffer, vertex_staging) = create_static_buffer(device, vertex_bytes)?;
+        let (index_buffer, index_staging) = create_static_buffer(device, index_bytes)?;
+        for (buffer, staging, size, state) in [
+            (&vertex_buffer, vertex_staging, vertex_size, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
+            (&index_buffer, index_staging, index_size, D3D12_RESOURCE_STATE_INDEX_BUFFER),
+        ] {
+            unsafe {
+                cmd.CopyBufferRegion(buffer, 0, &staging.0, 0, size as u64);
+                cmd.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::transmute_copy(buffer),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                            StateAfter: state,
+                        }),
+                    },
+                }]);
+            }
+            self.recording_resources.extend([buffer.clone(), staging.0]);
+        }
+
+        let vertex_address = unsafe { vertex_buffer.GetGPUVirtualAddress() };
+        let index_address = unsafe { index_buffer.GetGPUVirtualAddress() };
+        ranges.iter().map(|range| {
+            self.meshes.insert(Mesh {
+                vertices: vertex_buffer.clone(),
+                indices: index_buffer.clone(),
+                vertex_view: D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: vertex_address + range.vertices.start as u64 * u64::from(VERTEX_STRIDE),
+                    SizeInBytes: range.vertices.len() as u32 * VERTEX_STRIDE,
+                    StrideInBytes: VERTEX_STRIDE,
+                },
+                index_view: D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: index_address + range.indices.start as u64 * 2,
+                    SizeInBytes: range.indices.len() as u32 * 2,
+                    Format: DXGI_FORMAT_R16_UINT,
+                },
+                index_count: range.indices.len() as u32,
+            }).ok_or_else(failure)
+        }).collect()
     }
 
     pub fn destroy_mesh(&mut self, handle: MeshHandle) -> bool {
@@ -627,8 +730,8 @@ impl GeometryState {
 
         // Clone BEFORE command recording so CPU destruction cannot invalidate a draw.
         self.recording_resources.extend([
-            mesh.vertices.0.clone(),
-            mesh.indices.0.clone(),
+            mesh.vertices.clone(),
+            mesh.indices.clone(),
             camera.0.clone(),
             tf_buf.0.clone(),
             lt_buf.0.clone(),
@@ -723,8 +826,8 @@ impl GeometryState {
 
         // Clone BEFORE command recording so CPU destruction cannot invalidate a draw.
         self.recording_resources.extend([
-            mesh.vertices.0.clone(),
-            mesh.indices.0.clone(),
+            mesh.vertices.clone(),
+            mesh.indices.clone(),
             camera.0.clone(),
             tf_buf.0.clone(),
             lt_buf.0.clone(),
@@ -876,7 +979,7 @@ impl GeometryState {
                     current_transform = Some(transform_index);
                 }
                 let mesh = self.meshes.get(handle).unwrap();
-                self.recording_resources.extend([mesh.vertices.0.clone(), mesh.indices.0.clone()]);
+                self.recording_resources.extend([mesh.vertices.clone(), mesh.indices.clone()]);
                 cmd.IASetVertexBuffers(0, Some(&[mesh.vertex_view]));
                 cmd.IASetIndexBuffer(Some(&mesh.index_view));
                 cmd.DrawIndexedInstanced(mesh.index_count, 1, 0, 0, 0);
@@ -934,8 +1037,8 @@ impl GeometryState {
         let lt_buf = self.lights.as_ref().unwrap_or(default_lt);
 
         self.recording_resources.extend([
-            mesh.vertices.0.clone(),
-            mesh.indices.0.clone(),
+            mesh.vertices.clone(),
+            mesh.indices.clone(),
             camera.0.clone(),
             tf_buf.0.clone(),
             lt_buf.0.clone(),
@@ -1023,8 +1126,8 @@ impl GeometryState {
         let lt_buf = self.lights.as_ref().unwrap_or(default_lt);
 
         self.recording_resources.extend([
-            mesh.vertices.0.clone(),
-            mesh.indices.0.clone(),
+            mesh.vertices.clone(),
+            mesh.indices.clone(),
             camera.0.clone(),
             tf_buf.0.clone(),
             lt_buf.0.clone(),

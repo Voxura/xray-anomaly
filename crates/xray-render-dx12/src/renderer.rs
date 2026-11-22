@@ -29,6 +29,8 @@ use crate::pipeline::PipelineManager;
 use crate::swapchain::SwapChainManager;
 use crate::texture::{GpuTexture, TextureRegistry};
 
+const ASSET_STAGING_BUDGET: u64 = 32 * 1024 * 1024;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceState {
@@ -66,6 +68,7 @@ pub struct Dx12Renderer {
     pub height: u32,
     pub in_frame: bool,
     pub current_cmd_list: Option<ID3D12GraphicsCommandList>,
+    asset_staging_bytes: Option<u64>,
     pub shadow_map: Option<crate::shadow::DirectionalShadowMap>,
     pub particle_renderer: Option<crate::particle::ParticleSystemRenderer>,
     pub sky_renderer: Option<crate::sky::SkyRenderer>,
@@ -137,6 +140,7 @@ impl Dx12Renderer {
             height: 0,
             in_frame: false,
             current_cmd_list: None,
+            asset_staging_bytes: None,
             shadow_map: None,
             particle_renderer: None,
             sky_renderer: None,
@@ -195,34 +199,11 @@ impl Dx12Renderer {
 
     /// Begin frame recording: resets command allocator and transitions backbuffer to RenderTarget
     pub fn begin_frame(&mut self) -> WinResult<&ID3D12GraphicsCommandList> {
-        if self.swapchain.is_none() || self.in_frame {
+        if self.swapchain.is_none() || self.in_frame || self.asset_staging_bytes.is_some() {
             return Err(windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)));
         }
 
-        let required_fence = self
-            .command_mgr
-            .worker(0)
-            .map_or(0, |w| w.required_fence(self.frame_index));
-
-        if required_fence > 0 && unsafe { self.fence.GetCompletedValue() } < required_fence {
-            unsafe {
-                self.fence
-                    .SetEventOnCompletion(required_fence, self.fence_event)?;
-                WaitForSingleObject(self.fence_event, INFINITE);
-            }
-        }
-
-        let completed_fence = unsafe { self.fence.GetCompletedValue() };
-        self.geometry.retire(completed_fence);
-        self.textures.retire(completed_fence);
-        let allocator = self
-            .command_mgr
-            .worker(0)
-            .unwrap()
-            .begin_frame(self.frame_index, completed_fence)
-            .map_err(|_| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
-
-        let cmd = self.command_mgr.acquire_command_list(allocator)?;
+        let cmd = self.acquire_command_list()?;
 
         // Transition backbuffer from PRESENT to RENDER_TARGET
         let backbuffer = self.swapchain.as_ref().unwrap().current_backbuffer_resource();
@@ -306,8 +287,18 @@ impl Dx12Renderer {
         };
         unsafe {
             cmd.ResourceBarrier(&[barrier]);
+        }
+        self.submit_command_list(cmd)?;
+        self.frame_index += 1;
+        self.in_frame = false;
+        // Submission is tracked before Present: failure must not release live buffers.
+        self.swapchain.as_ref().unwrap().present(vsync)
+    }
+
+    fn submit_command_list(&mut self, cmd: ID3D12GraphicsCommandList) -> WinResult<()> {
+        unsafe {
             cmd.Close()?;
-            // Retain immutable draw buffers even if presentation or signaling fails.
+            // Retain both draw and upload buffers even if signaling fails.
             self.geometry.prepare_submission();
             self.device_ctx
                 .direct_queue
@@ -335,10 +326,7 @@ impl Dx12Renderer {
         self.textures.retire(completed);
 
         self.command_mgr.release_command_list(cmd);
-        self.frame_index += 1;
-        self.in_frame = false;
-        // Submission is tracked before Present: failure must not release live buffers.
-        self.swapchain.as_ref().unwrap().present(vsync)
+        Ok(())
     }
 
     /// Stall CPU until GPU finishes all submitted work
@@ -348,50 +336,118 @@ impl Dx12Renderer {
             self.device_ctx
                 .direct_queue
                 .Signal(&self.fence, self.fence_value)?;
-            self.fence
-                .SetEventOnCompletion(self.fence_value, self.fence_event)?;
-            WaitForSingleObject(self.fence_event, INFINITE);
+        }
+        self.wait_for_fence(self.fence_value).map(|_| ())
+    }
+
+    fn wait_for_fence(&mut self, value: u64) -> WinResult<u64> {
+        if unsafe { self.fence.GetCompletedValue() } < value {
+            unsafe {
+                self.fence.SetEventOnCompletion(value, self.fence_event)?;
+                WaitForSingleObject(self.fence_event, INFINITE);
+            }
         }
         let completed = unsafe { self.fence.GetCompletedValue() };
         self.geometry.retire(completed);
         self.textures.retire(completed);
+        Ok(completed)
+    }
+
+    fn acquire_command_list(&mut self) -> WinResult<ID3D12GraphicsCommandList> {
+        let required_fence = self.command_mgr.worker(0).unwrap().required_fence(self.frame_index);
+        let completed = self.wait_for_fence(required_fence)?;
+        let allocator = self.command_mgr.worker(0).unwrap().begin_frame(self.frame_index, completed)
+            .map_err(|_| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        self.command_mgr.acquire_command_list(allocator)
+    }
+
+    /// Batch startup and level-transition copies while bounding live staging buffers.
+    /// Inside a render frame, copies stay on the frame's command list.
+    pub fn with_asset_uploads<T>(
+        &mut self,
+        upload: impl FnOnce(&mut Self) -> WinResult<T>,
+    ) -> WinResult<T> {
+        if self.in_frame || self.asset_staging_bytes.is_some() {
+            return upload(self);
+        }
+        self.asset_staging_bytes = Some(0);
+        let result = upload(self);
+        self.asset_staging_bytes = None;
+        // Finish partial batches too. Successful assets may already be cached.
+        self.flush_asset_uploads()?;
+        result
+    }
+
+    fn asset_command_list(&mut self) -> WinResult<ID3D12GraphicsCommandList> {
+        if self.asset_staging_bytes.is_some_and(|bytes| bytes >= ASSET_STAGING_BUDGET) {
+            self.flush_asset_uploads()?;
+            self.asset_staging_bytes = Some(0);
+        }
+        if let Some(cmd) = &self.current_cmd_list {
+            return Ok(cmd.clone());
+        }
+        let cmd = self.acquire_command_list()?;
+        self.current_cmd_list = Some(cmd.clone());
+        Ok(cmd)
+    }
+
+    fn flush_asset_uploads(&mut self) -> WinResult<()> {
+        if let Some(cmd) = self.current_cmd_list.take() {
+            self.submit_command_list(cmd)?;
+            self.wait_for_fence(self.fence_value)?;
+        }
         Ok(())
+    }
+
+    fn add_asset_staging_bytes(&mut self, size: u64) {
+        if let Some(bytes) = &mut self.asset_staging_bytes {
+            *bytes = bytes.saturating_add(size);
+        }
     }
 
     /// Upload a DDS texture into GPU VRAM (default heap) and register into the bindless descriptor heap.
     /// Automatically deduplicates repeated texture requests across sub-meshes and materials.
     pub fn load_texture_from_dds(&mut self, name: &str, bytes: &[u8]) -> WinResult<DescriptorIndex> {
+        if let Some(existing) = self.get_texture(name) {
+            return Ok(existing.descriptor_index);
+        }
+        let dds = crate::texture::parse_dds(bytes)
+            .map_err(|_| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        self.load_parsed_dds_texture(name, &dds)
+    }
+
+    pub fn load_parsed_dds_texture(
+        &mut self,
+        name: &str,
+        dds: &crate::texture::DdsImage<'_>,
+    ) -> WinResult<DescriptorIndex> {
         let normalized_name = name.to_ascii_lowercase().replace('\\', "/");
         if let Some(existing) = self.textures.get_by_name(&normalized_name) {
             return Ok(existing.descriptor_index);
         }
+        self.with_asset_uploads(|renderer| renderer.record_dds_upload(normalized_name, dds))
+    }
 
-        let dds = crate::texture::parse_dds(bytes).map_err(|_| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
-
+    fn record_dds_upload(
+        &mut self,
+        normalized_name: String,
+        dds: &crate::texture::DdsImage<'_>,
+    ) -> WinResult<DescriptorIndex> {
+        let cmd = self.asset_command_list()?;
         let descriptor_index = self
             .bindless_allocator
             .allocate()
             .ok_or_else(|| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
 
-        let (texture_res, _staging_res) = if let Some(cmd) = &self.current_cmd_list {
-            let (tex, staging) = crate::texture::upload_dds_texture(&self.device_ctx.device, cmd, &dds)?;
-            self.textures.track_staging(staging);
-            (tex, ())
-        } else {
-            // Out of frame upload: execute synchronously
-            let allocator = self.command_mgr.worker(0).unwrap().begin_frame(self.frame_index, unsafe { self.fence.GetCompletedValue() })
-                .map_err(|_| windows::core::Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
-            let cmd = self.command_mgr.acquire_command_list(allocator)?;
-            let (tex, staging) = crate::texture::upload_dds_texture(&self.device_ctx.device, &cmd, &dds)?;
-            unsafe {
-                cmd.Close()?;
-                self.device_ctx.direct_queue.ExecuteCommandLists(&[Some(cmd.cast()?)]);
+        let (texture_res, staging) = match crate::texture::upload_dds_texture(&self.device_ctx.device, &cmd, dds) {
+            Ok(buffers) => buffers,
+            Err(err) => {
+                self.bindless_allocator.free_immediate(descriptor_index);
+                return Err(err);
             }
-            self.command_mgr.release_command_list(cmd);
-            self.wait_for_gpu()?;
-            drop(staging);
-            (tex, ())
         };
+        self.add_asset_staging_bytes(unsafe { staging.GetDesc() }.Width);
+        self.geometry.track_resource(staging);
 
         let heap_start = unsafe { self.bindless_heap.GetCPUDescriptorHandleForHeapStart() };
         let cpu_handle = windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -419,6 +475,25 @@ impl Dx12Renderer {
 
         self.textures.insert(normalized_name, gpu_tex);
         Ok(descriptor_index)
+    }
+
+    /// Upload geometry shared by immutable vertex and index buffer views.
+    pub fn create_static_mesh_page(
+        &mut self,
+        vertices: &[crate::geometry_abi::XRayVertex],
+        indices: &[u16],
+        ranges: &[crate::geometry::StaticMeshRange],
+    ) -> WinResult<Vec<crate::geometry_abi::MeshHandle>> {
+        self.with_asset_uploads(|renderer| {
+            let cmd = renderer.asset_command_list()?;
+            let handles = renderer.geometry.create_static_mesh_page(
+                &renderer.device_ctx.device, &cmd, vertices, indices, ranges,
+            )?;
+            renderer.add_asset_staging_bytes(
+                (std::mem::size_of_val(vertices) + std::mem::size_of_val(indices)) as u64,
+            );
+            Ok(handles)
+        })
     }
 
     /// Retrieve loaded texture metadata and GPU resource by name (case- and slash-normalized)
